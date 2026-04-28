@@ -1,0 +1,20 @@
+{
+  "name": "@heliopause/engine",
+  "version": "0.1.0",
+  "description": "A WebGPU-first local LLM engine library.",
+  "type": "module",
+  "private": false,
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "import": "./src/index.ts"
+    }
+  },
+  "scripts": {
+    "build": "tsc --noEmit",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3"
+  }
+}

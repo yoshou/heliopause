@@ -1,0 +1,10 @@
+node_modules
+.pnpm-store
+dist
+dist-ssr
+*.local
+
+**/src-tauri/target
+**/src-tauri/gen/schemas
+
+.DS_Store

@@ -1,0 +1,16 @@
+{
+  "name": "heliopause",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "pnpm --filter @heliopause/desktop dev",
+    "build": "pnpm --filter @heliopause/engine build && pnpm --filter @heliopause/desktop build",
+    "preview": "pnpm --filter @heliopause/desktop preview",
+    "tauri": "pnpm --filter @heliopause/desktop tauri",
+    "typecheck": "pnpm --filter @heliopause/engine typecheck && pnpm --filter @heliopause/desktop typecheck"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3"
+  }
+}
