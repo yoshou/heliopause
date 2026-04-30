@@ -51,6 +51,7 @@ export type Qwen35RecurrentCache = {
 export type Qwen35InferenceState = {
   recurrent: Map<number, Qwen35RecurrentCache>;
   fullAttention: Map<number, Qwen35FullAttentionCache>;
+  contextLength: number;
   nextPosition: number;
 };
 
@@ -82,6 +83,7 @@ export type Qwen35DecodeResult = {
 };
 
 export type Qwen35ModelSessionOptions = {
+  maxContextLength?: number;
   maxWeightCacheBytes?: number;
 };
 
@@ -90,6 +92,7 @@ export class Qwen35ModelSession {
   readonly manifest: Qwen35ModelManifest;
   readonly epsilon: number;
 
+  private readonly maxContextLength?: number;
   private readonly maxWeightCacheBytes: number;
   private readonly f32TensorCache = new Map<string, Float32Array>();
   private readonly weightBytesCache = new Map<string, Uint8Array>();
@@ -106,11 +109,16 @@ export class Qwen35ModelSession {
       tensorReader,
       "qwen35.attention.layer_norm_rms_epsilon",
     );
+    this.maxContextLength = options.maxContextLength;
     this.maxWeightCacheBytes = options.maxWeightCacheBytes ?? 256 * 1024 * 1024;
   }
 
   createInferenceState(): Qwen35InferenceState {
-    return createQwen35InferenceState(this.manifest);
+    return createQwen35InferenceState(this.manifest, {
+      contextLength: this.maxContextLength === undefined
+        ? this.manifest.contextLength
+        : Math.min(this.manifest.contextLength, this.maxContextLength),
+    });
   }
 
   getTensor(name: string) {
@@ -210,15 +218,17 @@ export type Qwen35ModelInput = GgufTensorReader | Qwen35ModelSession;
 
 export function createQwen35InferenceState(
   manifest: Qwen35ModelManifest,
+  options: { contextLength?: number } = {},
 ): Qwen35InferenceState {
   const recurrent = new Map<number, Qwen35RecurrentCache>();
   const fullAttention = new Map<number, Qwen35FullAttentionCache>();
+  const contextLength = options.contextLength ?? manifest.contextLength;
   const convDim =
     manifest.ssm.stateSize * manifest.ssm.groupCount * 2 +
     manifest.ssm.stateSize * manifest.ssm.timeStepRank;
   const recurrentStateSize =
     manifest.ssm.stateSize * manifest.ssm.stateSize * manifest.ssm.timeStepRank;
-  const fullCacheSize = manifest.contextLength * manifest.headCountKv * manifest.keyLength;
+  const fullCacheSize = contextLength * manifest.headCountKv * manifest.keyLength;
 
   for (const layer of manifest.recurrentLayers) {
     recurrent.set(layer, {
@@ -234,7 +244,7 @@ export function createQwen35InferenceState(
     });
   }
 
-  return { recurrent, fullAttention, nextPosition: 0 };
+  return { recurrent, fullAttention, contextLength, nextPosition: 0 };
 }
 
 export async function prefillQwen35(
@@ -244,7 +254,7 @@ export async function prefillQwen35(
 ): Promise<Qwen35PrefillResult> {
   const session = modelSession(model);
   const { manifest } = session;
-  const state = options.state ?? createQwen35InferenceState(manifest);
+  const state = options.state ?? session.createInferenceState();
   const positions = normalizePositions(options.positions, tokenIds.length);
   const epsilon = session.epsilon;
 
@@ -278,7 +288,7 @@ export async function decodeQwen35(
 ): Promise<Qwen35DecodeResult> {
   const session = modelSession(model);
   const { manifest } = session;
-  const state = options.state ?? createQwen35InferenceState(manifest);
+  const state = options.state ?? session.createInferenceState();
   const position = options.position ?? state.nextPosition;
   const positions = new Int32Array([position]);
   const epsilon = session.epsilon;
@@ -470,9 +480,9 @@ export async function forwardQwen35FullAttentionLayer(
     ...ropeCommon,
     headCount: manifest.headCountKv,
   });
-  updateFullAttentionCache(cache, kRope, vProjection, tokenPositions, manifest);
+  updateFullAttentionCache(cache, kRope, vProjection, tokenPositions, manifest, state.contextLength);
   const keyValueTokenCount = Math.min(
-    manifest.contextLength,
+    state.contextLength,
     Math.max(...Array.from(tokenPositions)) + 1,
   );
   const attentionOptions = {
@@ -486,7 +496,7 @@ export async function forwardQwen35FullAttentionLayer(
     valueLayout: "dim-head-token" as const,
     quantizeQueryForScore: "f16" as const,
   };
-  const compactValue = compactValueCache(cache.value, keyValueTokenCount, manifest);
+  const compactValue = compactValueCache(cache.value, keyValueTokenCount, manifest, state.contextLength);
   const attention = (await gqaAttentionWasm(
     qRope,
     cache.key.subarray(0, keyValueTokenCount * manifest.headCountKv * manifest.keyLength),
@@ -819,19 +829,20 @@ function updateFullAttentionCache(
   value: Float32Array,
   positions: Int32Array,
   manifest: Qwen35ModelManifest,
+  contextLength: number,
 ): void {
   const tokenCount = positions.length;
   for (let token = 0; token < tokenCount; token += 1) {
     const position = positions[token] ?? 0;
-    if (position < 0 || position >= manifest.contextLength) {
-      throw new Error(`Position ${position} is outside context length ${manifest.contextLength}`);
+    if (position < 0 || position >= contextLength) {
+      throw new Error(`Position ${position} is outside context length ${contextLength}`);
     }
     for (let head = 0; head < manifest.headCountKv; head += 1) {
       for (let dim = 0; dim < manifest.keyLength; dim += 1) {
         const currentOffset = (token * manifest.headCountKv + head) * manifest.keyLength + dim;
         cache.key[(position * manifest.headCountKv + head) * manifest.keyLength + dim] =
           key[currentOffset] ?? 0;
-        cache.value[(dim * manifest.headCountKv + head) * manifest.contextLength + position] =
+        cache.value[(dim * manifest.headCountKv + head) * contextLength + position] =
           value[currentOffset] ?? 0;
       }
     }
@@ -877,13 +888,14 @@ function compactValueCache(
   value: Float32Array,
   keyValueTokenCount: number,
   manifest: Qwen35ModelManifest,
+  contextLength: number,
 ): Float32Array {
   const output = new Float32Array(manifest.keyLength * manifest.headCountKv * keyValueTokenCount);
   for (let dim = 0; dim < manifest.keyLength; dim += 1) {
     for (let head = 0; head < manifest.headCountKv; head += 1) {
       for (let token = 0; token < keyValueTokenCount; token += 1) {
         output[(dim * manifest.headCountKv + head) * keyValueTokenCount + token] =
-          value[(dim * manifest.headCountKv + head) * manifest.contextLength + token] ?? 0;
+          value[(dim * manifest.headCountKv + head) * contextLength + token] ?? 0;
       }
     }
   }

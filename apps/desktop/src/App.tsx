@@ -1,96 +1,199 @@
-import { FormEvent, useEffect, useMemo, useState } from "react";
-import { WebGpuSupport, checkWebGpuSupport } from "@heliopause/engine";
+import { ChangeEvent, FormEvent, useMemo, useRef, useState } from "react";
+import {
+  DEFAULT_QWEN35_SYSTEM_PROMPT,
+  buildQwen35Tokenizer,
+  createFileGgufTensorReader,
+  createQwen35ChatSession,
+  generateQwen35ChatCompletion,
+  getGgufModelName,
+  stripQwen35Thinking,
+  type ChatMessage,
+  type Qwen35ModelSession,
+  type Qwen35Tokenizer,
+} from "@heliopause/engine";
 
-type Message = {
+type UiMessage = {
   id: string;
   role: "user" | "assistant";
   content: string;
 };
 
-type WebGpuStatus =
-  | { state: "checking"; label: string; detail: string }
-  | { state: "ready"; label: string; detail: string }
-  | { state: "unavailable"; label: string; detail: string };
+type ModelState =
+  | { status: "empty" }
+  | { status: "loading"; fileName: string }
+  | {
+      status: "ready";
+      fileName: string;
+      modelName: string;
+      contextLength: number;
+      originalContextLength: number;
+      session: Qwen35ModelSession;
+      tokenizer: Qwen35Tokenizer;
+    }
+  | { status: "error"; fileName: string; message: string };
 
-const initialWebGpuStatus: WebGpuStatus = {
-  state: "checking",
-  label: "Checking WebGPU",
-  detail: "Looking for a GPU adapter in the current WebView.",
-};
+const CHAT_CONTEXT_LENGTH = 4096;
 
 function App() {
+  const [model, setModel] = useState<ModelState>({ status: "empty" });
+  const [systemPrompt, setSystemPrompt] = useState(DEFAULT_QWEN35_SYSTEM_PROMPT);
   const [prompt, setPrompt] = useState("");
-  const [messages, setMessages] = useState<Message[]>([]);
-  const [webGpuStatus, setWebGpuStatus] =
-    useState<WebGpuStatus>(initialWebGpuStatus);
+  const [messages, setMessages] = useState<UiMessage[]>([]);
+  const [isGenerating, setIsGenerating] = useState(false);
+  const abortRef = useRef<AbortController | null>(null);
 
-  const canSubmit = useMemo(() => prompt.trim().length > 0, [prompt]);
+  const canSubmit = useMemo(
+    () => model.status === "ready" && prompt.trim().length > 0 && !isGenerating,
+    [isGenerating, model.status, prompt],
+  );
 
-  useEffect(() => {
-    let cancelled = false;
+  async function handleModelChange(event: ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0];
+    if (!file) {
+      return;
+    }
 
-    checkWebGpuSupport().then((support) => {
-      if (!cancelled) {
-        setWebGpuStatus(formatWebGpuStatus(support));
-      }
-    });
+    setModel({ status: "loading", fileName: file.name });
+    try {
+      const tensorReader = await createFileGgufTensorReader(file);
+      const session = createQwen35ChatSession(tensorReader, {
+        maxContextLength: CHAT_CONTEXT_LENGTH,
+        maxWeightCacheBytes: 256 * 1024 * 1024,
+      });
+      const tokenizer = buildQwen35Tokenizer(tensorReader.metadata);
+      setModel({
+        status: "ready",
+        fileName: file.name,
+        modelName: getGgufModelName(tensorReader),
+        contextLength: Math.min(session.manifest.contextLength, CHAT_CONTEXT_LENGTH),
+        originalContextLength: session.manifest.contextLength,
+        session,
+        tokenizer,
+      });
+    } catch (error) {
+      setModel({
+        status: "error",
+        fileName: file.name,
+        message: error instanceof Error ? error.message : String(error),
+      });
+    } finally {
+      event.target.value = "";
+    }
+  }
 
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-
-  function handleSubmit(event: FormEvent<HTMLFormElement>) {
+  async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    if (model.status !== "ready" || isGenerating) {
+      return;
+    }
 
     const trimmedPrompt = prompt.trim();
     if (!trimmedPrompt) {
       return;
     }
 
-    const submittedAt = Date.now().toString();
-    setMessages((currentMessages) => [
-      ...currentMessages,
-      {
-        id: `user-${submittedAt}`,
-        role: "user",
-        content: trimmedPrompt,
-      },
-      {
-        id: `assistant-${submittedAt}`,
-        role: "assistant",
-        content:
-          "The WebGPU inference engine is not connected yet. The next implementation step will send this prompt to a local LLM.",
-      },
-    ]);
+    const userMessage: UiMessage = {
+      id: createId("user"),
+      role: "user",
+      content: trimmedPrompt,
+    };
+    const assistantId = createId("assistant");
+    const nextMessages = [
+      ...messages,
+      userMessage,
+      { id: assistantId, role: "assistant" as const, content: "" },
+    ];
+
+    setMessages(nextMessages);
     setPrompt("");
+    setIsGenerating(true);
+
+    const abortController = new AbortController();
+    abortRef.current = abortController;
+
+    const chatMessages: ChatMessage[] = [
+      { role: "system", content: systemPrompt },
+      ...messages.map((message) => ({
+        role: message.role,
+        content: message.content,
+      })),
+      { role: "user", content: trimmedPrompt },
+    ];
+
+    try {
+      for await (const chunk of generateQwen35ChatCompletion(
+        model.session,
+        model.tokenizer,
+        chatMessages,
+        {
+          maxNewTokens: 256,
+          signal: abortController.signal,
+        },
+      )) {
+        setMessages((currentMessages) =>
+          currentMessages.map((message) =>
+            message.id === assistantId
+              ? { ...message, content: chunk.content }
+              : message,
+          ),
+        );
+      }
+    } catch (error) {
+      if (!abortController.signal.aborted) {
+        setMessages((currentMessages) =>
+          currentMessages.map((message) =>
+            message.id === assistantId
+              ? {
+                  ...message,
+                  content: `Generation failed: ${error instanceof Error ? error.message : String(error)}`,
+                }
+              : message,
+          ),
+        );
+      }
+    } finally {
+      abortRef.current = null;
+      setIsGenerating(false);
+    }
+  }
+
+  function handleStop() {
+    abortRef.current?.abort();
   }
 
   return (
     <main className="app-shell">
-      <section className="workspace" aria-labelledby="app-title">
-        <header className="app-header">
-          <div>
-            <p className="eyebrow">Local LLM Workspace</p>
-            <h1 id="app-title">Heliopause</h1>
-          </div>
-          <div className={`status-badge status-badge--${webGpuStatus.state}`}>
-            <span aria-hidden="true" />
-            <div>
-              <strong>{webGpuStatus.label}</strong>
-              <small>{webGpuStatus.detail}</small>
-            </div>
-          </div>
+      <aside className="sidebar" aria-label="Model settings">
+        <header>
+          <p className="eyebrow">CPU / WASM mode</p>
+          <h1>Heliopause</h1>
         </header>
 
+        <section className="model-panel">
+          <label className="file-picker">
+            <span>Load GGUF model</span>
+            <input type="file" accept=".gguf" onChange={handleModelChange} />
+          </label>
+          <ModelStatus model={model} />
+        </section>
+
+        <section className="system-panel">
+          <label htmlFor="system-prompt">System prompt</label>
+          <textarea
+            id="system-prompt"
+            value={systemPrompt}
+            onChange={(event) => setSystemPrompt(event.target.value)}
+            rows={8}
+          />
+        </section>
+      </aside>
+
+      <section className="chat-workspace" aria-label="Chat">
         <div className="message-panel" aria-live="polite">
           {messages.length === 0 ? (
             <div className="empty-state">
-              <h2>Prompt</h2>
-              <p>
-                Your text will be connected to WebGPU LLM inference in a later
-                phase.
-              </p>
+              <h2>Load a Qwen GGUF model</h2>
+              <p>Choose a local model file, then start a private on-device chat.</p>
             </div>
           ) : (
             messages.map((message) => (
@@ -99,26 +202,33 @@ function App() {
                 key={message.id}
               >
                 <span>{message.role === "user" ? "You" : "Assistant"}</span>
-                <p>{message.content}</p>
+                <p>{stripQwen35Thinking(message.content) || (message.role === "assistant" && isGenerating ? "Generating..." : "")}</p>
               </article>
             ))
           )}
         </div>
 
         <form className="prompt-form" onSubmit={handleSubmit}>
-          <label htmlFor="prompt">Prompt</label>
+          <label htmlFor="prompt">Message</label>
           <textarea
             id="prompt"
             value={prompt}
             onChange={(event) => setPrompt(event.target.value)}
-            placeholder="Enter a prompt for the local LLM"
-            rows={5}
+            placeholder={model.status === "ready" ? "Ask the local model" : "Load a GGUF model first"}
+            rows={4}
+            disabled={model.status !== "ready" || isGenerating}
           />
           <div className="form-actions">
-            <p>{prompt.trim().length} characters</p>
-            <button type="submit" disabled={!canSubmit}>
-              Send
-            </button>
+            <p>{model.status === "ready" ? `${prompt.trim().length} characters` : "No model loaded"}</p>
+            {isGenerating ? (
+              <button type="button" className="secondary-button" onClick={handleStop}>
+                Stop
+              </button>
+            ) : (
+              <button type="submit" disabled={!canSubmit}>
+                Send
+              </button>
+            )}
           </div>
         </form>
       </section>
@@ -126,35 +236,45 @@ function App() {
   );
 }
 
-function formatWebGpuStatus(support: WebGpuSupport): WebGpuStatus {
-  if (support.available === true) {
-    return {
-      state: "ready",
-      label: "WebGPU ready",
-      detail: "A GPU adapter is available for future local inference.",
-    };
+function ModelStatus({ model }: { model: ModelState }) {
+  if (model.status === "empty") {
+    return <p className="model-status">No model loaded.</p>;
   }
-
-  return {
-    state: "unavailable",
-    label: "WebGPU unavailable",
-    detail: getWebGpuUnavailableDetail(support),
-  };
+  if (model.status === "loading") {
+    return <p className="model-status">Loading {model.fileName}...</p>;
+  }
+  if (model.status === "error") {
+    return (
+      <p className="model-status model-status--error">
+        {model.fileName}: {model.message}
+      </p>
+    );
+  }
+  return (
+    <dl className="model-details">
+      <div>
+        <dt>Model</dt>
+        <dd>{model.modelName}</dd>
+      </div>
+      <div>
+        <dt>File</dt>
+        <dd>{model.fileName}</dd>
+      </div>
+      <div>
+        <dt>Context</dt>
+        <dd>
+          {model.contextLength.toLocaleString()} chat tokens
+          {model.originalContextLength > model.contextLength
+            ? ` (${model.originalContextLength.toLocaleString()} model max)`
+            : ""}
+        </dd>
+      </div>
+    </dl>
+  );
 }
 
-function getWebGpuUnavailableDetail(
-  support: Extract<WebGpuSupport, { available: false }>,
-): string {
-  switch (support.reason) {
-    case "navigator-missing":
-      return "navigator is not available in this runtime.";
-    case "api-missing":
-      return "This WebView does not expose navigator.gpu.";
-    case "adapter-missing":
-      return "No compatible GPU adapter was found.";
-    case "request-failed":
-      return support.error ?? "Adapter request failed.";
-  }
+function createId(prefix: string): string {
+  return `${prefix}-${globalThis.crypto?.randomUUID?.() ?? Date.now().toString(36)}`;
 }
 
 export default App;

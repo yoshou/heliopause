@@ -87,6 +87,35 @@ test("Qwen35 inference state allocates recurrent and full-attention caches from 
   assert.equal(state.fullAttention.get(0)?.value.length, 2);
 });
 
+test("Qwen35 model session can cap inference cache context", () => {
+  const reader = tensorReaderFromTensors([
+    f32Tensor("token_embd.weight", [4, 8], sequence(32)),
+  ], {
+    "qwen35.block_count": 1,
+    "qwen35.context_length": 16,
+    "qwen35.full_attention_interval": 1,
+  });
+  const session = createQwen35ModelSession(reader, { maxContextLength: 4 });
+  const state = session.createInferenceState();
+
+  assert.equal(session.manifest.contextLength, 16);
+  assert.equal(state.contextLength, 4);
+  assert.equal(state.fullAttention.get(0)?.key.length, 8);
+  assert.equal(state.fullAttention.get(0)?.value.length, 8);
+});
+
+test("Qwen35 inference state defaults capped context to manifest context", () => {
+  const manifest = buildQwen35Manifest({
+    ...minimalGguf(),
+    tensorCount: 0,
+    tensors: [],
+  });
+  const state = createQwen35InferenceState(manifest, { contextLength: 1 });
+
+  assert.equal(state.contextLength, 1);
+  assert.equal(state.fullAttention.get(0)?.key.length, 2);
+});
+
 test("Qwen35 prefill advances nextPosition from default and explicit positions", async () => {
   const reader = tensorReaderFromTensors([
     f32Tensor("token_embd.weight", [4, 8], sequence(32)),

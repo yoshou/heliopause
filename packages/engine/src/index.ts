@@ -76,6 +76,21 @@ export {
 } from "./tokenizer";
 
 export {
+  applyQwen35ChatTemplate,
+  createFileGgufTensorReader,
+  createQwen35ChatSession,
+  DEFAULT_QWEN35_SYSTEM_PROMPT,
+  generateQwen35ChatCompletion,
+  getGgufModelName,
+  stripQwen35Thinking,
+  type ChatMessage,
+  type FileGgufTensorReaderOptions,
+  type Qwen35ChatCompletionChunk,
+  type Qwen35ChatCompletionOptions,
+  type Qwen35ChatTemplateOptions,
+} from "./chat";
+
+export {
   gatedDeltaNet,
   l2NormRows,
   gqaAttention,

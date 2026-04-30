@@ -2,8 +2,8 @@
   font-family:
     Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
     sans-serif;
-  color: #18202a;
-  background: #eef2f3;
+  color: #172026;
+  background: #f3f5f2;
   font-synthesis: none;
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
@@ -21,139 +21,195 @@ body {
 }
 
 button,
-textarea {
+textarea,
+input {
   font: inherit;
 }
 
 .app-shell {
-  min-height: 100vh;
-  padding: 32px;
-  background:
-    linear-gradient(135deg, rgba(54, 112, 116, 0.14), transparent 34%),
-    linear-gradient(315deg, rgba(186, 73, 48, 0.12), transparent 38%),
-    #eef2f3;
-}
-
-.workspace {
   display: grid;
-  grid-template-rows: auto 1fr auto;
-  gap: 20px;
-  width: min(100%, 960px);
-  min-height: calc(100vh - 64px);
-  margin: 0 auto;
+  grid-template-columns: minmax(280px, 340px) minmax(0, 1fr);
+  min-height: 100vh;
+  background: #f3f5f2;
 }
 
-.app-header {
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 20px;
+.sidebar {
+  display: grid;
+  align-content: start;
+  gap: 22px;
+  padding: 28px;
+  border-right: 1px solid #d8ded8;
+  background: #ffffff;
+}
+
+.sidebar header {
+  display: grid;
+  gap: 6px;
 }
 
 .eyebrow {
-  margin: 0 0 6px;
-  color: #42656a;
+  margin: 0;
+  color: #5f6f5f;
   font-size: 0.78rem;
-  font-weight: 700;
+  font-weight: 800;
   letter-spacing: 0.08em;
   text-transform: uppercase;
 }
 
+h1,
+h2,
+p {
+  margin-top: 0;
+}
+
 h1 {
-  margin: 0;
+  margin-bottom: 0;
   color: #111820;
-  font-size: clamp(2.2rem, 8vw, 4.7rem);
-  line-height: 0.95;
+  font-size: 2.35rem;
+  line-height: 1;
   letter-spacing: 0;
 }
 
-.status-badge {
+.model-panel,
+.system-panel {
   display: grid;
-  grid-template-columns: 10px 1fr;
-  gap: 10px;
-  width: min(100%, 310px);
-  padding: 12px 14px;
-  border: 1px solid rgba(24, 32, 42, 0.14);
+  gap: 12px;
+}
+
+.file-picker {
+  display: grid;
+  gap: 8px;
+  color: #29343b;
+  font-size: 0.9rem;
+  font-weight: 800;
+}
+
+.file-picker input {
+  width: 100%;
+  padding: 10px;
+  border: 1px solid #c9d2cb;
   border-radius: 8px;
-  background: rgba(255, 255, 255, 0.72);
-  box-shadow: 0 12px 36px rgba(24, 32, 42, 0.08);
+  background: #f8faf7;
+  color: #172026;
 }
 
-.status-badge > span {
-  width: 10px;
-  height: 10px;
-  margin-top: 4px;
-  border-radius: 999px;
-  background: #9a6b22;
+.model-status {
+  margin: 0;
+  color: #647064;
+  line-height: 1.55;
 }
 
-.status-badge--ready > span {
-  background: #18805c;
+.model-status--error {
+  color: #a23a2a;
 }
 
-.status-badge--unavailable > span {
-  background: #ba4930;
+.model-details {
+  display: grid;
+  gap: 10px;
+  margin: 0;
+  padding: 12px;
+  border: 1px solid #d8ded8;
+  border-radius: 8px;
+  background: #f8faf7;
 }
 
-.status-badge strong,
-.status-badge small {
-  display: block;
+.model-details div {
+  display: grid;
+  gap: 2px;
 }
 
-.status-badge strong {
-  margin-bottom: 2px;
+.model-details dt {
+  color: #647064;
+  font-size: 0.74rem;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.model-details dd {
+  min-width: 0;
+  margin: 0;
+  overflow-wrap: anywhere;
+  color: #172026;
   font-size: 0.9rem;
 }
 
-.status-badge small {
-  color: #596674;
-  font-size: 0.76rem;
-  line-height: 1.35;
+.system-panel label,
+.prompt-form label {
+  color: #29343b;
+  font-size: 0.86rem;
+  font-weight: 800;
+}
+
+textarea {
+  width: 100%;
+  resize: vertical;
+  padding: 12px 14px;
+  border: 1px solid #c9d2cb;
+  border-radius: 8px;
+  color: #172026;
+  background: #ffffff;
+  line-height: 1.55;
+}
+
+textarea:focus {
+  border-color: #2f7565;
+  outline: 3px solid rgba(47, 117, 101, 0.16);
+}
+
+textarea:disabled {
+  cursor: not-allowed;
+  background: #eef1ee;
+}
+
+.chat-workspace {
+  display: grid;
+  grid-template-rows: minmax(0, 1fr) auto;
+  min-width: 0;
+  min-height: 100vh;
 }
 
 .message-panel {
   display: flex;
   flex-direction: column;
-  justify-content: flex-end;
-  gap: 12px;
-  min-height: 280px;
-  padding: 20px;
+  gap: 14px;
+  min-height: 0;
+  padding: 28px;
   overflow: auto;
-  border: 1px solid rgba(24, 32, 42, 0.12);
-  border-radius: 8px;
-  background: rgba(255, 255, 255, 0.58);
-  box-shadow: 0 20px 70px rgba(24, 32, 42, 0.1);
 }
 
 .empty-state {
-  max-width: 560px;
-  margin: auto;
+  display: grid;
+  place-items: center;
+  align-content: center;
+  min-height: 100%;
   text-align: center;
 }
 
 .empty-state h2 {
-  margin: 0 0 8px;
+  margin-bottom: 8px;
   color: #111820;
-  font-size: 1.55rem;
+  font-size: 1.45rem;
 }
 
 .empty-state p {
-  margin: 0;
-  color: #596674;
-  line-height: 1.7;
+  max-width: 420px;
+  margin-bottom: 0;
+  color: #65706c;
+  line-height: 1.65;
 }
 
 .message {
-  width: min(76%, 640px);
+  width: min(78%, 780px);
   padding: 14px 16px;
-  border: 1px solid rgba(24, 32, 42, 0.11);
+  border: 1px solid #d8ded8;
   border-radius: 8px;
   background: #ffffff;
 }
 
 .message--user {
   align-self: flex-end;
-  background: #dcecea;
+  border-color: #bfd8d1;
+  background: #e3f0ed;
 }
 
 .message--assistant {
@@ -163,13 +219,14 @@ h1 {
 .message span {
   display: block;
   margin-bottom: 6px;
-  color: #42656a;
+  color: #4d675f;
   font-size: 0.78rem;
-  font-weight: 700;
+  font-weight: 800;
 }
 
 .message p {
   margin: 0;
+  overflow-wrap: anywhere;
   line-height: 1.65;
   white-space: pre-wrap;
 }
@@ -177,34 +234,9 @@ h1 {
 .prompt-form {
   display: grid;
   gap: 10px;
-  padding: 16px;
-  border: 1px solid rgba(24, 32, 42, 0.12);
-  border-radius: 8px;
-  background: rgba(255, 255, 255, 0.82);
-  box-shadow: 0 20px 70px rgba(24, 32, 42, 0.1);
-}
-
-.prompt-form label {
-  color: #35414f;
-  font-size: 0.86rem;
-  font-weight: 700;
-}
-
-.prompt-form textarea {
-  width: 100%;
-  min-height: 124px;
-  resize: vertical;
-  padding: 12px 14px;
-  border: 1px solid rgba(24, 32, 42, 0.18);
-  border-radius: 8px;
-  color: #18202a;
+  padding: 18px 28px 24px;
+  border-top: 1px solid #d8ded8;
   background: #ffffff;
-  line-height: 1.6;
-}
-
-.prompt-form textarea:focus {
-  border-color: #367074;
-  outline: 3px solid rgba(54, 112, 116, 0.16);
 }
 
 .form-actions {
@@ -216,23 +248,23 @@ h1 {
 
 .form-actions p {
   margin: 0;
-  color: #596674;
+  color: #647064;
   font-size: 0.82rem;
 }
 
 .form-actions button {
-  min-width: 108px;
+  min-width: 104px;
   min-height: 42px;
   border: 0;
   border-radius: 8px;
   color: #ffffff;
-  background: #ba4930;
-  font-weight: 800;
+  background: #9f4636;
+  font-weight: 850;
   cursor: pointer;
 }
 
 .form-actions button:hover:not(:disabled) {
-  background: #a33e29;
+  background: #85392d;
 }
 
 .form-actions button:disabled {
@@ -240,30 +272,42 @@ h1 {
   opacity: 0.45;
 }
 
-@media (max-width: 720px) {
+.form-actions .secondary-button {
+  color: #172026;
+  background: #e6ebe6;
+}
+
+.form-actions .secondary-button:hover {
+  background: #d6ded7;
+}
+
+@media (max-width: 800px) {
   .app-shell {
-    padding: 18px;
+    grid-template-columns: 1fr;
   }
 
-  .workspace {
-    min-height: calc(100vh - 36px);
+  .sidebar {
+    border-right: 0;
+    border-bottom: 1px solid #d8ded8;
   }
 
-  .app-header,
-  .form-actions {
-    align-items: stretch;
-    flex-direction: column;
-  }
-
-  .status-badge {
-    width: 100%;
+  .chat-workspace {
+    min-height: 62vh;
   }
 
   .message {
     width: 100%;
   }
 
-  .form-actions button {
-    width: 100%;
+  .message-panel,
+  .prompt-form,
+  .sidebar {
+    padding-right: 18px;
+    padding-left: 18px;
+  }
+
+  .form-actions {
+    align-items: stretch;
+    flex-direction: column;
   }
 }
