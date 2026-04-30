@@ -25,11 +25,18 @@ export {
 
 export {
   createQwen35InferenceState,
+  createQwen35ModelSession,
+  decodeQwen35,
   forwardQwen35FullAttentionLayer,
   forwardQwen35RecurrentLayer,
   prefillQwen35,
+  Qwen35ModelSession,
+  type Qwen35DecodeOptions,
+  type Qwen35DecodeResult,
   type Qwen35FullAttentionCache,
   type Qwen35InferenceState,
+  type Qwen35ModelInput,
+  type Qwen35ModelSessionOptions,
   type Qwen35PrefillOptions,
   type Qwen35PrefillResult,
   type Qwen35RecurrentCache,

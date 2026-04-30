@@ -51,6 +51,7 @@ export type Qwen35RecurrentCache = {
 export type Qwen35InferenceState = {
   recurrent: Map<number, Qwen35RecurrentCache>;
   fullAttention: Map<number, Qwen35FullAttentionCache>;
+  nextPosition: number;
 };
 
 export type Qwen35PrefillOptions = {
@@ -66,6 +67,146 @@ export type Qwen35PrefillResult = {
   logits?: Float32Array;
   topTokens?: Array<{ id: number; value: number }>;
 };
+
+export type Qwen35DecodeOptions = {
+  position?: number;
+  state?: Qwen35InferenceState;
+  logitsTopK?: number;
+};
+
+export type Qwen35DecodeResult = {
+  hidden: Float32Array;
+  state: Qwen35InferenceState;
+  logits: Float32Array;
+  topTokens: Array<{ id: number; value: number }>;
+};
+
+export type Qwen35ModelSessionOptions = {
+  maxWeightCacheBytes?: number;
+};
+
+export class Qwen35ModelSession {
+  readonly tensorReader: GgufTensorReader;
+  readonly manifest: Qwen35ModelManifest;
+  readonly epsilon: number;
+
+  private readonly maxWeightCacheBytes: number;
+  private readonly f32TensorCache = new Map<string, Float32Array>();
+  private readonly weightBytesCache = new Map<string, Uint8Array>();
+  private readonly embeddingRowCache = new Map<number, Float32Array>();
+  private weightCacheBytes = 0;
+
+  constructor(
+    tensorReader: GgufTensorReader,
+    options: Qwen35ModelSessionOptions = {},
+  ) {
+    this.tensorReader = tensorReader;
+    this.manifest = buildQwen35Manifest(tensorReader.metadata);
+    this.epsilon = requiredMetadataNumber(
+      tensorReader,
+      "qwen35.attention.layer_norm_rms_epsilon",
+    );
+    this.maxWeightCacheBytes = options.maxWeightCacheBytes ?? 256 * 1024 * 1024;
+  }
+
+  createInferenceState(): Qwen35InferenceState {
+    return createQwen35InferenceState(this.manifest);
+  }
+
+  getTensor(name: string) {
+    return this.tensorReader.getTensor(name);
+  }
+
+  async readF32Tensor(name: string): Promise<Float32Array> {
+    const cached = this.f32TensorCache.get(name);
+    if (cached) {
+      return cached;
+    }
+
+    const tensor = this.tensorReader.getTensor(name);
+    if (tensor.type !== "F32") {
+      throw new Error(`${name} must be F32, got ${tensor.type}`);
+    }
+    const bytes = await this.tensorReader.readTensorBytes(name);
+    const value = new Float32Array(bytes.buffer, bytes.byteOffset, bytes.byteLength / 4).slice();
+    this.f32TensorCache.set(name, value);
+    return value;
+  }
+
+  async readWeightBytes(name: string): Promise<Uint8Array> {
+    const cached = this.weightBytesCache.get(name);
+    if (cached) {
+      this.weightBytesCache.delete(name);
+      this.weightBytesCache.set(name, cached);
+      return cached;
+    }
+
+    const bytes = await this.tensorReader.readTensorBytes(name);
+    if (bytes.byteLength <= this.maxWeightCacheBytes) {
+      this.weightBytesCache.set(name, bytes);
+      this.weightCacheBytes += bytes.byteLength;
+      this.evictWeightBytes();
+    }
+    return bytes;
+  }
+
+  async readEmbeddingRows(tokenIds: readonly number[]): Promise<Float32Array> {
+    const tokenEmbedding = this.tensorReader.getTensor("token_embd.weight");
+    const rowElements = tokenEmbedding.dimensions[0] ?? 0;
+    const rowByteLength = tensorByteLength({
+      ...tokenEmbedding,
+      dimensions: [rowElements],
+    });
+    const rows = new Float32Array(rowElements * tokenIds.length);
+
+    for (let index = 0; index < tokenIds.length; index += 1) {
+      const tokenId = tokenIds[index] ?? 0;
+      let row = this.embeddingRowCache.get(tokenId);
+      if (!row) {
+        const rowBytes = await this.tensorReader.readTensorRange({
+          tensor: tokenEmbedding,
+          offset: BigInt(rowByteLength * tokenId),
+          length: rowByteLength,
+        });
+        row = dequantizeRow(tokenEmbedding.type, rowBytes, rowElements);
+        this.embeddingRowCache.set(tokenId, row);
+      }
+      rows.set(row, index * rowElements);
+    }
+
+    return rows;
+  }
+
+  cacheStats() {
+    return {
+      f32TensorCount: this.f32TensorCache.size,
+      weightTensorCount: this.weightBytesCache.size,
+      weightCacheBytes: this.weightCacheBytes,
+      embeddingRowCount: this.embeddingRowCache.size,
+    };
+  }
+
+  private evictWeightBytes(): void {
+    while (this.weightCacheBytes > this.maxWeightCacheBytes) {
+      const oldest = this.weightBytesCache.entries().next().value as [string, Uint8Array] | undefined;
+      if (!oldest) {
+        this.weightCacheBytes = 0;
+        return;
+      }
+      this.weightBytesCache.delete(oldest[0]);
+      this.weightCacheBytes -= oldest[1].byteLength;
+    }
+  }
+}
+
+export function createQwen35ModelSession(
+  tensorReader: GgufTensorReader,
+  options: Qwen35ModelSessionOptions = {},
+): Qwen35ModelSession {
+  return new Qwen35ModelSession(tensorReader, options);
+}
+
+export type Qwen35ModelInput = GgufTensorReader | Qwen35ModelSession;
 
 export function createQwen35InferenceState(
   manifest: Qwen35ModelManifest,
@@ -93,37 +234,36 @@ export function createQwen35InferenceState(
     });
   }
 
-  return { recurrent, fullAttention };
+  return { recurrent, fullAttention, nextPosition: 0 };
 }
 
 export async function prefillQwen35(
-  tensorReader: GgufTensorReader,
+  model: Qwen35ModelInput,
   tokenIds: readonly number[],
   options: Qwen35PrefillOptions = {},
 ): Promise<Qwen35PrefillResult> {
-  const manifest = buildQwen35Manifest(tensorReader.metadata);
+  const session = modelSession(model);
+  const { manifest } = session;
   const state = options.state ?? createQwen35InferenceState(manifest);
   const positions = normalizePositions(options.positions, tokenIds.length);
-  const epsilon = requiredMetadataNumber(
-    tensorReader,
-    "qwen35.attention.layer_norm_rms_epsilon",
-  );
+  const epsilon = session.epsilon;
 
-  let hidden = await readEmbeddingRows(tensorReader, tokenIds);
+  let hidden = await session.readEmbeddingRows(tokenIds);
   for (let layer = 0; layer < manifest.blockCount; layer += 1) {
     hidden = manifest.fullAttentionLayers.includes(layer)
-      ? await forwardQwen35FullAttentionLayer(tensorReader, manifest, state, layer, hidden, positions, epsilon)
-      : await forwardQwen35RecurrentLayer(tensorReader, manifest, state, layer, hidden, epsilon);
+      ? await forwardQwen35FullAttentionLayer(session, manifest, state, layer, hidden, positions, epsilon)
+      : await forwardQwen35RecurrentLayer(session, manifest, state, layer, hidden, epsilon);
   }
+  updateNextPosition(state, positions, tokenIds.length);
 
   const result: Qwen35PrefillResult = { hidden, state };
   if (options.computeLogits) {
     const norm = rmsNorm(
       hidden,
-      await readF32ModelTensor(tensorReader, "output_norm.weight"),
+      await readF32ModelTensor(session, "output_norm.weight"),
       epsilon,
     );
-    const logits = await matMulQwen35Weight(tensorReader, "output.weight", norm);
+    const logits = await matMulQwen35Weight(session, "output.weight", norm);
     result.logits = logits;
     result.topTokens = topK(logits, options.logitsTopK ?? 10);
   }
@@ -131,14 +271,49 @@ export async function prefillQwen35(
   return result;
 }
 
+export async function decodeQwen35(
+  model: Qwen35ModelInput,
+  tokenId: number,
+  options: Qwen35DecodeOptions = {},
+): Promise<Qwen35DecodeResult> {
+  const session = modelSession(model);
+  const { manifest } = session;
+  const state = options.state ?? createQwen35InferenceState(manifest);
+  const position = options.position ?? state.nextPosition;
+  const positions = new Int32Array([position]);
+  const epsilon = session.epsilon;
+
+  let hidden = await session.readEmbeddingRows([tokenId]);
+  for (let layer = 0; layer < manifest.blockCount; layer += 1) {
+    hidden = manifest.fullAttentionLayers.includes(layer)
+      ? await forwardQwen35FullAttentionLayer(session, manifest, state, layer, hidden, positions, epsilon)
+      : await forwardQwen35RecurrentLayer(session, manifest, state, layer, hidden, epsilon);
+  }
+  state.nextPosition = Math.max(state.nextPosition, position + 1);
+
+  const norm = rmsNorm(
+    hidden,
+    await readF32ModelTensor(session, "output_norm.weight"),
+    epsilon,
+  );
+  const logits = await matMulQwen35Weight(session, "output.weight", norm);
+  return {
+    hidden,
+    state,
+    logits,
+    topTokens: topK(logits, options.logitsTopK ?? 10),
+  };
+}
+
 export async function forwardQwen35RecurrentLayer(
-  tensorReader: GgufTensorReader,
+  model: Qwen35ModelInput,
   manifest: Qwen35ModelManifest,
   state: Qwen35InferenceState,
   layer: number,
   input: Float32Array,
-  epsilon = requiredMetadataNumber(tensorReader, "qwen35.attention.layer_norm_rms_epsilon"),
+  epsilon = modelSession(model).epsilon,
 ): Promise<Float32Array> {
+  const session = modelSession(model);
   const cache = requiredRecurrentCache(state, layer);
   const tokenCount = input.length / manifest.embeddingLength;
   const convDim =
@@ -148,15 +323,15 @@ export async function forwardQwen35RecurrentLayer(
 
   const attnNorm = rmsNormRows(
     input,
-    await readF32ModelTensor(tensorReader, `blk.${layer}.attn_norm.weight`),
+    await readF32ModelTensor(session, `blk.${layer}.attn_norm.weight`),
     epsilon,
   );
-  const qkv = await matMulQwen35Weight(tensorReader, `blk.${layer}.attn_qkv.weight`, attnNorm);
-  const alpha = await matMulQwen35Weight(tensorReader, `blk.${layer}.ssm_alpha.weight`, attnNorm);
-  const beta = await matMulQwen35Weight(tensorReader, `blk.${layer}.ssm_beta.weight`, attnNorm);
-  const z = await matMulQwen35Weight(tensorReader, `blk.${layer}.attn_gate.weight`, attnNorm);
+  const qkv = await matMulQwen35Weight(session, `blk.${layer}.attn_qkv.weight`, attnNorm);
+  const alpha = await matMulQwen35Weight(session, `blk.${layer}.ssm_alpha.weight`, attnNorm);
+  const beta = await matMulQwen35Weight(session, `blk.${layer}.ssm_beta.weight`, attnNorm);
+  const z = await matMulQwen35Weight(session, `blk.${layer}.attn_gate.weight`, attnNorm);
   const convInput = composeConvInput(cache.conv, qkv, convDim, tokenCount, manifest.ssm.convKernel);
-  const convKernel = await readF32ModelTensor(tensorReader, `blk.${layer}.ssm_conv1d.weight`);
+  const convKernel = await readF32ModelTensor(session, `blk.${layer}.ssm_conv1d.weight`);
   const convRaw = (await ssmConv1dWasm(
     convInput,
     convKernel,
@@ -197,8 +372,8 @@ export async function forwardQwen35RecurrentLayer(
   );
   const gate = recurrentDeltaGate(
     alpha,
-    await readF32ModelTensor(tensorReader, `blk.${layer}.ssm_dt.bias`),
-    await readF32ModelTensor(tensorReader, `blk.${layer}.ssm_a`),
+    await readF32ModelTensor(session, `blk.${layer}.ssm_dt.bias`),
+    await readF32ModelTensor(session, `blk.${layer}.ssm_a`),
   );
   const betaSigmoid = sigmoid(beta);
   const delta = (await gatedDeltaNetWasm(
@@ -230,7 +405,7 @@ export async function forwardQwen35RecurrentLayer(
   );
   cache.state = delta.newState;
 
-  const ssmNormWeight = await readF32ModelTensor(tensorReader, `blk.${layer}.ssm_norm.weight`);
+  const ssmNormWeight = await readF32ModelTensor(session, `blk.${layer}.ssm_norm.weight`);
   const finalOutput = new Float32Array(delta.output.length);
   for (let row = 0; row < delta.output.length / ssmNormWeight.length; row += 1) {
     const offset = row * ssmNormWeight.length;
@@ -241,40 +416,41 @@ export async function forwardQwen35RecurrentLayer(
     }
   }
 
-  const attention = await matMulQ8_0Weight(tensorReader, `blk.${layer}.ssm_out.weight`, finalOutput);
-  return forwardQwen35Ffn(tensorReader, layer, residualAdd(input, attention), epsilon);
+  const attention = await matMulQ8_0Weight(session, `blk.${layer}.ssm_out.weight`, finalOutput);
+  return forwardQwen35Ffn(session, layer, residualAdd(input, attention), epsilon);
 }
 
 export async function forwardQwen35FullAttentionLayer(
-  tensorReader: GgufTensorReader,
+  model: Qwen35ModelInput,
   manifest: Qwen35ModelManifest,
   state: Qwen35InferenceState,
   layer: number,
   input: Float32Array,
   positions: Int32Array,
-  epsilon = requiredMetadataNumber(tensorReader, "qwen35.attention.layer_norm_rms_epsilon"),
+  epsilon = modelSession(model).epsilon,
 ): Promise<Float32Array> {
+  const session = modelSession(model);
   const cache = requiredFullAttentionCache(state, layer);
   const tokenCount = input.length / manifest.embeddingLength;
   const tokenPositions = tokenPositionsFromMrope(positions, tokenCount);
   const attnNorm = rmsNormRows(
     input,
-    await readF32ModelTensor(tensorReader, `blk.${layer}.attn_norm.weight`),
+    await readF32ModelTensor(session, `blk.${layer}.attn_norm.weight`),
     epsilon,
   );
-  const qFull = await matMulQwen35Weight(tensorReader, `blk.${layer}.attn_q.weight`, attnNorm);
+  const qFull = await matMulQwen35Weight(session, `blk.${layer}.attn_q.weight`, attnNorm);
   const q = sliceFullAttentionQ(qFull, manifest.headCount, manifest.keyLength, tokenCount);
   const gate = sliceFullAttentionGate(qFull, manifest.headCount, manifest.keyLength, tokenCount);
-  const kProjection = await matMulQwen35Weight(tensorReader, `blk.${layer}.attn_k.weight`, attnNorm);
-  const vProjection = await matMulQwen35Weight(tensorReader, `blk.${layer}.attn_v.weight`, attnNorm);
+  const kProjection = await matMulQwen35Weight(session, `blk.${layer}.attn_k.weight`, attnNorm);
+  const vProjection = await matMulQwen35Weight(session, `blk.${layer}.attn_v.weight`, attnNorm);
   const qNorm = normHeads(
     q,
-    await readF32ModelTensor(tensorReader, `blk.${layer}.attn_q_norm.weight`),
+    await readF32ModelTensor(session, `blk.${layer}.attn_q_norm.weight`),
     epsilon,
   );
   const kNorm = normHeads(
     kProjection,
-    await readF32ModelTensor(tensorReader, `blk.${layer}.attn_k_norm.weight`),
+    await readF32ModelTensor(session, `blk.${layer}.attn_k_norm.weight`),
     epsilon,
   );
   const ropeCommon = {
@@ -327,97 +503,67 @@ export async function forwardQwen35FullAttentionLayer(
   for (let index = 0; index < gated.length; index += 1) {
     gated[index] = (attention[index] ?? 0) * (gateSigmoid[index] ?? 0);
   }
-  const output = await matMulQwen35Weight(tensorReader, `blk.${layer}.attn_output.weight`, gated);
+  const output = await matMulQwen35Weight(session, `blk.${layer}.attn_output.weight`, gated);
   const residual = layer === manifest.blockCount - 1
     ? residualAdd(input, output).slice(input.length - manifest.embeddingLength)
     : residualAdd(input, output);
-  return forwardQwen35Ffn(tensorReader, layer, residual, epsilon);
+  return forwardQwen35Ffn(session, layer, residual, epsilon);
 }
 
 async function forwardQwen35Ffn(
-  tensorReader: GgufTensorReader,
+  session: Qwen35ModelSession,
   layer: number,
   residual: Float32Array,
   epsilon: number,
 ): Promise<Float32Array> {
   const postNorm = rmsNormRows(
     residual,
-    await readF32ModelTensor(tensorReader, `blk.${layer}.post_attention_norm.weight`),
+    await readF32ModelTensor(session, `blk.${layer}.post_attention_norm.weight`),
     epsilon,
   );
-  const gate = await matMulQwen35Weight(tensorReader, `blk.${layer}.ffn_gate.weight`, postNorm);
-  const up = await matMulQwen35Weight(tensorReader, `blk.${layer}.ffn_up.weight`, postNorm);
+  const gate = await matMulQwen35Weight(session, `blk.${layer}.ffn_gate.weight`, postNorm);
+  const up = await matMulQwen35Weight(session, `blk.${layer}.ffn_up.weight`, postNorm);
   const swiglu = new Float32Array(gate.length);
   for (let index = 0; index < swiglu.length; index += 1) {
     const gateValue = gate[index] ?? 0;
     swiglu[index] = (gateValue / (1 + Math.exp(-gateValue))) * (up[index] ?? 0);
   }
-  const ffnOut = await matMulQwen35Weight(tensorReader, `blk.${layer}.ffn_down.weight`, swiglu);
+  const ffnOut = await matMulQwen35Weight(session, `blk.${layer}.ffn_down.weight`, swiglu);
   return residualAdd(residual, ffnOut);
 }
 
-async function readEmbeddingRows(
-  tensorReader: GgufTensorReader,
-  tokenIds: readonly number[],
-): Promise<Float32Array> {
-  const tokenEmbedding = tensorReader.getTensor("token_embd.weight");
-  const rowElements = tokenEmbedding.dimensions[0] ?? 0;
-  const rowByteLength = tensorByteLength({
-    ...tokenEmbedding,
-    dimensions: [rowElements],
-  });
-  const rows = new Float32Array(rowElements * tokenIds.length);
-
-  for (let index = 0; index < tokenIds.length; index += 1) {
-    const tokenId = tokenIds[index] ?? 0;
-    const rowBytes = await tensorReader.readTensorRange({
-      tensor: tokenEmbedding,
-      offset: BigInt(rowByteLength * tokenId),
-      length: rowByteLength,
-    });
-    rows.set(dequantizeRow(tokenEmbedding.type, rowBytes, rowElements), index * rowElements);
-  }
-
-  return rows;
-}
-
 async function readF32ModelTensor(
-  tensorReader: GgufTensorReader,
+  session: Qwen35ModelSession,
   name: string,
 ): Promise<Float32Array> {
-  const tensor = tensorReader.getTensor(name);
-  if (tensor.type !== "F32") {
-    throw new Error(`${name} must be F32, got ${tensor.type}`);
-  }
-  const bytes = await tensorReader.readTensorBytes(name);
-  return new Float32Array(bytes.buffer, bytes.byteOffset, bytes.byteLength / 4).slice();
+  return session.readF32Tensor(name);
 }
 
 async function matMulQwen35Weight(
-  tensorReader: GgufTensorReader,
+  session: Qwen35ModelSession,
   weightName: string,
   inputColumns: Float32Array,
 ): Promise<Float32Array> {
-  const tensor = tensorReader.getTensor(weightName);
+  const tensor = session.getTensor(weightName);
   if (tensor.type === "F32") {
-    return matMulF32Rows(tensorReader, weightName, inputColumns);
+    return matMulF32Rows(session, weightName, inputColumns);
   }
   if (tensor.type === "Q4_K" || tensor.type === "Q5_K" || tensor.type === "Q6_K" || tensor.type === "IQ4_XS") {
-    return matMulKQ8K(tensorReader, weightName, inputColumns, tensor.type);
+    return matMulKQ8K(session, weightName, inputColumns, tensor.type);
   }
   throw new Error(`${weightName} has unsupported matmul type ${tensor.type}`);
 }
 
 async function matMulF32Rows(
-  tensorReader: GgufTensorReader,
+  session: Qwen35ModelSession,
   weightName: string,
   inputColumns: Float32Array,
 ): Promise<Float32Array> {
-  const tensor = tensorReader.getTensor(weightName);
+  const tensor = session.getTensor(weightName);
   const inputSize = tensor.dimensions[0] ?? 0;
   const rowCount = tensor.dimensions[1] ?? 0;
   const columnCount = inputColumns.length / inputSize;
-  const weight = await readF32ModelTensor(tensorReader, weightName);
+  const weight = await readF32ModelTensor(session, weightName);
   const rows: Float32Array[] = [];
 
   for (let row = 0; row < rowCount; row += 1) {
@@ -428,12 +574,12 @@ async function matMulF32Rows(
 }
 
 async function matMulKQ8K(
-  tensorReader: GgufTensorReader,
+  session: Qwen35ModelSession,
   weightName: string,
   inputColumns: Float32Array,
   type: Extract<GgmlTypeName, "Q4_K" | "Q5_K" | "Q6_K" | "IQ4_XS">,
 ): Promise<Float32Array> {
-  const tensor = tensorReader.getTensor(weightName);
+  const tensor = session.getTensor(weightName);
   const inputSize = tensor.dimensions[0] ?? 0;
   const rowCount = tensor.dimensions[1] ?? 0;
   const columnCount = inputColumns.length / inputSize;
@@ -441,7 +587,7 @@ async function matMulKQ8K(
     ...tensor,
     dimensions: [inputSize],
   });
-  const weightBytes = await tensorReader.readTensorBytes(weightName);
+  const weightBytes = await session.readWeightBytes(weightName);
   const wasm = await matMulQuantizedWasm(
     type,
     weightBytes,
@@ -476,11 +622,11 @@ async function matMulKQ8K(
 }
 
 async function matMulQ8_0Weight(
-  tensorReader: GgufTensorReader,
+  session: Qwen35ModelSession,
   weightName: string,
   inputColumns: Float32Array,
 ): Promise<Float32Array> {
-  const tensor = tensorReader.getTensor(weightName);
+  const tensor = session.getTensor(weightName);
   if (tensor.type !== "Q8_0") {
     throw new Error(`${weightName} must be Q8_0, got ${tensor.type}`);
   }
@@ -491,7 +637,7 @@ async function matMulQ8_0Weight(
     ...tensor,
     dimensions: [inputSize],
   });
-  const weightBytes = await tensorReader.readTensorBytes(weightName);
+  const weightBytes = await session.readWeightBytes(weightName);
   const wasm = await matMulQuantizedWasm(
     "Q8_0",
     weightBytes,
@@ -753,6 +899,28 @@ function normalizePositions(positions: Qwen35PrefillOptions["positions"], tokenC
     throw new Error(`Expected ${tokenCount} or ${tokenCount * 4} positions, got ${output.length}`);
   }
   return output;
+}
+
+function updateNextPosition(
+  state: Qwen35InferenceState,
+  positions: Int32Array,
+  tokenCount: number,
+): void {
+  if (tokenCount === 0) {
+    return;
+  }
+  const tokenPositions = tokenPositionsFromMrope(positions, tokenCount);
+  let nextPosition = state.nextPosition;
+  for (const position of tokenPositions) {
+    nextPosition = Math.max(nextPosition, position + 1);
+  }
+  state.nextPosition = nextPosition;
+}
+
+function modelSession(model: Qwen35ModelInput): Qwen35ModelSession {
+  return model instanceof Qwen35ModelSession
+    ? model
+    : new Qwen35ModelSession(model);
 }
 
 function requiredMetadataNumber(tensorReader: GgufTensorReader, key: string): number {
