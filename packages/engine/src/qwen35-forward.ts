@@ -31,6 +31,12 @@ import {
   buildQwen35Manifest,
   type Qwen35ModelManifest,
 } from "./qwen35";
+import {
+  gatedDeltaNetWasm,
+  gqaAttentionWasm,
+  matMulQuantizedWasm,
+  ssmConv1dWasm,
+} from "./prefill-wasm";
 
 export type Qwen35FullAttentionCache = {
   key: Float32Array;
@@ -150,9 +156,16 @@ export async function forwardQwen35RecurrentLayer(
   const beta = await matMulQwen35Weight(tensorReader, `blk.${layer}.ssm_beta.weight`, attnNorm);
   const z = await matMulQwen35Weight(tensorReader, `blk.${layer}.attn_gate.weight`, attnNorm);
   const convInput = composeConvInput(cache.conv, qkv, convDim, tokenCount, manifest.ssm.convKernel);
-  const convRaw = ssmConv1d(
+  const convKernel = await readF32ModelTensor(tensorReader, `blk.${layer}.ssm_conv1d.weight`);
+  const convRaw = (await ssmConv1dWasm(
     convInput,
-    await readF32ModelTensor(tensorReader, `blk.${layer}.ssm_conv1d.weight`),
+    convKernel,
+    convDim,
+    tokenCount,
+    manifest.ssm.convKernel,
+  )) ?? ssmConv1d(
+    convInput,
+    convKernel,
     convDim,
     tokenCount,
     manifest.ssm.convKernel,
@@ -187,12 +200,26 @@ export async function forwardQwen35RecurrentLayer(
     await readF32ModelTensor(tensorReader, `blk.${layer}.ssm_dt.bias`),
     await readF32ModelTensor(tensorReader, `blk.${layer}.ssm_a`),
   );
-  const delta = gatedDeltaNet(
+  const betaSigmoid = sigmoid(beta);
+  const delta = (await gatedDeltaNetWasm(
     qConv,
     kConv,
     vConv,
     gate,
-    sigmoid(beta),
+    betaSigmoid,
+    cache.state,
+    {
+      stateSize: manifest.ssm.stateSize,
+      keyHeadCount: manifest.ssm.groupCount,
+      valueHeadCount: manifest.ssm.timeStepRank,
+      tokenCount,
+    },
+  )) ?? gatedDeltaNet(
+    qConv,
+    kConv,
+    vConv,
+    gate,
+    betaSigmoid,
     cache.state,
     {
       stateSize: manifest.ssm.stateSize,
@@ -272,21 +299,28 @@ export async function forwardQwen35FullAttentionLayer(
     manifest.contextLength,
     Math.max(...Array.from(tokenPositions)) + 1,
   );
-  const attention = gqaAttention(
+  const attentionOptions = {
+    headSize: manifest.keyLength,
+    queryHeadCount: manifest.headCount,
+    keyValueHeadCount: manifest.headCountKv,
+    tokenCount,
+    keyValueTokenCount,
+    scale: 1 / Math.sqrt(manifest.keyLength),
+    mask: causalMask(tokenPositions, keyValueTokenCount),
+    valueLayout: "dim-head-token" as const,
+    quantizeQueryForScore: "f16" as const,
+  };
+  const compactValue = compactValueCache(cache.value, keyValueTokenCount, manifest);
+  const attention = (await gqaAttentionWasm(
     qRope,
     cache.key.subarray(0, keyValueTokenCount * manifest.headCountKv * manifest.keyLength),
-    compactValueCache(cache.value, keyValueTokenCount, manifest),
-    {
-      headSize: manifest.keyLength,
-      queryHeadCount: manifest.headCount,
-      keyValueHeadCount: manifest.headCountKv,
-      tokenCount,
-      keyValueTokenCount,
-      scale: 1 / Math.sqrt(manifest.keyLength),
-      mask: causalMask(tokenPositions, keyValueTokenCount),
-      valueLayout: "dim-head-token",
-      quantizeQueryForScore: "f16",
-    },
+    compactValue,
+    attentionOptions,
+  )) ?? gqaAttention(
+    qRope,
+    cache.key.subarray(0, keyValueTokenCount * manifest.headCountKv * manifest.keyLength),
+    compactValue,
+    attentionOptions,
   );
   const gateSigmoid = sigmoid(gate);
   const gated = new Float32Array(attention.length);
@@ -408,6 +442,17 @@ async function matMulKQ8K(
     dimensions: [inputSize],
   });
   const weightBytes = await tensorReader.readTensorBytes(weightName);
+  const wasm = await matMulQuantizedWasm(
+    type,
+    weightBytes,
+    inputColumns,
+    inputSize,
+    rowCount,
+    columnCount,
+  );
+  if (wasm) {
+    return wasm;
+  }
   const output = new Float32Array(rowCount * columnCount);
 
   for (let column = 0; column < columnCount; column += 1) {
@@ -447,6 +492,17 @@ async function matMulQ8_0Weight(
     dimensions: [inputSize],
   });
   const weightBytes = await tensorReader.readTensorBytes(weightName);
+  const wasm = await matMulQuantizedWasm(
+    "Q8_0",
+    weightBytes,
+    inputColumns,
+    inputSize,
+    rowCount,
+    columnCount,
+  );
+  if (wasm) {
+    return wasm;
+  }
   const output = new Float32Array(rowCount * columnCount);
 
   for (let column = 0; column < columnCount; column += 1) {

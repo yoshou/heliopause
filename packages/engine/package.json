@@ -11,9 +11,11 @@
     }
   },
   "scripts": {
+    "build:wasm": "node scripts/build-wasm-kernels.mjs",
     "build": "tsc --noEmit",
     "typecheck": "tsc --noEmit",
-    "test": "node --experimental-strip-types --loader ./test/ts-extension-loader.mjs --test test/*.test.ts"
+    "test": "node --experimental-strip-types --loader ./test/ts-extension-loader.mjs --test test/*.test.ts",
+    "bench:prefill": "node --experimental-strip-types --loader ./test/ts-extension-loader.mjs bench/prefill-kernels.bench.ts"
   },
   "devDependencies": {
     "typescript": "^5.9.3"
