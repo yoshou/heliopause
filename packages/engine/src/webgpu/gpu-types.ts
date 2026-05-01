@@ -175,9 +175,9 @@ export type Qwen35WebGpuHybridPlan = {
   fixedBytes: number;
   scratchBytes: number;
   selectedLayerCount: number;
-  firstGpuLayer?: number;
-  cpuPrefixLayerCount: number;
-  gpuSuffixLayerCount: number;
+  segmentStartLayer?: number;
+  cpuSegmentLayerCount: number;
+  gpuSegmentLayerCount: number;
   gpuWeightBytes: number;
   gpuCacheBytes: number;
   estimatedResidentBytes: number;
@@ -185,7 +185,7 @@ export type Qwen35WebGpuHybridPlan = {
   selectedLayers: Qwen35WebGpuLayerPlan[];
   copyAuditExpectations: {
     decodeTensorReads: 0;
-    suffixIntermediateReadbacks: 0;
+    segmentIntermediateReadbacks: 0;
     logitsReadbacks: 0;
     expectedBoundaryUploads: number;
     expectedTokenReadbacks: number;
@@ -194,7 +194,7 @@ export type Qwen35WebGpuHybridPlan = {
 
 export type Qwen35WebGpuCopyAuditObservation = {
   decodeTensorReads: number;
-  suffixIntermediateReadbacks: number;
+  segmentIntermediateReadbacks: number;
   logitsReadbacks: number;
   boundaryUploads: number;
   tokenReadbacks: number;

@@ -96,7 +96,7 @@ export async function loadF32Handle(
 ): Promise<F32Handle> {
   const tensor = tensorReader.getTensor(name);
   if (tensor.type !== "F32") {
-    throw new Error(`${name} must be F32 for WebGPU suffix, got ${tensor.type}`);
+    throw new Error(`${name} must be F32 for WebGPU segment execution, got ${tensor.type}`);
   }
   const bytes = await tensorReader.readTensorBytes(name);
   const buffer = arena.createBuffer(name, bytes.byteLength, GPU_STORAGE | GPU_COPY_DST);

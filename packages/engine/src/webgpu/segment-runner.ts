@@ -5,16 +5,18 @@ import { webGpuDevice } from "./gpu-device";
 import { planQwen35WebGpuHybrid } from "./planning";
 import { GpuMemoryArena, scratchF32, scratchQ8_0, scratchQ8K, type F32Handle, type GpuResource } from "./arena";
 import { dispatchDeltaGate, dispatchF32MatMul, dispatchFullAttentionApply, dispatchFullAttentionScore, dispatchFullKvUpdate, dispatchFullQuery, dispatchGatedDeltaNet, dispatchKMatMul, dispatchQkvConv, dispatchQ8_0MatMul, dispatchQ8_0Quantize, dispatchQ8KQuantize, dispatchResidualAdd, dispatchRmsNorm, dispatchSsmNormGate, dispatchSwiGlu, dispatchTokenSlice, dispatchTopK } from "./dispatch";
-import { loadF32Handle, loadGpuLayer, loadOutputStripes, type FullAttentionGpuLayer, type GpuLayer, type OutputStripe, type RecurrentGpuLayer } from "./suffix-layer-loader";
+import { loadF32Handle, loadGpuLayer, loadOutputStripes, type FullAttentionGpuLayer, type GpuLayer, type OutputStripe, type RecurrentGpuLayer } from "./segment-layer-loader";
 import type { WebGpuBufferLike, WebGpuComputePassLike, WebGpuTopToken } from "./gpu-types";
 
-export type Qwen35WebGpuSuffixRunnerOptions = {
+export type Qwen35WebGpuSegmentRunnerOptions = {
   tensorReader: GgufTensorReader;
   manifest: Qwen35ModelManifest;
   epsilon: number;
   contextLength: number;
   memoryLimitBytes?: number;
-  firstGpuLayer?: number;
+  segmentStartLayer?: number;
+  segmentEndLayerExclusive?: number;
+  loadOutput?: boolean;
 };
 
 export type Qwen35WebGpuStateLike = {
@@ -23,6 +25,11 @@ export type Qwen35WebGpuStateLike = {
 };
 
 export type Qwen35WebGpuTokenResult = {
+  topTokens?: WebGpuTopToken[];
+};
+
+export type Qwen35WebGpuHiddenResult = {
+  hidden: Float32Array;
   topTokens?: WebGpuTopToken[];
 };
 
@@ -41,25 +48,27 @@ type GpuState = {
   fullAttention: Map<number, FullAttentionGpuLayerState>;
 };
 
-export class Qwen35WebGpuSuffixRunner {
-  readonly firstGpuLayer: number;
+export class Qwen35WebGpuSegmentRunner {
+  readonly segmentStartLayer: number;
+  readonly segmentEndLayerExclusive: number;
 
   private readonly states = new WeakMap<object, GpuState>();
   private readonly arena: GpuMemoryArena;
   private readonly manifest: Qwen35ModelManifest;
   private readonly epsilon: number;
   private readonly layers: GpuLayer[];
-  private readonly outputNorm: F32Handle;
-  private readonly outputStripes: OutputStripe[];
+  private readonly outputNorm?: F32Handle;
+  private readonly outputStripes?: OutputStripe[];
 
   private constructor(
     arena: GpuMemoryArena,
     manifest: Qwen35ModelManifest,
     epsilon: number,
     layers: GpuLayer[],
-    outputNorm: F32Handle,
-    outputStripes: OutputStripe[],
-    firstGpuLayer: number,
+    outputNorm: F32Handle | undefined,
+    outputStripes: OutputStripe[] | undefined,
+    segmentStartLayer: number,
+    segmentEndLayerExclusive: number,
   ) {
     this.arena = arena;
     this.manifest = manifest;
@@ -67,13 +76,14 @@ export class Qwen35WebGpuSuffixRunner {
     this.layers = layers;
     this.outputNorm = outputNorm;
     this.outputStripes = outputStripes;
-    this.firstGpuLayer = firstGpuLayer;
+    this.segmentStartLayer = segmentStartLayer;
+    this.segmentEndLayerExclusive = segmentEndLayerExclusive;
   }
 
-  static async create(options: Qwen35WebGpuSuffixRunnerOptions): Promise<Qwen35WebGpuSuffixRunner> {
+  static async create(options: Qwen35WebGpuSegmentRunnerOptions): Promise<Qwen35WebGpuSegmentRunner> {
     const device = await webGpuDevice();
     if (!device) {
-      throw new Error("WebGPU is not available for Qwen3.5 suffix execution.");
+      throw new Error("WebGPU is not available for Qwen3.5 segment execution.");
     }
     const memoryLimitBytes = options.memoryLimitBytes ?? QWEN35_WEBGPU_MEMORY_LIMIT_BYTES;
     const plan = planQwen35WebGpuHybrid(
@@ -86,31 +96,41 @@ export class Qwen35WebGpuSuffixRunner {
         memoryLimitBytes,
       },
     );
-    const firstGpuLayer = options.firstGpuLayer ?? plan.firstGpuLayer;
-    if (firstGpuLayer === undefined || firstGpuLayer >= options.manifest.blockCount) {
-      throw new Error("WebGPU suffix planning selected no layers.");
+    const segmentStartLayer = options.segmentStartLayer ?? plan.segmentStartLayer;
+    const segmentEndLayerExclusive = options.segmentEndLayerExclusive ?? options.manifest.blockCount;
+    if (segmentStartLayer === undefined || segmentStartLayer >= options.manifest.blockCount) {
+      throw new Error("WebGPU segment planning selected no layers.");
     }
-    if (plan.estimatedResidentBytes > memoryLimitBytes) {
+    if (segmentEndLayerExclusive <= segmentStartLayer || segmentEndLayerExclusive > options.manifest.blockCount) {
+      throw new Error(`Invalid WebGPU layer segment: ${segmentStartLayer}..${segmentEndLayerExclusive}`);
+    }
+    if (options.segmentEndLayerExclusive === undefined && plan.estimatedResidentBytes > memoryLimitBytes) {
       throw new Error(
-        `WebGPU suffix plan exceeds memory cap: ${plan.estimatedResidentBytes} > ${memoryLimitBytes}`,
+        `WebGPU segment plan exceeds memory cap: ${plan.estimatedResidentBytes} > ${memoryLimitBytes}`,
       );
     }
 
     const arena = new GpuMemoryArena(device, memoryLimitBytes);
     const layers: GpuLayer[] = [];
-    for (let layer = firstGpuLayer; layer < options.manifest.blockCount; layer += 1) {
+    for (let layer = segmentStartLayer; layer < segmentEndLayerExclusive; layer += 1) {
       layers.push(await loadGpuLayer(arena, options.tensorReader, options.manifest, layer));
     }
-    const outputNorm = await loadF32Handle(arena, options.tensorReader, "output_norm.weight");
-    const outputStripes = await loadOutputStripes(arena, options.tensorReader, options.manifest);
-    return new Qwen35WebGpuSuffixRunner(
+    const loadOutput = options.loadOutput ?? true;
+    const outputNorm = loadOutput
+      ? await loadF32Handle(arena, options.tensorReader, "output_norm.weight")
+      : undefined;
+    const outputStripes = loadOutput
+      ? await loadOutputStripes(arena, options.tensorReader, options.manifest)
+      : undefined;
+    return new Qwen35WebGpuSegmentRunner(
       arena,
       options.manifest,
       options.epsilon,
       layers,
       outputNorm,
       outputStripes,
-      firstGpuLayer,
+      segmentStartLayer,
+      segmentEndLayerExclusive,
     );
   }
 
@@ -125,7 +145,7 @@ export class Qwen35WebGpuSuffixRunner {
     options: { computeTopK?: boolean; topK?: number } = {},
   ): Promise<Qwen35WebGpuTokenResult> {
     if (inputHidden.length !== this.manifest.embeddingLength) {
-      throw new Error(`WebGPU suffix input shape mismatch: ${inputHidden.length}`);
+      throw new Error(`WebGPU segment input shape mismatch: ${inputHidden.length}`);
     }
     const tokenPosition = tokenPositionFromSingleMrope(positions);
     const mropePosition = singleMropePosition(positions);
@@ -136,7 +156,7 @@ export class Qwen35WebGpuSuffixRunner {
     const pass = encoder.beginComputePass();
 
     let current = this.arena.createBuffer(
-      "suffix boundary hidden",
+      "segment boundary hidden",
       inputHidden.byteLength,
       GPU_STORAGE | GPU_COPY_DST,
     );
@@ -162,7 +182,8 @@ export class Qwen35WebGpuSuffixRunner {
     let topBuffer: WebGpuBufferLike | undefined;
     let topReadback: WebGpuBufferLike | undefined;
     const candidateCount = Math.max(1, options.topK ?? 1);
-    const candidateByteLength = this.outputStripes.length * candidateCount * 2 * Float32Array.BYTES_PER_ELEMENT;
+    const outputStripes = options.computeTopK ? this.requireOutputStripes() : undefined;
+    const candidateByteLength = (outputStripes?.length ?? 0) * candidateCount * 2 * Float32Array.BYTES_PER_ELEMENT;
     if (options.computeTopK) {
       topBuffer = this.dispatchOutputTopK(pass, current, candidateCount, cleanup, resources);
       topReadback = this.arena.device.createBuffer({
@@ -196,6 +217,28 @@ export class Qwen35WebGpuSuffixRunner {
     return { topTokens };
   }
 
+  async runTokenHidden(
+    inputHidden: Float32Array,
+    positions: Int32Array,
+    state: Qwen35WebGpuStateLike,
+    options: { computeTopK?: boolean; topK?: number } = {},
+  ): Promise<Qwen35WebGpuHiddenResult> {
+    if (inputHidden.length !== this.manifest.embeddingLength) {
+      throw new Error(`WebGPU segment input shape mismatch: ${inputHidden.length}`);
+    }
+    const boundary = this.arena.createBuffer(
+      "segment boundary hidden",
+      inputHidden.byteLength,
+      GPU_STORAGE | GPU_COPY_DST,
+    );
+    this.arena.device.queue.writeBuffer(boundary, 0, inputHidden);
+    try {
+      return await this.runTokenFromBoundaryHidden(boundary, 0, positions, state, options);
+    } finally {
+      boundary.destroy?.();
+    }
+  }
+
   async runTokens(
     inputHidden: Float32Array,
     positions: Int32Array,
@@ -204,14 +247,14 @@ export class Qwen35WebGpuSuffixRunner {
   ): Promise<Qwen35WebGpuTokenResult> {
     const tokenCount = inputHidden.length / this.manifest.embeddingLength;
     if (!Number.isInteger(tokenCount) || tokenCount <= 0) {
-      throw new Error(`WebGPU suffix batched input shape mismatch: ${inputHidden.length}`);
+      throw new Error(`WebGPU segment batched input shape mismatch: ${inputHidden.length}`);
     }
     if (positions.length !== tokenCount && positions.length !== tokenCount * 4) {
-      throw new Error(`WebGPU suffix batched position shape mismatch: ${positions.length}`);
+      throw new Error(`WebGPU segment batched position shape mismatch: ${positions.length}`);
     }
 
     const boundary = this.arena.createBuffer(
-      "suffix boundary hidden batch",
+      "segment boundary hidden batch",
       inputHidden.byteLength,
       GPU_STORAGE | GPU_COPY_DST,
     );
@@ -257,7 +300,7 @@ export class Qwen35WebGpuSuffixRunner {
     const pass = encoder.beginComputePass();
 
     let current = this.arena.createBuffer(
-      "suffix boundary hidden token",
+      "segment boundary hidden token",
       this.manifest.embeddingLength * Float32Array.BYTES_PER_ELEMENT,
       GPU_STORAGE,
     );
@@ -293,7 +336,8 @@ export class Qwen35WebGpuSuffixRunner {
     let topBuffer: WebGpuBufferLike | undefined;
     let topReadback: WebGpuBufferLike | undefined;
     const candidateCount = Math.max(1, options.topK ?? 1);
-    const candidateByteLength = this.outputStripes.length * candidateCount * 2 * Float32Array.BYTES_PER_ELEMENT;
+    const outputStripes = options.computeTopK ? this.requireOutputStripes() : undefined;
+    const candidateByteLength = (outputStripes?.length ?? 0) * candidateCount * 2 * Float32Array.BYTES_PER_ELEMENT;
     if (options.computeTopK) {
       topBuffer = this.dispatchOutputTopK(pass, current, candidateCount, cleanup, resources);
       topReadback = this.arena.device.createBuffer({
@@ -327,6 +371,151 @@ export class Qwen35WebGpuSuffixRunner {
     return { topTokens };
   }
 
+  async runTokensHidden(
+    inputHidden: Float32Array,
+    positions: Int32Array,
+    state: Qwen35WebGpuStateLike,
+    options: { computeTopK?: boolean; topK?: number } = {},
+  ): Promise<Qwen35WebGpuHiddenResult> {
+    const tokenCount = inputHidden.length / this.manifest.embeddingLength;
+    if (!Number.isInteger(tokenCount) || tokenCount <= 0) {
+      throw new Error(`WebGPU segment batched input shape mismatch: ${inputHidden.length}`);
+    }
+    if (positions.length !== tokenCount && positions.length !== tokenCount * 4) {
+      throw new Error(`WebGPU segment batched position shape mismatch: ${positions.length}`);
+    }
+
+    const boundary = this.arena.createBuffer(
+      "segment boundary hidden batch",
+      inputHidden.byteLength,
+      GPU_STORAGE | GPU_COPY_DST,
+    );
+    this.arena.device.queue.writeBuffer(boundary, 0, inputHidden);
+    const hidden = new Float32Array(inputHidden.length);
+    let topTokens: WebGpuTopToken[] | undefined;
+    try {
+      for (let tokenIndex = 0; tokenIndex < tokenCount; tokenIndex += 1) {
+        const tokenPositions = tokenPositionsFromBatch(positions, tokenIndex, tokenCount);
+        const computeTopK = options.computeTopK === true && tokenIndex === tokenCount - 1;
+        const result = await this.runTokenFromBoundaryHidden(
+          boundary,
+          tokenIndex,
+          tokenPositions,
+          state,
+          {
+            computeTopK,
+            topK: options.topK,
+          },
+        );
+        hidden.set(result.hidden, tokenIndex * this.manifest.embeddingLength);
+        if (computeTopK) {
+          topTokens = result.topTokens;
+        }
+      }
+    } finally {
+      boundary.destroy?.();
+    }
+    return { hidden, topTokens };
+  }
+
+  private async runTokenFromBoundaryHidden(
+    boundary: WebGpuBufferLike,
+    tokenIndex: number,
+    positions: Int32Array,
+    state: Qwen35WebGpuStateLike,
+    options: { computeTopK?: boolean; topK?: number } = {},
+  ): Promise<Qwen35WebGpuHiddenResult> {
+    const tokenPosition = tokenPositionFromSingleMrope(positions);
+    const mropePosition = singleMropePosition(positions);
+    const gpuState = this.ensureGpuState(state);
+    const cleanup: GpuResource[] = [];
+    const resources: Array<{ destroy: () => void }> = [];
+    const encoder = this.arena.device.createCommandEncoder();
+    const pass = encoder.beginComputePass();
+
+    let current = this.arena.createBuffer(
+      "segment boundary hidden token",
+      this.manifest.embeddingLength * Float32Array.BYTES_PER_ELEMENT,
+      GPU_STORAGE,
+    );
+    cleanup.push(current);
+    dispatchTokenSlice(
+      this.arena.device,
+      pass,
+      resources,
+      boundary,
+      current,
+      {
+        rowSize: this.manifest.embeddingLength,
+        rowIndex: tokenIndex,
+      },
+    );
+
+    for (const layer of this.layers) {
+      current = layer.kind === "recurrent"
+        ? this.dispatchRecurrentLayer(pass, layer, gpuState, current, cleanup, resources)
+        : this.dispatchFullAttentionLayer(
+          pass,
+          layer,
+          gpuState,
+          current,
+          tokenPosition,
+          mropePosition,
+          state.contextLength,
+          cleanup,
+          resources,
+        );
+    }
+
+    const hiddenByteLength = this.manifest.embeddingLength * Float32Array.BYTES_PER_ELEMENT;
+    const hiddenReadback = this.arena.device.createBuffer({
+      size: hiddenByteLength,
+      usage: GPU_MAP_READ | GPU_COPY_DST,
+    });
+    let topBuffer: WebGpuBufferLike | undefined;
+    let topReadback: WebGpuBufferLike | undefined;
+    const candidateCount = Math.max(1, options.topK ?? 1);
+    const outputStripes = options.computeTopK ? this.requireOutputStripes() : undefined;
+    const candidateByteLength = (outputStripes?.length ?? 0) * candidateCount * 2 * Float32Array.BYTES_PER_ELEMENT;
+    if (options.computeTopK) {
+      topBuffer = this.dispatchOutputTopK(pass, current, candidateCount, cleanup, resources);
+      topReadback = this.arena.device.createBuffer({
+        size: candidateByteLength,
+        usage: GPU_MAP_READ | GPU_COPY_DST,
+      });
+    }
+
+    pass.end();
+    encoder.copyBufferToBuffer(current, 0, hiddenReadback, 0, hiddenByteLength);
+    if (topBuffer && topReadback) {
+      encoder.copyBufferToBuffer(topBuffer, 0, topReadback, 0, candidateByteLength);
+    }
+    this.arena.device.queue.submit([encoder.finish()]);
+    await this.arena.device.queue.onSubmittedWorkDone?.();
+
+    await hiddenReadback.mapAsync(GPU_MAP_READ);
+    const hidden = new Float32Array(hiddenReadback.getMappedRange()).slice();
+    hiddenReadback.unmap();
+    hiddenReadback.destroy?.();
+
+    let topTokens: WebGpuTopToken[] | undefined;
+    if (topReadback) {
+      await topReadback.mapAsync(GPU_MAP_READ);
+      const values = new Float32Array(topReadback.getMappedRange()).slice();
+      topReadback.unmap();
+      topReadback.destroy?.();
+      topTokens = mergeTopCandidates(values, candidateCount);
+    }
+
+    for (const resource of resources) {
+      resource.destroy();
+    }
+    for (const item of cleanup.reverse()) {
+      item.destroy?.();
+    }
+    return { hidden, topTokens };
+  }
+
   private ensureGpuState(state: Qwen35WebGpuStateLike): GpuState {
     if (state.contextLength !== this.manifest.contextLength && state.contextLength <= 0) {
       throw new Error(`Invalid WebGPU state context length: ${state.contextLength}`);
@@ -338,7 +527,7 @@ export class Qwen35WebGpuSuffixRunner {
     }
     if (state.nextPosition !== 0) {
       throw new Error(
-        "WebGPU suffix state is missing for a non-empty chat state; replay from position 0 is required.",
+        "WebGPU segment state is missing for a non-empty chat state; replay from position 0 is required.",
       );
     }
     const recurrent = new Map<number, RecurrentGpuLayerState>();
@@ -668,20 +857,22 @@ export class Qwen35WebGpuSuffixRunner {
     cleanup: GpuResource[],
     resources: Array<{ destroy: () => void }>,
   ): WebGpuBufferLike {
+    const outputNorm = this.requireOutputNorm();
+    const outputStripes = this.requireOutputStripes();
     const hiddenSize = this.manifest.embeddingLength;
     const norm = scratchF32(this.arena, hiddenSize, cleanup, "output_norm");
-    dispatchRmsNorm(this.arena.device, pass, resources, hidden, this.outputNorm.buffer, norm, hiddenSize, this.epsilon);
+    dispatchRmsNorm(this.arena.device, pass, resources, hidden, outputNorm.buffer, norm, hiddenSize, this.epsilon);
     const q8 = scratchQ8K(this.arena, hiddenSize, 1, cleanup, "output_norm.q8k");
     dispatchQ8KQuantize(this.arena.device, pass, resources, norm, q8, hiddenSize, 1);
 
     const candidates = this.arena.createBuffer(
       "output.topk.candidates",
-      this.outputStripes.length * topKCount * 2 * Float32Array.BYTES_PER_ELEMENT,
+      outputStripes.length * topKCount * 2 * Float32Array.BYTES_PER_ELEMENT,
       GPU_STORAGE | GPU_COPY_SRC,
     );
     cleanup.push(candidates);
-    for (let index = 0; index < this.outputStripes.length; index += 1) {
-      const stripe = this.outputStripes[index];
+    for (let index = 0; index < outputStripes.length; index += 1) {
+      const stripe = outputStripes[index];
       if (!stripe) {
         continue;
       }
@@ -702,6 +893,20 @@ export class Qwen35WebGpuSuffixRunner {
       );
     }
     return candidates;
+  }
+
+  private requireOutputNorm(): F32Handle {
+    if (!this.outputNorm) {
+      throw new Error("WebGPU output norm was not loaded for this segment runner.");
+    }
+    return this.outputNorm;
+  }
+
+  private requireOutputStripes(): OutputStripe[] {
+    if (!this.outputStripes) {
+      throw new Error("WebGPU output stripes were not loaded for this segment runner.");
+    }
+    return this.outputStripes;
   }
 }
 

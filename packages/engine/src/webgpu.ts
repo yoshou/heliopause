@@ -35,5 +35,10 @@ export {
   recurrentAttentionDecodeWebGpuResident,
 } from "./webgpu/matmul";
 export { auditQwen35WebGpuCopies, planQwen35WebGpuHybrid } from "./webgpu/planning";
-export { Qwen35WebGpuSuffixRunner } from "./webgpu/suffix-runner";
-export type { Qwen35WebGpuStateLike, Qwen35WebGpuSuffixRunnerOptions, Qwen35WebGpuTokenResult } from "./webgpu/suffix-runner";
+export { Qwen35WebGpuSegmentRunner } from "./webgpu/segment-runner";
+export type {
+  Qwen35WebGpuHiddenResult,
+  Qwen35WebGpuStateLike,
+  Qwen35WebGpuSegmentRunnerOptions,
+  Qwen35WebGpuTokenResult,
+} from "./webgpu/segment-runner";

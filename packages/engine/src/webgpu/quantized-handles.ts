@@ -242,5 +242,5 @@ export function webGpuMatMulType(type: GgmlTypeName, name: string): WebGpuQuanti
   if (type === "Q4_K" || type === "Q5_K" || type === "Q6_K" || type === "Q8_0") {
     return type;
   }
-  throw new Error(`${name} has unsupported WebGPU suffix type ${type}`);
+  throw new Error(`${name} has unsupported WebGPU quantized type ${type}`);
 }

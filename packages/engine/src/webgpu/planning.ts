@@ -81,13 +81,13 @@ export function planQwen35WebGpuHybrid(
     selectedBytes += candidate.totalBytes;
   }
 
-  const firstGpuLayer = selectedLayers[0]?.layer;
+  const segmentStartLayer = selectedLayers[0]?.layer;
   const gpuWeightBytes = outputBytes +
     selectedLayers.reduce((sum, layer) => sum + layer.weightBytes, 0);
   const gpuCacheBytes = selectedLayers.reduce((sum, layer) => sum + layer.cacheBytes, 0);
   const status: Qwen35WebGpuPlanStatus = browserGate === "passed" ? "planned" : "blocked";
   const reason = browserGate === "passed"
-    ? "WebGPU suffix placement is planned, but execution still requires verified kernels."
+    ? "WebGPU segment placement is planned, but execution still requires verified kernels."
     : "Browser user check is required before WebGPU execution can be enabled.";
 
   return {
@@ -101,9 +101,9 @@ export function planQwen35WebGpuHybrid(
     fixedBytes,
     scratchBytes,
     selectedLayerCount: selectedLayers.length,
-    firstGpuLayer,
-    cpuPrefixLayerCount: firstGpuLayer === undefined ? manifest.blockCount : firstGpuLayer,
-    gpuSuffixLayerCount: selectedLayers.length,
+    segmentStartLayer,
+    cpuSegmentLayerCount: segmentStartLayer === undefined ? manifest.blockCount : segmentStartLayer,
+    gpuSegmentLayerCount: selectedLayers.length,
     gpuWeightBytes,
     gpuCacheBytes,
     estimatedResidentBytes: selectedBytes,
@@ -111,7 +111,7 @@ export function planQwen35WebGpuHybrid(
     selectedLayers,
     copyAuditExpectations: {
       decodeTensorReads: 0,
-      suffixIntermediateReadbacks: 0,
+      segmentIntermediateReadbacks: 0,
       logitsReadbacks: 0,
       expectedBoundaryUploads: selectedLayers.length > 0 ? 1 : 0,
       expectedTokenReadbacks: 1,
@@ -131,9 +131,9 @@ export function auditQwen35WebGpuCopies(
       `decode tensor reads: expected ${expected.decodeTensorReads}, got ${observed.decodeTensorReads}`,
     );
   }
-  if (observed.suffixIntermediateReadbacks !== expected.suffixIntermediateReadbacks) {
+  if (observed.segmentIntermediateReadbacks !== expected.segmentIntermediateReadbacks) {
     errors.push(
-      `suffix intermediate readbacks: expected ${expected.suffixIntermediateReadbacks}, got ${observed.suffixIntermediateReadbacks}`,
+      `segment intermediate readbacks: expected ${expected.segmentIntermediateReadbacks}, got ${observed.segmentIntermediateReadbacks}`,
     );
   }
   if (observed.logitsReadbacks !== expected.logitsReadbacks) {
@@ -234,8 +234,8 @@ function emptyPlan(params: {
     fixedBytes: params.fixedBytes,
     scratchBytes: params.scratchBytes,
     selectedLayerCount: 0,
-    cpuPrefixLayerCount: params.blockCount,
-    gpuSuffixLayerCount: 0,
+    cpuSegmentLayerCount: params.blockCount,
+    gpuSegmentLayerCount: 0,
     gpuWeightBytes: params.outputBytes,
     gpuCacheBytes: 0,
     estimatedResidentBytes,
@@ -243,7 +243,7 @@ function emptyPlan(params: {
     selectedLayers: [],
     copyAuditExpectations: {
       decodeTensorReads: 0,
-      suffixIntermediateReadbacks: 0,
+      segmentIntermediateReadbacks: 0,
       logitsReadbacks: 0,
       expectedBoundaryUploads: 0,
       expectedTokenReadbacks: 1,
