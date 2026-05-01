@@ -698,6 +698,7 @@ fn vec_dot_q8_0_q8_0(q8_bytes: &[u8], input: &QuantizedQ8_0) -> f32 {
     sum
 }
 
+#[inline(always)]
 fn vec_dot_q8_0_q8_0_prepared(q8_bytes: &[u8], input: &QuantizedQ8_0, scales: &[f32]) -> f32 {
     let mut sum = 0.0_f32;
     for block in 0..input.d.len() {
@@ -754,6 +755,7 @@ fn vec_dot_q6_k_q8_k(q6_bytes: &[u8], q8: &QuantizedQ8K) -> f32 {
     sums.iter().sum()
 }
 
+#[inline(always)]
 fn vec_dot_q6_k_q8_k_prepared(q6_bytes: &[u8], q8: &QuantizedQ8K, scales_f32: &[f32]) -> f32 {
     let mut sums = [0.0_f32; 8];
     let mut aux8 = [0_i8; QK_K];
@@ -861,6 +863,7 @@ fn vec_dot_q5_k_q8_k(q5_bytes: &[u8], q8: &QuantizedQ8K) -> f32 {
     sumf + sums.iter().sum::<f32>()
 }
 
+#[inline(always)]
 fn vec_dot_q5_k_q8_k_prepared(q5_bytes: &[u8], q8: &QuantizedQ8K, scales_f32: &[f32]) -> f32 {
     let mut sums = [0.0_f32; 8];
     let mut aux8 = [0_i8; QK_K];
@@ -979,6 +982,7 @@ fn vec_dot_q4_k_q8_k(q4_bytes: &[u8], q8: &QuantizedQ8K) -> f32 {
     sumf + sums.iter().sum::<f32>()
 }
 
+#[inline(always)]
 fn vec_dot_q4_k_q8_k_prepared(q4_bytes: &[u8], q8: &QuantizedQ8K, scales_f32: &[f32]) -> f32 {
     let mut sums = [0.0_f32; 8];
     let mut aux8 = [0_i8; QK_K];
@@ -1073,6 +1077,7 @@ fn vec_dot_iq4_xs_q8_k(iq4_bytes: &[u8], q8: &QuantizedQ8K) -> f32 {
     accum.iter().sum()
 }
 
+#[inline(always)]
 fn vec_dot_iq4_xs_q8_k_prepared(iq4_bytes: &[u8], q8: &QuantizedQ8K, scales_f32: &[f32]) -> f32 {
     let mut accum = [0.0_f32; 8];
 
