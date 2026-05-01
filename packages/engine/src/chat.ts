@@ -165,7 +165,8 @@ export async function generateQwen35ChatTurn(
     },
   );
   let logits = promptPrefill.logits;
-  if (!logits) {
+  let nextTokenId = nextTokenFrom(logits, promptPrefill.topTokens);
+  if (nextTokenId === undefined) {
     return { content: "", finishReason: "stop", state };
   }
 
@@ -181,7 +182,7 @@ export async function generateQwen35ChatTurn(
   for (let index = 0; index < maxNewTokens; index += 1) {
     throwIfAborted(options.signal);
 
-    const tokenId = argmax(logits);
+    const tokenId = nextTokenId;
     if (stopTokenIds.has(tokenId)) {
       finishReason = "stop";
       break;
@@ -196,6 +197,11 @@ export async function generateQwen35ChatTurn(
       logitsTopK: 1,
     });
     logits = decode.logits;
+    nextTokenId = nextTokenFrom(logits, decode.topTokens);
+    if (nextTokenId === undefined) {
+      finishReason = "stop";
+      break;
+    }
 
     const token = tokenizer.idToToken(tokenId) ?? "";
     const text = tokenizer.detokenize([tokenId]);
@@ -249,7 +255,8 @@ export async function* generateQwen35ChatCompletion(
     logitsTopK: 1,
   });
   let logits = prefill.logits;
-  if (!logits) {
+  let nextTokenId = nextTokenFrom(logits, prefill.topTokens);
+  if (nextTokenId === undefined) {
     return "";
   }
 
@@ -257,7 +264,7 @@ export async function* generateQwen35ChatCompletion(
   for (let index = 0; index < maxNewTokens; index += 1) {
     throwIfAborted(options.signal);
 
-    const tokenId = argmax(logits);
+    const tokenId = nextTokenId;
     if (stopTokenIds.has(tokenId)) {
       break;
     }
@@ -280,6 +287,10 @@ export async function* generateQwen35ChatCompletion(
       logitsTopK: 1,
     });
     logits = decode.logits;
+    nextTokenId = nextTokenFrom(logits, decode.topTokens);
+    if (nextTokenId === undefined) {
+      break;
+    }
   }
 
   return content;
@@ -295,7 +306,11 @@ async function prefillQwen35ChatText(
     computeLogits?: boolean;
     requireGenerationSlot?: boolean;
   } = {},
-): Promise<{ state: Qwen35InferenceState; logits?: Float32Array }> {
+): Promise<{
+  state: Qwen35InferenceState;
+  logits?: Float32Array;
+  topTokens?: Array<{ id: number; value: number }>;
+}> {
   throwIfAborted(options.signal);
 
   const tokenIds = tokenizer.tokenize(text);
@@ -401,6 +416,17 @@ function argmax(values: Float32Array): number {
     }
   }
   return bestId;
+}
+
+function nextTokenFrom(
+  logits: Float32Array | undefined,
+  topTokens: Array<{ id: number; value: number }> | undefined,
+): number | undefined {
+  const topToken = topTokens?.[0]?.id;
+  if (topToken !== undefined) {
+    return topToken;
+  }
+  return logits ? argmax(logits) : undefined;
 }
 
 function throwIfAborted(signal: AbortSignal | undefined): void {

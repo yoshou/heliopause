@@ -44,6 +44,10 @@ import {
   type QuantizedMatMulInput,
   ssmConv1dWasm,
 } from "./prefill-wasm";
+import {
+  QWEN35_WEBGPU_MEMORY_LIMIT_BYTES,
+  Qwen35WebGpuSuffixRunner,
+} from "./webgpu";
 
 export type Qwen35FullAttentionCache = {
   key: Float32Array;
@@ -87,7 +91,7 @@ export type Qwen35DecodeOptions = {
 export type Qwen35DecodeResult = {
   hidden: Float32Array;
   state: Qwen35InferenceState;
-  logits: Float32Array;
+  logits?: Float32Array;
   topTokens: Array<{ id: number; value: number }>;
 };
 
@@ -96,6 +100,9 @@ export type Qwen35ModelSessionOptions = {
   maxWeightCacheBytes?: number;
   enableProjectionBatching?: boolean;
   enableWasmWeightCache?: boolean;
+  enableWebGpu?: boolean;
+  webGpuMemoryLimitBytes?: number;
+  webGpuFirstLayer?: number;
 };
 
 export type Qwen35TimingPhase = "prefill" | "decode";
@@ -142,6 +149,10 @@ export class Qwen35ModelSession {
   private readonly maxWeightCacheBytes: number;
   readonly enableProjectionBatching: boolean;
   readonly enableWasmWeightCache: boolean;
+  readonly enableWebGpu: boolean;
+  private readonly webGpuMemoryLimitBytes: number;
+  private readonly webGpuFirstLayer?: number;
+  private webGpuSuffixRunnerPromise?: Promise<Qwen35WebGpuSuffixRunner>;
   private readonly f32TensorCache = new Map<string, Float32Array>();
   private readonly weightBytesCache = new Map<string, Uint8Array>();
   private readonly wasmWeightHandleCache = new Map<string, WasmQuantizedWeightHandle>();
@@ -168,6 +179,9 @@ export class Qwen35ModelSession {
     this.maxWeightCacheBytes = options.maxWeightCacheBytes ?? 256 * 1024 * 1024;
     this.enableProjectionBatching = options.enableProjectionBatching ?? false;
     this.enableWasmWeightCache = options.enableWasmWeightCache ?? false;
+    this.enableWebGpu = options.enableWebGpu ?? false;
+    this.webGpuMemoryLimitBytes = options.webGpuMemoryLimitBytes ?? QWEN35_WEBGPU_MEMORY_LIMIT_BYTES;
+    this.webGpuFirstLayer = options.webGpuFirstLayer;
   }
 
   createInferenceState(): Qwen35InferenceState {
@@ -288,6 +302,21 @@ export class Qwen35ModelSession {
     };
   }
 
+  async webGpuSuffixRunner(state: Qwen35InferenceState): Promise<Qwen35WebGpuSuffixRunner> {
+    if (!this.enableWebGpu) {
+      throw new Error("WebGPU suffix runner is not enabled for this Qwen35 session.");
+    }
+    this.webGpuSuffixRunnerPromise ??= Qwen35WebGpuSuffixRunner.create({
+      tensorReader: this.tensorReader,
+      manifest: this.manifest,
+      epsilon: this.epsilon,
+      contextLength: state.contextLength,
+      memoryLimitBytes: this.webGpuMemoryLimitBytes,
+      firstGpuLayer: this.webGpuFirstLayer,
+    });
+    return this.webGpuSuffixRunnerPromise;
+  }
+
   private evictWeightBytes(): void {
     while (this.weightCacheBytes > this.maxWeightCacheBytes) {
       const oldest = this.weightBytesCache.entries().next().value as [string, Uint8Array] | undefined;
@@ -388,6 +417,9 @@ export async function prefillQwen35(
   options: Qwen35PrefillOptions = {},
 ): Promise<Qwen35PrefillResult> {
   const session = modelSession(model);
+  if (session.enableWebGpu) {
+    return prefillQwen35HybridWebGpu(session, tokenIds, options);
+  }
   const { manifest } = session;
   const state = options.state ?? session.createInferenceState();
   const positions = normalizePositions(options.positions, tokenIds.length);
@@ -438,6 +470,9 @@ export async function decodeQwen35(
   options: Qwen35DecodeOptions = {},
 ): Promise<Qwen35DecodeResult> {
   const session = modelSession(model);
+  if (session.enableWebGpu) {
+    return decodeQwen35HybridWebGpu(session, tokenId, options);
+  }
   const { manifest } = session;
   const state = options.state ?? session.createInferenceState();
   const position = options.position ?? state.nextPosition;
@@ -479,6 +514,94 @@ export async function decodeQwen35(
     state,
     logits,
     topTokens: topK(logits, options.logitsTopK ?? 10),
+  };
+}
+
+async function prefillQwen35HybridWebGpu(
+  session: Qwen35ModelSession,
+  tokenIds: readonly number[],
+  options: Qwen35PrefillOptions = {},
+): Promise<Qwen35PrefillResult> {
+  const { manifest } = session;
+  const state = options.state ?? session.createInferenceState();
+  const positions = normalizePositions(options.positions, tokenIds.length);
+  const epsilon = session.epsilon;
+  const trace = createForwardTrace("prefill", options.onTiming);
+  const runner = await session.webGpuSuffixRunner(state);
+  if (tokenIds.length === 0) {
+    return { hidden: new Float32Array(), state };
+  }
+
+  let boundaryHidden = await timedAsync(trace, "embedding read", () => session.readEmbeddingRows(tokenIds));
+  for (let layer = 0; layer < runner.firstGpuLayer; layer += 1) {
+    const isFullAttention = manifest.fullAttentionLayers.includes(layer);
+    boundaryHidden = await timedAsync(
+      trace,
+      "layer total",
+      () => isFullAttention
+        ? forwardQwen35FullAttentionLayer(session, manifest, state, layer, boundaryHidden, positions, epsilon, trace)
+        : forwardQwen35RecurrentLayer(session, manifest, state, layer, boundaryHidden, epsilon, trace),
+      { layer, layerKind: isFullAttention ? "full-attention" : "recurrent" },
+    );
+  }
+  const gpu = await timedAsync(
+    trace,
+    "WebGPU suffix",
+    () => runner.runTokens(boundaryHidden, positions, state, {
+      computeTopK: options.computeLogits === true,
+      topK: options.logitsTopK ?? 10,
+    }),
+  );
+  updateNextPosition(state, positions, tokenIds.length);
+
+  const result: Qwen35PrefillResult = {
+    hidden: new Float32Array(),
+    state,
+  };
+  if (options.computeLogits) {
+    result.topTokens = gpu.topTokens ?? [];
+  }
+  return result;
+}
+
+async function decodeQwen35HybridWebGpu(
+  session: Qwen35ModelSession,
+  tokenId: number,
+  options: Qwen35DecodeOptions = {},
+): Promise<Qwen35DecodeResult> {
+  const { manifest } = session;
+  const state = options.state ?? session.createInferenceState();
+  const position = options.position ?? state.nextPosition;
+  const positions = new Int32Array([position]);
+  const epsilon = session.epsilon;
+  const trace = createForwardTrace("decode", options.onTiming);
+  const runner = await session.webGpuSuffixRunner(state);
+
+  let boundaryHidden = await timedAsync(trace, "embedding read", () => session.readEmbeddingRows([tokenId]));
+  for (let layer = 0; layer < runner.firstGpuLayer; layer += 1) {
+    const isFullAttention = manifest.fullAttentionLayers.includes(layer);
+    boundaryHidden = await timedAsync(
+      trace,
+      "layer total",
+      () => isFullAttention
+        ? forwardQwen35FullAttentionLayer(session, manifest, state, layer, boundaryHidden, positions, epsilon, trace)
+        : forwardQwen35RecurrentLayer(session, manifest, state, layer, boundaryHidden, epsilon, trace),
+      { layer, layerKind: isFullAttention ? "full-attention" : "recurrent" },
+    );
+  }
+  const gpu = await timedAsync(
+    trace,
+    "WebGPU suffix",
+    () => runner.runToken(boundaryHidden, positions, state, {
+      computeTopK: true,
+      topK: options.logitsTopK ?? 10,
+    }),
+  );
+  state.nextPosition = Math.max(state.nextPosition, position + 1);
+  return {
+    hidden: new Float32Array(),
+    state,
+    topTokens: gpu.topTokens ?? [],
   };
 }
 
