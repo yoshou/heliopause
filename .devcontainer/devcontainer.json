@@ -1,0 +1,31 @@
+{
+	"name": "Rust & Typescript",
+	"image": "ghcr.io/prulloac/base:bookworm",
+
+	// 👇 Features to add to the Dev Container. More info: https://containers.dev/implementors/features.
+	"features": {
+		"ghcr.io/devcontainers/features/docker-in-docker:2": {},
+		"ghcr.io/prulloac/devcontainer-features/bun:1": {},
+		"ghcr.io/devcontainers/features/node:1": {},
+		"ghcr.io/devcontainers/features/rust": {
+			"version": "latest",
+			"profile": "default"
+		}
+	},
+
+	// 👇 Use 'forwardPorts' to make a list of ports inside the container available locally.
+	"appPort": [5173],
+	"forwardPorts": [5173],
+	"portsAttributes": {
+		"5173": {
+			"label": "Vite dev server",
+			"onAutoForward": "notify"
+		}
+	}
+
+	// 👇 Configure tool-specific properties.
+	// "customizations": {},
+
+	// 👇 Uncomment to connect as root instead. More info: https://aka.ms/dev-containers-non-root.
+	// "remoteUser": "root"
+}

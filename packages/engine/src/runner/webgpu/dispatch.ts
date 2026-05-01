@@ -1,0 +1,388 @@
+import type { WebGpuBufferLike, WebGpuComputePassLike, WebGpuDeviceLike } from "./gpu-types";
+import type { Q8_0Buffers, Q8KBuffers, QuantizedHandle } from "./arena";
+import {
+  createDeltaGateResources,
+  createF32MatMulResources,
+  createFullAttentionApplyResources,
+  createFullAttentionScoreResources,
+  createFullKvUpdateResources,
+  createFullQueryResources,
+  createGatedDeltaNetResources,
+  createKMatMulBindResources,
+  createQkvConvResources,
+  createQ8_0MatMulBindResources,
+  createQ8_0QuantizeResources,
+  createQ8KQuantizeResources,
+  createResidualAddResources,
+  createRmsNormResources,
+  createSsmNormGateResources,
+  createSwiGluResources,
+  createTokenSliceResources,
+  createTopKResources,
+} from "./kernel-resources";
+
+export function dispatchKMatMul(
+  pass: WebGpuComputePassLike,
+  resources: Array<{ destroy: () => void }>,
+  handle: QuantizedHandle,
+  q8: Q8KBuffers,
+  output: WebGpuBufferLike,
+  columnCount: number,
+): void {
+  if (handle.type === "Q8_0") {
+    throw new Error("Q8_0 handle cannot use K-quant matmul dispatch");
+  }
+  const resource = createKMatMulBindResources(handle, q8.scale, q8.qs, q8.bsums, output, columnCount);
+  resources.push(resource);
+  pass.setPipeline(resource.pipeline);
+  pass.setBindGroup(0, resource.bindGroup);
+  pass.dispatchWorkgroups(Math.ceil(handle.rowCount / 8), columnCount);
+}
+
+export function dispatchQ8_0MatMul(
+  pass: WebGpuComputePassLike,
+  resources: Array<{ destroy: () => void }>,
+  handle: QuantizedHandle,
+  q8: Q8_0Buffers,
+  output: WebGpuBufferLike,
+  columnCount: number,
+): void {
+  if (handle.type !== "Q8_0") {
+    throw new Error("K-quant handle cannot use Q8_0 matmul dispatch");
+  }
+  const resource = createQ8_0MatMulBindResources(handle, q8.scale, q8.qs, output, columnCount);
+  resources.push(resource);
+  pass.setPipeline(resource.pipeline);
+  pass.setBindGroup(0, resource.bindGroup);
+  pass.dispatchWorkgroups(Math.ceil(handle.rowCount / 8), columnCount);
+}
+
+export function dispatchF32MatMul(
+  device: WebGpuDeviceLike,
+  pass: WebGpuComputePassLike,
+  resources: Array<{ destroy: () => void }>,
+  weight: WebGpuBufferLike,
+  input: WebGpuBufferLike,
+  output: WebGpuBufferLike,
+  inputSize: number,
+  rowCount: number,
+  columnCount: number,
+): void {
+  const resource = createF32MatMulResources(device, weight, input, output, inputSize, rowCount, columnCount);
+  resources.push(resource);
+  pass.setPipeline(resource.pipeline);
+  pass.setBindGroup(0, resource.bindGroup);
+  pass.dispatchWorkgroups(Math.ceil(rowCount / 8), columnCount);
+}
+
+export function dispatchQ8KQuantize(
+  device: WebGpuDeviceLike,
+  pass: WebGpuComputePassLike,
+  resources: Array<{ destroy: () => void }>,
+  input: WebGpuBufferLike,
+  q8: Q8KBuffers,
+  inputSize: number,
+  columnCount: number,
+): void {
+  const resource = createQ8KQuantizeResources(device, input, q8.scale, q8.qs, q8.bsums, inputSize, columnCount, inputSize / 256);
+  resources.push(resource);
+  pass.setPipeline(resource.pipeline);
+  pass.setBindGroup(0, resource.bindGroup);
+  pass.dispatchWorkgroups(columnCount, inputSize / 256);
+}
+
+export function dispatchQ8_0Quantize(
+  device: WebGpuDeviceLike,
+  pass: WebGpuComputePassLike,
+  resources: Array<{ destroy: () => void }>,
+  input: WebGpuBufferLike,
+  q8: Q8_0Buffers,
+  inputSize: number,
+  columnCount: number,
+  blockCount: number,
+): void {
+  const resource = createQ8_0QuantizeResources(device, input, q8.scale, q8.qs, inputSize, columnCount, blockCount);
+  resources.push(resource);
+  pass.setPipeline(resource.pipeline);
+  pass.setBindGroup(0, resource.bindGroup);
+  pass.dispatchWorkgroups(columnCount, blockCount);
+}
+
+export function dispatchRmsNorm(
+  device: WebGpuDeviceLike,
+  pass: WebGpuComputePassLike,
+  resources: Array<{ destroy: () => void }>,
+  input: WebGpuBufferLike,
+  weight: WebGpuBufferLike,
+  output: WebGpuBufferLike,
+  length: number,
+  epsilon: number,
+): void {
+  const resource = createRmsNormResources(device, input, weight, output, length, epsilon);
+  resources.push(resource);
+  pass.setPipeline(resource.pipeline);
+  pass.setBindGroup(0, resource.bindGroup);
+  pass.dispatchWorkgroups(1);
+}
+
+export function dispatchResidualAdd(
+  device: WebGpuDeviceLike,
+  pass: WebGpuComputePassLike,
+  resources: Array<{ destroy: () => void }>,
+  left: WebGpuBufferLike,
+  right: WebGpuBufferLike,
+  output: WebGpuBufferLike,
+  length: number,
+): void {
+  const resource = createResidualAddResources(device, left, right, output, length);
+  resources.push(resource);
+  pass.setPipeline(resource.pipeline);
+  pass.setBindGroup(0, resource.bindGroup);
+  pass.dispatchWorkgroups(Math.ceil(length / 256));
+}
+
+export function dispatchFullQuery(
+  device: WebGpuDeviceLike,
+  pass: WebGpuComputePassLike,
+  resources: Array<{ destroy: () => void }>,
+  qFull: WebGpuBufferLike,
+  qNorm: WebGpuBufferLike,
+  query: WebGpuBufferLike,
+  gate: WebGpuBufferLike,
+  options: {
+    headCount: number;
+    headSize: number;
+    ropeDims: number;
+    epsilon: number;
+    freqBase: number;
+    position: number;
+  },
+): void {
+  const resource = createFullQueryResources(device, qFull, qNorm, query, gate, options);
+  resources.push(resource);
+  pass.setPipeline(resource.pipeline);
+  pass.setBindGroup(0, resource.bindGroup);
+  pass.dispatchWorkgroups(options.headCount);
+}
+
+export function dispatchFullKvUpdate(
+  device: WebGpuDeviceLike,
+  pass: WebGpuComputePassLike,
+  resources: Array<{ destroy: () => void }>,
+  kProjection: WebGpuBufferLike,
+  vProjection: WebGpuBufferLike,
+  kNorm: WebGpuBufferLike,
+  keyCache: WebGpuBufferLike,
+  valueCache: WebGpuBufferLike,
+  options: {
+    headCount: number;
+    headSize: number;
+    ropeDims: number;
+    epsilon: number;
+    freqBase: number;
+    position: number;
+    tokenPosition: number;
+    contextLength: number;
+  },
+): void {
+  const resource = createFullKvUpdateResources(device, kProjection, vProjection, kNorm, keyCache, valueCache, options);
+  resources.push(resource);
+  pass.setPipeline(resource.pipeline);
+  pass.setBindGroup(0, resource.bindGroup);
+  pass.dispatchWorkgroups(options.headCount);
+}
+
+export function dispatchTopK(
+  device: WebGpuDeviceLike,
+  pass: WebGpuComputePassLike,
+  resources: Array<{ destroy: () => void }>,
+  logits: WebGpuBufferLike,
+  output: WebGpuBufferLike,
+  options: {
+    rowCount: number;
+    rowOffset: number;
+    topK: number;
+    candidateOffset: number;
+  },
+): void {
+  for (let slot = 0; slot < options.topK; slot += 1) {
+    const resource = createTopKResources(device, logits, output, { ...options, slot });
+    resources.push(resource);
+    pass.setPipeline(resource.pipeline);
+    pass.setBindGroup(0, resource.bindGroup);
+    pass.dispatchWorkgroups(1);
+  }
+}
+
+export function dispatchTokenSlice(
+  device: WebGpuDeviceLike,
+  pass: WebGpuComputePassLike,
+  resources: Array<{ destroy: () => void }>,
+  input: WebGpuBufferLike,
+  output: WebGpuBufferLike,
+  options: {
+    rowSize: number;
+    rowIndex: number;
+  },
+): void {
+  const resource = createTokenSliceResources(device, input, output, options);
+  resources.push(resource);
+  pass.setPipeline(resource.pipeline);
+  pass.setBindGroup(0, resource.bindGroup);
+  pass.dispatchWorkgroups(Math.ceil(options.rowSize / 256));
+}
+
+export function dispatchSwiGlu(
+  device: WebGpuDeviceLike,
+  pass: WebGpuComputePassLike,
+  resources: Array<{ destroy: () => void }>,
+  gate: WebGpuBufferLike,
+  up: WebGpuBufferLike,
+  output: WebGpuBufferLike,
+  length: number,
+): void {
+  const resource = createSwiGluResources(device, gate, up, output, length);
+  resources.push(resource);
+  pass.setPipeline(resource.pipeline);
+  pass.setBindGroup(0, resource.bindGroup);
+  pass.dispatchWorkgroups(Math.ceil(length / 256));
+}
+
+export function dispatchQkvConv(
+  device: WebGpuDeviceLike,
+  pass: WebGpuComputePassLike,
+  resources: Array<{ destroy: () => void }>,
+  qkv: WebGpuBufferLike,
+  convState: WebGpuBufferLike,
+  convKernel: WebGpuBufferLike,
+  q: WebGpuBufferLike,
+  k: WebGpuBufferLike,
+  v: WebGpuBufferLike,
+  nextConv: WebGpuBufferLike,
+  options: {
+    tokenCount: number;
+    convDim: number;
+    kernelSize: number;
+    stateSize: number;
+    groupCount: number;
+    valueDim: number;
+  },
+): void {
+  const resource = createQkvConvResources(device, qkv, convState, convKernel, q, k, v, nextConv, options);
+  resources.push(resource);
+  pass.setPipeline(resource.pipeline);
+  pass.setBindGroup(0, resource.bindGroup);
+  pass.dispatchWorkgroups(Math.max(options.groupCount, options.valueDim / options.stateSize, options.convDim), 3);
+}
+
+export function dispatchDeltaGate(
+  device: WebGpuDeviceLike,
+  pass: WebGpuComputePassLike,
+  resources: Array<{ destroy: () => void }>,
+  alpha: WebGpuBufferLike,
+  beta: WebGpuBufferLike,
+  dtBias: WebGpuBufferLike,
+  ssmA: WebGpuBufferLike,
+  gate: WebGpuBufferLike,
+  betaSigmoid: WebGpuBufferLike,
+  valueHeadCount: number,
+  tokenCount: number,
+): void {
+  const resource = createDeltaGateResources(device, alpha, beta, dtBias, ssmA, gate, betaSigmoid, valueHeadCount, tokenCount);
+  resources.push(resource);
+  pass.setPipeline(resource.pipeline);
+  pass.setBindGroup(0, resource.bindGroup);
+  pass.dispatchWorkgroups(valueHeadCount, tokenCount);
+}
+
+export function dispatchGatedDeltaNet(
+  device: WebGpuDeviceLike,
+  pass: WebGpuComputePassLike,
+  resources: Array<{ destroy: () => void }>,
+  query: WebGpuBufferLike,
+  key: WebGpuBufferLike,
+  value: WebGpuBufferLike,
+  gate: WebGpuBufferLike,
+  beta: WebGpuBufferLike,
+  state: WebGpuBufferLike,
+  output: WebGpuBufferLike,
+  nextState: WebGpuBufferLike,
+  options: {
+    stateSize: number;
+    keyHeadCount: number;
+    valueHeadCount: number;
+    tokenCount: number;
+  },
+): void {
+  const resource = createGatedDeltaNetResources(device, query, key, value, gate, beta, state, output, nextState, options);
+  resources.push(resource);
+  pass.setPipeline(resource.pipeline);
+  pass.setBindGroup(0, resource.bindGroup);
+  pass.dispatchWorkgroups(options.valueHeadCount);
+}
+
+export function dispatchSsmNormGate(
+  device: WebGpuDeviceLike,
+  pass: WebGpuComputePassLike,
+  resources: Array<{ destroy: () => void }>,
+  delta: WebGpuBufferLike,
+  z: WebGpuBufferLike,
+  normWeight: WebGpuBufferLike,
+  output: WebGpuBufferLike,
+  rowCount: number,
+  columnCount: number,
+  epsilon: number,
+): void {
+  const resource = createSsmNormGateResources(device, delta, z, normWeight, output, rowCount, columnCount, epsilon);
+  resources.push(resource);
+  pass.setPipeline(resource.pipeline);
+  pass.setBindGroup(0, resource.bindGroup);
+  pass.dispatchWorkgroups(columnCount);
+}
+
+export function dispatchFullAttentionScore(
+  device: WebGpuDeviceLike,
+  pass: WebGpuComputePassLike,
+  resources: Array<{ destroy: () => void }>,
+  query: WebGpuBufferLike,
+  key: WebGpuBufferLike,
+  probabilities: WebGpuBufferLike,
+  options: {
+    headSize: number;
+    queryHeadCount: number;
+    keyValueHeadCount: number;
+    keyValueTokenCount: number;
+    contextLength: number;
+    scale: number;
+  },
+): void {
+  const resource = createFullAttentionScoreResources(device, query, key, probabilities, options);
+  resources.push(resource);
+  pass.setPipeline(resource.pipeline);
+  pass.setBindGroup(0, resource.bindGroup);
+  pass.dispatchWorkgroups(options.queryHeadCount);
+}
+
+export function dispatchFullAttentionApply(
+  device: WebGpuDeviceLike,
+  pass: WebGpuComputePassLike,
+  resources: Array<{ destroy: () => void }>,
+  value: WebGpuBufferLike,
+  gate: WebGpuBufferLike,
+  probabilities: WebGpuBufferLike,
+  output: WebGpuBufferLike,
+  options: {
+    headSize: number;
+    queryHeadCount: number;
+    keyValueHeadCount: number;
+    keyValueTokenCount: number;
+    contextLength: number;
+    scale: number;
+  },
+): void {
+  const resource = createFullAttentionApplyResources(device, value, gate, probabilities, output, options);
+  resources.push(resource);
+  pass.setPipeline(resource.pipeline);
+  pass.setBindGroup(0, resource.bindGroup);
+  pass.dispatchWorkgroups(options.queryHeadCount, options.headSize);
+}
