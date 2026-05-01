@@ -1,7 +1,10 @@
 import {
   checkWebGpuSupport,
-  createWebGpuF32TensorHandle,
-  createWebGpuQuantizedWeightHandle,
+  runWebGpuSmokeTest,
+  type WebGpuSupport,
+} from "./runner/webgpu/index";
+import { createWebGpuF32TensorHandle, createWebGpuQuantizedWeightHandle } from "./runner/webgpu/quantized-handles";
+import {
   fullAttentionDecodeOutWebGpuResident,
   gatedDeltaNetWebGpu,
   matMulQ4_KWebGpu,
@@ -15,19 +18,17 @@ import {
   matMulTop1WebGpuQuantizedResident,
   matMulWebGpuQuantizedResident,
   recurrentAttentionDecodeWebGpuResident,
-  runWebGpuSmokeTest,
-  type WebGpuSupport,
-} from "./webgpu";
-import { GPU_COPY_DST } from "./webgpu/gpu-constants";
-import { storageBuffer } from "./webgpu/gpu-bindings";
-import { createKMatMulBindResources, createQ8_0MatMulBindResources } from "./webgpu/kernel-resources";
+} from "./runner/webgpu/matmul";
+import { GPU_COPY_DST } from "./runner/webgpu/gpu-constants";
+import { storageBuffer } from "./runner/webgpu/gpu-bindings";
+import { createKMatMulBindResources, createQ8_0MatMulBindResources } from "./runner/webgpu/kernel-resources";
 import {
   quantizeQ8_0Columns,
   quantizeQ8_KColumns,
   packBytesToU32,
   webGpuQuantizedWeightLayout,
-} from "./webgpu/quantized-handles";
-import type { WebGpuBufferLike, WebGpuComputePassLike, WebGpuDeviceLike, WebGpuQuantizedWeightHandleInternal } from "./webgpu/gpu-types";
+} from "./runner/webgpu/quantized-handles";
+import type { WebGpuBufferLike, WebGpuComputePassLike, WebGpuDeviceLike, WebGpuQuantizedWeightHandleInternal } from "./runner/webgpu/gpu-types";
 import {
   gatedDeltaNet,
   gqaAttention,
@@ -49,7 +50,7 @@ import {
   releaseWasmQuantizedWeightHandle,
   ssmConv1dWasm,
   type WasmQuantizedWeightHandle,
-} from "./prefill-wasm";
+} from "./runner/cpu/wasm-kernels";
 import {
   quantizeQ8_0,
   quantizeQ8_K,

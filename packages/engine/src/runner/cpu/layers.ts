@@ -1,6 +1,6 @@
 import {
   type GgmlTypeName,
-} from "./gguf";
+} from "../../gguf";
 import {
   gatedDeltaNet,
   gqaAttention,
@@ -12,9 +12,8 @@ import {
   silu,
   softplus,
   ssmConv1d,
-} from "./ops";
+} from "../../ops";
 import {
-  dequantizeRow,
   quantizeQ8_0,
   quantizeQ8_K,
   vecDotIQ4_XS_Q8_K,
@@ -22,593 +21,44 @@ import {
   vecDotQ5_K_Q8_K,
   vecDotQ6_K_Q8_K,
   vecDotQ8_0_Q8_0,
-} from "./quant";
+} from "../../quant";
 import {
-  type GgufTensorReader,
   tensorByteLength,
-} from "./tensor-reader";
+} from "../../tensor-reader";
 import {
-  buildQwen35Manifest,
-  type Qwen35LayerKind,
   type Qwen35ModelManifest,
-} from "./qwen35";
+} from "../../model";
+import {
+  type Qwen35ForwardTrace,
+  type Qwen35FullAttentionCache,
+  type Qwen35InferenceState,
+  type Qwen35ModelInput,
+  type Qwen35ModelSession,
+  type Qwen35OutputResult,
+  type Qwen35RecurrentCache,
+  modelSession,
+  requiredFullAttentionCache,
+  requiredRecurrentCache,
+  timedAsync,
+  timedSync,
+  topK,
+} from "../../runtime";
 import {
   gatedDeltaNetWasm,
   gqaAttentionWasm,
   matMulQuantizedMultiWasm,
-  matMulQuantizedWasmResidentMulti,
-  matMulQuantizedWasmResident,
   matMulQuantizedWasm,
-  createWasmQuantizedWeightHandle,
-  type WasmQuantizedWeightHandle,
-  type QuantizedMatMulInput,
+  matMulQuantizedWasmResident,
+  matMulQuantizedWasmResidentMulti,
   ssmConv1dWasm,
-} from "./prefill-wasm";
+  type QuantizedMatMulInput,
+  type WasmQuantizedWeightHandle,
+} from "./wasm-kernels";
 import {
-  QWEN35_WEBGPU_MEMORY_LIMIT_BYTES,
-  Qwen35WebGpuSegmentRunner,
-} from "./webgpu";
-
-export type Qwen35FullAttentionCache = {
-  key: Float32Array;
-  value: Float32Array;
-};
-
-export type Qwen35RecurrentCache = {
-  conv: Float32Array;
-  state: Float32Array;
-};
-
-export type Qwen35InferenceState = {
-  recurrent: Map<number, Qwen35RecurrentCache>;
-  fullAttention: Map<number, Qwen35FullAttentionCache>;
-  contextLength: number;
-  nextPosition: number;
-};
-
-export type Qwen35PrefillOptions = {
-  positions?: Int32Array | number[];
-  state?: Qwen35InferenceState;
-  computeLogits?: boolean;
-  logitsTopK?: number;
-  onTiming?: Qwen35TimingSink;
-};
-
-export type Qwen35PrefillResult = {
-  hidden: Float32Array;
-  state: Qwen35InferenceState;
-  logits?: Float32Array;
-  topTokens?: Array<{ id: number; value: number }>;
-};
-
-export type Qwen35DecodeOptions = {
-  position?: number;
-  state?: Qwen35InferenceState;
-  logitsTopK?: number;
-  onTiming?: Qwen35TimingSink;
-};
-
-export type Qwen35DecodeResult = {
-  hidden: Float32Array;
-  state: Qwen35InferenceState;
-  logits?: Float32Array;
-  topTokens: Array<{ id: number; value: number }>;
-};
-
-export type Qwen35OutputResult = {
-  logits: Float32Array;
-  topTokens: Array<{ id: number; value: number }>;
-};
-
-export type Qwen35ModelSessionOptions = {
-  maxContextLength?: number;
-  maxWeightCacheBytes?: number;
-  enableProjectionBatching?: boolean;
-  enableWasmWeightCache?: boolean;
-  enableWebGpu?: boolean;
-  webGpuMemoryLimitBytes?: number;
-  webGpuSegmentStartLayer?: number;
-};
-
-export type Qwen35TimingPhase = "prefill" | "decode";
-
-export type Qwen35TimingEvent = {
-  phase: Qwen35TimingPhase;
-  section: string;
-  durationMs: number;
-  layer?: number;
-  layerKind?: Qwen35LayerKind;
-  weightName?: string;
-  tokenIndex?: number;
-};
-
-export type Qwen35TimingSink = (event: Qwen35TimingEvent) => void;
-
-export type Qwen35ForwardTrace = {
-  phase: Qwen35TimingPhase;
-  onTiming: Qwen35TimingSink;
-};
-
-export type Qwen35CacheStats = {
-  f32TensorCount: number;
-  weightTensorCount: number;
-  weightCacheBytes: number;
-  maxWeightCacheBytes: number;
-  weightCacheHits: number;
-  weightCacheMisses: number;
-  weightCacheEvictions: number;
-  wasmWeightCacheEnabled: boolean;
-  wasmWeightCacheCount: number;
-  wasmWeightCacheBytes: number;
-  wasmWeightCacheHits: number;
-  wasmWeightCacheMisses: number;
-  embeddingRowCount: number;
-};
-
-export class Qwen35ModelSession {
-  readonly tensorReader: GgufTensorReader;
-  readonly manifest: Qwen35ModelManifest;
-  readonly epsilon: number;
-
-  private readonly maxContextLength?: number;
-  private readonly maxWeightCacheBytes: number;
-  readonly enableProjectionBatching: boolean;
-  readonly enableWasmWeightCache: boolean;
-  readonly enableWebGpu: boolean;
-  private readonly webGpuMemoryLimitBytes: number;
-  private readonly webGpuSegmentStartLayer?: number;
-  private webGpuSegmentRunnerPromise?: Promise<Qwen35WebGpuSegmentRunner>;
-  private readonly f32TensorCache = new Map<string, Float32Array>();
-  private readonly weightBytesCache = new Map<string, Uint8Array>();
-  private readonly wasmWeightHandleCache = new Map<string, WasmQuantizedWeightHandle>();
-  private readonly embeddingRowCache = new Map<number, Float32Array>();
-  private weightCacheBytes = 0;
-  private weightCacheHits = 0;
-  private weightCacheMisses = 0;
-  private weightCacheEvictions = 0;
-  private wasmWeightCacheBytes = 0;
-  private wasmWeightCacheHits = 0;
-  private wasmWeightCacheMisses = 0;
-
-  constructor(
-    tensorReader: GgufTensorReader,
-    options: Qwen35ModelSessionOptions = {},
-  ) {
-    this.tensorReader = tensorReader;
-    this.manifest = buildQwen35Manifest(tensorReader.metadata);
-    this.epsilon = requiredMetadataNumber(
-      tensorReader,
-      "qwen35.attention.layer_norm_rms_epsilon",
-    );
-    this.maxContextLength = options.maxContextLength;
-    this.maxWeightCacheBytes = options.maxWeightCacheBytes ?? 256 * 1024 * 1024;
-    this.enableProjectionBatching = options.enableProjectionBatching ?? false;
-    this.enableWasmWeightCache = options.enableWasmWeightCache ?? false;
-    this.enableWebGpu = options.enableWebGpu ?? false;
-    this.webGpuMemoryLimitBytes = options.webGpuMemoryLimitBytes ?? QWEN35_WEBGPU_MEMORY_LIMIT_BYTES;
-    this.webGpuSegmentStartLayer = options.webGpuSegmentStartLayer;
-  }
-
-  createInferenceState(): Qwen35InferenceState {
-    return createQwen35InferenceState(this.manifest, {
-      contextLength: this.maxContextLength === undefined
-        ? this.manifest.contextLength
-        : Math.min(this.manifest.contextLength, this.maxContextLength),
-    });
-  }
-
-  getTensor(name: string) {
-    return this.tensorReader.getTensor(name);
-  }
-
-  async readF32Tensor(name: string): Promise<Float32Array> {
-    const cached = this.f32TensorCache.get(name);
-    if (cached) {
-      return cached;
-    }
-
-    const tensor = this.tensorReader.getTensor(name);
-    if (tensor.type !== "F32") {
-      throw new Error(`${name} must be F32, got ${tensor.type}`);
-    }
-    const bytes = await this.tensorReader.readTensorBytes(name);
-    const value = new Float32Array(bytes.buffer, bytes.byteOffset, bytes.byteLength / 4).slice();
-    this.f32TensorCache.set(name, value);
-    return value;
-  }
-
-  async readWeightBytes(name: string): Promise<Uint8Array> {
-    const cached = this.weightBytesCache.get(name);
-    if (cached) {
-      this.weightCacheHits += 1;
-      this.weightBytesCache.delete(name);
-      this.weightBytesCache.set(name, cached);
-      return cached;
-    }
-
-    this.weightCacheMisses += 1;
-    const bytes = await this.tensorReader.readTensorBytes(name);
-    if (bytes.byteLength <= this.maxWeightCacheBytes) {
-      this.weightBytesCache.set(name, bytes);
-      this.weightCacheBytes += bytes.byteLength;
-      this.evictWeightBytes();
-    }
-    return bytes;
-  }
-
-  async readWasmWeightHandle(
-    name: string,
-    type: "Q4_K" | "Q5_K" | "Q6_K" | "IQ4_XS" | "Q8_0",
-    inputSize: number,
-    rowCount: number,
-  ): Promise<WasmQuantizedWeightHandle | undefined> {
-    if (!this.enableWasmWeightCache) {
-      return undefined;
-    }
-    const cached = this.wasmWeightHandleCache.get(name);
-    if (cached) {
-      this.wasmWeightCacheHits += 1;
-      return cached;
-    }
-
-    this.wasmWeightCacheMisses += 1;
-    const bytes = await this.tensorReader.readTensorBytes(name);
-    const handle = await createWasmQuantizedWeightHandle(type, bytes, inputSize, rowCount);
-    if (!handle) {
-      return undefined;
-    }
-    this.wasmWeightHandleCache.set(name, handle);
-    this.wasmWeightCacheBytes += handle.byteLength;
-    return handle;
-  }
-
-  async readEmbeddingRows(tokenIds: readonly number[]): Promise<Float32Array> {
-    const tokenEmbedding = this.tensorReader.getTensor("token_embd.weight");
-    const rowElements = tokenEmbedding.dimensions[0] ?? 0;
-    const rowByteLength = tensorByteLength({
-      ...tokenEmbedding,
-      dimensions: [rowElements],
-    });
-    const rows = new Float32Array(rowElements * tokenIds.length);
-
-    for (let index = 0; index < tokenIds.length; index += 1) {
-      const tokenId = tokenIds[index] ?? 0;
-      let row = this.embeddingRowCache.get(tokenId);
-      if (!row) {
-        const rowBytes = await this.tensorReader.readTensorRange({
-          tensor: tokenEmbedding,
-          offset: BigInt(rowByteLength * tokenId),
-          length: rowByteLength,
-        });
-        row = dequantizeRow(tokenEmbedding.type, rowBytes, rowElements);
-        this.embeddingRowCache.set(tokenId, row);
-      }
-      rows.set(row, index * rowElements);
-    }
-
-    return rows;
-  }
-
-  cacheStats(): Qwen35CacheStats {
-    return {
-      f32TensorCount: this.f32TensorCache.size,
-      weightTensorCount: this.weightBytesCache.size,
-      weightCacheBytes: this.weightCacheBytes,
-      maxWeightCacheBytes: this.maxWeightCacheBytes,
-      weightCacheHits: this.weightCacheHits,
-      weightCacheMisses: this.weightCacheMisses,
-      weightCacheEvictions: this.weightCacheEvictions,
-      wasmWeightCacheEnabled: this.enableWasmWeightCache,
-      wasmWeightCacheCount: this.wasmWeightHandleCache.size,
-      wasmWeightCacheBytes: this.wasmWeightCacheBytes,
-      wasmWeightCacheHits: this.wasmWeightCacheHits,
-      wasmWeightCacheMisses: this.wasmWeightCacheMisses,
-      embeddingRowCount: this.embeddingRowCache.size,
-    };
-  }
-
-  async webGpuSegmentRunner(state: Qwen35InferenceState): Promise<Qwen35WebGpuSegmentRunner> {
-    if (!this.enableWebGpu) {
-      throw new Error("WebGPU segment runner is not enabled for this Qwen35 session.");
-    }
-    this.webGpuSegmentRunnerPromise ??= Qwen35WebGpuSegmentRunner.create({
-      tensorReader: this.tensorReader,
-      manifest: this.manifest,
-      epsilon: this.epsilon,
-      contextLength: state.contextLength,
-      memoryLimitBytes: this.webGpuMemoryLimitBytes,
-      segmentStartLayer: this.webGpuSegmentStartLayer,
-    });
-    return this.webGpuSegmentRunnerPromise;
-  }
-
-  private evictWeightBytes(): void {
-    while (this.weightCacheBytes > this.maxWeightCacheBytes) {
-      const oldest = this.weightBytesCache.entries().next().value as [string, Uint8Array] | undefined;
-      if (!oldest) {
-        this.weightCacheBytes = 0;
-        return;
-      }
-      this.weightBytesCache.delete(oldest[0]);
-      this.weightCacheBytes -= oldest[1].byteLength;
-      this.weightCacheEvictions += 1;
-    }
-  }
-}
-
-export function estimateQwen35WeightCacheBytes(tensorReader: GgufTensorReader): number {
-  let total = 0;
-  for (const tensor of tensorReader.metadata.tensors) {
-    if (tensor.name === "token_embd.weight") {
-      continue;
-    }
-    if (!isCachedMatmulWeightType(tensor.type)) {
-      continue;
-    }
-    total += tensorByteLength(tensor);
-  }
-  return total;
-}
-
-export function createQwen35ModelSession(
-  tensorReader: GgufTensorReader,
-  options: Qwen35ModelSessionOptions = {},
-): Qwen35ModelSession {
-  return new Qwen35ModelSession(tensorReader, options);
-}
-
-export type Qwen35ModelInput = GgufTensorReader | Qwen35ModelSession;
-
-export function createQwen35InferenceState(
-  manifest: Qwen35ModelManifest,
-  options: { contextLength?: number } = {},
-): Qwen35InferenceState {
-  const recurrent = new Map<number, Qwen35RecurrentCache>();
-  const fullAttention = new Map<number, Qwen35FullAttentionCache>();
-  const contextLength = options.contextLength ?? manifest.contextLength;
-  const convDim =
-    manifest.ssm.stateSize * manifest.ssm.groupCount * 2 +
-    manifest.ssm.stateSize * manifest.ssm.timeStepRank;
-  const recurrentStateSize =
-    manifest.ssm.stateSize * manifest.ssm.stateSize * manifest.ssm.timeStepRank;
-  const fullCacheSize = contextLength * manifest.headCountKv * manifest.keyLength;
-
-  for (const layer of manifest.recurrentLayers) {
-    recurrent.set(layer, {
-      conv: new Float32Array((manifest.ssm.convKernel - 1) * convDim),
-      state: new Float32Array(recurrentStateSize),
-    });
-  }
-
-  for (const layer of manifest.fullAttentionLayers) {
-    fullAttention.set(layer, {
-      key: new Float32Array(fullCacheSize),
-      value: new Float32Array(fullCacheSize),
-    });
-  }
-
-  return { recurrent, fullAttention, contextLength, nextPosition: 0 };
-}
-
-export function cloneQwen35InferenceState(state: Qwen35InferenceState): Qwen35InferenceState {
-  const recurrent = new Map<number, Qwen35RecurrentCache>();
-  const fullAttention = new Map<number, Qwen35FullAttentionCache>();
-
-  for (const [layer, cache] of state.recurrent) {
-    recurrent.set(layer, {
-      conv: cache.conv.slice(),
-      state: cache.state.slice(),
-    });
-  }
-
-  for (const [layer, cache] of state.fullAttention) {
-    fullAttention.set(layer, {
-      key: cache.key.slice(),
-      value: cache.value.slice(),
-    });
-  }
-
-  return {
-    recurrent,
-    fullAttention,
-    contextLength: state.contextLength,
-    nextPosition: state.nextPosition,
-  };
-}
-
-export async function prefillQwen35(
-  model: Qwen35ModelInput,
-  tokenIds: readonly number[],
-  options: Qwen35PrefillOptions = {},
-): Promise<Qwen35PrefillResult> {
-  const session = modelSession(model);
-  if (session.enableWebGpu) {
-    return prefillQwen35HybridWebGpu(session, tokenIds, options);
-  }
-  const { manifest } = session;
-  const state = options.state ?? session.createInferenceState();
-  const positions = normalizePositions(options.positions, tokenIds.length);
-  const epsilon = session.epsilon;
-  const trace = createForwardTrace("prefill", options.onTiming);
-
-  let hidden = await timedAsync(trace, "embedding read", () => session.readEmbeddingRows(tokenIds));
-  for (let layer = 0; layer < manifest.blockCount; layer += 1) {
-    const isFullAttention = manifest.fullAttentionLayers.includes(layer);
-    hidden = await timedAsync(
-      trace,
-      "layer total",
-      () => isFullAttention
-        ? forwardQwen35FullAttentionLayer(session, manifest, state, layer, hidden, positions, epsilon, trace)
-        : forwardQwen35RecurrentLayer(session, manifest, state, layer, hidden, epsilon, trace),
-      { layer, layerKind: isFullAttention ? "full-attention" : "recurrent" },
-    );
-  }
-  updateNextPosition(state, positions, tokenIds.length);
-
-  const result: Qwen35PrefillResult = { hidden, state };
-  if (options.computeLogits) {
-    const norm = await timedAsync(
-      trace,
-      "final norm",
-      async () => rmsNorm(
-        hidden,
-        await readF32ModelTensor(session, "output_norm.weight"),
-        epsilon,
-      ),
-    );
-    const logits = await timedAsync(
-      trace,
-      "output logits",
-      () => matMulQwen35Weight(session, "output.weight", norm, trace),
-      { weightName: "output.weight" },
-    );
-    result.logits = logits;
-    result.topTokens = topK(logits, options.logitsTopK ?? 10);
-  }
-
-  return result;
-}
-
-export async function decodeQwen35(
-  model: Qwen35ModelInput,
-  tokenId: number,
-  options: Qwen35DecodeOptions = {},
-): Promise<Qwen35DecodeResult> {
-  const session = modelSession(model);
-  if (session.enableWebGpu) {
-    return decodeQwen35HybridWebGpu(session, tokenId, options);
-  }
-  const { manifest } = session;
-  const state = options.state ?? session.createInferenceState();
-  const position = options.position ?? state.nextPosition;
-  const positions = new Int32Array([position]);
-  const epsilon = session.epsilon;
-  const trace = createForwardTrace("decode", options.onTiming);
-
-  let hidden = await timedAsync(trace, "embedding read", () => session.readEmbeddingRows([tokenId]));
-  for (let layer = 0; layer < manifest.blockCount; layer += 1) {
-    const isFullAttention = manifest.fullAttentionLayers.includes(layer);
-    hidden = await timedAsync(
-      trace,
-      "layer total",
-      () => isFullAttention
-        ? forwardQwen35FullAttentionLayer(session, manifest, state, layer, hidden, positions, epsilon, trace)
-        : forwardQwen35RecurrentLayer(session, manifest, state, layer, hidden, epsilon, trace),
-      { layer, layerKind: isFullAttention ? "full-attention" : "recurrent" },
-    );
-  }
-  state.nextPosition = Math.max(state.nextPosition, position + 1);
-
-  const norm = await timedAsync(
-    trace,
-    "final norm",
-    async () => rmsNorm(
-      hidden,
-      await readF32ModelTensor(session, "output_norm.weight"),
-      epsilon,
-    ),
-  );
-  const logits = await timedAsync(
-    trace,
-    "output logits",
-    () => matMulQwen35Weight(session, "output.weight", norm, trace),
-    { weightName: "output.weight" },
-  );
-  return {
-    hidden,
-    state,
-    logits,
-    topTokens: topK(logits, options.logitsTopK ?? 10),
-  };
-}
-
-async function prefillQwen35HybridWebGpu(
-  session: Qwen35ModelSession,
-  tokenIds: readonly number[],
-  options: Qwen35PrefillOptions = {},
-): Promise<Qwen35PrefillResult> {
-  const { manifest } = session;
-  const state = options.state ?? session.createInferenceState();
-  const positions = normalizePositions(options.positions, tokenIds.length);
-  const epsilon = session.epsilon;
-  const trace = createForwardTrace("prefill", options.onTiming);
-  const runner = await session.webGpuSegmentRunner(state);
-  if (tokenIds.length === 0) {
-    return { hidden: new Float32Array(), state };
-  }
-
-  let segmentInputHidden = await timedAsync(trace, "embedding read", () => session.readEmbeddingRows(tokenIds));
-  for (let layer = 0; layer < runner.segmentStartLayer; layer += 1) {
-    const isFullAttention = manifest.fullAttentionLayers.includes(layer);
-    segmentInputHidden = await timedAsync(
-      trace,
-      "layer total",
-      () => isFullAttention
-        ? forwardQwen35FullAttentionLayer(session, manifest, state, layer, segmentInputHidden, positions, epsilon, trace)
-        : forwardQwen35RecurrentLayer(session, manifest, state, layer, segmentInputHidden, epsilon, trace),
-      { layer, layerKind: isFullAttention ? "full-attention" : "recurrent" },
-    );
-  }
-  const gpu = await timedAsync(
-    trace,
-    "WebGPU segment",
-    () => runner.runTokens(segmentInputHidden, positions, state, {
-      computeTopK: options.computeLogits === true,
-      topK: options.logitsTopK ?? 10,
-    }),
-  );
-  updateNextPosition(state, positions, tokenIds.length);
-
-  const result: Qwen35PrefillResult = {
-    hidden: new Float32Array(),
-    state,
-  };
-  if (options.computeLogits) {
-    result.topTokens = gpu.topTokens ?? [];
-  }
-  return result;
-}
-
-async function decodeQwen35HybridWebGpu(
-  session: Qwen35ModelSession,
-  tokenId: number,
-  options: Qwen35DecodeOptions = {},
-): Promise<Qwen35DecodeResult> {
-  const { manifest } = session;
-  const state = options.state ?? session.createInferenceState();
-  const position = options.position ?? state.nextPosition;
-  const positions = new Int32Array([position]);
-  const epsilon = session.epsilon;
-  const trace = createForwardTrace("decode", options.onTiming);
-  const runner = await session.webGpuSegmentRunner(state);
-
-  let segmentInputHidden = await timedAsync(trace, "embedding read", () => session.readEmbeddingRows([tokenId]));
-  for (let layer = 0; layer < runner.segmentStartLayer; layer += 1) {
-    const isFullAttention = manifest.fullAttentionLayers.includes(layer);
-    segmentInputHidden = await timedAsync(
-      trace,
-      "layer total",
-      () => isFullAttention
-        ? forwardQwen35FullAttentionLayer(session, manifest, state, layer, segmentInputHidden, positions, epsilon, trace)
-        : forwardQwen35RecurrentLayer(session, manifest, state, layer, segmentInputHidden, epsilon, trace),
-      { layer, layerKind: isFullAttention ? "full-attention" : "recurrent" },
-    );
-  }
-  const gpu = await timedAsync(
-    trace,
-    "WebGPU segment",
-    () => runner.runToken(segmentInputHidden, positions, state, {
-      computeTopK: true,
-      topK: options.logitsTopK ?? 10,
-    }),
-  );
-  state.nextPosition = Math.max(state.nextPosition, position + 1);
-  return {
-    hidden: new Float32Array(),
-    state,
-    topTokens: gpu.topTokens ?? [],
-  };
-}
+  cpuProjectionBatchingEnabled,
+  cpuResidentWeightCacheEnabled,
+  readWasmWeightHandle,
+} from "./acceleration";
 
 export async function forwardQwen35RecurrentLayer(
   model: Qwen35ModelInput,
@@ -1073,7 +523,9 @@ async function matMulQwen35WeightBatch(
   inputColumns: Float32Array,
   trace?: Qwen35ForwardTrace,
 ): Promise<Float32Array[] | undefined> {
-  if (!session.enableProjectionBatching && !session.enableWasmWeightCache) {
+  const projectionBatchingEnabled = cpuProjectionBatchingEnabled(session);
+  const residentWeightCacheEnabled = cpuResidentWeightCacheEnabled(session);
+  if (!projectionBatchingEnabled && !residentWeightCacheEnabled) {
     return undefined;
   }
   if (weightNames.length < 2 || weightNames.length > 4) {
@@ -1093,7 +545,7 @@ async function matMulQwen35WeightBatch(
     }
   }
 
-  if (session.enableWasmWeightCache) {
+  if (residentWeightCacheEnabled) {
     const handles: WasmQuantizedWeightHandle[] = [];
     for (let index = 0; index < weightNames.length; index += 1) {
       const name = weightNames[index];
@@ -1101,7 +553,7 @@ async function matMulQwen35WeightBatch(
       if (!name || !tensor || !isQuantizedMatmulWasmType(tensor.type)) {
         return undefined;
       }
-      const handle = await session.readWasmWeightHandle(name, tensor.type, inputSize, tensor.dimensions[1] ?? 0);
+      const handle = await readWasmWeightHandle(session, name, tensor.type, inputSize, tensor.dimensions[1] ?? 0);
       if (!handle) {
         return undefined;
       }
@@ -1159,7 +611,7 @@ async function matMulQwen35WeightBatch(
     }
   }
 
-  if (!session.enableProjectionBatching) {
+  if (!projectionBatchingEnabled) {
     return undefined;
   }
 
@@ -1182,6 +634,12 @@ async function matMulQwen35WeightBatch(
     "WASM matmul batch wrapper",
     () => matMulQuantizedMultiWasm(weights, inputColumns, inputSize, columnCount),
   );
+}
+
+function isQuantizedMatmulWasmType(
+  type: GgmlTypeName,
+): type is Extract<GgmlTypeName, "Q4_K" | "Q5_K" | "Q6_K" | "IQ4_XS" | "Q8_0"> {
+  return type === "Q4_K" || type === "Q5_K" || type === "Q6_K" || type === "IQ4_XS" || type === "Q8_0";
 }
 
 async function matMulF32Rows(
@@ -1218,7 +676,7 @@ async function matMulKQ8K(
     ...tensor,
     dimensions: [inputSize],
   });
-  const wasmHandle = await session.readWasmWeightHandle(weightName, type, inputSize, rowCount);
+  const wasmHandle = await readWasmWeightHandle(session, weightName, type, inputSize, rowCount);
   if (wasmHandle) {
     const wasm = await timedAsync(
       trace,
@@ -1292,7 +750,7 @@ async function matMulQ8_0Weight(
     ...tensor,
     dimensions: [inputSize],
   });
-  const wasmHandle = await session.readWasmWeightHandle(weightName, "Q8_0", inputSize, rowCount);
+  const wasmHandle = await readWasmWeightHandle(session, weightName, "Q8_0", inputSize, rowCount);
   if (wasmHandle) {
     const wasm = await timedAsync(
       trace,
@@ -1568,141 +1026,4 @@ function compactValueCache(
     }
   }
   return output;
-}
-
-function normalizePositions(positions: Qwen35PrefillOptions["positions"], tokenCount: number): Int32Array {
-  if (!positions) {
-    return Int32Array.from({ length: tokenCount }, (_, index) => index);
-  }
-  const output = positions instanceof Int32Array ? positions : Int32Array.from(positions);
-  if (output.length !== tokenCount && output.length !== tokenCount * 4) {
-    throw new Error(`Expected ${tokenCount} or ${tokenCount * 4} positions, got ${output.length}`);
-  }
-  return output;
-}
-
-function updateNextPosition(
-  state: Qwen35InferenceState,
-  positions: Int32Array,
-  tokenCount: number,
-): void {
-  if (tokenCount === 0) {
-    return;
-  }
-  const tokenPositions = tokenPositionsFromMrope(positions, tokenCount);
-  let nextPosition = state.nextPosition;
-  for (const position of tokenPositions) {
-    nextPosition = Math.max(nextPosition, position + 1);
-  }
-  state.nextPosition = nextPosition;
-}
-
-function modelSession(model: Qwen35ModelInput): Qwen35ModelSession {
-  return model instanceof Qwen35ModelSession
-    ? model
-    : new Qwen35ModelSession(model);
-}
-
-function requiredMetadataNumber(tensorReader: GgufTensorReader, key: string): number {
-  const value = tensorReader.metadata.metadata[key];
-  if (typeof value !== "number") {
-    throw new Error(`Missing numeric metadata ${key}`);
-  }
-  return value;
-}
-
-function requiredRecurrentCache(state: Qwen35InferenceState, layer: number): Qwen35RecurrentCache {
-  const cache = state.recurrent.get(layer);
-  if (!cache) {
-    throw new Error(`Missing recurrent cache for layer ${layer}`);
-  }
-  return cache;
-}
-
-function requiredFullAttentionCache(state: Qwen35InferenceState, layer: number): Qwen35FullAttentionCache {
-  const cache = state.fullAttention.get(layer);
-  if (!cache) {
-    throw new Error(`Missing full-attention cache for layer ${layer}`);
-  }
-  return cache;
-}
-
-function createForwardTrace(
-  phase: Qwen35TimingPhase,
-  onTiming: Qwen35TimingSink | undefined,
-): Qwen35ForwardTrace | undefined {
-  return onTiming ? { phase, onTiming } : undefined;
-}
-
-async function timedAsync<T>(
-  trace: Qwen35ForwardTrace | undefined,
-  section: string,
-  run: () => Promise<T> | T,
-  details: Omit<Qwen35TimingEvent, "phase" | "section" | "durationMs"> = {},
-): Promise<T> {
-  if (!trace) {
-    return run();
-  }
-  const start = nowMs();
-  try {
-    return await run();
-  } finally {
-    trace.onTiming({
-      phase: trace.phase,
-      section,
-      durationMs: nowMs() - start,
-      ...details,
-    });
-  }
-}
-
-function timedSync<T>(
-  trace: Qwen35ForwardTrace | undefined,
-  section: string,
-  run: () => T,
-  details: Omit<Qwen35TimingEvent, "phase" | "section" | "durationMs"> = {},
-): T {
-  if (!trace) {
-    return run();
-  }
-  const start = nowMs();
-  try {
-    return run();
-  } finally {
-    trace.onTiming({
-      phase: trace.phase,
-      section,
-      durationMs: nowMs() - start,
-      ...details,
-    });
-  }
-}
-
-function isCachedMatmulWeightType(type: GgmlTypeName): boolean {
-  return type === "Q4_K" || type === "Q5_K" || type === "Q6_K" || type === "IQ4_XS" || type === "Q8_0";
-}
-
-function isQuantizedMatmulWasmType(
-  type: GgmlTypeName,
-): type is Extract<GgmlTypeName, "Q4_K" | "Q5_K" | "Q6_K" | "IQ4_XS" | "Q8_0"> {
-  return type === "Q4_K" || type === "Q5_K" || type === "Q6_K" || type === "IQ4_XS" || type === "Q8_0";
-}
-
-function nowMs(): number {
-  return globalThis.performance?.now() ?? Date.now();
-}
-
-function topK(values: Float32Array, k: number): Array<{ id: number; value: number }> {
-  const best: Array<{ id: number; value: number }> = [];
-  for (let id = 0; id < values.length; id += 1) {
-    const value = values[id] ?? 0;
-    if (best.length < k || value > (best[best.length - 1]?.value ?? -Infinity)) {
-      best.push({ id, value });
-      best.sort((left, right) => right.value - left.value);
-      if (best.length > k) {
-        best.pop();
-      }
-    }
-  }
-  return best;
 }

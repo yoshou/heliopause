@@ -48,6 +48,7 @@ function App() {
   const [prompt, setPrompt] = useState("");
   const [messages, setMessages] = useState<UiMessage[]>([]);
   const [isGenerating, setIsGenerating] = useState(false);
+  const [generationError, setGenerationError] = useState<string | undefined>();
   const workerRef = useRef<Worker | null>(null);
   const nextRequestIdRef = useRef(1);
   const pendingRequestsRef = useRef(new Map<number, PendingRequest>());
@@ -136,6 +137,7 @@ function App() {
     setMessages(nextMessages);
     setPrompt("");
     setIsGenerating(true);
+    setGenerationError(undefined);
 
     try {
       const worker = workerRef.current;
@@ -144,6 +146,7 @@ function App() {
       }
       await generateTurnInWorker(worker, userMessage.id, assistantId, trimmedPrompt, 256);
     } catch (error) {
+      setGenerationError(error instanceof Error ? error.message : String(error));
       setMessages((currentMessages) =>
         currentMessages.filter((message) =>
           message.id !== userMessage.id && message.id !== assistantId
@@ -317,7 +320,7 @@ function App() {
     <main className="app-shell">
       <aside className="sidebar" aria-label="Model settings">
         <header>
-          <p className="eyebrow">CPU / WASM mode</p>
+          <p className="eyebrow">CPU / WebGPU mode</p>
           <h1>Heliopause</h1>
         </header>
 
@@ -378,11 +381,17 @@ function App() {
           <textarea
             id="prompt"
             value={prompt}
-            onChange={(event) => setPrompt(event.target.value)}
+            onChange={(event) => {
+              setPrompt(event.target.value);
+              setGenerationError(undefined);
+            }}
             placeholder={model.status === "ready" ? "Ask the local model" : "Load a GGUF model first"}
             rows={4}
             disabled={model.status !== "ready" || isGenerating}
           />
+          {generationError ? (
+            <p className="generation-error">{generationError}</p>
+          ) : null}
           <div className="form-actions">
             <p>{model.status === "ready" ? `${prompt.trim().length} characters` : "No model loaded"}</p>
             {isGenerating ? (

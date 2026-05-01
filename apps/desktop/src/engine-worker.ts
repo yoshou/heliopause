@@ -81,8 +81,15 @@ async function handleLoadModel(
   const nextSession = createQwen35ChatSession(tensorReader, {
     maxContextLength: CHAT_CONTEXT_LENGTH,
     maxWeightCacheBytes: resolvedMemoryProfile.maxWeightCacheBytes,
-    enableWasmWeightCache: resolvedMemoryProfile.wasmResidentWeightCache,
-    enableWebGpu: true,
+    executionProviders: [{
+      name: "cpu",
+      options: {
+        projectionBatching: true,
+        residentWeightCache: resolvedMemoryProfile.wasmResidentWeightCache,
+      },
+    }, {
+      name: "webgpu",
+    }],
   });
   const nextTokenizer = buildQwen35Tokenizer(tensorReader.metadata);
 
@@ -122,7 +129,7 @@ async function handleGenerateTurn(
       throw new Error("Chat state was not initialized.");
     }
 
-    const workingState = session.enableWebGpu
+    const workingState = session.executionProvider("webgpu")
       ? currentState
       : cloneQwen35InferenceState(currentState);
     activeGeneration.workingState = workingState;

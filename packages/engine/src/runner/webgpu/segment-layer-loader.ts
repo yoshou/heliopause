@@ -1,5 +1,5 @@
-import type { Qwen35ModelManifest } from "../qwen35";
-import type { GgufTensorReader } from "../tensor-reader";
+import type { Qwen35ModelManifest } from "../../model";
+import type { GgufTensorReader } from "../../tensor-reader";
 import { GPU_COPY_DST, GPU_STORAGE } from "./gpu-constants";
 import { webGpuAdapterLimits } from "./gpu-device";
 import { createQuantizedHandleFromBytes, webGpuMatMulType, webGpuQuantizedWeightLayout } from "./quantized-handles";

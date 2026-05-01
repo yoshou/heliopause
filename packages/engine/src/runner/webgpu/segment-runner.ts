@@ -1,8 +1,7 @@
-import type { GgufTensorReader } from "../tensor-reader";
-import type { Qwen35ModelManifest } from "../qwen35";
+import type { GgufTensorReader } from "../../tensor-reader";
+import type { Qwen35ModelManifest } from "../../model";
 import { GPU_COPY_DST, GPU_COPY_SRC, GPU_MAP_READ, GPU_STORAGE, QWEN35_WEBGPU_MEMORY_LIMIT_BYTES } from "./gpu-constants";
 import { webGpuDevice } from "./gpu-device";
-import { planQwen35WebGpuHybrid } from "./planning";
 import { GpuMemoryArena, scratchF32, scratchQ8_0, scratchQ8K, type F32Handle, type GpuResource } from "./arena";
 import { dispatchDeltaGate, dispatchF32MatMul, dispatchFullAttentionApply, dispatchFullAttentionScore, dispatchFullKvUpdate, dispatchFullQuery, dispatchGatedDeltaNet, dispatchKMatMul, dispatchQkvConv, dispatchQ8_0MatMul, dispatchQ8_0Quantize, dispatchQ8KQuantize, dispatchResidualAdd, dispatchRmsNorm, dispatchSsmNormGate, dispatchSwiGlu, dispatchTokenSlice, dispatchTopK } from "./dispatch";
 import { loadF32Handle, loadGpuLayer, loadOutputStripes, type FullAttentionGpuLayer, type GpuLayer, type OutputStripe, type RecurrentGpuLayer } from "./segment-layer-loader";
@@ -14,7 +13,7 @@ export type Qwen35WebGpuSegmentRunnerOptions = {
   epsilon: number;
   contextLength: number;
   memoryLimitBytes?: number;
-  segmentStartLayer?: number;
+  segmentStartLayer: number;
   segmentEndLayerExclusive?: number;
   loadOutput?: boolean;
 };
@@ -86,28 +85,10 @@ export class Qwen35WebGpuSegmentRunner {
       throw new Error("WebGPU is not available for Qwen3.5 segment execution.");
     }
     const memoryLimitBytes = options.memoryLimitBytes ?? QWEN35_WEBGPU_MEMORY_LIMIT_BYTES;
-    const plan = planQwen35WebGpuHybrid(
-      options.tensorReader.metadata,
-      options.manifest,
-      {
-        mode: "enabled",
-        browserGate: "passed",
-        contextLength: options.contextLength,
-        memoryLimitBytes,
-      },
-    );
-    const segmentStartLayer = options.segmentStartLayer ?? plan.segmentStartLayer;
+    const segmentStartLayer = options.segmentStartLayer;
     const segmentEndLayerExclusive = options.segmentEndLayerExclusive ?? options.manifest.blockCount;
-    if (segmentStartLayer === undefined || segmentStartLayer >= options.manifest.blockCount) {
-      throw new Error("WebGPU segment planning selected no layers.");
-    }
     if (segmentEndLayerExclusive <= segmentStartLayer || segmentEndLayerExclusive > options.manifest.blockCount) {
       throw new Error(`Invalid WebGPU layer segment: ${segmentStartLayer}..${segmentEndLayerExclusive}`);
-    }
-    if (options.segmentEndLayerExclusive === undefined && plan.estimatedResidentBytes > memoryLimitBytes) {
-      throw new Error(
-        `WebGPU segment plan exceeds memory cap: ${plan.estimatedResidentBytes} > ${memoryLimitBytes}`,
-      );
     }
 
     const arena = new GpuMemoryArena(device, memoryLimitBytes);

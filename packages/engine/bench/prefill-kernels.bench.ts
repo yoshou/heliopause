@@ -12,7 +12,7 @@ import {
   matMulQuantizedWasm,
   prefillWasmBackend,
   ssmConv1dWasm,
-} from "../src/prefill-wasm.ts";
+} from "../src/runner/cpu/wasm-kernels.ts";
 import {
   quantizeQ8_0,
   quantizeQ8_K,

@@ -1,4 +1,4 @@
-import type { GgmlTypeName } from "../gguf";
+import type { GgmlTypeName } from "../../gguf";
 import { GPU_COPY_DST, GPU_STORAGE } from "./gpu-constants";
 import { storageBuffer } from "./gpu-bindings";
 import { assertStorageBindingFits, webGpuDevice } from "./gpu-device";

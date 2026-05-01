@@ -223,12 +223,8 @@ test("Qwen35 model session caches F32 tensors and embedding rows", async () => {
     weightCacheHits: 0,
     weightCacheMisses: 0,
     weightCacheEvictions: 0,
-    wasmWeightCacheEnabled: false,
-    wasmWeightCacheCount: 0,
-    wasmWeightCacheBytes: 0,
-    wasmWeightCacheHits: 0,
-    wasmWeightCacheMisses: 0,
     embeddingRowCount: 1,
+    executionProviderStats: {},
   });
 });
 

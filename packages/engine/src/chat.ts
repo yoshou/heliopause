@@ -5,12 +5,14 @@ import {
 } from "./gguf";
 import {
   createQwen35ModelSession,
-  decodeQwen35,
-  prefillQwen35,
   type Qwen35InferenceState,
   type Qwen35ModelSession,
   type Qwen35ModelSessionOptions,
-} from "./qwen35-forward";
+} from "./runtime";
+import {
+  decodeQwen35,
+  prefillQwen35,
+} from "./forward";
 import {
   GgufTensorReader,
   type GgufTensorReadTrace,

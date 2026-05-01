@@ -8,13 +8,15 @@ import {
   prefillQwen35,
 } from "../src/index.ts";
 import {
-  buildQwen35CpuOnlyForwardGraph,
-  buildQwen35ManualSegmentForwardGraph,
   ForwardGraphExecutor,
   topologicalSortForwardNodes,
   type ForwardGraphContext,
   type ForwardRunnerNode,
-} from "../src/forward-graph.ts";
+} from "../src/runner/graph.ts";
+import {
+  buildQwen35CpuOnlyForwardGraph,
+  buildQwen35ManualSegmentForwardGraph,
+} from "../src/runner/nodes.ts";
 
 test("forward graph topologically sorts dependency order", () => {
   const nodes = [
@@ -50,7 +52,8 @@ test("forward graph cleans produced WebGPU values when execution fails", async (
       backend: "webgpu",
       run() {
         return {
-          kind: "webgpu-hidden",
+          kind: "provider-hidden",
+          provider: "webgpu",
           hidden: new Float32Array([1]),
           destroy() {
             destroyed = true;
@@ -132,10 +135,10 @@ test("manual WebGPU segment graph is explicit and leaves transfer test-only", ()
 
   assert.deepEqual(nodes.map((item) => item.id), [
     "embedding",
-    "cpu-layer:0",
+    "cpu-segment:0:1",
     "webgpu-segment:1:2",
     "gpu-to-cpu-hidden",
-    "cpu-layer:2",
+    "cpu-segment:2:3",
     "output",
   ]);
 });

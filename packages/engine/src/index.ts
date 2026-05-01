@@ -1,7 +1,10 @@
 export {
   checkWebGpuSupport,
+  qwen35WebGpuPlanningProvider,
+  Qwen35WebGpuSegmentRunner,
   type WebGpuSupport,
-} from "./webgpu";
+  type Qwen35WebGpuSegmentRunnerOptions,
+} from "./runner/webgpu/index";
 
 export {
   parseGguf,
@@ -21,33 +24,41 @@ export {
   type Qwen35LayerKind,
   type Qwen35ModelManifest,
   type TensorCoverageAudit,
-} from "./qwen35";
+} from "./model";
+
+export {
+  decodeQwen35,
+  prefillQwen35,
+  type Qwen35DecodeOptions,
+  type Qwen35DecodeResult,
+  type Qwen35PrefillOptions,
+  type Qwen35PrefillResult,
+} from "./forward";
 
 export {
   createQwen35InferenceState,
   createQwen35ModelSession,
   cloneQwen35InferenceState,
-  decodeQwen35,
   estimateQwen35WeightCacheBytes,
-  forwardQwen35FullAttentionLayer,
-  forwardQwen35RecurrentLayer,
-  prefillQwen35,
   Qwen35ModelSession,
   type Qwen35CacheStats,
-  type Qwen35DecodeOptions,
-  type Qwen35DecodeResult,
+  type Qwen35ExecutionProviderConfig,
   type Qwen35ForwardTrace,
   type Qwen35FullAttentionCache,
   type Qwen35InferenceState,
   type Qwen35ModelInput,
   type Qwen35ModelSessionOptions,
-  type Qwen35PrefillOptions,
-  type Qwen35PrefillResult,
   type Qwen35RecurrentCache,
   type Qwen35TimingEvent,
   type Qwen35TimingPhase,
   type Qwen35TimingSink,
-} from "./qwen35-forward";
+} from "./runtime";
+
+export { Qwen35CpuSegmentRunner } from "./runner/cpu/index";
+export type {
+  Qwen35CpuHiddenResult,
+  Qwen35CpuSegmentRunnerOptions,
+} from "./runner/cpu/index";
 
 export {
   GgufTensorReader,
@@ -108,20 +119,31 @@ export {
 } from "./chat";
 
 export {
-  createWasmQuantizedWeightHandle,
-  matMulQuantizedMultiWasm,
-  matMulQuantizedWasmResidentMulti,
-  matMulQuantizedWasmResident,
-  prefillWasmBackend,
-  releaseWasmQuantizedWeightHandle,
-  setPrefillWasmTrace,
-  wasmResidentWeightStats,
-  type QuantizedMatMulInput,
-  type PrefillWasmTrace,
-  type PrefillWasmTraceEvent,
-  type WasmQuantizedWeightHandle,
-  type WasmResidentWeightStats,
-} from "./prefill-wasm";
+  ForwardGraphExecutor,
+  topologicalSortForwardNodes,
+  type ForwardGraphContext,
+  type ForwardGraphExecutionResult,
+  type ForwardRunnerBackend,
+  type ForwardRunnerNode,
+  type ForwardValue,
+} from "./runner/graph";
+
+export {
+  buildQwen35CpuOnlyForwardGraph,
+  buildQwen35ManualSegmentForwardGraph,
+} from "./runner/nodes";
+
+export {
+  auditQwen35RunnerPlacementCopies,
+  planQwen35ProviderPlacement,
+  planQwen35RunnerPlacement,
+  type Qwen35RunnerCopyAuditObservation,
+  type Qwen35RunnerCopyAuditResult,
+  type Qwen35RunnerLayerPlacement,
+  type Qwen35RunnerPlacementPlan,
+  type Qwen35RunnerPlanningOptions,
+  type Qwen35RunnerPlanningProvider,
+} from "./runner/planning";
 
 export {
   gatedDeltaNet,

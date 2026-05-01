@@ -1,7 +1,7 @@
 import type {
   GatedDeltaNetOptions,
   GqaAttentionOptions,
-} from "./ops";
+} from "../../ops";
 import { PREFILL_WASM_SIMD_BASE64 } from "./wasm-kernels.generated";
 
 type KernelExports = WebAssembly.Exports & {

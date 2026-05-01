@@ -13,7 +13,7 @@ import {
   releaseWasmQuantizedWeightHandle,
   resetPrefillWasmForTesting,
   ssmConv1dWasm,
-} from "../src/prefill-wasm.ts";
+} from "../src/runner/cpu/wasm-kernels.ts";
 
 test("prefill wasm falls back when SIMD module is unavailable", async () => {
   resetPrefillWasmForTesting("not valid wasm");

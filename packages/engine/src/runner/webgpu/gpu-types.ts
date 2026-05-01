@@ -1,5 +1,3 @@
-import type { Qwen35LayerKind } from "../qwen35";
-
 export type WebGpuSupport =
   | {
       available: true;
@@ -100,17 +98,6 @@ export type WebGpuComputePassLike = {
   end: () => void;
 };
 
-
-export type Qwen35WebGpuMode = "off" | "verify" | "enabled";
-
-export type Qwen35WebGpuPlanStatus =
-  | "off"
-  | "unavailable"
-  | "blocked"
-  | "planned";
-
-export type Qwen35WebGpuBrowserGate = "required" | "passed";
-
 export type WebGpuQuantizedMatMulType = "Q4_K" | "Q5_K" | "Q6_K" | "Q8_0";
 
 export type WebGpuQuantizedWeightHandle = {
@@ -154,63 +141,4 @@ export type WebGpuQuantizedWeightHandleInternal = WebGpuQuantizedWeightHandle & 
 export type WebGpuF32TensorHandleInternal = WebGpuF32TensorHandle & {
   readonly device: WebGpuDeviceLike;
   readonly buffer: WebGpuBufferLike;
-};
-
-export type Qwen35WebGpuLayerPlan = {
-  layer: number;
-  layerKind: Qwen35LayerKind;
-  weightBytes: number;
-  cacheBytes: number;
-  totalBytes: number;
-};
-
-export type Qwen35WebGpuHybridPlan = {
-  status: Qwen35WebGpuPlanStatus;
-  mode: Qwen35WebGpuMode;
-  memoryLimitBytes: number;
-  browserGate: Qwen35WebGpuBrowserGate;
-  enabled: false;
-  reason?: string;
-  outputBytes: number;
-  fixedBytes: number;
-  scratchBytes: number;
-  selectedLayerCount: number;
-  segmentStartLayer?: number;
-  cpuSegmentLayerCount: number;
-  gpuSegmentLayerCount: number;
-  gpuWeightBytes: number;
-  gpuCacheBytes: number;
-  estimatedResidentBytes: number;
-  remainingBytes: number;
-  selectedLayers: Qwen35WebGpuLayerPlan[];
-  copyAuditExpectations: {
-    decodeTensorReads: 0;
-    segmentIntermediateReadbacks: 0;
-    logitsReadbacks: 0;
-    expectedBoundaryUploads: number;
-    expectedTokenReadbacks: number;
-  };
-};
-
-export type Qwen35WebGpuCopyAuditObservation = {
-  decodeTensorReads: number;
-  segmentIntermediateReadbacks: number;
-  logitsReadbacks: number;
-  boundaryUploads: number;
-  tokenReadbacks: number;
-};
-
-export type Qwen35WebGpuCopyAuditResult = {
-  ok: boolean;
-  errors: string[];
-  expected: Qwen35WebGpuHybridPlan["copyAuditExpectations"];
-  observed: Qwen35WebGpuCopyAuditObservation;
-};
-
-export type Qwen35WebGpuPlanningOptions = {
-  mode?: Qwen35WebGpuMode;
-  memoryLimitBytes?: number;
-  contextLength?: number;
-  browserGate?: Qwen35WebGpuBrowserGate;
-  support?: WebGpuSupport;
 };
