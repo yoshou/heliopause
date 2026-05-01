@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   auditQwen35TensorCoverage,
   buildQwen35Manifest,
+  cloneQwen35InferenceState,
   createQwen35ModelSession,
   createQwen35InferenceState,
   decodeQwen35,
@@ -115,6 +116,46 @@ test("Qwen35 inference state defaults capped context to manifest context", () =>
 
   assert.equal(state.contextLength, 1);
   assert.equal(state.fullAttention.get(0)?.key.length, 2);
+});
+
+test("Qwen35 inference state clone deep-copies cache arrays", () => {
+  const manifest = buildQwen35Manifest({
+    ...minimalGguf(),
+    metadata: {
+      ...minimalGguf().metadata,
+      "qwen35.block_count": 2,
+      "qwen35.full_attention_interval": 2,
+    },
+    tensorCount: 0,
+    tensors: [],
+  });
+  const state = createQwen35InferenceState(manifest);
+  state.nextPosition = 3;
+  const recurrent = state.recurrent.get(0);
+  const fullAttention = state.fullAttention.get(1);
+  assert.ok(recurrent);
+  assert.ok(fullAttention);
+  recurrent.conv[0] = 3;
+  recurrent.state[0] = 4;
+  fullAttention.key[0] = 1;
+  fullAttention.value[0] = 2;
+
+  const clone = cloneQwen35InferenceState(state);
+  const cloneRecurrent = clone.recurrent.get(0);
+  const cloneFullAttention = clone.fullAttention.get(1);
+  assert.ok(cloneRecurrent);
+  assert.ok(cloneFullAttention);
+  clone.nextPosition = 7;
+  cloneRecurrent.conv[0] = 30;
+  cloneRecurrent.state[0] = 40;
+  cloneFullAttention.key[0] = 10;
+  cloneFullAttention.value[0] = 20;
+
+  assert.equal(state.nextPosition, 3);
+  assert.equal(recurrent.conv[0], 3);
+  assert.equal(recurrent.state[0], 4);
+  assert.equal(fullAttention.key[0], 1);
+  assert.equal(fullAttention.value[0], 2);
 });
 
 test("Qwen35 prefill advances nextPosition from default and explicit positions", async () => {

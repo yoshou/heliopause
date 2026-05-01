@@ -356,6 +356,32 @@ export function createQwen35InferenceState(
   return { recurrent, fullAttention, contextLength, nextPosition: 0 };
 }
 
+export function cloneQwen35InferenceState(state: Qwen35InferenceState): Qwen35InferenceState {
+  const recurrent = new Map<number, Qwen35RecurrentCache>();
+  const fullAttention = new Map<number, Qwen35FullAttentionCache>();
+
+  for (const [layer, cache] of state.recurrent) {
+    recurrent.set(layer, {
+      conv: cache.conv.slice(),
+      state: cache.state.slice(),
+    });
+  }
+
+  for (const [layer, cache] of state.fullAttention) {
+    fullAttention.set(layer, {
+      key: cache.key.slice(),
+      value: cache.value.slice(),
+    });
+  }
+
+  return {
+    recurrent,
+    fullAttention,
+    contextLength: state.contextLength,
+    nextPosition: state.nextPosition,
+  };
+}
+
 export async function prefillQwen35(
   model: Qwen35ModelInput,
   tokenIds: readonly number[],

@@ -6,8 +6,10 @@ import {
   buildQwen35Tokenizer,
   createFileGgufTensorReader,
   createQwen35ModelSession,
+  generateQwen35ChatTurn,
   generateQwen35ChatCompletion,
   GgufTensorReader,
+  prefillQwen35ChatMessages,
   stripQwen35Thinking,
   type GgufMetadata,
 } from "../src/index.ts";
@@ -117,6 +119,89 @@ test("Qwen35 chat generation stops on im_end token", async () => {
   }
 
   assert.deepEqual(chunks.map((chunk) => chunk.text), ["A"]);
+});
+
+test("Qwen35 stateful chat turn pre-fills only the new turn suffix", async () => {
+  const tokenizedTexts: string[] = [];
+  const tokenizer = {
+    eosTokenId: 3,
+    tokenize(text: string) {
+      tokenizedTexts.push(text);
+      if (text === "<|im_end|>\n") {
+        return [3];
+      }
+      if (text.startsWith("<|im_start|>assistant\n")) {
+        return [2];
+      }
+      return [1];
+    },
+    detokenize(tokenIds: readonly number[]) {
+      return tokenIds.map((id) => id === 0 ? "A" : "").join("");
+    },
+    idToToken(id: number) {
+      return id === 0 ? "A" : id === 3 ? "<|im_end|>" : undefined;
+    },
+    tokenToId(token: string) {
+      return token === "<|im_end|>" ? 3 : undefined;
+    },
+  };
+  const session = createQwen35ModelSession(tensorReaderFromTensors([
+    f32Tensor("token_embd.weight", [4, 12], new Float32Array([
+      1, 0, 0, 0,
+      0, 1, 0, 0,
+      0, 0, 1, 0,
+      0, 0, 0, 1,
+      0, 0, 0, 0,
+      0, 0, 0, 0,
+      0, 0, 0, 0,
+      0, 0, 0, 0,
+      0, 0, 0, 0,
+      0, 0, 0, 0,
+      0, 0, 0, 0,
+      0, 0, 0, 0,
+    ])),
+    f32Tensor("output_norm.weight", [4], new Float32Array([1, 1, 1, 1])),
+    f32Tensor("output.weight", [4, 4], new Float32Array([
+      0, 0, 1, 0,
+      0, 0, 0, 0,
+      0, 0, 0, 0,
+      1, 0, 0, 0,
+    ])),
+  ]));
+  const state = session.createInferenceState();
+
+  await prefillQwen35ChatMessages(
+    session,
+    tokenizer,
+    state,
+    [{ role: "system", content: "Be concise." }],
+  );
+  assert.equal(state.nextPosition, 1);
+
+  const chunks: string[] = [];
+  const result = await generateQwen35ChatTurn(
+    session,
+    tokenizer,
+    state,
+    "Hello",
+    {
+      maxNewTokens: 4,
+      onToken(chunk) {
+        chunks.push(chunk.text);
+      },
+    },
+  );
+
+  assert.equal(result.content, "A");
+  assert.equal(result.finishReason, "stop");
+  assert.deepEqual(chunks, ["A"]);
+  assert.equal(state.nextPosition, 5);
+  assert.deepEqual(tokenizedTexts, [
+    "<|im_start|>system\nBe concise.<|im_end|>\n",
+    "<|im_start|>user\nHello<|im_end|>\n",
+    "<|im_start|>assistant\n<think>\n\n</think>\n\n",
+    "<|im_end|>\n",
+  ]);
 });
 
 test("file GGUF tensor reader uses File.slice ranges", async () => {

@@ -26,6 +26,7 @@ export {
 export {
   createQwen35InferenceState,
   createQwen35ModelSession,
+  cloneQwen35InferenceState,
   decodeQwen35,
   estimateQwen35WeightCacheBytes,
   forwardQwen35FullAttentionLayer,
@@ -87,17 +88,23 @@ export {
 
 export {
   applyQwen35ChatTemplate,
+  applyQwen35ChatGenerationPrompt,
   createFileGgufTensorReader,
   createQwen35ChatSession,
   DEFAULT_QWEN35_SYSTEM_PROMPT,
+  generateQwen35ChatTurn,
   generateQwen35ChatCompletion,
   getGgufModelName,
+  prefillQwen35ChatMessages,
   stripQwen35Thinking,
   type ChatMessage,
   type FileGgufTensorReaderOptions,
   type Qwen35ChatCompletionChunk,
   type Qwen35ChatCompletionOptions,
+  type Qwen35ChatPrefillOptions,
   type Qwen35ChatTemplateOptions,
+  type Qwen35ChatTurnOptions,
+  type Qwen35ChatTurnResult,
 } from "./chat";
 
 export {

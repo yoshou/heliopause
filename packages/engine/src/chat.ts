@@ -7,6 +7,7 @@ import {
   createQwen35ModelSession,
   decodeQwen35,
   prefillQwen35,
+  type Qwen35InferenceState,
   type Qwen35ModelSession,
   type Qwen35ModelSessionOptions,
 } from "./qwen35-forward";
@@ -37,6 +38,18 @@ export type Qwen35ChatCompletionOptions = {
   stopTokenIds?: readonly number[];
   signal?: AbortSignal;
   onToken?: (chunk: Qwen35ChatCompletionChunk) => void;
+};
+
+export type Qwen35ChatPrefillOptions = {
+  signal?: AbortSignal;
+};
+
+export type Qwen35ChatTurnOptions = Qwen35ChatCompletionOptions;
+
+export type Qwen35ChatTurnResult = {
+  content: string;
+  finishReason: "stop" | "length";
+  state: Qwen35InferenceState;
 };
 
 export type Qwen35ChatCompletionChunk = {
@@ -74,6 +87,16 @@ export function applyQwen35ChatTemplate(
   return output;
 }
 
+export function applyQwen35ChatGenerationPrompt(
+  options: Pick<Qwen35ChatTemplateOptions, "enableThinking"> = {},
+): string {
+  let output = "<|im_start|>assistant\n";
+  if (!(options.enableThinking ?? false)) {
+    output += "<think>\n\n</think>\n\n";
+  }
+  return output;
+}
+
 export async function createFileGgufTensorReader(
   file: Pick<File, "slice">,
   options: FileGgufTensorReaderOptions = {},
@@ -94,6 +117,106 @@ export function createQwen35ChatSession(
   options: Qwen35ModelSessionOptions = {},
 ): Qwen35ModelSession {
   return createQwen35ModelSession(tensorReader, options);
+}
+
+export async function prefillQwen35ChatMessages(
+  session: Qwen35ModelSession,
+  tokenizer: Qwen35Tokenizer,
+  state: Qwen35InferenceState,
+  messages: readonly ChatMessage[],
+  options: Qwen35ChatPrefillOptions = {},
+): Promise<Qwen35InferenceState> {
+  const prompt = applyQwen35ChatTemplate(messages, { addGenerationPrompt: false });
+  await prefillQwen35ChatText(session, tokenizer, state, prompt, {
+    signal: options.signal,
+    requireGenerationSlot: false,
+  });
+  return state;
+}
+
+export async function generateQwen35ChatTurn(
+  session: Qwen35ModelSession,
+  tokenizer: Qwen35Tokenizer,
+  state: Qwen35InferenceState,
+  userContent: string,
+  options: Qwen35ChatTurnOptions = {},
+): Promise<Qwen35ChatTurnResult> {
+  throwIfAborted(options.signal);
+
+  await prefillQwen35ChatText(
+    session,
+    tokenizer,
+    state,
+    applyQwen35ChatTemplate([{ role: "user", content: userContent }], {
+      addGenerationPrompt: false,
+    }),
+    { signal: options.signal, requireGenerationSlot: true },
+  );
+
+  const promptPrefill = await prefillQwen35ChatText(
+    session,
+    tokenizer,
+    state,
+    applyQwen35ChatGenerationPrompt(),
+    {
+      signal: options.signal,
+      computeLogits: true,
+      requireGenerationSlot: true,
+    },
+  );
+  let logits = promptPrefill.logits;
+  if (!logits) {
+    return { content: "", finishReason: "stop", state };
+  }
+
+  const stopTokenIds = new Set([
+    tokenizer.eosTokenId,
+    tokenizer.tokenToId("<|im_end|>"),
+    ...(options.stopTokenIds ?? []),
+  ].filter((id): id is number => typeof id === "number"));
+  const maxNewTokens = options.maxNewTokens ?? DEFAULT_MAX_NEW_TOKENS;
+  let content = "";
+  let finishReason: Qwen35ChatTurnResult["finishReason"] = "length";
+
+  for (let index = 0; index < maxNewTokens; index += 1) {
+    throwIfAborted(options.signal);
+
+    const tokenId = argmax(logits);
+    if (stopTokenIds.has(tokenId)) {
+      finishReason = "stop";
+      break;
+    }
+    if (state.nextPosition >= state.contextLength) {
+      finishReason = "length";
+      break;
+    }
+
+    const decode = await decodeQwen35(session, tokenId, {
+      state,
+      logitsTopK: 1,
+    });
+    logits = decode.logits;
+
+    const token = tokenizer.idToToken(tokenId) ?? "";
+    const text = tokenizer.detokenize([tokenId]);
+    content += text;
+
+    options.onToken?.({
+      tokenId,
+      token,
+      text,
+      content,
+    });
+  }
+
+  if (state.nextPosition < state.contextLength) {
+    await prefillQwen35ChatText(session, tokenizer, state, "<|im_end|>\n", {
+      signal: options.signal,
+      requireGenerationSlot: false,
+    });
+  }
+
+  return { content, finishReason, state };
 }
 
 export async function* generateQwen35ChatCompletion(
@@ -160,6 +283,43 @@ export async function* generateQwen35ChatCompletion(
   }
 
   return content;
+}
+
+async function prefillQwen35ChatText(
+  session: Qwen35ModelSession,
+  tokenizer: Qwen35Tokenizer,
+  state: Qwen35InferenceState,
+  text: string,
+  options: {
+    signal?: AbortSignal;
+    computeLogits?: boolean;
+    requireGenerationSlot?: boolean;
+  } = {},
+): Promise<{ state: Qwen35InferenceState; logits?: Float32Array }> {
+  throwIfAborted(options.signal);
+
+  const tokenIds = tokenizer.tokenize(text);
+  if (tokenIds.length === 0) {
+    return { state };
+  }
+
+  const requiredPositions = state.nextPosition + tokenIds.length;
+  const limit = options.requireGenerationSlot ? state.contextLength - 1 : state.contextLength;
+  if (requiredPositions > limit) {
+    throw new Error(
+      `Chat state would use ${requiredPositions} tokens, which exceeds the configured chat context of ${state.contextLength} tokens.`,
+    );
+  }
+
+  return prefillQwen35(session, tokenIds, {
+    state,
+    positions: Int32Array.from(
+      { length: tokenIds.length },
+      (_, index) => state.nextPosition + index,
+    ),
+    computeLogits: options.computeLogits,
+    logitsTopK: options.computeLogits ? 1 : undefined,
+  });
 }
 
 export function stripQwen35Thinking(content: string): string {

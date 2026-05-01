@@ -1,5 +1,3 @@
-import type { ChatMessage } from "@heliopause/engine";
-
 export type MemoryProfile = "auto" | "low" | "full";
 
 export type ResolvedMemoryProfile = {
@@ -34,9 +32,10 @@ export type EngineWorkerRequest =
       memoryInfo?: SystemMemoryInfo;
     }
   | {
-      type: "generate";
+      type: "generateTurn";
       requestId: number;
-      messages: ChatMessage[];
+      systemPrompt: string;
+      userContent: string;
       maxNewTokens: number;
     }
   | {

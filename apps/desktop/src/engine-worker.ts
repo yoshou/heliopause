@@ -1,10 +1,13 @@
 import {
   buildQwen35Tokenizer,
+  cloneQwen35InferenceState,
   createFileGgufTensorReader,
   createQwen35ChatSession,
   estimateQwen35WeightCacheBytes,
-  generateQwen35ChatCompletion,
+  generateQwen35ChatTurn,
   getGgufModelName,
+  prefillQwen35ChatMessages,
+  type Qwen35InferenceState,
   type Qwen35ModelSession,
   type Qwen35Tokenizer,
 } from "@heliopause/engine";
@@ -23,10 +26,13 @@ const FULL_WEIGHT_CACHE_HEADROOM = 1.25;
 
 let session: Qwen35ModelSession | undefined;
 let tokenizer: Qwen35Tokenizer | undefined;
+let currentState: Qwen35InferenceState | undefined;
+let currentSystemPrompt: string | undefined;
 let activeGeneration:
   | {
       requestId: number;
       abortController: AbortController;
+      workingState?: Qwen35InferenceState;
     }
   | undefined;
 
@@ -45,8 +51,8 @@ async function handleRequest(request: EngineWorkerRequest): Promise<void> {
       await handleLoadModel(request);
       return;
     }
-    if (request.type === "generate") {
-      await handleGenerate(request);
+    if (request.type === "generateTurn") {
+      await handleGenerateTurn(request);
       return;
     }
     handleCancelGeneration(request.requestId);
@@ -62,6 +68,8 @@ async function handleLoadModel(
   activeGeneration = undefined;
   session = undefined;
   tokenizer = undefined;
+  currentState = undefined;
+  currentSystemPrompt = undefined;
 
   const tensorReader = await createFileGgufTensorReader(request.file);
   const estimatedWeightCacheBytes = estimateQwen35WeightCacheBytes(tensorReader);
@@ -93,8 +101,8 @@ async function handleLoadModel(
   });
 }
 
-async function handleGenerate(
-  request: Extract<EngineWorkerRequest, { type: "generate" }>,
+async function handleGenerateTurn(
+  request: Extract<EngineWorkerRequest, { type: "generateTurn" }>,
 ): Promise<void> {
   if (!session || !tokenizer) {
     throw new Error("No model loaded.");
@@ -107,20 +115,34 @@ async function handleGenerate(
   activeGeneration = { requestId: request.requestId, abortController };
 
   try {
-    for await (const chunk of generateQwen35ChatCompletion(
+    await ensureChatState(request.systemPrompt, abortController.signal);
+    if (!currentState) {
+      throw new Error("Chat state was not initialized.");
+    }
+
+    const workingState = cloneQwen35InferenceState(currentState);
+    activeGeneration.workingState = workingState;
+
+    await generateQwen35ChatTurn(
       session,
       tokenizer,
-      request.messages,
+      workingState,
+      request.userContent,
       {
         maxNewTokens: request.maxNewTokens,
         signal: abortController.signal,
+        onToken(chunk) {
+          workerScope.postMessage({
+            type: "generationChunk",
+            requestId: request.requestId,
+            content: chunk.content,
+          });
+        },
       },
-    )) {
-      workerScope.postMessage({
-        type: "generationChunk",
-        requestId: request.requestId,
-        content: chunk.content,
-      });
+    );
+
+    if (!abortController.signal.aborted) {
+      currentState = workingState;
     }
 
     workerScope.postMessage({
@@ -140,6 +162,29 @@ async function handleGenerate(
       activeGeneration = undefined;
     }
   }
+}
+
+async function ensureChatState(systemPrompt: string, signal?: AbortSignal): Promise<void> {
+  if (currentState && currentSystemPrompt === systemPrompt) {
+    return;
+  }
+  await resetChatState(systemPrompt, signal);
+}
+
+async function resetChatState(systemPrompt: string, signal?: AbortSignal): Promise<void> {
+  if (!session || !tokenizer) {
+    return;
+  }
+  const state = session.createInferenceState();
+  await prefillQwen35ChatMessages(
+    session,
+    tokenizer,
+    state,
+    [{ role: "system", content: systemPrompt }],
+    { signal },
+  );
+  currentState = state;
+  currentSystemPrompt = systemPrompt;
 }
 
 function handleCancelGeneration(requestId: number): void {

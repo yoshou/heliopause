@@ -2,7 +2,6 @@ import { ChangeEvent, FormEvent, useEffect, useMemo, useRef, useState } from "re
 import {
   DEFAULT_QWEN35_SYSTEM_PROMPT,
   stripQwen35Thinking,
-  type ChatMessage,
 } from "@heliopause/engine";
 import type {
   EngineWorkerRequest,
@@ -34,7 +33,9 @@ type PendingRequest =
   | {
       type: "generate";
       worker: Worker;
+      userId: string;
       assistantId: string;
+      userContent: string;
       resolve: () => void;
       reject: (error: Error) => void;
     };
@@ -88,6 +89,7 @@ function App() {
         memoryProfile,
         await readSystemMemoryInfo(),
       );
+      setMessages([]);
       setModel({
         status: "ready",
         ...modelInfo,
@@ -134,32 +136,19 @@ function App() {
     setPrompt("");
     setIsGenerating(true);
 
-    const chatMessages: ChatMessage[] = [
-      { role: "system", content: systemPrompt },
-      ...messages.map((message) => ({
-        role: message.role,
-        content: message.content,
-      })),
-      { role: "user", content: trimmedPrompt },
-    ];
-
     try {
       const worker = workerRef.current;
       if (!worker) {
         throw new Error("The model worker is not running. Reload the model.");
       }
-      await generateInWorker(worker, assistantId, chatMessages, 256);
+      await generateTurnInWorker(worker, userMessage.id, assistantId, trimmedPrompt, 256);
     } catch (error) {
       setMessages((currentMessages) =>
-        currentMessages.map((message) =>
-          message.id === assistantId
-            ? {
-                ...message,
-                content: `Generation failed: ${error instanceof Error ? error.message : String(error)}`,
-              }
-            : message,
+        currentMessages.filter((message) =>
+          message.id !== userMessage.id && message.id !== assistantId
         ),
       );
+      setPrompt((currentPrompt) => currentPrompt.length === 0 ? trimmedPrompt : currentPrompt);
     } finally {
       generationRequestRef.current = null;
       setIsGenerating(false);
@@ -221,10 +210,11 @@ function App() {
     });
   }
 
-  function generateInWorker(
+  function generateTurnInWorker(
     worker: Worker,
+    userId: string,
     assistantId: string,
-    chatMessages: ChatMessage[],
+    userContent: string,
     maxNewTokens: number,
   ): Promise<void> {
     const requestId = nextRequestIdRef.current;
@@ -235,14 +225,17 @@ function App() {
       pendingRequestsRef.current.set(requestId, {
         type: "generate",
         worker,
+        userId,
         assistantId,
+        userContent,
         resolve,
         reject,
       });
       worker.postMessage({
-        type: "generate",
+        type: "generateTurn",
         requestId,
-        messages: chatMessages,
+        systemPrompt,
+        userContent,
         maxNewTokens,
       } satisfies EngineWorkerRequest);
     });
@@ -286,11 +279,12 @@ function App() {
 
     if (message.type === "generationCancelled") {
       setMessages((currentMessages) =>
-        currentMessages.map((uiMessage) =>
-          uiMessage.id === pending.assistantId && uiMessage.content.length === 0
-            ? { ...uiMessage, content: "Generation stopped." }
-            : uiMessage,
+        currentMessages.filter((uiMessage) =>
+          uiMessage.id !== pending.userId && uiMessage.id !== pending.assistantId
         ),
+      );
+      setPrompt((currentPrompt) =>
+        currentPrompt.length === 0 ? pending.userContent : currentPrompt
       );
     }
 
@@ -340,8 +334,12 @@ function App() {
           <textarea
             id="system-prompt"
             value={systemPrompt}
-            onChange={(event) => setSystemPrompt(event.target.value)}
+            onChange={(event) => {
+              setSystemPrompt(event.target.value);
+              setMessages([]);
+            }}
             rows={8}
+            disabled={isGenerating}
           />
         </section>
       </aside>
