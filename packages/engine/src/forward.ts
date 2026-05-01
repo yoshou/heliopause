@@ -5,7 +5,7 @@ import {
   type Qwen35InferenceState,
   type Qwen35ModelInput,
   type Qwen35ModelSession,
-  type Qwen35TimingSink,
+  type TimingSink,
 } from "./runtime";
 import { planQwen35RunnerPlacement } from "./runner/planning";
 import {
@@ -18,42 +18,42 @@ import {
   webGpuExecutionProviderOptions,
 } from "./runner/webgpu/execution-provider";
 
-export type Qwen35PrefillOptions = {
+export type PrefillOptions = {
   positions?: Int32Array | number[];
   state?: Qwen35InferenceState;
   computeLogits?: boolean;
   logitsTopK?: number;
-  onTiming?: Qwen35TimingSink;
+  onTiming?: TimingSink;
 };
 
-export type Qwen35PrefillResult = {
+export type PrefillResult = {
   hidden: Float32Array;
   state: Qwen35InferenceState;
   logits?: Float32Array;
   topTokens?: Array<{ id: number; value: number }>;
 };
 
-export type Qwen35DecodeOptions = {
+export type DecodeOptions = {
   position?: number;
   state?: Qwen35InferenceState;
   logitsTopK?: number;
-  onTiming?: Qwen35TimingSink;
+  onTiming?: TimingSink;
 };
 
-export type Qwen35DecodeResult = {
+export type DecodeResult = {
   hidden: Float32Array;
   state: Qwen35InferenceState;
   logits?: Float32Array;
   topTokens: Array<{ id: number; value: number }>;
 };
 
-export type { Qwen35OutputResult } from "./runtime";
+export type { OutputResult } from "./runtime";
 
 export async function prefillQwen35(
   model: Qwen35ModelInput,
   tokenIds: readonly number[],
-  options: Qwen35PrefillOptions = {},
-): Promise<Qwen35PrefillResult> {
+  options: PrefillOptions = {},
+): Promise<PrefillResult> {
   const session = modelSession(model);
   if (webGpuExecutionProviderEnabled(session)) {
     return prefillQwen35HybridWebGpu(session, tokenIds, options);
@@ -77,7 +77,7 @@ export async function prefillQwen35(
   const hidden = (await runner.runTokensHidden(embedding, positions, state, { trace })).hidden;
   updateNextPosition(state, positions, tokenIds.length);
 
-  const result: Qwen35PrefillResult = { hidden, state };
+  const result: PrefillResult = { hidden, state };
   if (options.computeLogits) {
     const output = await qwen35CpuOutput(session, hidden, {
       topK: options.logitsTopK ?? 10,
@@ -92,8 +92,8 @@ export async function prefillQwen35(
 export async function decodeQwen35(
   model: Qwen35ModelInput,
   tokenId: number,
-  options: Qwen35DecodeOptions = {},
-): Promise<Qwen35DecodeResult> {
+  options: DecodeOptions = {},
+): Promise<DecodeResult> {
   const session = modelSession(model);
   if (webGpuExecutionProviderEnabled(session)) {
     return decodeQwen35HybridWebGpu(session, tokenId, options);
@@ -127,8 +127,8 @@ export async function decodeQwen35(
 async function prefillQwen35HybridWebGpu(
   session: Qwen35ModelSession,
   tokenIds: readonly number[],
-  options: Qwen35PrefillOptions = {},
-): Promise<Qwen35PrefillResult> {
+  options: PrefillOptions = {},
+): Promise<PrefillResult> {
   const state = options.state ?? session.createInferenceState();
   const positions = normalizePositions(options.positions, tokenIds.length);
   const trace = createForwardTrace("prefill", options.onTiming);
@@ -156,7 +156,7 @@ async function prefillQwen35HybridWebGpu(
   );
   updateNextPosition(state, positions, tokenIds.length);
 
-  const result: Qwen35PrefillResult = {
+  const result: PrefillResult = {
     hidden: new Float32Array(),
     state,
   };
@@ -169,8 +169,8 @@ async function prefillQwen35HybridWebGpu(
 async function decodeQwen35HybridWebGpu(
   session: Qwen35ModelSession,
   tokenId: number,
-  options: Qwen35DecodeOptions = {},
-): Promise<Qwen35DecodeResult> {
+  options: DecodeOptions = {},
+): Promise<DecodeResult> {
   const state = options.state ?? session.createInferenceState();
   const position = options.position ?? state.nextPosition;
   const positions = new Int32Array([position]);
@@ -202,7 +202,7 @@ async function decodeQwen35HybridWebGpu(
   };
 }
 
-function normalizePositions(positions: Qwen35PrefillOptions["positions"], tokenCount: number): Int32Array {
+function normalizePositions(positions: PrefillOptions["positions"], tokenCount: number): Int32Array {
   if (!positions) {
     return Int32Array.from({ length: tokenCount }, (_, index) => index);
   }

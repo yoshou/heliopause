@@ -31,7 +31,7 @@ export type Qwen35InferenceState = {
   nextPosition: number;
 };
 
-export type Qwen35OutputResult = {
+export type OutputResult = {
   logits: Float32Array;
   topTokens: Array<{ id: number; value: number }>;
 };
@@ -39,18 +39,18 @@ export type Qwen35OutputResult = {
 export type Qwen35ModelSessionOptions = {
   maxContextLength?: number;
   maxWeightCacheBytes?: number;
-  executionProviders?: readonly Qwen35ExecutionProviderConfig[];
+  executionProviders?: readonly ExecutionProviderConfig[];
 };
 
-export type Qwen35ExecutionProviderConfig = {
+export type ExecutionProviderConfig = {
   name: string;
   options?: Readonly<Record<string, unknown>>;
 };
 
-export type Qwen35TimingPhase = "prefill" | "decode";
+export type TimingPhase = "prefill" | "decode";
 
-export type Qwen35TimingEvent = {
-  phase: Qwen35TimingPhase;
+export type TimingEvent = {
+  phase: TimingPhase;
   section: string;
   durationMs: number;
   layer?: number;
@@ -59,14 +59,14 @@ export type Qwen35TimingEvent = {
   tokenIndex?: number;
 };
 
-export type Qwen35TimingSink = (event: Qwen35TimingEvent) => void;
+export type TimingSink = (event: TimingEvent) => void;
 
-export type Qwen35ForwardTrace = {
-  phase: Qwen35TimingPhase;
-  onTiming: Qwen35TimingSink;
+export type ForwardTrace = {
+  phase: TimingPhase;
+  onTiming: TimingSink;
 };
 
-export type Qwen35CacheStats = {
+export type CacheStats = {
   f32TensorCount: number;
   weightTensorCount: number;
   weightCacheBytes: number;
@@ -75,10 +75,10 @@ export type Qwen35CacheStats = {
   weightCacheMisses: number;
   weightCacheEvictions: number;
   embeddingRowCount: number;
-  executionProviderStats: Qwen35ExecutionProviderStats;
+  executionProviderStats: ExecutionProviderStats;
 };
 
-export type Qwen35ExecutionProviderStats = Record<string, number | boolean | string>;
+export type ExecutionProviderStats = Record<string, number | boolean | string>;
 
 export class Qwen35ModelSession {
   readonly tensorReader: GgufTensorReader;
@@ -87,11 +87,11 @@ export class Qwen35ModelSession {
 
   private readonly maxContextLength?: number;
   private readonly maxWeightCacheBytes: number;
-  readonly executionProviders: readonly Qwen35ExecutionProviderConfig[];
+  readonly executionProviders: readonly ExecutionProviderConfig[];
   private readonly f32TensorCache = new Map<string, Float32Array>();
   private readonly weightBytesCache = new Map<string, Uint8Array>();
   private readonly embeddingRowCache = new Map<number, Float32Array>();
-  private executionProviderStatsProvider?: () => Qwen35ExecutionProviderStats;
+  private executionProviderStatsProvider?: () => ExecutionProviderStats;
   private weightCacheBytes = 0;
   private weightCacheHits = 0;
   private weightCacheMisses = 0;
@@ -189,7 +189,7 @@ export class Qwen35ModelSession {
     return rows;
   }
 
-  cacheStats(): Qwen35CacheStats {
+  cacheStats(): CacheStats {
     return {
       f32TensorCount: this.f32TensorCache.size,
       weightTensorCount: this.weightBytesCache.size,
@@ -203,11 +203,11 @@ export class Qwen35ModelSession {
     };
   }
 
-  setExecutionProviderStatsProvider(provider: (() => Qwen35ExecutionProviderStats) | undefined): void {
+  setExecutionProviderStatsProvider(provider: (() => ExecutionProviderStats) | undefined): void {
     this.executionProviderStatsProvider = provider;
   }
 
-  executionProvider(name: string): Qwen35ExecutionProviderConfig | undefined {
+  executionProvider(name: string): ExecutionProviderConfig | undefined {
     return this.executionProviders.find((provider) => provider.name === name);
   }
 
@@ -225,7 +225,7 @@ export class Qwen35ModelSession {
   }
 }
 
-export function estimateQwen35WeightCacheBytes(tensorReader: GgufTensorReader): number {
+export function estimateWeightCacheBytes(tensorReader: GgufTensorReader): number {
   let total = 0;
   for (const tensor of tensorReader.metadata.tensors) {
     if (tensor.name === "token_embd.weight") {
@@ -336,17 +336,17 @@ export function requiredFullAttentionCache(state: Qwen35InferenceState, layer: n
 }
 
 export function createForwardTrace(
-  phase: Qwen35TimingPhase,
-  onTiming: Qwen35TimingSink | undefined,
-): Qwen35ForwardTrace | undefined {
+  phase: TimingPhase,
+  onTiming: TimingSink | undefined,
+): ForwardTrace | undefined {
   return onTiming ? { phase, onTiming } : undefined;
 }
 
 export async function timedAsync<T>(
-  trace: Qwen35ForwardTrace | undefined,
+  trace: ForwardTrace | undefined,
   section: string,
   run: () => Promise<T> | T,
-  details: Omit<Qwen35TimingEvent, "phase" | "section" | "durationMs"> = {},
+  details: Omit<TimingEvent, "phase" | "section" | "durationMs"> = {},
 ): Promise<T> {
   if (!trace) {
     return run();
@@ -365,10 +365,10 @@ export async function timedAsync<T>(
 }
 
 export function timedSync<T>(
-  trace: Qwen35ForwardTrace | undefined,
+  trace: ForwardTrace | undefined,
   section: string,
   run: () => T,
-  details: Omit<Qwen35TimingEvent, "phase" | "section" | "durationMs"> = {},
+  details: Omit<TimingEvent, "phase" | "section" | "durationMs"> = {},
 ): T {
   if (!trace) {
     return run();

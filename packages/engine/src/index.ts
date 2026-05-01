@@ -29,29 +29,29 @@ export {
 export {
   decodeQwen35,
   prefillQwen35,
-  type Qwen35DecodeOptions,
-  type Qwen35DecodeResult,
-  type Qwen35PrefillOptions,
-  type Qwen35PrefillResult,
+  type DecodeOptions,
+  type DecodeResult,
+  type PrefillOptions,
+  type PrefillResult,
 } from "./forward";
 
 export {
   createQwen35InferenceState,
   createQwen35ModelSession,
   cloneQwen35InferenceState,
-  estimateQwen35WeightCacheBytes,
+  estimateWeightCacheBytes,
   Qwen35ModelSession,
-  type Qwen35CacheStats,
-  type Qwen35ExecutionProviderConfig,
-  type Qwen35ForwardTrace,
+  type CacheStats,
+  type ExecutionProviderConfig,
+  type ForwardTrace,
   type Qwen35FullAttentionCache,
   type Qwen35InferenceState,
   type Qwen35ModelInput,
   type Qwen35ModelSessionOptions,
   type Qwen35RecurrentCache,
-  type Qwen35TimingEvent,
-  type Qwen35TimingPhase,
-  type Qwen35TimingSink,
+  type TimingEvent,
+  type TimingPhase,
+  type TimingSink,
 } from "./runtime";
 
 export { Qwen35CpuSegmentRunner } from "./runner/cpu/index";

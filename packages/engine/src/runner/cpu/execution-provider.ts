@@ -1,7 +1,7 @@
 import type {
-  Qwen35ForwardTrace,
+  ForwardTrace,
   Qwen35ModelSession,
-  Qwen35OutputResult,
+  OutputResult,
 } from "../../runtime";
 import { forwardQwen35Output } from "./layers";
 import {
@@ -18,7 +18,7 @@ export function qwen35CpuSegmentRunner(
 export function qwen35CpuOutput(
   session: Qwen35ModelSession,
   hidden: Float32Array,
-  options: { topK: number; trace?: Qwen35ForwardTrace },
-): Promise<Qwen35OutputResult> {
+  options: { topK: number; trace?: ForwardTrace },
+): Promise<OutputResult> {
   return forwardQwen35Output(session, hidden, options);
 }

@@ -3,7 +3,7 @@ import {
   cloneQwen35InferenceState,
   createFileGgufTensorReader,
   createQwen35ChatSession,
-  estimateQwen35WeightCacheBytes,
+  estimateWeightCacheBytes,
   generateQwen35ChatTurn,
   getGgufModelName,
   prefillQwen35ChatMessages,
@@ -72,7 +72,7 @@ async function handleLoadModel(
   currentSystemPrompt = undefined;
 
   const tensorReader = await createFileGgufTensorReader(request.file);
-  const estimatedWeightCacheBytes = estimateQwen35WeightCacheBytes(tensorReader);
+  const estimatedWeightCacheBytes = estimateWeightCacheBytes(tensorReader);
   const resolvedMemoryProfile = resolveMemoryProfile(
     request.memoryProfile,
     estimatedWeightCacheBytes,

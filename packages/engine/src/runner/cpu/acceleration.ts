@@ -1,4 +1,4 @@
-import type { Qwen35ExecutionProviderStats, Qwen35ModelSession } from "../../runtime";
+import type { ExecutionProviderStats, Qwen35ModelSession } from "../../runtime";
 import {
   createWasmQuantizedWeightHandle,
   type WasmQuantizedWeightHandle,
@@ -17,7 +17,7 @@ export function registerQwen35CpuExecutionProvider(session: Qwen35ModelSession):
   session.setExecutionProviderStatsProvider(() => cpuExecutionProviderStats(session));
 }
 
-export function cpuExecutionProviderStats(session: Qwen35ModelSession): Qwen35ExecutionProviderStats {
+export function cpuExecutionProviderStats(session: Qwen35ModelSession): ExecutionProviderStats {
   const cache = wasmWeightCaches.get(session);
   return {
     cpuResidentWeightCacheEnabled: cpuResidentWeightCacheEnabled(session),

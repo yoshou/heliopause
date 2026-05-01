@@ -1,5 +1,5 @@
 import type {
-  Qwen35ForwardTrace,
+  ForwardTrace,
   Qwen35InferenceState,
   Qwen35ModelSession,
 } from "../../runtime";
@@ -52,7 +52,7 @@ export class Qwen35CpuSegmentRunner {
     inputHidden: Float32Array,
     positions: Int32Array,
     state: Qwen35InferenceState,
-    options: { trace?: Qwen35ForwardTrace } = {},
+    options: { trace?: ForwardTrace } = {},
   ): Promise<Qwen35CpuHiddenResult> {
     let hidden = inputHidden;
     for (let layer = this.segmentStartLayer; layer < this.segmentEndLayerExclusive; layer += 1) {
@@ -85,7 +85,7 @@ export class Qwen35CpuSegmentRunner {
     inputHidden: Float32Array,
     positions: Int32Array,
     state: Qwen35InferenceState,
-    options: { trace?: Qwen35ForwardTrace } = {},
+    options: { trace?: ForwardTrace } = {},
   ): Promise<Qwen35CpuHiddenResult> {
     return this.runTokensHidden(inputHidden, positions, state, options);
   }

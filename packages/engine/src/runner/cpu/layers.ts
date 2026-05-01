@@ -29,12 +29,12 @@ import {
   type Qwen35ModelManifest,
 } from "../../model";
 import {
-  type Qwen35ForwardTrace,
+  type ForwardTrace,
   type Qwen35FullAttentionCache,
   type Qwen35InferenceState,
   type Qwen35ModelInput,
   type Qwen35ModelSession,
-  type Qwen35OutputResult,
+  type OutputResult,
   type Qwen35RecurrentCache,
   modelSession,
   requiredFullAttentionCache,
@@ -67,7 +67,7 @@ export async function forwardQwen35RecurrentLayer(
   layer: number,
   input: Float32Array,
   epsilon = modelSession(model).epsilon,
-  trace?: Qwen35ForwardTrace,
+  trace?: ForwardTrace,
 ): Promise<Float32Array> {
   const session = modelSession(model);
   const cache = requiredRecurrentCache(state, layer);
@@ -254,7 +254,7 @@ export async function forwardQwen35FullAttentionLayer(
   input: Float32Array,
   positions: Int32Array,
   epsilon = modelSession(model).epsilon,
-  trace?: Qwen35ForwardTrace,
+  trace?: ForwardTrace,
 ): Promise<Float32Array> {
   const session = modelSession(model);
   const cache = requiredFullAttentionCache(state, layer);
@@ -417,9 +417,9 @@ export async function forwardQwen35Output(
   hidden: Float32Array,
   options: {
     topK?: number;
-    trace?: Qwen35ForwardTrace;
+    trace?: ForwardTrace;
   } = {},
-): Promise<Qwen35OutputResult> {
+): Promise<OutputResult> {
   const session = modelSession(model);
   const norm = await timedAsync(
     options.trace,
@@ -447,7 +447,7 @@ async function forwardQwen35Ffn(
   layer: number,
   residual: Float32Array,
   epsilon: number,
-  trace?: Qwen35ForwardTrace,
+  trace?: ForwardTrace,
 ): Promise<Float32Array> {
   const postNorm = await timedAsync(
     trace,
@@ -505,7 +505,7 @@ async function matMulQwen35Weight(
   session: Qwen35ModelSession,
   weightName: string,
   inputColumns: Float32Array,
-  trace?: Qwen35ForwardTrace,
+  trace?: ForwardTrace,
 ): Promise<Float32Array> {
   const tensor = session.getTensor(weightName);
   if (tensor.type === "F32") {
@@ -521,7 +521,7 @@ async function matMulQwen35WeightBatch(
   session: Qwen35ModelSession,
   weightNames: readonly string[],
   inputColumns: Float32Array,
-  trace?: Qwen35ForwardTrace,
+  trace?: ForwardTrace,
 ): Promise<Float32Array[] | undefined> {
   const projectionBatchingEnabled = cpuProjectionBatchingEnabled(session);
   const residentWeightCacheEnabled = cpuResidentWeightCacheEnabled(session);
@@ -666,7 +666,7 @@ async function matMulKQ8K(
   weightName: string,
   inputColumns: Float32Array,
   type: Extract<GgmlTypeName, "Q4_K" | "Q5_K" | "Q6_K" | "IQ4_XS">,
-  trace?: Qwen35ForwardTrace,
+  trace?: ForwardTrace,
 ): Promise<Float32Array> {
   const tensor = session.getTensor(weightName);
   const inputSize = tensor.dimensions[0] ?? 0;
@@ -737,7 +737,7 @@ async function matMulQ8_0Weight(
   session: Qwen35ModelSession,
   weightName: string,
   inputColumns: Float32Array,
-  trace?: Qwen35ForwardTrace,
+  trace?: ForwardTrace,
 ): Promise<Float32Array> {
   const tensor = session.getTensor(weightName);
   if (tensor.type !== "Q8_0") {

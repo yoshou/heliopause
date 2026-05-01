@@ -8,7 +8,7 @@ import {
   createQwen35ModelSession,
   createQwen35InferenceState,
   decodeQwen35,
-  estimateQwen35WeightCacheBytes,
+  estimateWeightCacheBytes,
   GgufTensorReader,
   prefillQwen35,
 } from "../src/index.ts";
@@ -260,7 +260,7 @@ test("Qwen35 weight cache estimate counts quantized matmul weights only", () => 
     f32Tensor("output_norm.weight", [4], new Float32Array([1, 1, 1, 1])),
   ]);
 
-  assert.equal(estimateQwen35WeightCacheBytes(reader), 212);
+  assert.equal(estimateWeightCacheBytes(reader), 212);
 });
 
 test("Qwen35 full-attention decode rejects positions outside context", async () => {

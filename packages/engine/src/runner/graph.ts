@@ -1,9 +1,9 @@
 import type { Qwen35ModelManifest } from "../model";
 import type {
-  Qwen35ForwardTrace,
+  ForwardTrace,
   Qwen35InferenceState,
   Qwen35ModelSession,
-  Qwen35OutputResult,
+  OutputResult,
 } from "../runtime";
 
 export type ForwardRunnerBackend = "cpu" | "webgpu" | "transfer";
@@ -22,7 +22,7 @@ export type ForwardProviderHiddenValue = {
 
 export type ForwardOutputValue = {
   kind: "output";
-  result: Qwen35OutputResult;
+  result: OutputResult;
 };
 
 export type ForwardValue =
@@ -36,7 +36,7 @@ export type ForwardGraphContext = {
   state: Qwen35InferenceState;
   positions: Int32Array;
   phase: "prefill" | "decode";
-  trace?: Qwen35ForwardTrace;
+  trace?: ForwardTrace;
 };
 
 export type ForwardRunnerNode = {
