@@ -1,17 +1,16 @@
-import { ChangeEvent, FormEvent, useMemo, useRef, useState } from "react";
+import { ChangeEvent, FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import {
   DEFAULT_QWEN35_SYSTEM_PROMPT,
-  buildQwen35Tokenizer,
-  createFileGgufTensorReader,
-  createQwen35ChatSession,
-  estimateQwen35WeightCacheBytes,
-  generateQwen35ChatCompletion,
-  getGgufModelName,
   stripQwen35Thinking,
   type ChatMessage,
-  type Qwen35ModelSession,
-  type Qwen35Tokenizer,
 } from "@heliopause/engine";
+import type {
+  EngineWorkerRequest,
+  EngineWorkerResponse,
+  MemoryProfile,
+  SystemMemoryInfo,
+  WorkerModelInfo,
+} from "./engine-worker-protocol";
 
 type UiMessage = {
   id: string;
@@ -19,41 +18,26 @@ type UiMessage = {
   content: string;
 };
 
-type MemoryProfile = "auto" | "low" | "full";
-
-type ResolvedMemoryProfile = {
-  requested: MemoryProfile;
-  resolved: "low" | "full";
-  maxWeightCacheBytes: number;
-  estimatedWeightCacheBytes: number;
-  wasmResidentWeightCache: boolean;
-  availableMemoryBytes?: number;
-};
-
-type SystemMemoryInfo = {
-  total_bytes: number;
-  available_bytes: number;
-};
-
 type ModelState =
   | { status: "empty" }
   | { status: "loading"; fileName: string }
-  | {
-      status: "ready";
-      fileName: string;
-      modelName: string;
-      contextLength: number;
-      originalContextLength: number;
-      memoryProfile: ResolvedMemoryProfile;
-      session: Qwen35ModelSession;
-      tokenizer: Qwen35Tokenizer;
-    }
+  | ({ status: "ready" } & WorkerModelInfo)
   | { status: "error"; fileName: string; message: string };
 
-const CHAT_CONTEXT_LENGTH = 4096;
-const LOW_WEIGHT_CACHE_BYTES = 768 * 1024 * 1024;
-const FULL_WEIGHT_CACHE_LIMIT_BYTES = 32 * 1024 * 1024 * 1024;
-const FULL_WEIGHT_CACHE_HEADROOM = 1.25;
+type PendingRequest =
+  | {
+      type: "load";
+      worker: Worker;
+      resolve: (model: WorkerModelInfo) => void;
+      reject: (error: Error) => void;
+    }
+  | {
+      type: "generate";
+      worker: Worker;
+      assistantId: string;
+      resolve: () => void;
+      reject: (error: Error) => void;
+    };
 
 function App() {
   const [model, setModel] = useState<ModelState>({ status: "empty" });
@@ -62,12 +46,23 @@ function App() {
   const [prompt, setPrompt] = useState("");
   const [messages, setMessages] = useState<UiMessage[]>([]);
   const [isGenerating, setIsGenerating] = useState(false);
-  const abortRef = useRef<AbortController | null>(null);
+  const workerRef = useRef<Worker | null>(null);
+  const nextRequestIdRef = useRef(1);
+  const pendingRequestsRef = useRef(new Map<number, PendingRequest>());
+  const generationRequestRef = useRef<{ requestId: number; worker: Worker } | null>(null);
 
   const canSubmit = useMemo(
     () => model.status === "ready" && prompt.trim().length > 0 && !isGenerating,
     [isGenerating, model.status, prompt],
   );
+
+  useEffect(() => () => {
+    const worker = workerRef.current;
+    if (worker) {
+      rejectWorkerRequests(worker, new Error("Application closed."));
+      worker.terminate();
+    }
+  }, []);
 
   async function handleModelChange(event: ChangeEvent<HTMLInputElement>) {
     const file = event.target.files?.[0];
@@ -75,32 +70,33 @@ function App() {
       return;
     }
 
+    const worker = createEngineWorker();
+    const previousWorker = workerRef.current;
+    if (previousWorker) {
+      rejectWorkerRequests(previousWorker, new Error("Model was replaced."));
+      previousWorker.terminate();
+    }
+    workerRef.current = worker;
+    generationRequestRef.current = null;
+
     setModel({ status: "loading", fileName: file.name });
     try {
-      const tensorReader = await createFileGgufTensorReader(file);
-      const estimatedWeightCacheBytes = estimateQwen35WeightCacheBytes(tensorReader);
-      const resolvedMemoryProfile = resolveMemoryProfile(
+      const modelInfo = await loadModelInWorker(
+        worker,
+        file,
+        file.name,
         memoryProfile,
-        estimatedWeightCacheBytes,
         await readSystemMemoryInfo(),
       );
-      const session = createQwen35ChatSession(tensorReader, {
-        maxContextLength: CHAT_CONTEXT_LENGTH,
-        maxWeightCacheBytes: resolvedMemoryProfile.maxWeightCacheBytes,
-        enableWasmWeightCache: resolvedMemoryProfile.wasmResidentWeightCache,
-      });
-      const tokenizer = buildQwen35Tokenizer(tensorReader.metadata);
       setModel({
         status: "ready",
-        fileName: file.name,
-        modelName: getGgufModelName(tensorReader),
-        contextLength: Math.min(session.manifest.contextLength, CHAT_CONTEXT_LENGTH),
-        originalContextLength: session.manifest.contextLength,
-        memoryProfile: resolvedMemoryProfile,
-        session,
-        tokenizer,
+        ...modelInfo,
       });
     } catch (error) {
+      if (workerRef.current === worker) {
+        workerRef.current = null;
+        worker.terminate();
+      }
       setModel({
         status: "error",
         fileName: file.name,
@@ -138,9 +134,6 @@ function App() {
     setPrompt("");
     setIsGenerating(true);
 
-    const abortController = new AbortController();
-    abortRef.current = abortController;
-
     const chatMessages: ChatMessage[] = [
       { role: "system", content: systemPrompt },
       ...messages.map((message) => ({
@@ -151,44 +144,168 @@ function App() {
     ];
 
     try {
-      for await (const chunk of generateQwen35ChatCompletion(
-        model.session,
-        model.tokenizer,
-        chatMessages,
-        {
-          maxNewTokens: 256,
-          signal: abortController.signal,
-        },
-      )) {
-        setMessages((currentMessages) =>
-          currentMessages.map((message) =>
-            message.id === assistantId
-              ? { ...message, content: chunk.content }
-              : message,
-          ),
-        );
+      const worker = workerRef.current;
+      if (!worker) {
+        throw new Error("The model worker is not running. Reload the model.");
       }
+      await generateInWorker(worker, assistantId, chatMessages, 256);
     } catch (error) {
-      if (!abortController.signal.aborted) {
-        setMessages((currentMessages) =>
-          currentMessages.map((message) =>
-            message.id === assistantId
-              ? {
-                  ...message,
-                  content: `Generation failed: ${error instanceof Error ? error.message : String(error)}`,
-                }
-              : message,
-          ),
-        );
-      }
+      setMessages((currentMessages) =>
+        currentMessages.map((message) =>
+          message.id === assistantId
+            ? {
+                ...message,
+                content: `Generation failed: ${error instanceof Error ? error.message : String(error)}`,
+              }
+            : message,
+        ),
+      );
     } finally {
-      abortRef.current = null;
+      generationRequestRef.current = null;
       setIsGenerating(false);
     }
   }
 
   function handleStop() {
-    abortRef.current?.abort();
+    const activeGeneration = generationRequestRef.current;
+    if (!activeGeneration) {
+      return;
+    }
+    activeGeneration.worker.postMessage({
+      type: "cancelGeneration",
+      requestId: activeGeneration.requestId,
+    } satisfies EngineWorkerRequest);
+  }
+
+  function createEngineWorker(): Worker {
+    const worker = new Worker(new URL("./engine-worker.ts", import.meta.url), {
+      type: "module",
+    });
+    worker.onmessage = (event: MessageEvent<EngineWorkerResponse>) => {
+      handleWorkerMessage(worker, event.data);
+    };
+    worker.onerror = (event) => {
+      rejectWorkerRequests(
+        worker,
+        new Error(event.message || "The model worker failed."),
+      );
+    };
+    return worker;
+  }
+
+  function loadModelInWorker(
+    worker: Worker,
+    file: File,
+    fileName: string,
+    requestedMemoryProfile: MemoryProfile,
+    memoryInfo: SystemMemoryInfo | undefined,
+  ): Promise<WorkerModelInfo> {
+    const requestId = nextRequestIdRef.current;
+    nextRequestIdRef.current += 1;
+
+    return new Promise((resolve, reject) => {
+      pendingRequestsRef.current.set(requestId, {
+        type: "load",
+        worker,
+        resolve,
+        reject,
+      });
+      worker.postMessage({
+        type: "loadModel",
+        requestId,
+        file,
+        fileName,
+        memoryProfile: requestedMemoryProfile,
+        memoryInfo,
+      } satisfies EngineWorkerRequest);
+    });
+  }
+
+  function generateInWorker(
+    worker: Worker,
+    assistantId: string,
+    chatMessages: ChatMessage[],
+    maxNewTokens: number,
+  ): Promise<void> {
+    const requestId = nextRequestIdRef.current;
+    nextRequestIdRef.current += 1;
+    generationRequestRef.current = { requestId, worker };
+
+    return new Promise((resolve, reject) => {
+      pendingRequestsRef.current.set(requestId, {
+        type: "generate",
+        worker,
+        assistantId,
+        resolve,
+        reject,
+      });
+      worker.postMessage({
+        type: "generate",
+        requestId,
+        messages: chatMessages,
+        maxNewTokens,
+      } satisfies EngineWorkerRequest);
+    });
+  }
+
+  function handleWorkerMessage(worker: Worker, message: EngineWorkerResponse) {
+    const pending = pendingRequestsRef.current.get(message.requestId);
+    if (!pending || pending.worker !== worker) {
+      return;
+    }
+
+    if (message.type === "error") {
+      pendingRequestsRef.current.delete(message.requestId);
+      pending.reject(new Error(message.message));
+      return;
+    }
+
+    if (message.type === "modelLoaded") {
+      if (pending.type !== "load") {
+        return;
+      }
+      pendingRequestsRef.current.delete(message.requestId);
+      pending.resolve(message.model);
+      return;
+    }
+
+    if (pending.type !== "generate") {
+      return;
+    }
+
+    if (message.type === "generationChunk") {
+      setMessages((currentMessages) =>
+        currentMessages.map((uiMessage) =>
+          uiMessage.id === pending.assistantId
+            ? { ...uiMessage, content: message.content }
+            : uiMessage,
+        ),
+      );
+      return;
+    }
+
+    if (message.type === "generationCancelled") {
+      setMessages((currentMessages) =>
+        currentMessages.map((uiMessage) =>
+          uiMessage.id === pending.assistantId && uiMessage.content.length === 0
+            ? { ...uiMessage, content: "Generation stopped." }
+            : uiMessage,
+        ),
+      );
+    }
+
+    pendingRequestsRef.current.delete(message.requestId);
+    pending.resolve();
+  }
+
+  function rejectWorkerRequests(worker: Worker, error: Error) {
+    for (const [requestId, pending] of pendingRequestsRef.current) {
+      if (pending.worker !== worker) {
+        continue;
+      }
+      pendingRequestsRef.current.delete(requestId);
+      pending.reject(error);
+    }
   }
 
   return (
@@ -324,35 +441,6 @@ function ModelStatus({ model }: { model: ModelState }) {
       </div>
     </dl>
   );
-}
-
-function resolveMemoryProfile(
-  requested: MemoryProfile,
-  estimatedWeightCacheBytes: number,
-  memoryInfo: SystemMemoryInfo | undefined,
-): ResolvedMemoryProfile {
-  const fullBytes = Math.min(
-    FULL_WEIGHT_CACHE_LIMIT_BYTES,
-    Math.ceil(estimatedWeightCacheBytes * FULL_WEIGHT_CACHE_HEADROOM),
-  );
-  const availableMemoryBytes = memoryInfo?.available_bytes && memoryInfo.available_bytes > 0
-    ? memoryInfo.available_bytes
-    : undefined;
-  const hasFullMemory = availableMemoryBytes === undefined
-    ? requested === "full"
-    : availableMemoryBytes > fullBytes + 2 * 1024 * 1024 * 1024;
-  const resolved = requested === "full" || (requested === "auto" && hasFullMemory)
-    ? "full"
-    : "low";
-
-  return {
-    requested,
-    resolved,
-    maxWeightCacheBytes: resolved === "full" ? fullBytes : LOW_WEIGHT_CACHE_BYTES,
-    estimatedWeightCacheBytes,
-    wasmResidentWeightCache: resolved === "full",
-    availableMemoryBytes,
-  };
 }
 
 async function readSystemMemoryInfo(): Promise<SystemMemoryInfo | undefined> {

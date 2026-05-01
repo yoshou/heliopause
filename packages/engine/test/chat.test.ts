@@ -12,7 +12,7 @@ import {
   type GgufMetadata,
 } from "../src/index.ts";
 
-test("Qwen35 chat template formats history and appends generation prompt", () => {
+test("Qwen35 chat template formats history and disables thinking by default", () => {
   assert.equal(
     applyQwen35ChatTemplate([
       { role: "system", content: "Be concise." },
@@ -22,6 +22,16 @@ test("Qwen35 chat template formats history and appends generation prompt", () =>
     "<|im_start|>system\nBe concise.<|im_end|>\n" +
       "<|im_start|>user\nHello<|im_end|>\n" +
       "<|im_start|>assistant\nHi<|im_end|>\n" +
+      "<|im_start|>assistant\n<think>\n\n</think>\n\n",
+  );
+});
+
+test("Qwen35 chat template can leave thinking enabled", () => {
+  assert.equal(
+    applyQwen35ChatTemplate([
+      { role: "user", content: "Hello" },
+    ], { enableThinking: true }),
+    "<|im_start|>user\nHello<|im_end|>\n" +
       "<|im_start|>assistant\n",
   );
 });

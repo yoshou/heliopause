@@ -23,6 +23,7 @@ export type ChatMessage = {
 
 export type Qwen35ChatTemplateOptions = {
   addGenerationPrompt?: boolean;
+  enableThinking?: boolean;
 };
 
 export type FileGgufTensorReaderOptions = {
@@ -56,6 +57,7 @@ export function applyQwen35ChatTemplate(
   options: Qwen35ChatTemplateOptions = {},
 ): string {
   const addGenerationPrompt = options.addGenerationPrompt ?? true;
+  const enableThinking = options.enableThinking ?? false;
   let output = "";
 
   for (const message of messages) {
@@ -64,6 +66,9 @@ export function applyQwen35ChatTemplate(
 
   if (addGenerationPrompt) {
     output += "<|im_start|>assistant\n";
+    if (!enableThinking) {
+      output += "<think>\n\n</think>\n\n";
+    }
   }
 
   return output;
