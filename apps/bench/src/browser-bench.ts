@@ -2,8 +2,8 @@ import {
   checkWebGpuSupport,
   runWebGpuSmokeTest,
   type WebGpuSupport,
-} from "./runner/webgpu/index";
-import { createWebGpuF32TensorHandle, createWebGpuQuantizedWeightHandle } from "./runner/webgpu/quantized-handles";
+} from "../../../packages/engine/src/runner/webgpu/index";
+import { createWebGpuF32TensorHandle, createWebGpuQuantizedWeightHandle } from "../../../packages/engine/src/runner/webgpu/quantized-handles";
 import {
   fullAttentionDecodeOutWebGpuResident,
   gatedDeltaNetWebGpu,
@@ -18,17 +18,17 @@ import {
   matMulTop1WebGpuQuantizedResident,
   matMulWebGpuQuantizedResident,
   recurrentAttentionDecodeWebGpuResident,
-} from "./runner/webgpu/matmul";
-import { GPU_COPY_DST } from "./runner/webgpu/gpu-constants";
-import { storageBuffer } from "./runner/webgpu/gpu-bindings";
-import { createKMatMulBindResources, createQ8_0MatMulBindResources } from "./runner/webgpu/kernel-resources";
+} from "../../../packages/engine/src/runner/webgpu/matmul";
+import { GPU_COPY_DST } from "../../../packages/engine/src/runner/webgpu/gpu-constants";
+import { storageBuffer } from "../../../packages/engine/src/runner/webgpu/gpu-bindings";
+import { createKMatMulBindResources, createQ8_0MatMulBindResources } from "../../../packages/engine/src/runner/webgpu/kernel-resources";
 import {
   quantizeQ8_0Columns,
   quantizeQ8_KColumns,
   packBytesToU32,
   webGpuQuantizedWeightLayout,
-} from "./runner/webgpu/quantized-handles";
-import type { WebGpuBufferLike, WebGpuComputePassLike, WebGpuDeviceLike, WebGpuQuantizedWeightHandleInternal } from "./runner/webgpu/gpu-types";
+} from "../../../packages/engine/src/runner/webgpu/quantized-handles";
+import type { WebGpuBufferLike, WebGpuComputePassLike, WebGpuDeviceLike, WebGpuQuantizedWeightHandleInternal } from "../../../packages/engine/src/runner/webgpu/gpu-types";
 import {
   gatedDeltaNet,
   gqaAttention,
@@ -39,7 +39,7 @@ import {
   softplus,
   type GatedDeltaNetOptions,
   type GqaAttentionOptions,
-} from "./ops";
+} from "../../../packages/engine/src/ops";
 import {
   createWasmQuantizedWeightHandle,
   gatedDeltaNetWasm,
@@ -50,7 +50,7 @@ import {
   releaseWasmQuantizedWeightHandle,
   ssmConv1dWasm,
   type WasmQuantizedWeightHandle,
-} from "./runner/cpu/wasm-kernels";
+} from "../../../packages/engine/src/runner/cpu/wasm-kernels";
 import {
   quantizeQ8_0,
   quantizeQ8_K,
@@ -60,7 +60,7 @@ import {
   vecDotQ8_0_Q8_0,
   type QuantizedQ8K,
   type QuantizedQ8_0,
-} from "./quant";
+} from "../../../packages/engine/src/quant";
 
 export type BrowserBenchSize = "small" | "medium" | "large";
 

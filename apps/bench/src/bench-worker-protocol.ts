@@ -4,7 +4,7 @@ import type {
   BrowserBenchReport,
   BrowserBenchResult,
   BrowserBenchSize,
-} from "@heliopause/engine";
+} from "./browser-bench";
 
 export type BenchWorkerRequest =
   | {

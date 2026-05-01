@@ -7,7 +7,7 @@ import {
   type BrowserBenchReport,
   type BrowserBenchResult,
   type BrowserBenchSize,
-} from "@heliopause/engine";
+} from "./browser-bench";
 import type { BenchWorkerRequest, BenchWorkerResponse } from "./bench-worker-protocol";
 
 type RunState =

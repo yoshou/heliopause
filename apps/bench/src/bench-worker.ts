@@ -1,7 +1,7 @@
 import {
   readBenchEnvironment,
   runBrowserBench,
-} from "@heliopause/engine";
+} from "./browser-bench";
 import type { BenchWorkerRequest, BenchWorkerResponse } from "./bench-worker-protocol";
 
 let activeRun: { requestId: number; abortController: AbortController } | undefined;
