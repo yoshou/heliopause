@@ -114,6 +114,7 @@ async function handleGenerateTurn(
 
   const abortController = new AbortController();
   activeGeneration = { requestId: request.requestId, abortController };
+  const inferenceStartedAt = performance.now();
 
   try {
     await ensureChatState(request.systemPrompt, abortController.signal);
@@ -148,10 +149,18 @@ async function handleGenerateTurn(
       currentState = workingState;
     }
 
-    workerScope.postMessage({
-      type: abortController.signal.aborted ? "generationCancelled" : "generationDone",
-      requestId: request.requestId,
-    });
+    if (abortController.signal.aborted) {
+      workerScope.postMessage({
+        type: "generationCancelled",
+        requestId: request.requestId,
+      });
+    } else {
+      workerScope.postMessage({
+        type: "generationDone",
+        requestId: request.requestId,
+        inferenceDurationMs: performance.now() - inferenceStartedAt,
+      });
+    }
   } catch (error) {
     if (!abortController.signal.aborted) {
       throw error;

@@ -239,6 +239,14 @@ textarea:disabled {
   white-space: pre-wrap;
 }
 
+.message-meta {
+  margin-top: 10px;
+  color: #647064;
+  font-size: 0.78rem;
+  font-weight: 750;
+  line-height: 1.4;
+}
+
 .prompt-form {
   display: grid;
   gap: 10px;

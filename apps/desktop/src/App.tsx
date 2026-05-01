@@ -15,6 +15,7 @@ type UiMessage = {
   id: string;
   role: "user" | "assistant";
   content: string;
+  inferenceDurationMs?: number;
 };
 
 type ModelState =
@@ -288,6 +289,16 @@ function App() {
       );
     }
 
+    if (message.type === "generationDone") {
+      setMessages((currentMessages) =>
+        currentMessages.map((uiMessage) =>
+          uiMessage.id === pending.assistantId
+            ? { ...uiMessage, inferenceDurationMs: message.inferenceDurationMs }
+            : uiMessage,
+        ),
+      );
+    }
+
     pendingRequestsRef.current.delete(message.requestId);
     pending.resolve();
   }
@@ -353,13 +364,11 @@ function App() {
             </div>
           ) : (
             messages.map((message) => (
-              <article
-                className={`message message--${message.role}`}
+              <MessageBubble
+                isGenerating={isGenerating}
                 key={message.id}
-              >
-                <span>{message.role === "user" ? "You" : "Assistant"}</span>
-                <p>{stripQwen35Thinking(message.content) || (message.role === "assistant" && isGenerating ? "Generating..." : "")}</p>
-              </article>
+                message={message}
+              />
             ))
           )}
         </div>
@@ -389,6 +398,24 @@ function App() {
         </form>
       </section>
     </main>
+  );
+}
+
+function MessageBubble(
+  { isGenerating, message }: { isGenerating: boolean; message: UiMessage },
+) {
+  const visibleContent = stripQwen35Thinking(message.content);
+  const placeholder = message.role === "assistant" && isGenerating ? "Generating..." : "";
+  return (
+    <article className={`message message--${message.role}`}>
+      <span>{message.role === "user" ? "You" : "Assistant"}</span>
+      <p>{visibleContent || placeholder}</p>
+      {message.role === "assistant" && message.inferenceDurationMs !== undefined ? (
+        <footer className="message-meta">
+          {formatDuration(message.inferenceDurationMs)}
+        </footer>
+      ) : null}
+    </article>
   );
 }
 
@@ -462,6 +489,18 @@ function formatBytes(bytes: number): string {
     return `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
   }
   return `${bytes.toLocaleString()} bytes`;
+}
+
+function formatDuration(durationMs: number): string {
+  if (durationMs < 1000) {
+    return `${Math.round(durationMs)} ms`;
+  }
+  if (durationMs < 60_000) {
+    return `${(durationMs / 1000).toFixed(1)} s`;
+  }
+  const minutes = Math.floor(durationMs / 60_000);
+  const seconds = Math.round((durationMs % 60_000) / 1000);
+  return `${minutes} min ${seconds} s`;
 }
 
 function createId(prefix: string): string {

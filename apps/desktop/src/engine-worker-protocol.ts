@@ -57,6 +57,7 @@ export type EngineWorkerResponse =
   | {
       type: "generationDone";
       requestId: number;
+      inferenceDurationMs: number;
     }
   | {
       type: "generationCancelled";
