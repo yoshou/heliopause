@@ -3,9 +3,14 @@ import test from "node:test";
 
 import {
   gatedDeltaNetWasm,
+  createWasmQuantizedWeightHandle,
   gqaAttentionWasm,
+  matMulQuantizedMultiWasm,
+  matMulQuantizedWasmResidentMulti,
+  matMulQuantizedWasmResident,
   matMulQuantizedWasm,
   prefillWasmBackend,
+  releaseWasmQuantizedWeightHandle,
   resetPrefillWasmForTesting,
   ssmConv1dWasm,
 } from "../src/prefill-wasm.ts";
@@ -129,6 +134,91 @@ test("prefill wasm quantized matmul returns fixed expected values", async (t) =>
   );
 });
 
+test("prefill wasm quantized multi matmul matches individual matmuls", async (t) => {
+  resetPrefillWasmForTesting();
+  if (await prefillWasmBackend() !== "wasm-simd") {
+    t.skip("WebAssembly SIMD module is not available in this runtime");
+    return;
+  }
+
+  const input = new Float32Array(64);
+  for (let column = 0; column < 2; column += 1) {
+    for (let index = 0; index < 32; index += 1) {
+      input[column * 32 + index] = (index - 11.5) * (column === 0 ? 0.0625 : -0.03125);
+    }
+  }
+  const left = q8Weight(2, 1);
+  const right = q8Weight(3, 7);
+
+  const individualLeft = await matMulQuantizedWasm("Q8_0", left, input, 32, 2, 2);
+  const individualRight = await matMulQuantizedWasm("Q8_0", right, input, 32, 3, 2);
+  const multi = await matMulQuantizedMultiWasm([
+    { type: "Q8_0", weightBytes: left, rowCount: 2 },
+    { type: "Q8_0", weightBytes: right, rowCount: 3 },
+  ], input, 32, 2);
+
+  assert.equal(multi?.length, 2);
+  assertClose(multi?.[0], individualLeft, 1e-5);
+  assertClose(multi?.[1], individualRight, 1e-5);
+});
+
+test("prefill wasm resident quantized matmul matches copied matmul", async (t) => {
+  resetPrefillWasmForTesting();
+  if (await prefillWasmBackend() !== "wasm-simd") {
+    t.skip("WebAssembly SIMD module is not available in this runtime");
+    return;
+  }
+
+  const input = new Float32Array(64);
+  for (let column = 0; column < 2; column += 1) {
+    for (let index = 0; index < 32; index += 1) {
+      input[column * 32 + index] = (index - 8.5) * (column === 0 ? 0.05 : -0.075);
+    }
+  }
+  const weight = q8Weight(3, 11);
+  const expected = await matMulQuantizedWasm("Q8_0", weight, input, 32, 3, 2);
+  const handle = await createWasmQuantizedWeightHandle("Q8_0", weight, 32, 3);
+  assert.ok(handle);
+  try {
+    const actual = await matMulQuantizedWasmResident(handle, input, 32, 3, 2);
+    assertClose(actual, expected, 1e-5);
+  } finally {
+    releaseWasmQuantizedWeightHandle(handle);
+  }
+});
+
+test("prefill wasm resident multi matmul matches resident individual matmuls", async (t) => {
+  resetPrefillWasmForTesting();
+  if (await prefillWasmBackend() !== "wasm-simd") {
+    t.skip("WebAssembly SIMD module is not available in this runtime");
+    return;
+  }
+
+  const input = new Float32Array(64);
+  for (let column = 0; column < 2; column += 1) {
+    for (let index = 0; index < 32; index += 1) {
+      input[column * 32 + index] = (index - 7.5) * (column === 0 ? 0.04 : -0.065);
+    }
+  }
+  const leftWeight = q8Weight(2, 17);
+  const rightWeight = q8Weight(3, 23);
+  const leftHandle = await createWasmQuantizedWeightHandle("Q8_0", leftWeight, 32, 2);
+  const rightHandle = await createWasmQuantizedWeightHandle("Q8_0", rightWeight, 32, 3);
+  assert.ok(leftHandle);
+  assert.ok(rightHandle);
+  try {
+    const left = await matMulQuantizedWasmResident(leftHandle, input, 32, 2, 2);
+    const right = await matMulQuantizedWasmResident(rightHandle, input, 32, 3, 2);
+    const multi = await matMulQuantizedWasmResidentMulti([leftHandle, rightHandle], input, 32, 2);
+    assert.equal(multi?.length, 2);
+    assertClose(multi?.[0], left, 1e-5);
+    assertClose(multi?.[1], right, 1e-5);
+  } finally {
+    releaseWasmQuantizedWeightHandle(leftHandle);
+    releaseWasmQuantizedWeightHandle(rightHandle);
+  }
+});
+
 test("prefill wasm GQA attention returns fixed expected values", async (t) => {
   resetPrefillWasmForTesting();
   if (await prefillWasmBackend() !== "wasm-simd") {
@@ -167,6 +257,19 @@ function sequence(length: number, seed: number): Float32Array {
     output[index] = ((value / 0xffffffff) * 2 - 1) * 0.25;
   }
   return output;
+}
+
+function q8Weight(rowCount: number, seed: number): Uint8Array {
+  const weight = new Uint8Array(rowCount * 34);
+  const view = new DataView(weight.buffer);
+  for (let row = 0; row < rowCount; row += 1) {
+    const offset = row * 34;
+    view.setUint16(offset, 0x3c00 + row, true);
+    for (let index = 0; index < 32; index += 1) {
+      weight[offset + 2 + index] = (seed + row * 17 + index * 5) & 255;
+    }
+  }
+  return weight;
 }
 
 function assertClose(actual: Float32Array | undefined, expected: Float32Array, tolerance = 1e-8): void {

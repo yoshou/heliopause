@@ -7,6 +7,7 @@ import {
   createQwen35ModelSession,
   createQwen35InferenceState,
   decodeQwen35,
+  estimateQwen35WeightCacheBytes,
   GgufTensorReader,
   prefillQwen35,
 } from "../src/index.ts";
@@ -177,6 +178,15 @@ test("Qwen35 model session caches F32 tensors and embedding rows", async () => {
     f32TensorCount: 1,
     weightTensorCount: 0,
     weightCacheBytes: 0,
+    maxWeightCacheBytes: 256 * 1024 * 1024,
+    weightCacheHits: 0,
+    weightCacheMisses: 0,
+    weightCacheEvictions: 0,
+    wasmWeightCacheEnabled: false,
+    wasmWeightCacheCount: 0,
+    wasmWeightCacheBytes: 0,
+    wasmWeightCacheHits: 0,
+    wasmWeightCacheMisses: 0,
     embeddingRowCount: 1,
   });
 });
@@ -200,6 +210,20 @@ test("Qwen35 model session evicts large weight bytes without evicting small F32 
   assert.equal(reader.readCounts.get("b.weight"), 1);
   assert.equal(session.cacheStats().f32TensorCount, 1);
   assert.equal(session.cacheStats().weightTensorCount, 1);
+  assert.equal(session.cacheStats().weightCacheHits, 0);
+  assert.equal(session.cacheStats().weightCacheMisses, 3);
+  assert.equal(session.cacheStats().weightCacheEvictions, 2);
+});
+
+test("Qwen35 weight cache estimate counts quantized matmul weights only", () => {
+  const reader = tensorReaderFromTensors([
+    f32Tensor("token_embd.weight", [4, 8], sequence(32)),
+    bytesTensor("blk.0.attn_q.weight", [32, 2], "Q8_0", new Uint8Array(68).fill(1)),
+    bytesTensor("blk.0.ffn_gate.weight", [256, 1], "Q4_K", new Uint8Array(144).fill(2)),
+    f32Tensor("output_norm.weight", [4], new Float32Array([1, 1, 1, 1])),
+  ]);
+
+  assert.equal(estimateQwen35WeightCacheBytes(reader), 212);
 });
 
 test("Qwen35 full-attention decode rejects positions outside context", async () => {
@@ -276,7 +300,7 @@ function tensorReaderFromTensors(
   tensors: Array<{
     name: string;
     dimensions: number[];
-    type: "F32" | "Q8_0";
+    type: "F32" | "Q8_0" | "Q4_K";
     bytes: Uint8Array;
   }>,
   metadataOverrides: Record<string, unknown> = {},
@@ -340,7 +364,7 @@ function f32Tensor(name: string, dimensions: number[], values: Float32Array) {
   };
 }
 
-function bytesTensor(name: string, dimensions: number[], type: "Q8_0", bytes: Uint8Array) {
+function bytesTensor(name: string, dimensions: number[], type: "Q8_0" | "Q4_K", bytes: Uint8Array) {
   return { name, dimensions, type, bytes };
 }
 

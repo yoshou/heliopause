@@ -4,6 +4,7 @@ import {
   buildQwen35Tokenizer,
   createFileGgufTensorReader,
   createQwen35ChatSession,
+  estimateQwen35WeightCacheBytes,
   generateQwen35ChatCompletion,
   getGgufModelName,
   stripQwen35Thinking,
@@ -18,6 +19,22 @@ type UiMessage = {
   content: string;
 };
 
+type MemoryProfile = "auto" | "low" | "full";
+
+type ResolvedMemoryProfile = {
+  requested: MemoryProfile;
+  resolved: "low" | "full";
+  maxWeightCacheBytes: number;
+  estimatedWeightCacheBytes: number;
+  wasmResidentWeightCache: boolean;
+  availableMemoryBytes?: number;
+};
+
+type SystemMemoryInfo = {
+  total_bytes: number;
+  available_bytes: number;
+};
+
 type ModelState =
   | { status: "empty" }
   | { status: "loading"; fileName: string }
@@ -27,15 +44,20 @@ type ModelState =
       modelName: string;
       contextLength: number;
       originalContextLength: number;
+      memoryProfile: ResolvedMemoryProfile;
       session: Qwen35ModelSession;
       tokenizer: Qwen35Tokenizer;
     }
   | { status: "error"; fileName: string; message: string };
 
 const CHAT_CONTEXT_LENGTH = 4096;
+const LOW_WEIGHT_CACHE_BYTES = 768 * 1024 * 1024;
+const FULL_WEIGHT_CACHE_LIMIT_BYTES = 32 * 1024 * 1024 * 1024;
+const FULL_WEIGHT_CACHE_HEADROOM = 1.25;
 
 function App() {
   const [model, setModel] = useState<ModelState>({ status: "empty" });
+  const [memoryProfile, setMemoryProfile] = useState<MemoryProfile>("auto");
   const [systemPrompt, setSystemPrompt] = useState(DEFAULT_QWEN35_SYSTEM_PROMPT);
   const [prompt, setPrompt] = useState("");
   const [messages, setMessages] = useState<UiMessage[]>([]);
@@ -56,9 +78,16 @@ function App() {
     setModel({ status: "loading", fileName: file.name });
     try {
       const tensorReader = await createFileGgufTensorReader(file);
+      const estimatedWeightCacheBytes = estimateQwen35WeightCacheBytes(tensorReader);
+      const resolvedMemoryProfile = resolveMemoryProfile(
+        memoryProfile,
+        estimatedWeightCacheBytes,
+        await readSystemMemoryInfo(),
+      );
       const session = createQwen35ChatSession(tensorReader, {
         maxContextLength: CHAT_CONTEXT_LENGTH,
-        maxWeightCacheBytes: 256 * 1024 * 1024,
+        maxWeightCacheBytes: resolvedMemoryProfile.maxWeightCacheBytes,
+        enableWasmWeightCache: resolvedMemoryProfile.wasmResidentWeightCache,
       });
       const tokenizer = buildQwen35Tokenizer(tensorReader.metadata);
       setModel({
@@ -67,6 +96,7 @@ function App() {
         modelName: getGgufModelName(tensorReader),
         contextLength: Math.min(session.manifest.contextLength, CHAT_CONTEXT_LENGTH),
         originalContextLength: session.manifest.contextLength,
+        memoryProfile: resolvedMemoryProfile,
         session,
         tokenizer,
       });
@@ -170,6 +200,17 @@ function App() {
         </header>
 
         <section className="model-panel">
+          <label className="field-label" htmlFor="memory-profile">Weight cache</label>
+          <select
+            id="memory-profile"
+            value={memoryProfile}
+            onChange={(event) => setMemoryProfile(event.target.value as MemoryProfile)}
+            disabled={model.status === "loading" || isGenerating}
+          >
+            <option value="auto">Auto</option>
+            <option value="full">Full</option>
+            <option value="low">Low</option>
+          </select>
           <label className="file-picker">
             <span>Load GGUF model</span>
             <input type="file" accept=".gguf" onChange={handleModelChange} />
@@ -269,8 +310,72 @@ function ModelStatus({ model }: { model: ModelState }) {
             : ""}
         </dd>
       </div>
+      <div>
+        <dt>Weight cache</dt>
+        <dd>
+          {model.memoryProfile.resolved} / {formatBytes(model.memoryProfile.maxWeightCacheBytes)}
+          {model.memoryProfile.requested === "auto" ? " (auto)" : ""}
+          {model.memoryProfile.wasmResidentWeightCache ? " / WASM resident" : ""}
+        </dd>
+      </div>
+      <div>
+        <dt>Estimated weights</dt>
+        <dd>{formatBytes(model.memoryProfile.estimatedWeightCacheBytes)}</dd>
+      </div>
     </dl>
   );
+}
+
+function resolveMemoryProfile(
+  requested: MemoryProfile,
+  estimatedWeightCacheBytes: number,
+  memoryInfo: SystemMemoryInfo | undefined,
+): ResolvedMemoryProfile {
+  const fullBytes = Math.min(
+    FULL_WEIGHT_CACHE_LIMIT_BYTES,
+    Math.ceil(estimatedWeightCacheBytes * FULL_WEIGHT_CACHE_HEADROOM),
+  );
+  const availableMemoryBytes = memoryInfo?.available_bytes && memoryInfo.available_bytes > 0
+    ? memoryInfo.available_bytes
+    : undefined;
+  const hasFullMemory = availableMemoryBytes === undefined
+    ? requested === "full"
+    : availableMemoryBytes > fullBytes + 2 * 1024 * 1024 * 1024;
+  const resolved = requested === "full" || (requested === "auto" && hasFullMemory)
+    ? "full"
+    : "low";
+
+  return {
+    requested,
+    resolved,
+    maxWeightCacheBytes: resolved === "full" ? fullBytes : LOW_WEIGHT_CACHE_BYTES,
+    estimatedWeightCacheBytes,
+    wasmResidentWeightCache: resolved === "full",
+    availableMemoryBytes,
+  };
+}
+
+async function readSystemMemoryInfo(): Promise<SystemMemoryInfo | undefined> {
+  try {
+    const { invoke } = await import("@tauri-apps/api/core");
+    const info = await invoke<SystemMemoryInfo>("system_memory_info");
+    if (info.total_bytes <= 0 && info.available_bytes <= 0) {
+      return undefined;
+    }
+    return info;
+  } catch {
+    return undefined;
+  }
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes >= 1024 * 1024 * 1024) {
+    return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GiB`;
+  }
+  if (bytes >= 1024 * 1024) {
+    return `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
+  }
+  return `${bytes.toLocaleString()} bytes`;
 }
 
 function createId(prefix: string): string {

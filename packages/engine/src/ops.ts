@@ -400,6 +400,9 @@ export function gqaAttention(
     for (let qHead = 0; qHead < queryHeadCount; qHead += 1) {
       const kvHead = Math.floor(qHead / groupSize);
       const queryOffset = (token * queryHeadCount + qHead) * headSize;
+      const queryValues = quantizeQueryForScore === "f16"
+        ? quantizedF16Query(query, queryOffset, headSize)
+        : query.subarray(queryOffset, queryOffset + headSize);
 
       let maxScore = -Infinity;
       for (let keyToken = 0; keyToken < keyValueTokenCount; keyToken += 1) {
@@ -411,13 +414,8 @@ export function gqaAttention(
         const keyOffset = (keyToken * keyValueHeadCount + kvHead) * headSize;
         let dot = 0;
         for (let index = 0; index < headSize; index += 1) {
-          const queryValue = query[queryOffset + index] ?? 0;
-          const scoreQueryValue =
-            quantizeQueryForScore === "f16"
-              ? float16ToFloat32(float32ToFloat16(queryValue))
-              : queryValue;
           dot = Math.fround(
-            dot + Math.fround(scoreQueryValue * (key[keyOffset + index] ?? 0)),
+            dot + Math.fround((queryValues[index] ?? 0) * (key[keyOffset + index] ?? 0)),
           );
         }
         const maskValue = mask ? (mask[token * keyValueTokenCount + keyToken] ?? 0) : 0;
@@ -452,6 +450,14 @@ export function gqaAttention(
     }
   }
 
+  return output;
+}
+
+function quantizedF16Query(query: Float32Array, offset: number, headSize: number): Float32Array {
+  const output = new Float32Array(headSize);
+  for (let index = 0; index < headSize; index += 1) {
+    output[index] = float16ToFloat32(float32ToFloat16(query[offset + index] ?? 0));
+  }
   return output;
 }
 

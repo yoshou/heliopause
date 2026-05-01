@@ -16,7 +16,9 @@ import {
 import {
   quantizeQ8_0,
   quantizeQ8_K,
+  vecDotIQ4_XS_Q8_K,
   vecDotQ4_K_Q8_K,
+  vecDotQ6_K_Q8_K,
   vecDotQ8_0_Q8_0,
 } from "../src/quant.ts";
 
@@ -59,8 +61,13 @@ for (const size of [
   { name: "smoke", type: "Q4_K" as const, inputSize: 256, rowCount: 256, columnCount: 4 },
   { name: "medium", type: "Q4_K" as const, inputSize: 1024, rowCount: 1024, columnCount: 16 },
   { name: "large", type: "Q4_K" as const, inputSize: 2048, rowCount: 2048, columnCount: 32 },
+  { name: "medium", type: "Q6_K" as const, inputSize: 1024, rowCount: 1024, columnCount: 16 },
+  { name: "large", type: "Q6_K" as const, inputSize: 2048, rowCount: 2048, columnCount: 32 },
+  { name: "medium", type: "IQ4_XS" as const, inputSize: 1024, rowCount: 1024, columnCount: 16 },
+  { name: "large", type: "IQ4_XS" as const, inputSize: 2048, rowCount: 2048, columnCount: 32 },
   { name: "smoke", type: "Q8_0" as const, inputSize: 256, rowCount: 256, columnCount: 4 },
   { name: "medium", type: "Q8_0" as const, inputSize: 1024, rowCount: 1024, columnCount: 16 },
+  { name: "large", type: "Q8_0" as const, inputSize: 2048, rowCount: 2048, columnCount: 32 },
 ]) {
   const weightBytes = quantizedWeightBytes(size.type, size.inputSize, size.rowCount);
   const inputColumns = sequence(size.inputSize * size.columnCount, 0x9000 + size.rowCount);
@@ -206,31 +213,41 @@ function checksum(values: Float32Array): number {
 }
 
 function matMulQuantizedTs(
-  type: "Q4_K" | "Q8_0",
+  type: "Q4_K" | "Q6_K" | "IQ4_XS" | "Q8_0",
   weightBytes: Uint8Array,
   inputColumns: Float32Array,
   inputSize: number,
   rowCount: number,
   columnCount: number,
 ): Float32Array {
-  const rowByteLength = type === "Q4_K" ? inputSize / 256 * 144 : inputSize / 32 * 34;
+  const rowByteLength = quantizedRowByteLength(type, inputSize);
   const output = new Float32Array(rowCount * columnCount);
   for (let column = 0; column < columnCount; column += 1) {
     const input = inputColumns.slice(column * inputSize, (column + 1) * inputSize);
-    const q8 = type === "Q4_K" ? quantizeQ8_K(input) : quantizeQ8_0(input);
+    const q8 = type === "Q8_0" ? quantizeQ8_0(input) : quantizeQ8_K(input);
     for (let row = 0; row < rowCount; row += 1) {
       const rowOffset = row * rowByteLength;
       const rowBytes = weightBytes.subarray(rowOffset, rowOffset + rowByteLength);
-      output[column * rowCount + row] = type === "Q4_K"
-        ? vecDotQ4_K_Q8_K(rowBytes, q8 as ReturnType<typeof quantizeQ8_K>)
-        : vecDotQ8_0_Q8_0(rowBytes, q8 as ReturnType<typeof quantizeQ8_0>);
+      if (type === "Q4_K") {
+        output[column * rowCount + row] = vecDotQ4_K_Q8_K(rowBytes, q8 as ReturnType<typeof quantizeQ8_K>);
+      } else if (type === "Q6_K") {
+        output[column * rowCount + row] = vecDotQ6_K_Q8_K(rowBytes, q8 as ReturnType<typeof quantizeQ8_K>);
+      } else if (type === "IQ4_XS") {
+        output[column * rowCount + row] = vecDotIQ4_XS_Q8_K(rowBytes, q8 as ReturnType<typeof quantizeQ8_K>);
+      } else {
+        output[column * rowCount + row] = vecDotQ8_0_Q8_0(rowBytes, q8 as ReturnType<typeof quantizeQ8_0>);
+      }
     }
   }
   return output;
 }
 
-function quantizedWeightBytes(type: "Q4_K" | "Q8_0", inputSize: number, rowCount: number): Uint8Array {
-  const rowByteLength = type === "Q4_K" ? inputSize / 256 * 144 : inputSize / 32 * 34;
+function quantizedWeightBytes(
+  type: "Q4_K" | "Q6_K" | "IQ4_XS" | "Q8_0",
+  inputSize: number,
+  rowCount: number,
+): Uint8Array {
+  const rowByteLength = quantizedRowByteLength(type, inputSize);
   const bytes = new Uint8Array(rowByteLength * rowCount);
   let seed = 0xd000 + inputSize + rowCount;
   for (let index = 0; index < bytes.length; index += 1) {
@@ -239,15 +256,40 @@ function quantizedWeightBytes(type: "Q4_K" | "Q8_0", inputSize: number, rowCount
   }
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   for (let row = 0; row < rowCount; row += 1) {
-    for (let block = 0; block < inputSize / (type === "Q4_K" ? 256 : 32); block += 1) {
-      const offset = row * rowByteLength + block * (type === "Q4_K" ? 144 : 34);
+    const blockElements = type === "Q8_0" ? 32 : 256;
+    for (let block = 0; block < inputSize / blockElements; block += 1) {
+      const offset = row * rowByteLength + block * quantizedBlockByteLength(type);
       view.setUint16(offset, 0x3c00, true);
       if (type === "Q4_K") {
         view.setUint16(offset + 2, 0x3400, true);
+      } else if (type === "Q6_K") {
+        view.setUint16(offset + 208, 0x3c00, true);
+      } else if (type === "IQ4_XS") {
+        view.setUint16(offset + 2, 0x2222, true);
       }
     }
   }
   return bytes;
+}
+
+function quantizedRowByteLength(type: "Q4_K" | "Q6_K" | "IQ4_XS" | "Q8_0", inputSize: number): number {
+  if (type === "Q8_0") {
+    return inputSize / 32 * 34;
+  }
+  return inputSize / 256 * quantizedBlockByteLength(type);
+}
+
+function quantizedBlockByteLength(type: "Q4_K" | "Q6_K" | "IQ4_XS" | "Q8_0"): number {
+  if (type === "Q4_K") {
+    return 144;
+  }
+  if (type === "Q6_K") {
+    return 210;
+  }
+  if (type === "IQ4_XS") {
+    return 136;
+  }
+  return 34;
 }
 
 function causalMask(tokenCount: number, keyValueTokenCount: number): Float32Array {

@@ -27,12 +27,15 @@ export {
   createQwen35InferenceState,
   createQwen35ModelSession,
   decodeQwen35,
+  estimateQwen35WeightCacheBytes,
   forwardQwen35FullAttentionLayer,
   forwardQwen35RecurrentLayer,
   prefillQwen35,
   Qwen35ModelSession,
+  type Qwen35CacheStats,
   type Qwen35DecodeOptions,
   type Qwen35DecodeResult,
+  type Qwen35ForwardTrace,
   type Qwen35FullAttentionCache,
   type Qwen35InferenceState,
   type Qwen35ModelInput,
@@ -40,12 +43,19 @@ export {
   type Qwen35PrefillOptions,
   type Qwen35PrefillResult,
   type Qwen35RecurrentCache,
+  type Qwen35TimingEvent,
+  type Qwen35TimingPhase,
+  type Qwen35TimingSink,
 } from "./qwen35-forward";
 
 export {
   GgufTensorReader,
   ggmlTypeStorage,
   tensorByteLength,
+  type GgufTensorReaderOptions,
+  type GgufTensorReadKind,
+  type GgufTensorReadTrace,
+  type GgufTensorReadTraceEvent,
   type TensorByteRange,
 } from "./tensor-reader";
 
@@ -89,6 +99,22 @@ export {
   type Qwen35ChatCompletionOptions,
   type Qwen35ChatTemplateOptions,
 } from "./chat";
+
+export {
+  createWasmQuantizedWeightHandle,
+  matMulQuantizedMultiWasm,
+  matMulQuantizedWasmResidentMulti,
+  matMulQuantizedWasmResident,
+  prefillWasmBackend,
+  releaseWasmQuantizedWeightHandle,
+  setPrefillWasmTrace,
+  wasmResidentWeightStats,
+  type QuantizedMatMulInput,
+  type PrefillWasmTrace,
+  type PrefillWasmTraceEvent,
+  type WasmQuantizedWeightHandle,
+  type WasmResidentWeightStats,
+} from "./prefill-wasm";
 
 export {
   gatedDeltaNet,

@@ -6,18 +6,41 @@ export type TensorByteRange = {
   length: number;
 };
 
+export type GgufTensorReadKind = "tensor" | "range";
+
+export type GgufTensorReadTraceEvent = {
+  kind: GgufTensorReadKind;
+  tensorName: string;
+  offset: bigint;
+  length: number;
+  durationMs: number;
+};
+
+export type GgufTensorReadTrace = (event: GgufTensorReadTraceEvent) => void;
+
+export type GgufTensorReaderOptions = {
+  onRead?: GgufTensorReadTrace;
+};
+
 export class GgufTensorReader {
   private readonly gguf: GgufMetadata;
   private readonly reader: GgufByteReader;
   private readonly tensorsByName: Map<string, GgufTensorInfo>;
+  private onRead?: GgufTensorReadTrace;
 
   constructor(
     gguf: GgufMetadata,
     reader: GgufByteReader,
+    options: GgufTensorReaderOptions = {},
   ) {
     this.gguf = gguf;
     this.reader = reader;
     this.tensorsByName = new Map(gguf.tensors.map((tensor) => [tensor.name, tensor]));
+    this.onRead = options.onRead;
+  }
+
+  setReadTrace(onRead: GgufTensorReadTrace | undefined): void {
+    this.onRead = onRead;
   }
 
   getTensor(name: string): GgufTensorInfo {
@@ -30,16 +53,40 @@ export class GgufTensorReader {
 
   async readTensorBytes(name: string): Promise<Uint8Array> {
     const tensor = this.getTensor(name);
-    return this.reader.read(tensor.dataOffset, tensorByteLength(tensor));
+    const length = tensorByteLength(tensor);
+    const start = nowMs();
+    const bytes = await this.reader.read(tensor.dataOffset, length);
+    this.onRead?.({
+      kind: "tensor",
+      tensorName: name,
+      offset: tensor.dataOffset,
+      length,
+      durationMs: nowMs() - start,
+    });
+    return bytes;
   }
 
   async readTensorRange(range: TensorByteRange): Promise<Uint8Array> {
-    return this.reader.read(range.tensor.dataOffset + range.offset, range.length);
+    const absoluteOffset = range.tensor.dataOffset + range.offset;
+    const start = nowMs();
+    const bytes = await this.reader.read(absoluteOffset, range.length);
+    this.onRead?.({
+      kind: "range",
+      tensorName: range.tensor.name,
+      offset: absoluteOffset,
+      length: range.length,
+      durationMs: nowMs() - start,
+    });
+    return bytes;
   }
 
   get metadata(): GgufMetadata {
     return this.gguf;
   }
+}
+
+function nowMs(): number {
+  return globalThis.performance?.now() ?? Date.now();
 }
 
 export function tensorByteLength(tensor: GgufTensorInfo): number {

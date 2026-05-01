@@ -10,7 +10,10 @@ import {
   type Qwen35ModelSession,
   type Qwen35ModelSessionOptions,
 } from "./qwen35-forward";
-import { GgufTensorReader } from "./tensor-reader";
+import {
+  GgufTensorReader,
+  type GgufTensorReadTrace,
+} from "./tensor-reader";
 import type { Qwen35Tokenizer } from "./tokenizer";
 
 export type ChatMessage = {
@@ -25,6 +28,7 @@ export type Qwen35ChatTemplateOptions = {
 export type FileGgufTensorReaderOptions = {
   bufferSizeBytes?: number;
   maxArraySample?: number;
+  onRead?: GgufTensorReadTrace;
 };
 
 export type Qwen35ChatCompletionOptions = {
@@ -77,7 +81,7 @@ export async function createFileGgufTensorReader(
   const gguf = await parseGguf(parseReader, {
     maxArraySample: options.maxArraySample ?? 300000,
   });
-  return new GgufTensorReader(gguf, byteReader);
+  return new GgufTensorReader(gguf, byteReader, { onRead: options.onRead });
 }
 
 export function createQwen35ChatSession(

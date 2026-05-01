@@ -22,7 +22,8 @@ body {
 
 button,
 textarea,
-input {
+input,
+select {
   font: inherit;
 }
 
@@ -76,7 +77,8 @@ h1 {
   gap: 12px;
 }
 
-.file-picker {
+.file-picker,
+.field-label {
   display: grid;
   gap: 8px;
   color: #29343b;
@@ -84,13 +86,19 @@ h1 {
   font-weight: 800;
 }
 
-.file-picker input {
+.file-picker input,
+select {
   width: 100%;
   padding: 10px;
   border: 1px solid #c9d2cb;
   border-radius: 8px;
   background: #f8faf7;
   color: #172026;
+}
+
+select:focus {
+  border-color: #2f7565;
+  outline: 3px solid rgba(47, 117, 101, 0.16);
 }
 
 .model-status {
