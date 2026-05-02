@@ -57,8 +57,14 @@ import {
 import {
   cpuProjectionBatchingEnabled,
   cpuResidentWeightCacheEnabled,
+  matMulWasmShardedWeightHandle,
+  matMulWasmShardedWeightHandleBatch,
+  readWasmShardedWeightHandle,
   readWasmWeightHandle,
 } from "./acceleration";
+import type {
+  WasmShardedQuantizedWeightHandle,
+} from "./thread-pool";
 
 export async function forwardQwen35RecurrentLayer(
   model: Qwen35ModelInput,
@@ -546,6 +552,31 @@ async function matMulQwen35WeightBatch(
   }
 
   if (residentWeightCacheEnabled) {
+    const shardedHandles: WasmShardedQuantizedWeightHandle[] = [];
+    for (let index = 0; index < weightNames.length; index += 1) {
+      const name = weightNames[index];
+      const tensor = tensors[index];
+      if (!name || !tensor || !isQuantizedMatmulWasmType(tensor.type)) {
+        return undefined;
+      }
+      const handle = await readWasmShardedWeightHandle(session, name, tensor.type, inputSize, tensor.dimensions[1] ?? 0);
+      if (!handle) {
+        shardedHandles.length = 0;
+        break;
+      }
+      shardedHandles.push(handle);
+    }
+    if (shardedHandles.length === weightNames.length) {
+      const shardedOutputs = await timedAsync(
+        trace,
+        "WASM threaded resident matmul batch wrapper",
+        () => matMulWasmShardedWeightHandleBatch(shardedHandles, inputColumns, inputSize, columnCount),
+      );
+      if (shardedOutputs && shardedOutputs.length === shardedHandles.length) {
+        return shardedOutputs;
+      }
+    }
+
     const handles: WasmQuantizedWeightHandle[] = [];
     for (let index = 0; index < weightNames.length; index += 1) {
       const name = weightNames[index];
@@ -676,6 +707,24 @@ async function matMulKQ8K(
     ...tensor,
     dimensions: [inputSize],
   });
+  const shardedWasmHandle = await readWasmShardedWeightHandle(session, weightName, type, inputSize, rowCount);
+  if (shardedWasmHandle) {
+    const wasm = await timedAsync(
+      trace,
+      "WASM threaded resident matmul wrapper",
+      () => matMulWasmShardedWeightHandle(
+        shardedWasmHandle,
+        inputColumns,
+        inputSize,
+        rowCount,
+        columnCount,
+      ),
+      { weightName },
+    );
+    if (wasm) {
+      return wasm;
+    }
+  }
   const wasmHandle = await readWasmWeightHandle(session, weightName, type, inputSize, rowCount);
   if (wasmHandle) {
     const wasm = await timedAsync(
@@ -750,6 +799,24 @@ async function matMulQ8_0Weight(
     ...tensor,
     dimensions: [inputSize],
   });
+  const shardedWasmHandle = await readWasmShardedWeightHandle(session, weightName, "Q8_0", inputSize, rowCount);
+  if (shardedWasmHandle) {
+    const wasm = await timedAsync(
+      trace,
+      "WASM threaded resident matmul wrapper",
+      () => matMulWasmShardedWeightHandle(
+        shardedWasmHandle,
+        inputColumns,
+        inputSize,
+        rowCount,
+        columnCount,
+      ),
+      { weightName },
+    );
+    if (wasm) {
+      return wasm;
+    }
+  }
   const wasmHandle = await readWasmWeightHandle(session, weightName, "Q8_0", inputSize, rowCount);
   if (wasmHandle) {
     const wasm = await timedAsync(

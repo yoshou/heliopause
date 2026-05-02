@@ -86,9 +86,10 @@ async function handleLoadModel(
       options: {
         projectionBatching: true,
         residentWeightCache: resolvedMemoryProfile.wasmResidentWeightCache,
+        parallelResidentMatmul: resolvedMemoryProfile.wasmResidentWeightCache,
+        parallelMatmulMinRows: 512,
+        threadPoolSize: resolvedMemoryProfile.wasmResidentWeightCache ? "auto" : 1,
       },
-    }, {
-      name: "webgpu",
     }],
   });
   const nextTokenizer = buildQwen35Tokenizer(tensorReader.metadata);
@@ -226,7 +227,7 @@ function resolveMemoryProfile(
     ? memoryInfo.available_bytes
     : undefined;
   const hasFullMemory = availableMemoryBytes === undefined
-    ? requested === "full"
+    ? requested !== "low"
     : availableMemoryBytes > fullBytes + 2 * 1024 * 1024 * 1024;
   const resolved = requested === "full" || (requested === "auto" && hasFullMemory)
     ? "full"
