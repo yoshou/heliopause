@@ -320,7 +320,6 @@ function App() {
     <main className="app-shell">
       <aside className="sidebar" aria-label="Model settings">
         <header>
-          <p className="eyebrow">CPU / WebGPU mode</p>
           <h1>Heliopause</h1>
         </header>
 
