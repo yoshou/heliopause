@@ -204,17 +204,18 @@ export class WasmThreadPool {
     if (handle.pool !== this || handle.inputSize !== inputSize || handle.rowCount !== rowCount) {
       return undefined;
     }
+    const sharedInput = sharedFloat32Buffer(inputColumns);
     const shardOutputs = await Promise.all(handle.shards.map(async (shard) => {
-      const input = inputColumns.slice();
+      const input = sharedInput ?? (inputColumns.slice().buffer as ArrayBuffer);
       const response = await this.send(shard.workerIndex, {
         type: "matmul",
         requestId: this.nextRequestId++,
         handleId: shard.handleId,
-        inputBuffer: input.buffer as ArrayBuffer,
+        inputBuffer: input,
         inputSize,
         rowCount: shard.rowCount,
         columnCount,
-      }, [input.buffer as ArrayBuffer]);
+      }, sharedInput ? [] : [input as ArrayBuffer]);
       if (response.type !== "matmulResult") {
         throw new Error("Unexpected WASM thread matmul response");
       }
@@ -244,6 +245,7 @@ export class WasmThreadPool {
     }
 
     const outputs = handles.map((handle) => new Float32Array(handle.rowCount * columnCount));
+    const sharedInput = sharedFloat32Buffer(inputColumns);
     await Promise.all(this.workers.map(async (_worker, workerIndex) => {
       const workerShards = handles.map((handle) =>
         handle.shards.find((shard) => shard.workerIndex === workerIndex),
@@ -251,15 +253,15 @@ export class WasmThreadPool {
       if (workerShards.some((shard) => !shard)) {
         return;
       }
-      const input = inputColumns.slice();
+      const input = sharedInput ?? (inputColumns.slice().buffer as ArrayBuffer);
       const response = await this.send(workerIndex, {
         type: "matmulBatch",
         requestId: this.nextRequestId++,
         handleIds: workerShards.map((shard) => shard?.handleId ?? 0),
-        inputBuffer: input.buffer as ArrayBuffer,
+        inputBuffer: input,
         inputSize,
         columnCount,
-      }, [input.buffer as ArrayBuffer]);
+      }, sharedInput ? [] : [input as ArrayBuffer]);
       if (response.type !== "matmulBatchResult") {
         throw new Error("Unexpected WASM thread batch matmul response");
       }
@@ -422,4 +424,13 @@ function copyShardOutput(
       column * totalRowCount + rowStart,
     );
   }
+}
+
+function sharedFloat32Buffer(input: Float32Array): SharedArrayBuffer | undefined {
+  if (typeof SharedArrayBuffer === "undefined") {
+    return undefined;
+  }
+  const buffer = new SharedArrayBuffer(input.byteLength);
+  new Float32Array(buffer).set(input);
+  return buffer;
 }

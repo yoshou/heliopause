@@ -5,7 +5,6 @@ import {
   gatedDeltaNet,
   gqaAttention,
   l2NormRows,
-  matMulRows,
   rmsNorm,
   ropeMultiMropeNeox,
   sigmoid,
@@ -99,10 +98,14 @@ export async function forwardQwen35RecurrentLayer(
     `blk.${layer}.ssm_beta.weight`,
     `blk.${layer}.attn_gate.weight`,
   ] as const;
+  const recurrentQuantizedProjectionNames = [
+    recurrentProjectionNames[0],
+    recurrentProjectionNames[3],
+  ] as const;
   const recurrentProjectionBatch = await timedAsync(
     trace,
-    "recurrent projection batch",
-    () => matMulQwen35WeightBatch(session, recurrentProjectionNames, attnNorm, trace),
+    "recurrent quantized projection batch",
+    () => matMulQwen35WeightBatch(session, recurrentQuantizedProjectionNames, attnNorm, trace),
     { layer, layerKind: "recurrent" },
   );
   const qkv = recurrentProjectionBatch?.[0] ?? await timedAsync(
@@ -111,19 +114,19 @@ export async function forwardQwen35RecurrentLayer(
     () => matMulQwen35Weight(session, recurrentProjectionNames[0], attnNorm, trace),
     { layer, layerKind: "recurrent", weightName: recurrentProjectionNames[0] },
   );
-  const alpha = recurrentProjectionBatch?.[1] ?? await timedAsync(
+  const alpha = await timedAsync(
     trace,
     "recurrent projection alpha",
     () => matMulQwen35Weight(session, recurrentProjectionNames[1], attnNorm, trace),
     { layer, layerKind: "recurrent", weightName: recurrentProjectionNames[1] },
   );
-  const beta = recurrentProjectionBatch?.[2] ?? await timedAsync(
+  const beta = await timedAsync(
     trace,
     "recurrent projection beta",
     () => matMulQwen35Weight(session, recurrentProjectionNames[2], attnNorm, trace),
     { layer, layerKind: "recurrent", weightName: recurrentProjectionNames[2] },
   );
-  const z = recurrentProjectionBatch?.[3] ?? await timedAsync(
+  const z = recurrentProjectionBatch?.[1] ?? await timedAsync(
     trace,
     "recurrent projection z",
     () => matMulQwen35Weight(session, recurrentProjectionNames[3], attnNorm, trace),
@@ -552,21 +555,14 @@ async function matMulQwen35WeightBatch(
   }
 
   if (residentWeightCacheEnabled) {
-    const shardedHandles: WasmShardedQuantizedWeightHandle[] = [];
-    for (let index = 0; index < weightNames.length; index += 1) {
-      const name = weightNames[index];
+    const shardedHandles = await Promise.all(weightNames.map((name, index) => {
       const tensor = tensors[index];
       if (!name || !tensor || !isQuantizedMatmulWasmType(tensor.type)) {
-        return undefined;
+        return Promise.resolve(undefined);
       }
-      const handle = await readWasmShardedWeightHandle(session, name, tensor.type, inputSize, tensor.dimensions[1] ?? 0);
-      if (!handle) {
-        shardedHandles.length = 0;
-        break;
-      }
-      shardedHandles.push(handle);
-    }
-    if (shardedHandles.length === weightNames.length) {
+      return readWasmShardedWeightHandle(session, name, tensor.type, inputSize, tensor.dimensions[1] ?? 0);
+    }));
+    if (shardedHandles.every((handle): handle is WasmShardedQuantizedWeightHandle => Boolean(handle))) {
       const shardedOutputs = await timedAsync(
         trace,
         "WASM threaded resident matmul batch wrapper",
@@ -577,18 +573,15 @@ async function matMulQwen35WeightBatch(
       }
     }
 
-    const handles: WasmQuantizedWeightHandle[] = [];
-    for (let index = 0; index < weightNames.length; index += 1) {
-      const name = weightNames[index];
+    const handles = await Promise.all(weightNames.map((name, index) => {
       const tensor = tensors[index];
       if (!name || !tensor || !isQuantizedMatmulWasmType(tensor.type)) {
-        return undefined;
+        return Promise.resolve(undefined);
       }
-      const handle = await readWasmWeightHandle(session, name, tensor.type, inputSize, tensor.dimensions[1] ?? 0);
-      if (!handle) {
-        return undefined;
-      }
-      handles.push(handle);
+      return readWasmWeightHandle(session, name, tensor.type, inputSize, tensor.dimensions[1] ?? 0);
+    }));
+    if (!handles.every((handle): handle is WasmQuantizedWeightHandle => Boolean(handle))) {
+      return undefined;
     }
 
     const outputs: Array<Float32Array | undefined> = new Array(handles.length);
@@ -683,13 +676,26 @@ async function matMulF32Rows(
   const rowCount = tensor.dimensions[1] ?? 0;
   const columnCount = inputColumns.length / inputSize;
   const weight = await readF32ModelTensor(session, weightName);
-  const rows: Float32Array[] = [];
-
-  for (let row = 0; row < rowCount; row += 1) {
-    rows.push(weight.slice(row * inputSize, (row + 1) * inputSize));
+  if (weight.length !== inputSize * rowCount) {
+    throw new Error(`${weightName} shape mismatch: expected ${inputSize * rowCount}, got ${weight.length}`);
   }
 
-  return matMulRows(rows, inputColumns, inputSize, columnCount);
+  const output = new Float32Array(rowCount * columnCount);
+  for (let column = 0; column < columnCount; column += 1) {
+    const inputOffset = column * inputSize;
+    const outputOffset = column * rowCount;
+    for (let row = 0; row < rowCount; row += 1) {
+      const weightOffset = row * inputSize;
+      let sum = 0;
+      for (let index = 0; index < inputSize; index += 1) {
+        sum = Math.fround(
+          sum + Math.fround((weight[weightOffset + index] ?? 0) * (inputColumns[inputOffset + index] ?? 0)),
+        );
+      }
+      output[outputOffset + row] = sum;
+    }
+  }
+  return output;
 }
 
 async function matMulKQ8K(

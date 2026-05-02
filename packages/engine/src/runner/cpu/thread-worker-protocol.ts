@@ -1,6 +1,7 @@
 import type { WasmQuantizedWeightHandle } from "./wasm-kernels";
 
 export type WasmThreadQuantizedType = WasmQuantizedWeightHandle["type"];
+export type WasmThreadInputBuffer = ArrayBuffer | SharedArrayBuffer;
 
 export type WasmThreadWorkerRequest =
   | {
@@ -27,7 +28,7 @@ export type WasmThreadWorkerRequest =
       type: "matmul";
       requestId: number;
       handleId: number;
-      inputBuffer: ArrayBuffer;
+      inputBuffer: WasmThreadInputBuffer;
       inputSize: number;
       rowCount: number;
       columnCount: number;
@@ -36,7 +37,7 @@ export type WasmThreadWorkerRequest =
       type: "matmulBatch";
       requestId: number;
       handleIds: number[];
-      inputBuffer: ArrayBuffer;
+      inputBuffer: WasmThreadInputBuffer;
       inputSize: number;
       columnCount: number;
     }
