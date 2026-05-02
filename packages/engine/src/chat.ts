@@ -360,6 +360,7 @@ export function getGgufModelName(reader: GgufTensorReader): string {
 
 function fileGgufByteReader(file: Pick<File, "slice">): GgufByteReader {
   return {
+    sourceBlob: typeof Blob !== "undefined" && file instanceof Blob ? file : undefined,
     async read(offset, length) {
       const start = Number(offset);
       if (!Number.isSafeInteger(start)) {

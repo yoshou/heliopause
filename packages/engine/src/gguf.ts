@@ -1,4 +1,5 @@
 export type GgufByteReader = {
+  sourceBlob?: Blob;
   read(offset: bigint, length: number): Promise<Uint8Array>;
 };
 

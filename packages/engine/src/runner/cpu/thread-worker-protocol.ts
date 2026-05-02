@@ -13,6 +13,17 @@ export type WasmThreadWorkerRequest =
       rowCount: number;
     }
   | {
+      type: "prepareWeightFromBlob";
+      requestId: number;
+      handleId: number;
+      quantizedType: WasmThreadQuantizedType;
+      fileBlob: Blob;
+      fileOffset: number;
+      byteLength: number;
+      inputSize: number;
+      rowCount: number;
+    }
+  | {
       type: "matmul";
       requestId: number;
       handleId: number;

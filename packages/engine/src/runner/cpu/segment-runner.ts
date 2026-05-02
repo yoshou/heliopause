@@ -8,7 +8,11 @@ import {
   forwardQwen35FullAttentionLayer,
   forwardQwen35RecurrentLayer,
 } from "./layers";
-import { registerQwen35CpuExecutionProvider } from "./acceleration";
+import {
+  prefetchWasmShardedLayerWeights,
+  prefetchWasmShardedOutputWeight,
+  registerQwen35CpuExecutionProvider,
+} from "./acceleration";
 
 export type Qwen35CpuSegmentRunnerOptions = {
   session: Qwen35ModelSession;
@@ -56,6 +60,12 @@ export class Qwen35CpuSegmentRunner {
   ): Promise<Qwen35CpuHiddenResult> {
     let hidden = inputHidden;
     for (let layer = this.segmentStartLayer; layer < this.segmentEndLayerExclusive; layer += 1) {
+      const lookaheadLayer = layer + 1;
+      if (lookaheadLayer < this.segmentEndLayerExclusive) {
+        prefetchWasmShardedLayerWeights(this.session, lookaheadLayer);
+      } else if (this.segmentEndLayerExclusive === this.manifest.blockCount) {
+        prefetchWasmShardedOutputWeight(this.session);
+      }
       const isFullAttention = this.manifest.fullAttentionLayers.includes(layer);
       hidden = isFullAttention
         ? await forwardQwen35FullAttentionLayer(

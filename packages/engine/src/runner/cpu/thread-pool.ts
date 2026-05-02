@@ -26,6 +26,13 @@ export type WasmWeightShardInput = {
   weightBytes: Uint8Array;
 };
 
+export type WasmWeightShardBlobInput = {
+  rowStart: number;
+  rowCount: number;
+  fileOffset: number;
+  byteLength: number;
+};
+
 export type WasmShardedWeightShard = {
   workerIndex: number;
   handleId: number;
@@ -120,6 +127,53 @@ export class WasmThreadPool {
       }, [weightBytes.buffer as ArrayBuffer]);
       if (response.type !== "preparedWeight") {
         throw new Error("Unexpected WASM thread prepare response");
+      }
+      return {
+        workerIndex,
+        handleId,
+        rowStart: shard.rowStart,
+        rowCount: shard.rowCount,
+        residentBytes: response.residentBytes,
+      };
+    }));
+
+    return {
+      pool: this,
+      type,
+      inputSize,
+      rowCount,
+      residentBytes: prepared.reduce((sum, shard) => sum + shard.residentBytes, 0),
+      shards: prepared,
+    };
+  }
+
+  async prepareWeightFromBlob(
+    type: WasmThreadQuantizedType,
+    inputSize: number,
+    rowCount: number,
+    fileBlob: Blob,
+    shards: readonly WasmWeightShardBlobInput[],
+  ): Promise<WasmShardedQuantizedWeightHandle | undefined> {
+    if (this.shutdownStarted || shards.length < 2) {
+      return undefined;
+    }
+
+    const prepared = await Promise.all(shards.map(async (shard, index) => {
+      const workerIndex = index % this.workers.length;
+      const handleId = this.nextHandleId++;
+      const response = await this.send(workerIndex, {
+        type: "prepareWeightFromBlob",
+        requestId: this.nextRequestId++,
+        handleId,
+        quantizedType: type,
+        fileBlob,
+        fileOffset: shard.fileOffset,
+        byteLength: shard.byteLength,
+        inputSize,
+        rowCount: shard.rowCount,
+      });
+      if (response.type !== "preparedWeight") {
+        throw new Error("Unexpected WASM thread blob prepare response");
       }
       return {
         workerIndex,

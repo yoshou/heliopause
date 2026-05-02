@@ -48,6 +48,28 @@ async function handleRequest(request: WasmThreadWorkerRequest): Promise<void> {
       return;
     }
 
+    if (request.type === "prepareWeightFromBlob") {
+      const weightBuffer = await request.fileBlob
+        .slice(request.fileOffset, request.fileOffset + request.byteLength)
+        .arrayBuffer();
+      const handle = await createWasmQuantizedWeightHandle(
+        request.quantizedType,
+        new Uint8Array(weightBuffer),
+        request.inputSize,
+        request.rowCount,
+      );
+      if (!handle) {
+        throw new Error("WASM resident blob weight preparation failed");
+      }
+      handles.set(request.handleId, handle);
+      postMessage({
+        type: "preparedWeight",
+        requestId: request.requestId,
+        residentBytes: handle.byteLength + handle.scaleByteLength,
+      });
+      return;
+    }
+
     if (request.type === "matmul") {
       const handle = requiredHandle(request.handleId);
       const output = await matMulQuantizedWasmResident(

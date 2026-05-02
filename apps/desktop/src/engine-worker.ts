@@ -89,6 +89,9 @@ async function handleLoadModel(
         parallelResidentMatmul: resolvedMemoryProfile.wasmResidentWeightCache,
         parallelMatmulMinRows: 512,
         threadPoolSize: resolvedMemoryProfile.wasmResidentWeightCache ? "auto" : 1,
+        ioPrefetch: resolvedMemoryProfile.wasmResidentWeightCache,
+        ioPrefetchConcurrency: "auto",
+        ioWorkerBlobRead: false,
       },
     }],
   });
