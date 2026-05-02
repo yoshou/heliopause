@@ -93,23 +93,36 @@ async function handleRequest(request: WasmThreadWorkerRequest): Promise<void> {
 
     if (request.type === "matmulBatch") {
       const batchHandles = request.handleIds.map((handleId) => requiredHandle(handleId));
-      const outputs = await matMulQuantizedWasmResidentMulti(
+      let outputs: Array<Float32Array | undefined> | undefined = await matMulQuantizedWasmResidentMulti(
         batchHandles,
         new Float32Array(request.inputBuffer),
         request.inputSize,
         request.columnCount,
       );
-      if (!outputs || outputs.length !== batchHandles.length) {
+      if (!outputs) {
+        const input = new Float32Array(request.inputBuffer);
+        outputs = await Promise.all(batchHandles.map((handle) =>
+          matMulQuantizedWasmResident(
+            handle,
+            input,
+            request.inputSize,
+            handle.rowCount,
+            request.columnCount,
+          ),
+        ));
+      }
+      const completedOutputs = outputs.filter((output): output is Float32Array => Boolean(output));
+      if (completedOutputs.length !== batchHandles.length) {
         throw new Error("WASM resident shard batch matmul failed");
       }
       postMessage({
         type: "matmulBatchResult",
         requestId: request.requestId,
-        outputs: outputs.map((output) => ({
+        outputs: completedOutputs.map((output) => ({
           outputBuffer: output.buffer as ArrayBuffer,
           outputLength: output.length,
         })),
-      }, outputs.map((output) => output.buffer as ArrayBuffer));
+      }, completedOutputs.map((output) => output.buffer as ArrayBuffer));
       return;
     }
 
