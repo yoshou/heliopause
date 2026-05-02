@@ -7,7 +7,7 @@ import {
   type Qwen35ModelSession,
   type TimingSink,
 } from "./runtime";
-import { planQwen35RunnerPlacement } from "./runner/planning";
+import { planQwen35RunnerPlacement } from "./runner/webgpu/planning";
 import {
   qwen35CpuOutput,
   qwen35CpuSegmentRunner,
@@ -227,7 +227,6 @@ async function webGpuSegmentRunnerForForward(
       session.manifest,
       {
         mode: "enabled",
-        browserGate: "passed",
         contextLength: state.contextLength,
         memoryLimitBytes: providerOptions.memoryLimitBytes,
       },

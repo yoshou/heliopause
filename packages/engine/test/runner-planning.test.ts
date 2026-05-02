@@ -17,7 +17,6 @@ test("runner placement planning handles off, blocked, and planned WebGPU placeme
 
   const blocked = planQwen35RunnerPlacement(gguf, manifest, {
     mode: "enabled",
-    browserGate: "passed",
     memoryLimitBytes: 1,
   });
   assert.equal(blocked.status, "blocked");
@@ -25,7 +24,6 @@ test("runner placement planning handles off, blocked, and planned WebGPU placeme
 
   const planned = planQwen35RunnerPlacement(gguf, manifest, {
     mode: "enabled",
-    browserGate: "passed",
     memoryLimitBytes: 2 * 1024 * 1024 * 1024,
   });
   assert.equal(planned.status, "planned");
@@ -38,7 +36,6 @@ test("runner placement copy audit reports unexpected copies", () => {
   const manifest = buildQwen35Manifest(gguf);
   const plan = planQwen35RunnerPlacement(gguf, manifest, {
     mode: "enabled",
-    browserGate: "passed",
     memoryLimitBytes: 2 * 1024 * 1024 * 1024,
   });
 

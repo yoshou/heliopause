@@ -1,5 +1,5 @@
 export { checkWebGpuSupport, runWebGpuSmokeTest } from "./gpu-device";
-export { qwen35WebGpuPlanningProvider } from "./planning";
+export { planQwen35RunnerPlacement, qwen35WebGpuPlanningProvider } from "./planning";
 export { Qwen35WebGpuSegmentRunner } from "./segment-runner";
 export type {
   WebGpuSmokeTest,

@@ -1,7 +1,6 @@
 import type { GgufMetadata, GgufTensorInfo } from "../gguf";
 import type { Qwen35LayerKind, Qwen35ModelManifest } from "../model";
 import { tensorByteLength } from "../tensor-reader";
-import { qwen35WebGpuPlanningProvider } from "./webgpu/planning";
 
 export type Qwen35RunnerExecutionMode = "off" | "verify" | "enabled";
 
@@ -10,8 +9,6 @@ export type Qwen35RunnerPlanStatus =
   | "unavailable"
   | "blocked"
   | "planned";
-
-export type Qwen35RunnerBrowserGate = "required" | "passed";
 
 export type Qwen35RunnerProviderSupport =
   | {
@@ -36,7 +33,6 @@ export type Qwen35RunnerPlacementPlan = {
   status: Qwen35RunnerPlanStatus;
   mode: Qwen35RunnerExecutionMode;
   memoryLimitBytes: number;
-  browserGate: Qwen35RunnerBrowserGate;
   enabled: false;
   reason?: string;
   outputBytes: number;
@@ -79,13 +75,8 @@ export type Qwen35RunnerPlanningOptions = {
   mode?: Qwen35RunnerExecutionMode;
   memoryLimitBytes?: number;
   contextLength?: number;
-  browserGate?: Qwen35RunnerBrowserGate;
   support?: Qwen35RunnerProviderSupport;
 };
-
-export type Qwen35WebGpuMode = Qwen35RunnerExecutionMode;
-export type Qwen35WebGpuPlanStatus = Qwen35RunnerPlanStatus;
-export type Qwen35WebGpuBrowserGate = Qwen35RunnerBrowserGate;
 
 export type Qwen35RunnerPlanningProvider = {
   name: string;
@@ -96,7 +87,7 @@ export type Qwen35RunnerPlanningProvider = {
   offReason: string;
   blockedByMemoryReason: string;
   unavailableReason: (support: Qwen35RunnerProviderSupport) => string;
-  plannedReason: (browserGate: Qwen35RunnerBrowserGate) => string;
+  plannedReason: string;
   layerPlacement: (params: {
     tensorsByName: ReadonlyMap<string, GgufTensorInfo>;
     manifest: Qwen35ModelManifest;
@@ -106,19 +97,6 @@ export type Qwen35RunnerPlanningProvider = {
   copyAuditExpectations: (selectedLayerCount: number) => Qwen35RunnerPlacementPlan["copyAuditExpectations"];
 };
 
-export function planQwen35RunnerPlacement(
-  gguf: GgufMetadata,
-  manifest: Qwen35ModelManifest,
-  options: Qwen35RunnerPlanningOptions = {},
-): Qwen35RunnerPlacementPlan {
-  return planQwen35ProviderPlacement(
-    qwen35WebGpuPlanningProvider,
-    gguf,
-    manifest,
-    options,
-  );
-}
-
 export function planQwen35ProviderPlacement(
   provider: Qwen35RunnerPlanningProvider,
   gguf: GgufMetadata,
@@ -127,7 +105,6 @@ export function planQwen35ProviderPlacement(
 ): Qwen35RunnerPlacementPlan {
   const mode = options.mode ?? "off";
   const memoryLimitBytes = options.memoryLimitBytes ?? provider.defaultMemoryLimitBytes;
-  const browserGate = options.browserGate ?? "required";
   const contextLength = Math.min(
     options.contextLength ?? manifest.contextLength,
     manifest.contextLength,
@@ -145,7 +122,6 @@ export function planQwen35ProviderPlacement(
       status: "off",
       mode,
       memoryLimitBytes,
-      browserGate,
       reason: provider.offReason,
       outputBytes,
       blockCount: manifest.blockCount,
@@ -157,7 +133,6 @@ export function planQwen35ProviderPlacement(
       status: "unavailable",
       mode,
       memoryLimitBytes,
-      browserGate,
       reason: provider.unavailableReason(support),
       outputBytes,
       blockCount: manifest.blockCount,
@@ -172,7 +147,6 @@ export function planQwen35ProviderPlacement(
       status: "blocked",
       mode,
       memoryLimitBytes,
-      browserGate,
       reason: provider.blockedByMemoryReason,
       outputBytes,
       blockCount: manifest.blockCount,
@@ -195,15 +169,13 @@ export function planQwen35ProviderPlacement(
   const gpuWeightBytes = outputBytes +
     selectedLayers.reduce((sum, layer) => sum + layer.weightBytes, 0);
   const gpuCacheBytes = selectedLayers.reduce((sum, layer) => sum + layer.cacheBytes, 0);
-  const status: Qwen35WebGpuPlanStatus = browserGate === "passed" ? "planned" : "blocked";
 
   return {
-    status,
+    status: "planned",
     mode,
     memoryLimitBytes,
-    browserGate,
     enabled: false,
-    reason: provider.plannedReason(browserGate),
+    reason: provider.plannedReason,
     outputBytes,
     fixedBytes: provider.fixedBytes,
     scratchBytes: provider.scratchBytes,
@@ -285,10 +257,9 @@ function tensorBytes(tensorsByName: ReadonlyMap<string, GgufTensorInfo>, name: s
 function emptyPlan(
   provider: Qwen35RunnerPlanningProvider,
   params: {
-    status: Qwen35WebGpuPlanStatus;
+    status: Qwen35RunnerPlanStatus;
     mode: Qwen35RunnerExecutionMode;
     memoryLimitBytes: number;
-    browserGate: Qwen35RunnerBrowserGate;
     reason: string;
     outputBytes: number;
     blockCount: number;
@@ -299,7 +270,6 @@ function emptyPlan(
     status: params.status,
     mode: params.mode,
     memoryLimitBytes: params.memoryLimitBytes,
-    browserGate: params.browserGate,
     enabled: false,
     reason: params.reason,
     outputBytes: params.outputBytes,

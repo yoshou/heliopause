@@ -1,6 +1,11 @@
-import type { GgufTensorInfo } from "../../gguf";
+import type { GgufMetadata, GgufTensorInfo } from "../../gguf";
 import type { Qwen35LayerKind, Qwen35ModelManifest } from "../../model";
 import { tensorByteLength } from "../../tensor-reader";
+import {
+  planQwen35ProviderPlacement,
+  type Qwen35RunnerPlacementPlan,
+  type Qwen35RunnerPlanningOptions,
+} from "../planning";
 import {
   DEFAULT_GPU_FIXED_BYTES,
   DEFAULT_GPU_SCRATCH_BYTES,
@@ -10,8 +15,6 @@ import {
 type WebGpuPlanningSupport =
   | { available: true }
   | { available: false; reason: string };
-
-type WebGpuPlanningBrowserGate = "required" | "passed";
 
 type WebGpuLayerPlacementParams = {
   tensorsByName: ReadonlyMap<string, GgufTensorInfo>;
@@ -37,9 +40,7 @@ export const qwen35WebGpuPlanningProvider = {
   offReason: "WebGPU execution is off; this is a placement plan only.",
   blockedByMemoryReason: "`output.weight` plus fixed GPU buffers exceed the configured WebGPU memory cap.",
   unavailableReason: (support: WebGpuPlanningSupport) => `WebGPU unavailable: ${support.available ? "unknown" : support.reason}`,
-  plannedReason: (browserGate: WebGpuPlanningBrowserGate) => browserGate === "passed"
-    ? "WebGPU segment placement is planned, but execution still requires verified kernels."
-    : "Browser user check is required before WebGPU execution can be enabled.",
+  plannedReason: "WebGPU segment placement is planned, but execution still requires verified kernels.",
   layerPlacement: ({ tensorsByName, manifest, layer, contextLength }: WebGpuLayerPlacementParams) => {
     const layerKind: Qwen35LayerKind = manifest.fullAttentionLayers.includes(layer)
       ? "full-attention"
@@ -69,6 +70,19 @@ export const qwen35WebGpuPlanningProvider = {
     expectedTokenReadbacks: 1,
   }),
 };
+
+export function planQwen35RunnerPlacement(
+  gguf: GgufMetadata,
+  manifest: Qwen35ModelManifest,
+  options: Qwen35RunnerPlanningOptions = {},
+): Qwen35RunnerPlacementPlan {
+  return planQwen35ProviderPlacement(
+    qwen35WebGpuPlanningProvider,
+    gguf,
+    manifest,
+    options,
+  );
+}
 
 function tensorBytes(tensorsByName: ReadonlyMap<string, GgufTensorInfo>, name: string): number {
   const tensor = tensorsByName.get(name);

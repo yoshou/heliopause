@@ -1,5 +1,6 @@
 export {
   checkWebGpuSupport,
+  planQwen35RunnerPlacement,
   qwen35WebGpuPlanningProvider,
   Qwen35WebGpuSegmentRunner,
   type WebGpuSupport,
@@ -139,7 +140,6 @@ export {
 export {
   auditQwen35RunnerPlacementCopies,
   planQwen35ProviderPlacement,
-  planQwen35RunnerPlacement,
   type Qwen35RunnerCopyAuditObservation,
   type Qwen35RunnerCopyAuditResult,
   type Qwen35RunnerLayerPlacement,
