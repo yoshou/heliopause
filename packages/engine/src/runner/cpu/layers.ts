@@ -114,17 +114,11 @@ export async function forwardQwen35RecurrentLayer(
     () => matMulQwen35Weight(session, recurrentProjectionNames[0], attnNorm, trace),
     { layer, layerKind: "recurrent", weightName: recurrentProjectionNames[0] },
   );
-  const alpha = await timedAsync(
+  const [alpha, beta] = await timedAsync(
     trace,
-    "recurrent projection alpha",
-    () => matMulQwen35Weight(session, recurrentProjectionNames[1], attnNorm, trace),
-    { layer, layerKind: "recurrent", weightName: recurrentProjectionNames[1] },
-  );
-  const beta = await timedAsync(
-    trace,
-    "recurrent projection beta",
-    () => matMulQwen35Weight(session, recurrentProjectionNames[2], attnNorm, trace),
-    { layer, layerKind: "recurrent", weightName: recurrentProjectionNames[2] },
+    "recurrent projection alpha/beta",
+    () => matMulF32WeightPair(session, recurrentProjectionNames[1], recurrentProjectionNames[2], attnNorm),
+    { layer, layerKind: "recurrent" },
   );
   const z = recurrentProjectionBatch?.[1] ?? await timedAsync(
     trace,
@@ -696,6 +690,59 @@ async function matMulF32Rows(
     }
   }
   return output;
+}
+
+async function matMulF32WeightPair(
+  session: Qwen35ModelSession,
+  leftWeightName: string,
+  rightWeightName: string,
+  inputColumns: Float32Array,
+): Promise<[Float32Array, Float32Array]> {
+  const leftTensor = session.getTensor(leftWeightName);
+  const rightTensor = session.getTensor(rightWeightName);
+  if (leftTensor.type !== "F32" || rightTensor.type !== "F32") {
+    throw new Error(`${leftWeightName} and ${rightWeightName} must both be F32`);
+  }
+  const inputSize = leftTensor.dimensions[0] ?? 0;
+  const rowCount = leftTensor.dimensions[1] ?? 0;
+  if (
+    inputSize <= 0 ||
+    rowCount <= 0 ||
+    rightTensor.dimensions[0] !== inputSize ||
+    rightTensor.dimensions[1] !== rowCount ||
+    inputColumns.length % inputSize !== 0
+  ) {
+    throw new Error(`${leftWeightName} and ${rightWeightName} shape mismatch`);
+  }
+  const columnCount = inputColumns.length / inputSize;
+  const [leftWeight, rightWeight] = await Promise.all([
+    readF32ModelTensor(session, leftWeightName),
+    readF32ModelTensor(session, rightWeightName),
+  ]);
+  const expectedLength = inputSize * rowCount;
+  if (leftWeight.length !== expectedLength || rightWeight.length !== expectedLength) {
+    throw new Error(`${leftWeightName} and ${rightWeightName} tensor length mismatch`);
+  }
+
+  const leftOutput = new Float32Array(rowCount * columnCount);
+  const rightOutput = new Float32Array(rowCount * columnCount);
+  for (let column = 0; column < columnCount; column += 1) {
+    const inputOffset = column * inputSize;
+    const outputOffset = column * rowCount;
+    for (let row = 0; row < rowCount; row += 1) {
+      const weightOffset = row * inputSize;
+      let leftSum = 0;
+      let rightSum = 0;
+      for (let index = 0; index < inputSize; index += 1) {
+        const input = inputColumns[inputOffset + index] ?? 0;
+        leftSum = Math.fround(leftSum + Math.fround((leftWeight[weightOffset + index] ?? 0) * input));
+        rightSum = Math.fround(rightSum + Math.fround((rightWeight[weightOffset + index] ?? 0) * input));
+      }
+      leftOutput[outputOffset + row] = leftSum;
+      rightOutput[outputOffset + row] = rightSum;
+    }
+  }
+  return [leftOutput, rightOutput];
 }
 
 async function matMulKQ8K(
