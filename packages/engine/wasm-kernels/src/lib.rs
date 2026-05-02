@@ -599,7 +599,7 @@ fn dot_f32(left: &[f32], right: &[f32]) -> f32 {
 struct QuantizedQ8K {
     d: Vec<f32>,
     qs: Vec<i8>,
-    bsums: Vec<i16>,
+    bsums32: Vec<i16>,
 }
 
 struct QuantizedQ8_0 {
@@ -631,7 +631,7 @@ fn quantize_q8_k(input: &[f32]) -> QuantizedQ8K {
     let block_count = input.len() / QK_K;
     let mut d = vec![0.0_f32; block_count];
     let mut qs = vec![0_i8; input.len()];
-    let mut bsums = vec![0_i16; block_count * (QK_K / 16)];
+    let mut bsums32 = vec![0_i16; block_count * (QK_K / 32)];
 
     for block in 0..block_count {
         let base = block * QK_K;
@@ -653,17 +653,17 @@ fn quantize_q8_k(input: &[f32]) -> QuantizedQ8K {
         for index in 0..QK_K {
             qs[base + index] = (inverse_scale * input[base + index]).round().min(127.0) as i8;
         }
-        for group in 0..QK_K / 16 {
+        for group in 0..QK_K / 32 {
             let mut sum = 0_i16;
-            for index in 0..16 {
-                sum += qs[base + group * 16 + index] as i16;
+            for index in 0..32 {
+                sum += qs[base + group * 32 + index] as i16;
             }
-            bsums[block * (QK_K / 16) + group] = sum;
+            bsums32[block * (QK_K / 32) + group] = sum;
         }
         d[block] = 1.0 / inverse_scale;
     }
 
-    QuantizedQ8K { d, qs, bsums }
+    QuantizedQ8K { d, qs, bsums32 }
 }
 
 fn quantize_q8_0(input: &[f32]) -> QuantizedQ8_0 {
@@ -838,9 +838,9 @@ fn vec_dot_q5_k_q8_k(q5_bytes: &[u8], q8: &QuantizedQ8K) -> f32 {
         }
 
         let mut sumi = 0_i32;
-        let q8_block_offset = block * (QK_K / 16);
-        for group in 0..QK_K / 16 {
-            sumi += q8.bsums[q8_block_offset + group] as i32 * mins[group / 2] as i32;
+        let q8_block_offset = block * (QK_K / 32);
+        for group in 0..QK_K / 32 {
+            sumi += q8.bsums32[q8_block_offset + group] as i32 * mins[group] as i32;
         }
 
         let mut aux32 = [0_i32; 8];
@@ -900,9 +900,9 @@ fn vec_dot_q5_k_q8_k_prepared(q5_bytes: &[u8], q8: &QuantizedQ8K, scales_f32: &[
         }
 
         let mut sumi = 0_i32;
-        let q8_block_offset = block * (QK_K / 16);
-        for group in 0..QK_K / 16 {
-            sumi += q8.bsums[q8_block_offset + group] as i32 * mins[group / 2] as i32;
+        let q8_block_offset = block * (QK_K / 32);
+        for group in 0..QK_K / 32 {
+            sumi += q8.bsums32[q8_block_offset + group] as i32 * mins[group] as i32;
         }
 
         let mut aux32 = [0_i32; 8];
@@ -957,9 +957,9 @@ fn vec_dot_q4_k_q8_k(q4_bytes: &[u8], q8: &QuantizedQ8K) -> f32 {
         }
 
         let mut sumi = 0_i32;
-        let q8_block_offset = block * (QK_K / 16);
-        for group in 0..QK_K / 16 {
-            sumi += q8.bsums[q8_block_offset + group] as i32 * mins[group / 2] as i32;
+        let q8_block_offset = block * (QK_K / 32);
+        for group in 0..QK_K / 32 {
+            sumi += q8.bsums32[q8_block_offset + group] as i32 * mins[group] as i32;
         }
 
         let mut aux32 = [0_i32; 8];
@@ -1015,9 +1015,9 @@ fn vec_dot_q4_k_q8_k_prepared(q4_bytes: &[u8], q8: &QuantizedQ8K, scales_f32: &[
         }
 
         let mut sumi = 0_i32;
-        let q8_block_offset = block * (QK_K / 16);
-        for group in 0..QK_K / 16 {
-            sumi += q8.bsums[q8_block_offset + group] as i32 * mins[group / 2] as i32;
+        let q8_block_offset = block * (QK_K / 32);
+        for group in 0..QK_K / 32 {
+            sumi += q8.bsums32[q8_block_offset + group] as i32 * mins[group] as i32;
         }
 
         let mut aux32 = [0_i32; 8];
