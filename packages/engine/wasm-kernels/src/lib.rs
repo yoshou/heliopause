@@ -812,43 +812,26 @@ fn vec_dot_q5_k_q8_k(q5_bytes: &[u8], q8: &QuantizedQ8K) -> f32 {
         let scales_min_bytes = &q5_bytes[offset + 4..offset + 16];
         let qh = &q5_bytes[offset + 16..offset + 48];
         let qs = &q5_bytes[offset + 48..offset + 176];
-        let mut scales = [0_u8; 8];
-        let mut mins = [0_u8; 8];
-        for index in 0..8 {
-            let (scale, min) = get_scale_min_k4(index, scales_min_bytes);
-            scales[index] = scale;
-            mins[index] = min;
-        }
-
-        let mut q_offset = 0;
-        let mut out = 0;
-        let mut high_mask = 1_u8;
-        for _group in 0..QK_K / 64 {
-            for lane in 0..32 {
-                aux8[out + lane] = ((qs[q_offset + lane] & 0x0f) + if qh[lane] & high_mask != 0 { 16 } else { 0 }) as i8;
-            }
-            out += 32;
-            high_mask <<= 1;
-            for lane in 0..32 {
-                aux8[out + lane] = ((qs[q_offset + lane] >> 4) + if qh[lane] & high_mask != 0 { 16 } else { 0 }) as i8;
-            }
-            out += 32;
-            high_mask <<= 1;
-            q_offset += 32;
-        }
-
-        let mut sumi = 0_i32;
-        let q8_block_offset = block * (QK_K / 32);
-        for group in 0..QK_K / 32 {
-            sumi += q8.bsums32[q8_block_offset + group] as i32 * mins[group] as i32;
+        for lane in 0..32 {
+            aux8[lane] = ((qs[lane] & 0x0f) | ((qh[lane] & 1) << 4)) as i8;
+            aux8[lane + 32] = ((qs[lane] >> 4) | (((qh[lane] >> 1) & 1) << 4)) as i8;
+            aux8[lane + 64] = ((qs[lane + 32] & 0x0f) | (((qh[lane] >> 2) & 1) << 4)) as i8;
+            aux8[lane + 96] = ((qs[lane + 32] >> 4) | (((qh[lane] >> 3) & 1) << 4)) as i8;
+            aux8[lane + 128] = ((qs[lane + 64] & 0x0f) | (((qh[lane] >> 4) & 1) << 4)) as i8;
+            aux8[lane + 160] = ((qs[lane + 64] >> 4) | (((qh[lane] >> 5) & 1) << 4)) as i8;
+            aux8[lane + 192] = ((qs[lane + 96] & 0x0f) | (((qh[lane] >> 6) & 1) << 4)) as i8;
+            aux8[lane + 224] = ((qs[lane + 96] >> 4) | ((qh[lane] >> 7) << 4)) as i8;
         }
 
         let mut aux32 = [0_i32; 8];
         let mut value_index = 0;
         let q8_base = block * QK_K;
+        let q8_block_offset = block * (QK_K / 32);
+        let mut sumi = 0_i32;
         for group in 0..QK_K / 32 {
-            let scale = scales[group] as i32;
-            accumulate_scaled_i8_i8_32_lanes(&mut aux32, scale, &q8.qs, q8_base + value_index, &aux8, value_index);
+            let (scale, min) = get_scale_min_k4(group, scales_min_bytes);
+            sumi += q8.bsums32[q8_block_offset + group] as i32 * min as i32;
+            accumulate_scaled_i8_i8_32_lanes(&mut aux32, scale as i32, &q8.qs, q8_base + value_index, &aux8, value_index);
             value_index += 32;
         }
 
@@ -874,43 +857,26 @@ fn vec_dot_q5_k_q8_k_prepared(q5_bytes: &[u8], q8: &QuantizedQ8K, scales_f32: &[
         let scales_min_bytes = &q5_bytes[offset + 4..offset + 16];
         let qh = &q5_bytes[offset + 16..offset + 48];
         let qs = &q5_bytes[offset + 48..offset + 176];
-        let mut scales = [0_u8; 8];
-        let mut mins = [0_u8; 8];
-        for index in 0..8 {
-            let (scale, min) = get_scale_min_k4(index, scales_min_bytes);
-            scales[index] = scale;
-            mins[index] = min;
-        }
-
-        let mut q_offset = 0;
-        let mut out = 0;
-        let mut high_mask = 1_u8;
-        for _group in 0..QK_K / 64 {
-            for lane in 0..32 {
-                aux8[out + lane] = ((qs[q_offset + lane] & 0x0f) + if qh[lane] & high_mask != 0 { 16 } else { 0 }) as i8;
-            }
-            out += 32;
-            high_mask <<= 1;
-            for lane in 0..32 {
-                aux8[out + lane] = ((qs[q_offset + lane] >> 4) + if qh[lane] & high_mask != 0 { 16 } else { 0 }) as i8;
-            }
-            out += 32;
-            high_mask <<= 1;
-            q_offset += 32;
-        }
-
-        let mut sumi = 0_i32;
-        let q8_block_offset = block * (QK_K / 32);
-        for group in 0..QK_K / 32 {
-            sumi += q8.bsums32[q8_block_offset + group] as i32 * mins[group] as i32;
+        for lane in 0..32 {
+            aux8[lane] = ((qs[lane] & 0x0f) | ((qh[lane] & 1) << 4)) as i8;
+            aux8[lane + 32] = ((qs[lane] >> 4) | (((qh[lane] >> 1) & 1) << 4)) as i8;
+            aux8[lane + 64] = ((qs[lane + 32] & 0x0f) | (((qh[lane] >> 2) & 1) << 4)) as i8;
+            aux8[lane + 96] = ((qs[lane + 32] >> 4) | (((qh[lane] >> 3) & 1) << 4)) as i8;
+            aux8[lane + 128] = ((qs[lane + 64] & 0x0f) | (((qh[lane] >> 4) & 1) << 4)) as i8;
+            aux8[lane + 160] = ((qs[lane + 64] >> 4) | (((qh[lane] >> 5) & 1) << 4)) as i8;
+            aux8[lane + 192] = ((qs[lane + 96] & 0x0f) | (((qh[lane] >> 6) & 1) << 4)) as i8;
+            aux8[lane + 224] = ((qs[lane + 96] >> 4) | ((qh[lane] >> 7) << 4)) as i8;
         }
 
         let mut aux32 = [0_i32; 8];
         let mut value_index = 0;
         let q8_base = block * QK_K;
+        let q8_block_offset = block * (QK_K / 32);
+        let mut sumi = 0_i32;
         for group in 0..QK_K / 32 {
-            let scale = scales[group] as i32;
-            accumulate_scaled_i8_i8_32_lanes(&mut aux32, scale, &q8.qs, q8_base + value_index, &aux8, value_index);
+            let (scale, min) = get_scale_min_k4(group, scales_min_bytes);
+            sumi += q8.bsums32[q8_block_offset + group] as i32 * min as i32;
+            accumulate_scaled_i8_i8_32_lanes(&mut aux32, scale as i32, &q8.qs, q8_base + value_index, &aux8, value_index);
             value_index += 32;
         }
 
@@ -1115,6 +1081,7 @@ fn vec_dot_iq4_xs_q8_k_prepared(iq4_bytes: &[u8], q8: &QuantizedQ8K, scales_f32:
     accum.iter().sum()
 }
 
+#[inline(always)]
 fn get_scale_min_k4(index: usize, q: &[u8]) -> (u8, u8) {
     if index < 4 {
         (q[index] & 63, q[index + 4] & 63)
