@@ -366,6 +366,132 @@ pub unsafe extern "C" fn hp_matmul_quantized_prepared_f32(
 
 #[no_mangle]
 #[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn hp_matmul_quantized_prepared_multi_f32(
+    count: usize,
+    input_ptr: *const f32,
+    input_len: usize,
+    input_size: usize,
+    column_count: usize,
+    type_id_0: i32,
+    weight_ptr_0: *const u8,
+    weight_len_0: usize,
+    scale_ptr_0: *const f32,
+    scale_len_0: usize,
+    row_count_0: usize,
+    output_ptr_0: *mut f32,
+    output_len_0: usize,
+    type_id_1: i32,
+    weight_ptr_1: *const u8,
+    weight_len_1: usize,
+    scale_ptr_1: *const f32,
+    scale_len_1: usize,
+    row_count_1: usize,
+    output_ptr_1: *mut f32,
+    output_len_1: usize,
+    type_id_2: i32,
+    weight_ptr_2: *const u8,
+    weight_len_2: usize,
+    scale_ptr_2: *const f32,
+    scale_len_2: usize,
+    row_count_2: usize,
+    output_ptr_2: *mut f32,
+    output_len_2: usize,
+    type_id_3: i32,
+    weight_ptr_3: *const u8,
+    weight_len_3: usize,
+    scale_ptr_3: *const f32,
+    scale_len_3: usize,
+    row_count_3: usize,
+    output_ptr_3: *mut f32,
+    output_len_3: usize,
+) -> i32 {
+    if count == 0 || count > 4 || input_len != input_size.saturating_mul(column_count) {
+        return ERR_SHAPE;
+    }
+
+    let specs = [
+        (type_id_0, weight_ptr_0, weight_len_0, scale_ptr_0, scale_len_0, row_count_0, output_ptr_0, output_len_0),
+        (type_id_1, weight_ptr_1, weight_len_1, scale_ptr_1, scale_len_1, row_count_1, output_ptr_1, output_len_1),
+        (type_id_2, weight_ptr_2, weight_len_2, scale_ptr_2, scale_len_2, row_count_2, output_ptr_2, output_len_2),
+        (type_id_3, weight_ptr_3, weight_len_3, scale_ptr_3, scale_len_3, row_count_3, output_ptr_3, output_len_3),
+    ];
+
+    for (index, (type_id, _weight_ptr, weight_len, _scale_ptr, scale_len, row_count, _output_ptr, output_len)) in specs.iter().enumerate() {
+        if index >= count {
+            break;
+        }
+        let Some(row_bytes) = quantized_row_bytes(*type_id, input_size) else {
+            return ERR_TYPE;
+        };
+        let Some(scale_values_per_row) = quantized_scale_values_per_row(*type_id, input_size) else {
+            return ERR_TYPE;
+        };
+        if *weight_len != row_bytes.saturating_mul(*row_count)
+            || *scale_len != scale_values_per_row.saturating_mul(*row_count)
+            || *output_len != row_count.saturating_mul(column_count)
+        {
+            return ERR_SHAPE;
+        }
+    }
+
+    let input = slice::from_raw_parts(input_ptr, input_len);
+    for column in 0..column_count {
+        let input_column = &input[column * input_size..(column + 1) * input_size];
+        let mut q8_k: Option<QuantizedQ8K> = None;
+        let mut q8_0: Option<QuantizedQ8_0> = None;
+
+        for (index, (type_id, weight_ptr, weight_len, scale_ptr, scale_len, row_count, output_ptr, output_len)) in specs.iter().enumerate() {
+            if index >= count {
+                break;
+            }
+            let row_bytes = quantized_row_bytes(*type_id, input_size).expect("validated row bytes");
+            let scale_values_per_row = quantized_scale_values_per_row(*type_id, input_size).expect("validated scale values");
+            let weight = slice::from_raw_parts(*weight_ptr, *weight_len);
+            let scales = slice::from_raw_parts(*scale_ptr, *scale_len);
+            let output = slice::from_raw_parts_mut(*output_ptr, *output_len);
+            let output_base = column * *row_count;
+
+            if *type_id == TYPE_Q8_0 {
+                if q8_0.is_none() {
+                    q8_0 = Some(quantize_q8_0(input_column));
+                }
+                let q8 = q8_0.as_ref().expect("q8_0 initialized");
+                for row in 0..*row_count {
+                    let row_offset = row * row_bytes;
+                    let scale_offset = row * scale_values_per_row;
+                    output[output_base + row] = vec_dot_q8_0_q8_0_prepared(
+                        &weight[row_offset..row_offset + row_bytes],
+                        q8,
+                        &scales[scale_offset..scale_offset + scale_values_per_row],
+                    );
+                }
+            } else {
+                if q8_k.is_none() {
+                    q8_k = Some(quantize_q8_k(input_column));
+                }
+                let q8 = q8_k.as_ref().expect("q8_k initialized");
+                for row in 0..*row_count {
+                    let row_offset = row * row_bytes;
+                    let scale_offset = row * scale_values_per_row;
+                    let row_data = &weight[row_offset..row_offset + row_bytes];
+                    let row_scales = &scales[scale_offset..scale_offset + scale_values_per_row];
+                    output[output_base + row] = match *type_id {
+                        TYPE_Q4_K => vec_dot_q4_k_q8_k_prepared(row_data, q8, row_scales),
+                        TYPE_Q5_K => vec_dot_q5_k_q8_k_prepared(row_data, q8, row_scales),
+                        TYPE_Q6_K => vec_dot_q6_k_q8_k_prepared(row_data, q8, row_scales),
+                        TYPE_IQ4_XS => vec_dot_iq4_xs_q8_k_prepared(row_data, q8, row_scales),
+                        _ => return ERR_TYPE,
+                    };
+                }
+            }
+        }
+    }
+
+    OK
+}
+
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn hp_matmul_quantized_multi_f32(
     count: usize,
     input_ptr: *const f32,

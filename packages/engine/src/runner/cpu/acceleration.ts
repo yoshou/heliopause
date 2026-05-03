@@ -5,6 +5,7 @@ import {
 } from "../../tensor-reader";
 import {
   createWasmQuantizedWeightHandle,
+  releaseWasmQuantizedWeightHandle,
   type WasmQuantizedWeightHandle,
 } from "./wasm-kernels";
 import {
@@ -84,6 +85,27 @@ export function cpuExecutionProviderStats(session: Qwen35ModelSession): Executio
     cpuIoInflightHits: ioStats.inflightHits,
     cpuIoReadMs: ioStats.readMs,
   };
+}
+
+export function shutdownQwen35CpuExecutionProvider(session: Qwen35ModelSession): void {
+  const cache = wasmWeightCaches.get(session);
+  if (cache) {
+    for (const handle of cache.handles.values()) {
+      releaseWasmQuantizedWeightHandle(handle);
+    }
+    cache.handles.clear();
+    cache.pending.clear();
+    cache.bytes = 0;
+  }
+
+  wasmShardedWeightCaches.delete(session);
+  wasmIoPrefetchStates.delete(session);
+  const pool = wasmThreadPools.get(session);
+  if (pool) {
+    pool.shutdown();
+    wasmThreadPools.delete(session);
+  }
+  wasmThreadPoolPromises.delete(session);
 }
 
 export function cpuProjectionBatchingEnabled(session: Qwen35ModelSession): boolean {

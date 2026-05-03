@@ -76,6 +76,45 @@ type KernelExports = WebAssembly.Exports & {
     outputPtr: number,
     outputLen: number,
   ): number;
+  hp_matmul_quantized_prepared_multi_f32(
+    count: number,
+    inputPtr: number,
+    inputLen: number,
+    inputSize: number,
+    columnCount: number,
+    typeId0: number,
+    weightPtr0: number,
+    weightLen0: number,
+    scalePtr0: number,
+    scaleLen0: number,
+    rowCount0: number,
+    outputPtr0: number,
+    outputLen0: number,
+    typeId1: number,
+    weightPtr1: number,
+    weightLen1: number,
+    scalePtr1: number,
+    scaleLen1: number,
+    rowCount1: number,
+    outputPtr1: number,
+    outputLen1: number,
+    typeId2: number,
+    weightPtr2: number,
+    weightLen2: number,
+    scalePtr2: number,
+    scaleLen2: number,
+    rowCount2: number,
+    outputPtr2: number,
+    outputLen2: number,
+    typeId3: number,
+    weightPtr3: number,
+    weightLen3: number,
+    scalePtr3: number,
+    scaleLen3: number,
+    rowCount3: number,
+    outputPtr3: number,
+    outputLen3: number,
+  ): number;
   hp_matmul_quantized_multi_f32(
     count: number,
     inputPtr: number,
@@ -549,29 +588,46 @@ export async function matMulQuantizedWasmResidentMulti(
       outputLength: outputLengths[index] ?? 0,
     }));
 
-    timedWasmSection("matMulQuantizedResidentMulti", "kernel call", () => {
-      for (const slot of slots.slice(0, handles.length)) {
-        const handle = slot.handle;
-        if (!handle) {
-          throw new Error("Resident quantized multi matmul missing handle");
-        }
-        const code = instance.exports.hp_matmul_quantized_prepared_f32(
-          slot.typeId,
-          handle.ptr,
-          handle.byteLength,
-          handle.scalePtr,
-          handle.scaleLength,
-          allocated.inputAlloc.ptr,
-          inputColumns.length,
-          inputSize,
-          handle.rowCount,
-          columnCount,
-          slot.outputAlloc.ptr,
-          slot.outputLength,
-        );
-        assertWasmOk(code, "matMulQuantizedResidentMulti");
-      }
-    });
+    const code = timedWasmSection("matMulQuantizedResidentMulti", "kernel call", () => instance.exports.hp_matmul_quantized_prepared_multi_f32(
+      handles.length,
+      allocated.inputAlloc.ptr,
+      inputColumns.length,
+      inputSize,
+      columnCount,
+      slots[0].typeId,
+      slots[0].handle?.ptr ?? 0,
+      slots[0].handle?.byteLength ?? 0,
+      slots[0].handle?.scalePtr ?? 0,
+      slots[0].handle?.scaleLength ?? 0,
+      slots[0].handle?.rowCount ?? 0,
+      slots[0].outputAlloc.ptr,
+      slots[0].outputLength,
+      slots[1].typeId,
+      slots[1].handle?.ptr ?? 0,
+      slots[1].handle?.byteLength ?? 0,
+      slots[1].handle?.scalePtr ?? 0,
+      slots[1].handle?.scaleLength ?? 0,
+      slots[1].handle?.rowCount ?? 0,
+      slots[1].outputAlloc.ptr,
+      slots[1].outputLength,
+      slots[2].typeId,
+      slots[2].handle?.ptr ?? 0,
+      slots[2].handle?.byteLength ?? 0,
+      slots[2].handle?.scalePtr ?? 0,
+      slots[2].handle?.scaleLength ?? 0,
+      slots[2].handle?.rowCount ?? 0,
+      slots[2].outputAlloc.ptr,
+      slots[2].outputLength,
+      slots[3].typeId,
+      slots[3].handle?.ptr ?? 0,
+      slots[3].handle?.byteLength ?? 0,
+      slots[3].handle?.scalePtr ?? 0,
+      slots[3].handle?.scaleLength ?? 0,
+      slots[3].handle?.rowCount ?? 0,
+      slots[3].outputAlloc.ptr,
+      slots[3].outputLength,
+    ));
+    assertWasmOk(code, "MatMulQuantizedResidentMulti");
 
     return timedWasmSection("matMulQuantizedResidentMulti", "output copy + free", () => {
       const outputs = slots.slice(0, handles.length).map((slot) =>
