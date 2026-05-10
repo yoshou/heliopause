@@ -50,6 +50,9 @@ export function gemma4WebGpuSegmentRunner(
       segmentStartLayer,
     });
     segmentRunners.set(session, runner);
+    void runner.then((resolved) => {
+      session.setExecutionProviderStatsProvider(() => resolved.runtimeStats(), "webgpu");
+    });
   }
   return runner;
 }

@@ -4,6 +4,7 @@ import {
   createDeltaGateResources,
   createElementwiseMulResources,
   createF16CastResources,
+  createF32GatherRowsScaleResources,
   createF32MatMulResources,
   createFullAttentionApplyResources,
   createFullAttentionScoreResources,
@@ -14,11 +15,15 @@ import {
   createKMatMulBindResources,
   createQkvConvResources,
   createQ8_0MatMulBindResources,
+  createQuantizedGatherRowsScaleResources,
   createQ8_0QuantizeResources,
   createQ8KQuantizeResources,
+  createPreparePerLayerInputsResources,
   createResidualAddResources,
   createRmsNormResources,
   createScaleResources,
+  createSelectTop1CandidateResources,
+  createSigmoidMulResources,
   createSsmNormGateResources,
   createSwiGluResources,
   createTokenSliceResources,
@@ -222,6 +227,21 @@ export function dispatchTopK(
   }
 }
 
+export function dispatchSelectTop1Candidate(
+  device: WebGpuDeviceLike,
+  pass: WebGpuComputePassLike,
+  resources: Array<{ destroy: () => void }>,
+  candidates: WebGpuBufferLike,
+  selectedToken: WebGpuBufferLike,
+  candidateCount: number,
+): void {
+  const resource = createSelectTop1CandidateResources(device, candidates, selectedToken, candidateCount);
+  resources.push(resource);
+  pass.setPipeline(resource.pipeline);
+  pass.setBindGroup(0, resource.bindGroup);
+  pass.dispatchWorkgroups(1);
+}
+
 export function dispatchTokenSlice(
   device: WebGpuDeviceLike,
   pass: WebGpuComputePassLike,
@@ -238,6 +258,102 @@ export function dispatchTokenSlice(
   pass.setPipeline(resource.pipeline);
   pass.setBindGroup(0, resource.bindGroup);
   pass.dispatchWorkgroups(Math.ceil(options.rowSize / 256));
+}
+
+export function dispatchF32GatherRowsScale(
+  device: WebGpuDeviceLike,
+  pass: WebGpuComputePassLike,
+  resources: Array<{ destroy: () => void }>,
+  rows: WebGpuBufferLike,
+  tokenIds: WebGpuBufferLike,
+  output: WebGpuBufferLike,
+  options: {
+    rowSize: number;
+    tokenCount: number;
+    scale: number;
+  },
+): void {
+  const resource = createF32GatherRowsScaleResources(device, rows, tokenIds, output, options);
+  resources.push(resource);
+  pass.setPipeline(resource.pipeline);
+  pass.setBindGroup(0, resource.bindGroup);
+  pass.dispatchWorkgroups(Math.ceil(options.rowSize / 256), options.tokenCount);
+}
+
+export function dispatchQ8_0GatherRowsScale(
+  device: WebGpuDeviceLike,
+  pass: WebGpuComputePassLike,
+  resources: Array<{ destroy: () => void }>,
+  weight: WebGpuBufferLike,
+  tokenIds: WebGpuBufferLike,
+  output: WebGpuBufferLike,
+  options: {
+    rowSize: number;
+    tokenCount: number;
+    blockCount: number;
+    rowByteLength: number;
+    scale: number;
+  },
+): void {
+  const resource = createQuantizedGatherRowsScaleResources(device, "Q8_0", weight, tokenIds, output, options);
+  resources.push(resource);
+  pass.setPipeline(resource.pipeline);
+  pass.setBindGroup(0, resource.bindGroup);
+  pass.dispatchWorkgroups(Math.ceil(options.rowSize / 256), options.tokenCount);
+}
+
+export function dispatchQuantizedGatherRowsScale(
+  pass: WebGpuComputePassLike,
+  resources: Array<{ destroy: () => void }>,
+  handle: QuantizedHandle,
+  tokenIds: WebGpuBufferLike,
+  output: WebGpuBufferLike,
+  options: {
+    rowSize: number;
+    tokenCount: number;
+    scale: number;
+  },
+): void {
+  const resource = createQuantizedGatherRowsScaleResources(
+    handle.device,
+    handle.type,
+    handle.weightBuffer,
+    tokenIds,
+    output,
+    {
+      ...options,
+      blockCount: handle.blockCount,
+      rowByteLength: handle.rowByteLength,
+    },
+  );
+  resources.push(resource);
+  pass.setPipeline(resource.pipeline);
+  pass.setBindGroup(0, resource.bindGroup);
+  pass.dispatchWorkgroups(Math.ceil(options.rowSize / 256), options.tokenCount);
+}
+
+export function dispatchPreparePerLayerInputs(
+  device: WebGpuDeviceLike,
+  pass: WebGpuComputePassLike,
+  resources: Array<{ destroy: () => void }>,
+  tokenRows: WebGpuBufferLike,
+  projected: WebGpuBufferLike,
+  normWeight: WebGpuBufferLike,
+  output: WebGpuBufferLike,
+  options: {
+    perLayerLength: number;
+    totalPerLayerLength: number;
+    tokenCount: number;
+    blockCount: number;
+    projectionScale: number;
+    epsilon: number;
+  },
+): void {
+  const resource = createPreparePerLayerInputsResources(device, tokenRows, projected, normWeight, output, options);
+  resources.push(resource);
+  pass.setPipeline(resource.pipeline);
+  pass.setBindGroup(0, resource.bindGroup);
+  pass.dispatchWorkgroups(Math.ceil(options.perLayerLength / 256), options.tokenCount, options.blockCount);
 }
 
 export function dispatchSwiGlu(
@@ -297,6 +413,22 @@ export function dispatchElementwiseMul(
   length: number,
 ): void {
   const resource = createElementwiseMulResources(device, left, right, output, length);
+  resources.push(resource);
+  pass.setPipeline(resource.pipeline);
+  pass.setBindGroup(0, resource.bindGroup);
+  pass.dispatchWorkgroups(Math.ceil(length / 256));
+}
+
+export function dispatchSigmoidMul(
+  device: WebGpuDeviceLike,
+  pass: WebGpuComputePassLike,
+  resources: Array<{ destroy: () => void }>,
+  left: WebGpuBufferLike,
+  gate: WebGpuBufferLike,
+  output: WebGpuBufferLike,
+  length: number,
+): void {
+  const resource = createSigmoidMulResources(device, left, gate, output, length);
   resources.push(resource);
   pass.setPipeline(resource.pipeline);
   pass.setBindGroup(0, resource.bindGroup);

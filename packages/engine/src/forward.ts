@@ -33,6 +33,7 @@ export type PrefillResult = {
   hidden: Float32Array;
   state: Gemma4InferenceState;
   logits?: Float32Array;
+  selectedTokenId?: number;
   topTokens?: Array<{ id: number; value: number }>;
 };
 
@@ -47,7 +48,8 @@ export type DecodeResult = {
   hidden: Float32Array;
   state: Gemma4InferenceState;
   logits?: Float32Array;
-  topTokens: Array<{ id: number; value: number }>;
+  selectedTokenId?: number;
+  topTokens?: Array<{ id: number; value: number }>;
 };
 
 export type { OutputResult } from "./runtime";
@@ -90,6 +92,7 @@ export async function prefillGemma4(
       trace,
     });
     result.logits = output.logits;
+    result.selectedTokenId = output.topTokens[0]?.id;
     result.topTokens = output.topTokens;
   }
   return result;
@@ -129,6 +132,7 @@ export async function decodeGemma4(
     hidden,
     state,
     logits: output.logits,
+    selectedTokenId: output.topTokens[0]?.id,
     topTokens: output.topTokens,
   };
 }
@@ -144,6 +148,24 @@ async function prefillGemma4HybridWebGpu(
   const runner = await webGpuSegmentRunnerForForward(session, state);
   if (tokenIds.length === 0) {
     return { hidden: new Float32Array(), state };
+  }
+
+  if (runner.supportsGpuInputPreparation()) {
+    const gpu = await timedAsync(
+      trace,
+      "WebGPU token-id input segment",
+      () => runner.runTokenIds(tokenIds, positions, state, {
+        computeSelectedToken: options.computeLogits === true,
+        topK: options.logitsTopK ?? 10,
+      }),
+    );
+    updateNextPosition(state, positions, tokenIds.length);
+    return {
+      hidden: new Float32Array(),
+      state,
+      selectedTokenId: options.computeLogits ? gpu.selectedTokenId : undefined,
+      topTokens: options.computeLogits ? [] : undefined,
+    };
   }
 
   const prepared = await prepareGemma4Input(session, tokenIds, trace);
@@ -162,7 +184,7 @@ async function prefillGemma4HybridWebGpu(
     trace,
     "WebGPU segment",
     () => runner.runTokens(segmentInputHidden, positions, state, {
-      computeTopK: options.computeLogits === true,
+      computeSelectedToken: options.computeLogits === true,
       topK: options.logitsTopK ?? 10,
       perLayerInputs: prepared.perLayerInputs,
     }),
@@ -174,7 +196,8 @@ async function prefillGemma4HybridWebGpu(
     state,
   };
   if (options.computeLogits) {
-    result.topTokens = gpu.topTokens ?? [];
+    result.selectedTokenId = gpu.selectedTokenId;
+    result.topTokens = [];
   }
   return result;
 }
@@ -189,6 +212,24 @@ async function decodeGemma4HybridWebGpu(
   const positions = new Int32Array([position]);
   const trace = createForwardTrace("decode", options.onTiming);
   const runner = await webGpuSegmentRunnerForForward(session, state);
+
+  if (runner.supportsGpuInputPreparation()) {
+    const gpu = await timedAsync(
+      trace,
+      "WebGPU token-id input segment",
+      () => runner.runTokenIds([tokenId], positions, state, {
+        computeSelectedToken: true,
+        topK: options.logitsTopK ?? 10,
+      }),
+    );
+    state.nextPosition = Math.max(state.nextPosition, position + 1);
+    return {
+      hidden: new Float32Array(),
+      state,
+      selectedTokenId: gpu.selectedTokenId,
+      topTokens: [],
+    };
+  }
 
   const prepared = await prepareGemma4Input(session, [tokenId], trace);
   const cpuPrefix = gemma4CpuSegmentRunner({
@@ -206,7 +247,7 @@ async function decodeGemma4HybridWebGpu(
     trace,
     "WebGPU segment",
     () => runner.runToken(segmentInputHidden, positions, state, {
-      computeTopK: true,
+      computeSelectedToken: true,
       topK: options.logitsTopK ?? 10,
       perLayerInputs: prepared.perLayerInputs,
     }),
@@ -215,7 +256,8 @@ async function decodeGemma4HybridWebGpu(
   return {
     hidden: new Float32Array(),
     state,
-    topTokens: gpu.topTokens ?? [],
+    selectedTokenId: gpu.selectedTokenId,
+    topTokens: [],
   };
 }
 

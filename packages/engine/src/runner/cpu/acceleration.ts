@@ -55,7 +55,7 @@ type WasmPrefetchWeight = {
 };
 
 export function registerGemma4CpuExecutionProvider(session: Gemma4ModelSession): void {
-  session.setExecutionProviderStatsProvider(() => cpuExecutionProviderStats(session));
+  session.setExecutionProviderStatsProvider(() => cpuExecutionProviderStats(session), "cpu");
 }
 
 export function cpuExecutionProviderStats(session: Gemma4ModelSession): ExecutionProviderStats {

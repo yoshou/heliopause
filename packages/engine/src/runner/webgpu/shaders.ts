@@ -20,6 +20,395 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 }
 `;
 
+export const F32_GATHER_ROWS_SCALE_WGSL = `
+struct Params {
+  rowSize: u32,
+  tokenCount: u32,
+  scale: f32,
+  _pad0: u32,
+};
+
+@group(0) @binding(0) var<storage, read> rows: array<f32>;
+@group(0) @binding(1) var<storage, read> tokenIds: array<u32>;
+@group(0) @binding(2) var<uniform> params: Params;
+@group(0) @binding(3) var<storage, read_write> outputValues: array<f32>;
+
+@compute @workgroup_size(256, 1, 1)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let column = id.x;
+  let token = id.y;
+  if (column >= params.rowSize || token >= params.tokenCount) {
+    return;
+  }
+  let row = tokenIds[token];
+  outputValues[token * params.rowSize + column] = rows[row * params.rowSize + column] * params.scale;
+}
+`;
+
+export const Q8_0_GATHER_ROWS_SCALE_WGSL = `
+struct Params {
+  rowSize: u32,
+  tokenCount: u32,
+  blockCount: u32,
+  rowByteLength: u32,
+  scale: f32,
+  _pad0: u32,
+  _pad1: u32,
+  _pad2: u32,
+};
+
+@group(0) @binding(0) var<storage, read> weightWords: array<u32>;
+@group(0) @binding(1) var<storage, read> tokenIds: array<u32>;
+@group(0) @binding(2) var<uniform> params: Params;
+@group(0) @binding(3) var<storage, read_write> outputValues: array<f32>;
+
+fn byteAt(index: u32) -> u32 {
+  let word = weightWords[index / 4u];
+  let shift = (index & 3u) * 8u;
+  return (word >> shift) & 255u;
+}
+
+fn signedByteAt(index: u32) -> i32 {
+  let value = i32(byteAt(index));
+  if (value >= 128) {
+    return value - 256;
+  }
+  return value;
+}
+
+fn f16At(index: u32) -> f32 {
+  let bits = byteAt(index) | (byteAt(index + 1u) << 8u);
+  let sign = select(1.0, -1.0, (bits & 0x8000u) != 0u);
+  let exponent = (bits >> 10u) & 31u;
+  let fraction = bits & 1023u;
+  if (exponent == 0u) {
+    return sign * exp2(-14.0) * (f32(fraction) / 1024.0);
+  }
+  if (exponent == 31u) {
+    return sign * 65504.0;
+  }
+  return sign * exp2(f32(exponent) - 15.0) * (1.0 + f32(fraction) / 1024.0);
+}
+
+@compute @workgroup_size(256, 1, 1)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let column = id.x;
+  let token = id.y;
+  if (column >= params.rowSize || token >= params.tokenCount) {
+    return;
+  }
+  let row = tokenIds[token];
+  let block = column / 32u;
+  let index = column & 31u;
+  let base = row * params.rowByteLength + block * 34u;
+  outputValues[token * params.rowSize + column] =
+    f32(signedByteAt(base + 2u + index)) * f16At(base) * params.scale;
+}
+`;
+
+export const Q4_K_GATHER_ROWS_SCALE_WGSL = `
+struct Params {
+  rowSize: u32,
+  tokenCount: u32,
+  blockCount: u32,
+  rowByteLength: u32,
+  scale: f32,
+  _pad0: u32,
+  _pad1: u32,
+  _pad2: u32,
+};
+
+@group(0) @binding(0) var<storage, read> weightWords: array<u32>;
+@group(0) @binding(1) var<storage, read> tokenIds: array<u32>;
+@group(0) @binding(2) var<uniform> params: Params;
+@group(0) @binding(3) var<storage, read_write> outputValues: array<f32>;
+
+fn byteAt(index: u32) -> u32 {
+  let word = weightWords[index / 4u];
+  let shift = (index & 3u) * 8u;
+  return (word >> shift) & 255u;
+}
+
+fn f16At(index: u32) -> f32 {
+  let bits = byteAt(index) | (byteAt(index + 1u) << 8u);
+  let sign = select(1.0, -1.0, (bits & 0x8000u) != 0u);
+  let exponent = (bits >> 10u) & 31u;
+  let fraction = bits & 1023u;
+  if (exponent == 0u) {
+    return sign * exp2(-14.0) * (f32(fraction) / 1024.0);
+  }
+  if (exponent == 31u) {
+    return sign * 65504.0;
+  }
+  return sign * exp2(f32(exponent) - 15.0) * (1.0 + f32(fraction) / 1024.0);
+}
+
+fn kScale(blockBase: u32, index: u32) -> u32 {
+  let qBase = blockBase + 4u;
+  if (index < 4u) {
+    return byteAt(qBase + index) & 63u;
+  }
+  return (byteAt(qBase + index + 4u) & 15u) | ((byteAt(qBase + index - 4u) >> 6u) << 4u);
+}
+
+fn kMin(blockBase: u32, index: u32) -> u32 {
+  let qBase = blockBase + 4u;
+  if (index < 4u) {
+    return byteAt(qBase + index + 4u) & 63u;
+  }
+  return (byteAt(qBase + index + 4u) >> 4u) | ((byteAt(qBase + index) >> 6u) << 4u);
+}
+
+fn q4Value(blockBase: u32, element: u32) -> u32 {
+  let group64 = element / 64u;
+  let within = element - group64 * 64u;
+  let packed = byteAt(blockBase + 16u + group64 * 32u + (within & 31u));
+  if (within < 32u) {
+    return packed & 15u;
+  }
+  return packed >> 4u;
+}
+
+@compute @workgroup_size(256, 1, 1)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let column = id.x;
+  let token = id.y;
+  if (column >= params.rowSize || token >= params.tokenCount) {
+    return;
+  }
+  let row = tokenIds[token];
+  let block = column / 256u;
+  let element = column - block * 256u;
+  let scaleIndex = element / 32u;
+  let blockBase = row * params.rowByteLength + block * 144u;
+  let value = f16At(blockBase) * f32(kScale(blockBase, scaleIndex)) * f32(q4Value(blockBase, element)) -
+    f16At(blockBase + 2u) * f32(kMin(blockBase, scaleIndex));
+  outputValues[token * params.rowSize + column] = value * params.scale;
+}
+`;
+
+export const Q5_K_GATHER_ROWS_SCALE_WGSL = `
+struct Params {
+  rowSize: u32,
+  tokenCount: u32,
+  blockCount: u32,
+  rowByteLength: u32,
+  scale: f32,
+  _pad0: u32,
+  _pad1: u32,
+  _pad2: u32,
+};
+
+@group(0) @binding(0) var<storage, read> weightWords: array<u32>;
+@group(0) @binding(1) var<storage, read> tokenIds: array<u32>;
+@group(0) @binding(2) var<uniform> params: Params;
+@group(0) @binding(3) var<storage, read_write> outputValues: array<f32>;
+
+fn byteAt(index: u32) -> u32 {
+  let word = weightWords[index / 4u];
+  let shift = (index & 3u) * 8u;
+  return (word >> shift) & 255u;
+}
+
+fn f16At(index: u32) -> f32 {
+  let bits = byteAt(index) | (byteAt(index + 1u) << 8u);
+  let sign = select(1.0, -1.0, (bits & 0x8000u) != 0u);
+  let exponent = (bits >> 10u) & 31u;
+  let fraction = bits & 1023u;
+  if (exponent == 0u) {
+    return sign * exp2(-14.0) * (f32(fraction) / 1024.0);
+  }
+  if (exponent == 31u) {
+    return sign * 65504.0;
+  }
+  return sign * exp2(f32(exponent) - 15.0) * (1.0 + f32(fraction) / 1024.0);
+}
+
+fn kScale(blockBase: u32, index: u32) -> u32 {
+  let qBase = blockBase + 4u;
+  if (index < 4u) {
+    return byteAt(qBase + index) & 63u;
+  }
+  return (byteAt(qBase + index + 4u) & 15u) | ((byteAt(qBase + index - 4u) >> 6u) << 4u);
+}
+
+fn kMin(blockBase: u32, index: u32) -> u32 {
+  let qBase = blockBase + 4u;
+  if (index < 4u) {
+    return byteAt(qBase + index + 4u) & 63u;
+  }
+  return (byteAt(qBase + index + 4u) >> 4u) | ((byteAt(qBase + index) >> 6u) << 4u);
+}
+
+fn q5Value(blockBase: u32, element: u32) -> u32 {
+  let group64 = element / 64u;
+  let within = element - group64 * 64u;
+  let lane = within & 31u;
+  let packed = byteAt(blockBase + 48u + group64 * 32u + lane);
+  let highMask = 1u << (group64 * 2u + select(0u, 1u, within >= 32u));
+  let high = select(0u, 16u, (byteAt(blockBase + 16u + lane) & highMask) != 0u);
+  if (within < 32u) {
+    return (packed & 15u) + high;
+  }
+  return (packed >> 4u) + high;
+}
+
+@compute @workgroup_size(256, 1, 1)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let column = id.x;
+  let token = id.y;
+  if (column >= params.rowSize || token >= params.tokenCount) {
+    return;
+  }
+  let row = tokenIds[token];
+  let block = column / 256u;
+  let element = column - block * 256u;
+  let scaleIndex = element / 32u;
+  let blockBase = row * params.rowByteLength + block * 176u;
+  let value = f16At(blockBase) * f32(kScale(blockBase, scaleIndex)) * f32(q5Value(blockBase, element)) -
+    f16At(blockBase + 2u) * f32(kMin(blockBase, scaleIndex));
+  outputValues[token * params.rowSize + column] = value * params.scale;
+}
+`;
+
+export const Q6_K_GATHER_ROWS_SCALE_WGSL = `
+struct Params {
+  rowSize: u32,
+  tokenCount: u32,
+  blockCount: u32,
+  rowByteLength: u32,
+  scale: f32,
+  _pad0: u32,
+  _pad1: u32,
+  _pad2: u32,
+};
+
+@group(0) @binding(0) var<storage, read> weightWords: array<u32>;
+@group(0) @binding(1) var<storage, read> tokenIds: array<u32>;
+@group(0) @binding(2) var<uniform> params: Params;
+@group(0) @binding(3) var<storage, read_write> outputValues: array<f32>;
+
+fn byteAt(index: u32) -> u32 {
+  let word = weightWords[index / 4u];
+  let shift = (index & 3u) * 8u;
+  return (word >> shift) & 255u;
+}
+
+fn signedByteAt(index: u32) -> i32 {
+  let value = i32(byteAt(index));
+  if (value >= 128) {
+    return value - 256;
+  }
+  return value;
+}
+
+fn f16At(index: u32) -> f32 {
+  let bits = byteAt(index) | (byteAt(index + 1u) << 8u);
+  let sign = select(1.0, -1.0, (bits & 0x8000u) != 0u);
+  let exponent = (bits >> 10u) & 31u;
+  let fraction = bits & 1023u;
+  if (exponent == 0u) {
+    return sign * exp2(-14.0) * (f32(fraction) / 1024.0);
+  }
+  if (exponent == 31u) {
+    return sign * 65504.0;
+  }
+  return sign * exp2(f32(exponent) - 15.0) * (1.0 + f32(fraction) / 1024.0);
+}
+
+fn q6Value(blockBase: u32, element: u32) -> i32 {
+  let group128 = element / 128u;
+  let within128 = element - group128 * 128u;
+  let lane = within128 & 31u;
+  let qlBase = blockBase + group128 * 64u;
+  let qhByte = byteAt(blockBase + 128u + group128 * 32u + lane);
+  if (within128 < 32u) {
+    return i32((byteAt(qlBase + lane) & 15u) | (((qhByte >> 0u) & 3u) << 4u)) - 32;
+  }
+  if (within128 < 64u) {
+    return i32((byteAt(qlBase + lane + 32u) & 15u) | (((qhByte >> 2u) & 3u) << 4u)) - 32;
+  }
+  if (within128 < 96u) {
+    return i32((byteAt(qlBase + lane) >> 4u) | (((qhByte >> 4u) & 3u) << 4u)) - 32;
+  }
+  return i32((byteAt(qlBase + lane + 32u) >> 4u) | (((qhByte >> 6u) & 3u) << 4u)) - 32;
+}
+
+fn q6ScaleIndex(element: u32) -> u32 {
+  let group128 = element / 128u;
+  let within128 = element - group128 * 128u;
+  let pair = (within128 & 31u) / 16u;
+  if (within128 < 32u) {
+    return group128 * 8u + pair;
+  }
+  if (within128 < 64u) {
+    return group128 * 8u + pair + 2u;
+  }
+  if (within128 < 96u) {
+    return group128 * 8u + pair + 4u;
+  }
+  return group128 * 8u + pair + 6u;
+}
+
+@compute @workgroup_size(256, 1, 1)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let column = id.x;
+  let token = id.y;
+  if (column >= params.rowSize || token >= params.tokenCount) {
+    return;
+  }
+  let row = tokenIds[token];
+  let block = column / 256u;
+  let element = column - block * 256u;
+  let blockBase = row * params.rowByteLength + block * 210u;
+  let value = f16At(blockBase + 208u) *
+    f32(signedByteAt(blockBase + 192u + q6ScaleIndex(element))) *
+    f32(q6Value(blockBase, element));
+  outputValues[token * params.rowSize + column] = value * params.scale;
+}
+`;
+
+export const PREPARE_PER_LAYER_INPUTS_WGSL = `
+struct Params {
+  perLayerLength: u32,
+  totalPerLayerLength: u32,
+  tokenCount: u32,
+  blockCount: u32,
+  projectionScale: f32,
+  epsilon: f32,
+  _pad0: u32,
+  _pad1: u32,
+};
+
+@group(0) @binding(0) var<storage, read> tokenRows: array<f32>;
+@group(0) @binding(1) var<storage, read> projectedValues: array<f32>;
+@group(0) @binding(2) var<storage, read> normWeight: array<f32>;
+@group(0) @binding(3) var<uniform> params: Params;
+@group(0) @binding(4) var<storage, read_write> outputValues: array<f32>;
+
+@compute @workgroup_size(256, 1, 1)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let index = id.x;
+  let token = id.y;
+  let layer = id.z;
+  if (index >= params.perLayerLength || token >= params.tokenCount || layer >= params.blockCount) {
+    return;
+  }
+
+  let sliceBase = token * params.totalPerLayerLength + layer * params.perLayerLength;
+  var meanSquare = 0.0;
+  for (var dim = 0u; dim < params.perLayerLength; dim = dim + 1u) {
+    let value = projectedValues[sliceBase + dim] * params.projectionScale;
+    meanSquare = meanSquare + value * value;
+  }
+  let normScale = inverseSqrt(meanSquare / f32(params.perLayerLength) + params.epsilon);
+  let projected = projectedValues[sliceBase + index] * params.projectionScale * normScale * normWeight[index];
+  let tokenValue = tokenRows[sliceBase + index];
+  outputValues[(layer * params.tokenCount + token) * params.perLayerLength + index] =
+    (tokenValue + projected) * 0.7071067811865476;
+}
+`;
+
 export const RMS_NORM_WGSL = `
 struct Params {
   epsilon: f32,
@@ -528,6 +917,30 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 }
 `;
 
+export const SIGMOID_MUL_WGSL = `
+struct Params {
+  length: u32,
+  _pad0: u32,
+  _pad1: u32,
+  _pad2: u32,
+};
+
+@group(0) @binding(0) var<storage, read> leftValues: array<f32>;
+@group(0) @binding(1) var<storage, read> gateValues: array<f32>;
+@group(0) @binding(2) var<uniform> params: Params;
+@group(0) @binding(3) var<storage, read_write> outputValues: array<f32>;
+
+@compute @workgroup_size(256, 1, 1)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let index = id.x;
+  if (index >= params.length) {
+    return;
+  }
+  let gate = gateValues[index];
+  outputValues[index] = leftValues[index] * (1.0 / (1.0 + exp(-gate)));
+}
+`;
+
 export const SCALE_WGSL = `
 struct Params {
   length: u32,
@@ -709,6 +1122,34 @@ fn main() {
   }
   outputValues[0] = f32(bestId);
   outputValues[1] = bestValue;
+}
+`;
+
+export const SELECT_TOP1_CANDIDATE_WGSL = `
+struct Params {
+  candidateCount: u32,
+  _pad0: u32,
+  _pad1: u32,
+  _pad2: u32,
+};
+
+@group(0) @binding(0) var<storage, read> candidates: array<f32>;
+@group(0) @binding(1) var<uniform> params: Params;
+@group(0) @binding(2) var<storage, read_write> selectedToken: array<u32>;
+
+@compute @workgroup_size(1, 1, 1)
+fn main() {
+  var bestId = 0u;
+  var bestValue = -3.4028234663852886e38;
+  for (var index = 0u; index < params.candidateCount; index = index + 1u) {
+    let base = index * 2u;
+    let value = candidates[base + 1u];
+    if (value > bestValue) {
+      bestValue = value;
+      bestId = u32(candidates[base]);
+    }
+  }
+  selectedToken[0] = bestId;
 }
 `;
 

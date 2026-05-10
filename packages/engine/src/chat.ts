@@ -166,7 +166,7 @@ export async function generateGemma4ChatTurn(
     },
   );
   let logits = promptPrefill.logits;
-  let nextTokenId = nextTokenFrom(logits, promptPrefill.topTokens);
+  let nextTokenId = nextTokenFrom(logits, promptPrefill.topTokens, promptPrefill.selectedTokenId);
   if (nextTokenId === undefined) {
     return { content: "", finishReason: "stop", state };
   }
@@ -200,7 +200,7 @@ export async function generateGemma4ChatTurn(
       logitsTopK: 1,
     });
     logits = decode.logits;
-    nextTokenId = nextTokenFrom(logits, decode.topTokens);
+    nextTokenId = nextTokenFrom(logits, decode.topTokens, decode.selectedTokenId);
     if (nextTokenId === undefined) {
       finishReason = "stop";
       break;
@@ -260,7 +260,7 @@ export async function* generateGemma4ChatCompletion(
     logitsTopK: 1,
   });
   let logits = prefill.logits;
-  let nextTokenId = nextTokenFrom(logits, prefill.topTokens);
+  let nextTokenId = nextTokenFrom(logits, prefill.topTokens, prefill.selectedTokenId);
   if (nextTokenId === undefined) {
     return "";
   }
@@ -292,7 +292,7 @@ export async function* generateGemma4ChatCompletion(
       logitsTopK: 1,
     });
     logits = decode.logits;
-    nextTokenId = nextTokenFrom(logits, decode.topTokens);
+    nextTokenId = nextTokenFrom(logits, decode.topTokens, decode.selectedTokenId);
     if (nextTokenId === undefined) {
       break;
     }
@@ -314,6 +314,7 @@ async function prefillGemma4ChatText(
 ): Promise<{
   state: Gemma4InferenceState;
   logits?: Float32Array;
+  selectedTokenId?: number;
   topTokens?: Array<{ id: number; value: number }>;
 }> {
   throwIfAborted(options.signal);
@@ -448,7 +449,11 @@ function argmax(values: Float32Array): number {
 function nextTokenFrom(
   logits: Float32Array | undefined,
   topTokens: Array<{ id: number; value: number }> | undefined,
+  selectedTokenId: number | undefined,
 ): number | undefined {
+  if (selectedTokenId !== undefined) {
+    return selectedTokenId;
+  }
   const topToken = topTokens?.[0]?.id;
   if (topToken !== undefined) {
     return topToken;

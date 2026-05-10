@@ -7,6 +7,7 @@ export type {
 } from "./gpu-types";
 export type {
   Gemma4WebGpuHiddenResult,
+  Gemma4WebGpuRuntimeStats,
   Gemma4WebGpuSegmentRunnerOptions,
   Gemma4WebGpuStateLike,
   Gemma4WebGpuTokenResult,

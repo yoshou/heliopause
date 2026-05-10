@@ -29,6 +29,8 @@ test("runner placement planning handles off, blocked, and planned WebGPU placeme
   assert.equal(planned.status, "planned");
   assert.equal(planned.selectedLayerCount, 2);
   assert.equal(planned.segmentStartLayer, 0);
+  assert.equal(planned.copyAuditExpectations.expectedTokenReadbacks, 0);
+  assert.equal(planned.copyAuditExpectations.expectedSelectedTokenReadbacks, 1);
 });
 
 test("runner placement copy audit reports unexpected copies", () => {
@@ -45,10 +47,40 @@ test("runner placement copy audit reports unexpected copies", () => {
     logitsReadbacks: 0,
     boundaryUploads: 0,
     tokenReadbacks: 0,
+    selectedTokenReadbacks: 0,
   });
 
   assert.equal(audit.ok, false);
   assert.match(audit.errors.join("\n"), /segment intermediate readbacks/);
+});
+
+test("runner placement copy audit treats selected token readback as the only normal WebGPU readback", () => {
+  const gguf = minimalGguf();
+  const manifest = buildGemma4Manifest(gguf);
+  const plan = planGemma4RunnerPlacement(gguf, manifest, {
+    mode: "enabled",
+    memoryLimitBytes: 2 * 1024 * 1024 * 1024,
+  });
+
+  assert.equal(auditGemma4RunnerPlacementCopies(plan, {
+    decodeTensorReads: 0,
+    segmentIntermediateReadbacks: 0,
+    logitsReadbacks: 0,
+    boundaryUploads: 1,
+    tokenReadbacks: 0,
+    selectedTokenReadbacks: 1,
+  }).ok, true);
+
+  const topKReadback = auditGemma4RunnerPlacementCopies(plan, {
+    decodeTensorReads: 0,
+    segmentIntermediateReadbacks: 0,
+    logitsReadbacks: 0,
+    boundaryUploads: 1,
+    tokenReadbacks: 1,
+    selectedTokenReadbacks: 1,
+  });
+  assert.equal(topKReadback.ok, false);
+  assert.match(topKReadback.errors.join("\n"), /token readbacks/);
 });
 
 function minimalGguf() {

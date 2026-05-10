@@ -53,6 +53,7 @@ export type Gemma4RunnerPlacementPlan = {
     logitsReadbacks: 0;
     expectedBoundaryUploads: number;
     expectedTokenReadbacks: number;
+    expectedSelectedTokenReadbacks: number;
   };
 };
 
@@ -62,6 +63,7 @@ export type Gemma4RunnerCopyAuditObservation = {
   logitsReadbacks: number;
   boundaryUploads: number;
   tokenReadbacks: number;
+  selectedTokenReadbacks?: number;
 };
 
 export type Gemma4RunnerCopyAuditResult = {
@@ -247,6 +249,12 @@ export function auditGemma4RunnerPlacementCopies(
   if (observed.tokenReadbacks > expected.expectedTokenReadbacks) {
     errors.push(
       `token readbacks: expected at most ${expected.expectedTokenReadbacks}, got ${observed.tokenReadbacks}`,
+    );
+  }
+  const observedSelectedTokenReadbacks = observed.selectedTokenReadbacks ?? 0;
+  if (observedSelectedTokenReadbacks > expected.expectedSelectedTokenReadbacks) {
+    errors.push(
+      `selected token readbacks: expected at most ${expected.expectedSelectedTokenReadbacks}, got ${observedSelectedTokenReadbacks}`,
     );
   }
 

@@ -9,6 +9,7 @@ import {
   createQ8_0QuantizeResources,
   createQ8KQuantizeResources,
   createQkvConvResources,
+  createSigmoidMulResources,
   createSsmNormGateResources,
   createSwiGluResources,
   createTop1Resources,
@@ -1000,6 +1001,7 @@ export async function fullAttentionDecodeOutWebGpuResident(
   const keyBuffer = storageBuffer(out.device, keyCache.byteLength, GPU_COPY_DST);
   const valueBuffer = storageBuffer(out.device, valueCache.byteLength, GPU_COPY_DST);
   const gateBuffer = storageBuffer(out.device, gate.byteLength, GPU_COPY_DST);
+  const attentionBuffer = storageBuffer(out.device, hiddenSize * Float32Array.BYTES_PER_ELEMENT, 0);
   const gatedBuffer = storageBuffer(out.device, hiddenSize * Float32Array.BYTES_PER_ELEMENT, 0);
   const probabilitiesBuffer = storageBuffer(
     out.device,
@@ -1035,7 +1037,7 @@ export async function fullAttentionDecodeOutWebGpuResident(
       out.device,
       valueBuffer,
       probabilitiesBuffer,
-      gatedBuffer,
+      attentionBuffer,
       {
         valueSize: options.headSize,
         queryHeadCount: options.queryHeadCount,
@@ -1044,6 +1046,13 @@ export async function fullAttentionDecodeOutWebGpuResident(
         contextLength: options.contextLength,
         scale: options.scale,
       },
+    );
+    const gateResources = createSigmoidMulResources(
+      out.device,
+      attentionBuffer,
+      gateBuffer,
+      gatedBuffer,
+      hiddenSize,
     );
     const quantizeResources = createQ8KQuantizeResources(
       out.device,
@@ -1065,6 +1074,9 @@ export async function fullAttentionDecodeOutWebGpuResident(
     pass.setPipeline(applyResources.pipeline);
     pass.setBindGroup(0, applyResources.bindGroup);
     pass.dispatchWorkgroups(queryHeadCount, headSize);
+    pass.setPipeline(gateResources.pipeline);
+    pass.setBindGroup(0, gateResources.bindGroup);
+    pass.dispatchWorkgroups(Math.ceil(hiddenSize / 256));
     pass.setPipeline(quantizeResources.pipeline);
     pass.setBindGroup(0, quantizeResources.bindGroup);
     pass.dispatchWorkgroups(1, out.blockCount);
@@ -1080,6 +1092,7 @@ export async function fullAttentionDecodeOutWebGpuResident(
     readbackBuffer.unmap();
     scoreResources.destroy();
     applyResources.destroy();
+    gateResources.destroy();
     quantizeResources.destroy();
     outResources.destroy();
     return output;
@@ -1088,6 +1101,7 @@ export async function fullAttentionDecodeOutWebGpuResident(
     keyBuffer.destroy?.();
     valueBuffer.destroy?.();
     gateBuffer.destroy?.();
+    attentionBuffer.destroy?.();
     gatedBuffer.destroy?.();
     probabilitiesBuffer.destroy?.();
     outputBuffer.destroy?.();

@@ -4,6 +4,7 @@ export {
   gemma4WebGpuPlanningProvider,
   Gemma4WebGpuSegmentRunner,
   type WebGpuSupport,
+  type Gemma4WebGpuRuntimeStats,
   type Gemma4WebGpuSegmentRunnerOptions,
 } from "./runner/webgpu/index";
 

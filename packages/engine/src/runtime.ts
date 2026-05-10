@@ -87,7 +87,7 @@ export class Gemma4ModelSession {
   private readonly f32TensorCache = new Map<string, Float32Array>();
   private readonly weightBytesCache = new Map<string, Uint8Array>();
   private readonly embeddingRowCache = new Map<number, Float32Array>();
-  private executionProviderStatsProvider?: () => ExecutionProviderStats;
+  private readonly executionProviderStatsProviders = new Map<string, () => ExecutionProviderStats>();
   private weightCacheBytes = 0;
   private weightCacheHits = 0;
   private weightCacheMisses = 0;
@@ -195,16 +195,31 @@ export class Gemma4ModelSession {
       weightCacheMisses: this.weightCacheMisses,
       weightCacheEvictions: this.weightCacheEvictions,
       embeddingRowCount: this.embeddingRowCache.size,
-      executionProviderStats: this.executionProviderStatsProvider?.() ?? {},
+      executionProviderStats: this.executionProviderStats(),
     };
   }
 
-  setExecutionProviderStatsProvider(provider: (() => ExecutionProviderStats) | undefined): void {
-    this.executionProviderStatsProvider = provider;
+  setExecutionProviderStatsProvider(
+    provider: (() => ExecutionProviderStats) | undefined,
+    name = "default",
+  ): void {
+    if (!provider) {
+      this.executionProviderStatsProviders.delete(name);
+      return;
+    }
+    this.executionProviderStatsProviders.set(name, provider);
   }
 
   executionProvider(name: string): ExecutionProviderConfig | undefined {
     return this.executionProviders.find((provider) => provider.name === name);
+  }
+
+  private executionProviderStats(): ExecutionProviderStats {
+    const stats: ExecutionProviderStats = {};
+    for (const provider of this.executionProviderStatsProviders.values()) {
+      Object.assign(stats, provider());
+    }
+    return stats;
   }
 
   private evictWeightBytes(): void {

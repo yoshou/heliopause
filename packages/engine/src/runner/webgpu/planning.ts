@@ -29,6 +29,7 @@ type WebGpuCopyAuditExpectations = {
   logitsReadbacks: 0;
   expectedBoundaryUploads: number;
   expectedTokenReadbacks: number;
+  expectedSelectedTokenReadbacks: number;
 };
 
 export const gemma4WebGpuPlanningProvider = {
@@ -65,7 +66,8 @@ export const gemma4WebGpuPlanningProvider = {
     segmentIntermediateReadbacks: 0,
     logitsReadbacks: 0,
     expectedBoundaryUploads: selectedLayerCount > 0 ? 1 : 0,
-    expectedTokenReadbacks: 1,
+    expectedTokenReadbacks: 0,
+    expectedSelectedTokenReadbacks: selectedLayerCount > 0 ? 1 : 0,
   }),
   requiredSegmentStart: ({
     manifest,
