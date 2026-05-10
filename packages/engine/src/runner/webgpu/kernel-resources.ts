@@ -13,12 +13,14 @@ import {
   RESIDUAL_ADD_WGSL,
   RESIDUAL_ADD_SCALE_WGSL,
   RMS_NORM_RESIDUAL_ADD_WGSL,
+  RMS_NORM_RESIDUAL_ADD_SCALE_WGSL,
   FULL_QUERY_NORM_ROPE_WGSL,
   FULL_KV_UPDATE_WGSL,
   TOPK_WGSL,
   Q8_0_MATMUL_WGSL,
   SWIGLU_WGSL,
   GEGLU_WGSL,
+  GEGLU_SLICE_WGSL,
   GELU_WGSL,
   ELEMENTWISE_MUL_WGSL,
   SIGMOID_MUL_WGSL,
@@ -252,6 +254,54 @@ export function createGegluResources(
   length: number,
 ): { pipeline: unknown; bindGroup: unknown; destroy: () => void } {
   return createBinaryElementwiseResources(device, gateOutputBuffer, upOutputBuffer, outputBuffer, length, GEGLU_WGSL);
+}
+
+export function createGegluSliceResources(
+  device: WebGpuDeviceLike,
+  gateOutputBuffer: WebGpuBufferLike,
+  rightBuffer: WebGpuBufferLike,
+  outputBuffer: WebGpuBufferLike,
+  length: number,
+  rightOffset: number,
+): { pipeline: unknown; bindGroup: unknown; destroy: () => void } {
+  const params = new Uint32Array([length, rightOffset, 0, 0]);
+  const paramsBuffer = device.createBuffer({
+    size: params.byteLength,
+    usage: GPU_UNIFORM | GPU_COPY_DST,
+  });
+  device.queue.writeBuffer(paramsBuffer, 0, params);
+  const bindGroupLayout = device.createBindGroupLayout({
+    entries: [
+      storageEntry(0, "read-only-storage"),
+      storageEntry(1, "read-only-storage"),
+      {
+        binding: 2,
+        visibility: GPU_SHADER_STAGE_COMPUTE,
+        buffer: { type: "uniform" },
+      },
+      storageEntry(3, "storage"),
+    ],
+  });
+  const pipeline = device.createComputePipeline({
+    layout: device.createPipelineLayout({ bindGroupLayouts: [bindGroupLayout] }),
+    compute: {
+      module: device.createShaderModule({ code: GEGLU_SLICE_WGSL }),
+      entryPoint: "main",
+    },
+  });
+  return {
+    pipeline,
+    bindGroup: device.createBindGroup({
+      layout: bindGroupLayout,
+      entries: [
+        bindBuffer(0, gateOutputBuffer),
+        bindBuffer(1, rightBuffer),
+        bindBuffer(2, paramsBuffer),
+        bindBuffer(3, outputBuffer),
+      ],
+    }),
+    destroy: () => paramsBuffer.destroy?.(),
+  };
 }
 
 export function createElementwiseMulResources(
@@ -1023,6 +1073,52 @@ export function createRmsNormResidualAddResources(
         bindBuffer(2, residual),
         bindBuffer(3, paramsBuffer),
         bindBuffer(4, output),
+      ],
+    }),
+    destroy: () => paramsBuffer.destroy?.(),
+  };
+}
+
+export function createRmsNormResidualAddScaleResources(
+  device: WebGpuDeviceLike,
+  input: WebGpuBufferLike,
+  weight: WebGpuBufferLike,
+  residual: WebGpuBufferLike,
+  scale: WebGpuBufferLike,
+  output: WebGpuBufferLike,
+  length: number,
+  epsilon: number,
+): { pipeline: unknown; bindGroup: unknown; destroy: () => void } {
+  const paramsF32 = new Float32Array([epsilon, 0, 0, 0]);
+  const paramsU32 = new Uint32Array(paramsF32.buffer);
+  paramsU32[1] = length;
+  const paramsBuffer = device.createBuffer({ size: paramsU32.byteLength, usage: GPU_UNIFORM | GPU_COPY_DST });
+  device.queue.writeBuffer(paramsBuffer, 0, paramsU32);
+  const bindGroupLayout = device.createBindGroupLayout({
+    entries: [
+      storageEntry(0, "read-only-storage"),
+      storageEntry(1, "read-only-storage"),
+      storageEntry(2, "read-only-storage"),
+      storageEntry(3, "read-only-storage"),
+      { binding: 4, visibility: GPU_SHADER_STAGE_COMPUTE, buffer: { type: "uniform" } },
+      storageEntry(5, "storage"),
+    ],
+  });
+  const pipeline = device.createComputePipeline({
+    layout: device.createPipelineLayout({ bindGroupLayouts: [bindGroupLayout] }),
+    compute: { module: device.createShaderModule({ code: RMS_NORM_RESIDUAL_ADD_SCALE_WGSL }), entryPoint: "main" },
+  });
+  return {
+    pipeline,
+    bindGroup: device.createBindGroup({
+      layout: bindGroupLayout,
+      entries: [
+        bindBuffer(0, input),
+        bindBuffer(1, weight),
+        bindBuffer(2, residual),
+        bindBuffer(3, scale),
+        bindBuffer(4, paramsBuffer),
+        bindBuffer(5, output),
       ],
     }),
     destroy: () => paramsBuffer.destroy?.(),

@@ -352,6 +352,7 @@ function logWebGpuRunnerTiming(session: Gemma4ModelSession, phase: "prefill" | "
     lastRunBindGroupCreateMs: roundMs(stats.webgpuLastRunBindGroupCreateMs),
     lastRunBufferCreates: numberStat(stats.webgpuLastRunBufferCreates),
     lastRunBufferCreateMs: roundMs(stats.webgpuLastRunBufferCreateMs),
+    lastRunBufferCreateLabels: stringStat(stats.webgpuLastRunBufferCreateLabels),
     lastRunEncodeMs: roundMs(stats.webgpuLastRunEncodeMs),
     lastRunSubmitMs: roundMs(stats.webgpuLastRunSubmitMs),
     lastRunReadbackWaitMs: roundMs(stats.webgpuLastRunReadbackWaitMs),
@@ -412,6 +413,7 @@ type WebGpuRunnerTimingRow = {
   lastRunBindGroupCreateMs: number;
   lastRunBufferCreates: number;
   lastRunBufferCreateMs: number;
+  lastRunBufferCreateLabels: string;
   lastRunEncodeMs: number;
   lastRunSubmitMs: number;
   lastRunReadbackWaitMs: number;
@@ -464,6 +466,7 @@ function webGpuTimingRowsToTsv(rows: readonly WebGpuRunnerTimingRow[]): string {
     "lastRunBindGroupCreateMs",
     "lastRunBufferCreates",
     "lastRunBufferCreateMs",
+    "lastRunBufferCreateLabels",
     "lastRunEncodeMs",
     "lastRunSubmitMs",
     "lastRunReadbackWaitMs",

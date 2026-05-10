@@ -13,7 +13,6 @@ import {
   type QuantizedHandle,
 } from "./arena";
 import {
-  dispatchElementwiseMul,
   dispatchDualQ4KMatMul,
   dispatchF32GatherRowsScale,
   dispatchF32MatMul,
@@ -22,7 +21,7 @@ import {
   dispatchFullKvUpdate,
   dispatchFullQuery,
   dispatchGeglu,
-  dispatchGelu,
+  dispatchGegluSlice,
   dispatchKMatMul,
   dispatchQ8_0MatMul,
   dispatchQ8_0Quantize,
@@ -30,10 +29,9 @@ import {
   dispatchPreparePerLayerInputs,
   dispatchQuantizedGatherRowsScale,
   dispatchResidualAdd,
-  dispatchResidualAddScale,
-  dispatchRmsNorm,
   dispatchRmsNormQ8KQuantize,
   dispatchRmsNormResidualAdd,
+  dispatchRmsNormResidualAddScale,
   dispatchScale,
   dispatchSelectTop1Candidate,
   dispatchTokenSlice,
@@ -131,6 +129,7 @@ export type Gemma4WebGpuRuntimeStats = {
   webgpuLastRunBindGroupCreateMs: number;
   webgpuLastRunBufferCreates: number;
   webgpuLastRunBufferCreateMs: number;
+  webgpuLastRunBufferCreateLabels: string;
   webgpuLastRunEncodeMs: number;
   webgpuLastRunSubmitMs: number;
   webgpuLastRunReadbackWaitMs: number;
@@ -394,6 +393,7 @@ export class Gemma4WebGpuSegmentRunner {
       webgpuLastRunBindGroupCreateMs: this.lastRunStats.resourceStats?.bindGroupCreateMs ?? 0,
       webgpuLastRunBufferCreates: this.lastRunStats.resourceStats?.bufferCreates ?? 0,
       webgpuLastRunBufferCreateMs: this.lastRunStats.resourceStats?.bufferCreateMs ?? 0,
+      webgpuLastRunBufferCreateLabels: this.lastRunStats.resourceStats?.bufferCreateLabels ?? "",
       webgpuLastRunEncodeMs: this.lastRunStats.encodeMs,
       webgpuLastRunSubmitMs: this.lastRunStats.submitMs,
       webgpuLastRunReadbackWaitMs: this.lastRunStats.readbackWaitMs,
@@ -1000,7 +1000,7 @@ export class Gemma4WebGpuSegmentRunner {
     const cleanup: GpuResource[] = [];
     const resources: Array<{ destroy: () => void }> = [];
     const tokenIdValues = Uint32Array.from(tokenIds);
-    const tokenIdBuffer = this.arena.createBuffer(
+    const tokenIdBuffer = this.arena.createScratchBuffer(
       "input.token_ids",
       tokenIdValues.byteLength,
       GPU_STORAGE | GPU_COPY_DST,
@@ -1008,7 +1008,7 @@ export class Gemma4WebGpuSegmentRunner {
     this.arena.device.queue.writeBuffer(tokenIdBuffer, 0, tokenIdValues);
     cleanup.push(tokenIdBuffer);
 
-    const hidden = this.arena.createBuffer(
+    const hidden = this.arena.createScratchBuffer(
       "input.hidden.gpu",
       tokenCount * this.manifest.embeddingLength * Float32Array.BYTES_PER_ELEMENT,
       GPU_STORAGE,
@@ -1031,17 +1031,17 @@ export class Gemma4WebGpuSegmentRunner {
       }
       const perLayerLength = this.manifest.perLayerEmbeddingLength;
       const totalPerLayerLength = perLayerLength * this.manifest.blockCount;
-      const tokenRows = this.arena.createBuffer(
+      const tokenRows = this.arena.createScratchBuffer(
         "input.per_layer_token_rows",
         tokenCount * totalPerLayerLength * Float32Array.BYTES_PER_ELEMENT,
         GPU_STORAGE,
       );
-      const projected = this.arena.createBuffer(
+      const projected = this.arena.createScratchBuffer(
         "input.per_layer_projected",
         tokenCount * totalPerLayerLength * Float32Array.BYTES_PER_ELEMENT,
         GPU_STORAGE,
       );
-      perLayerInputs = this.arena.createBuffer(
+      perLayerInputs = this.arena.createScratchBuffer(
         "input.per_layer_inputs",
         tokenCount * totalPerLayerLength * Float32Array.BYTES_PER_ELEMENT,
         GPU_STORAGE,
@@ -1431,8 +1431,20 @@ export class Gemma4WebGpuSegmentRunner {
       const kProjection = scratchF32(this.arena, kvDim, cleanup, `blk.${layer.layer}.k`);
       const vProjection = scratchF32(this.arena, kvValueDim, cleanup, `blk.${layer.layer}.v`);
       restartLayerSection("attn.kv_proj");
-      dispatchKMatMul(pass, resources, layer.k, attnQ8, kProjection, tokenCount);
-      dispatchKMatMul(pass, resources, layer.v, attnQ8, vProjection, tokenCount);
+      const dispatchedDualKv = dispatchDualQ4KMatMul(
+        pass,
+        resources,
+        layer.k,
+        layer.v,
+        attnQ8,
+        kProjection,
+        vProjection,
+        tokenCount,
+      );
+      if (!dispatchedDualKv) {
+        dispatchKMatMul(pass, resources, layer.k, attnQ8, kProjection, tokenCount);
+        dispatchKMatMul(pass, resources, layer.v, attnQ8, vProjection, tokenCount);
+      }
       restartLayerSection("attn.kv_update");
       dispatchFullKvUpdate(
         this.arena.device,
@@ -1465,9 +1477,10 @@ export class Gemma4WebGpuSegmentRunner {
       throw new Error(`Missing WebGPU KV state for layer ${layer.layer}`);
     }
     const keyValueTokenCount = Math.min(contextLength, tokenPosition + 1);
+    const probabilityTokenCapacity = bucketAttentionProbabilityTokenCount(keyValueTokenCount);
     const probabilities = scratchF32(
       this.arena,
-      this.manifest.headCount * keyValueTokenCount,
+      this.manifest.headCount * probabilityTokenCapacity,
       cleanup,
       `blk.${layer.layer}.attention_probabilities`,
     );
@@ -1557,14 +1570,9 @@ export class Gemma4WebGpuSegmentRunner {
       throw new Error("WebGPU Gemma4 per-layer input requires prepared per-layer inputs and weights.");
     }
     const perLayerLength = this.manifest.perLayerEmbeddingLength;
-    let perLayerBuffer: WebGpuBufferLike;
-    if (options.perLayerInputsBuffer) {
-      perLayerBuffer = scratchF32(this.arena, perLayerLength, cleanup, `blk.${layer.layer}.per_layer_input`);
-      dispatchTokenSlice(this.arena.device, pass, resources, options.perLayerInputsBuffer, perLayerBuffer, {
-        rowSize: perLayerLength,
-        rowIndex: layer.layer * options.sourceTokenCount + options.sourceTokenIndex,
-      });
-    } else {
+    const perLayerOffset = (layer.layer * options.sourceTokenCount + options.sourceTokenIndex) * perLayerLength;
+    let perLayerBuffer = options.perLayerInputsBuffer;
+    if (!perLayerBuffer) {
       const sourceOffset = (layer.layer * options.sourceTokenCount + options.sourceTokenIndex) * perLayerLength;
       const perLayerSlice = options.perLayerInputs!.slice(sourceOffset, sourceOffset + perLayerLength);
       if (perLayerSlice.length !== perLayerLength) {
@@ -1580,25 +1588,27 @@ export class Gemma4WebGpuSegmentRunner {
     }
 
     const gate = scratchF32(this.arena, perLayerLength, cleanup, `blk.${layer.layer}.inp_gate`);
-    const activated = scratchF32(this.arena, perLayerLength, cleanup, `blk.${layer.layer}.inp_gate_gelu`);
     const mixed = scratchF32(this.arena, perLayerLength, cleanup, `blk.${layer.layer}.inp_mixed`);
     dispatchF32MatMul(this.arena.device, pass, resources, layer.perLayerInputGate.buffer, input, gate, this.manifest.embeddingLength, perLayerLength, 1);
-    dispatchGelu(this.arena.device, pass, resources, gate, activated, perLayerLength);
-    dispatchElementwiseMul(this.arena.device, pass, resources, activated, perLayerBuffer, mixed, perLayerLength);
+    if (options.perLayerInputsBuffer) {
+      dispatchGegluSlice(this.arena.device, pass, resources, gate, perLayerBuffer, mixed, perLayerLength, perLayerOffset);
+    } else {
+      dispatchGeglu(this.arena.device, pass, resources, gate, perLayerBuffer, mixed, perLayerLength);
+    }
     const projected = scratchF32(this.arena, this.manifest.embeddingLength, cleanup, `blk.${layer.layer}.inp_projected`);
     dispatchF32MatMul(this.arena.device, pass, resources, layer.perLayerProjection.buffer, mixed, projected, perLayerLength, this.manifest.embeddingLength, 1);
-    const norm = scratchF32(this.arena, this.manifest.embeddingLength, cleanup, `blk.${layer.layer}.inp_post_norm`);
-    dispatchRmsNorm(this.arena.device, pass, resources, projected, layer.postNorm.buffer, norm, this.manifest.embeddingLength, this.epsilon);
     const output = scratchF32(this.arena, this.manifest.embeddingLength, cleanup, `blk.${layer.layer}.scaled`);
-    dispatchResidualAddScale(
+    dispatchRmsNormResidualAddScale(
       this.arena.device,
       pass,
       resources,
+      projected,
+      layer.postNorm.buffer,
       input,
-      norm,
       layer.layerOutputScale.buffer,
       output,
       this.manifest.embeddingLength,
+      this.epsilon,
     );
     return output;
   }
@@ -1635,12 +1645,10 @@ export class Gemma4WebGpuSegmentRunner {
     const outputNorm = this.requireOutputNorm();
     const outputStripes = this.requireOutputStripes();
     const hiddenSize = this.manifest.embeddingLength;
-    const norm = scratchF32(this.arena, hiddenSize, cleanup, "output_norm");
-    dispatchRmsNorm(this.arena.device, pass, resources, hidden, outputNorm.buffer, norm, hiddenSize, this.epsilon);
     const q8 = scratchQ8K(this.arena, hiddenSize, 1, cleanup, "output_norm.q8k");
-    dispatchQ8KQuantize(this.arena.device, pass, resources, norm, q8, hiddenSize, 1);
+    dispatchRmsNormQ8KQuantize(this.arena.device, pass, resources, hidden, outputNorm.buffer, q8, hiddenSize, this.epsilon);
 
-    const candidates = this.arena.createBuffer(
+    const candidates = this.arena.createScratchBuffer(
       "output.topk.candidates",
       outputStripes.length * topKCount * 2 * Float32Array.BYTES_PER_ELEMENT,
       GPU_STORAGE | GPU_COPY_SRC,
@@ -1672,18 +1680,16 @@ export class Gemma4WebGpuSegmentRunner {
     const outputNorm = this.requireOutputNorm();
     const outputStripes = this.requireOutputStripes();
     const hiddenSize = this.manifest.embeddingLength;
-    const norm = scratchF32(this.arena, hiddenSize, cleanup, "output_norm.selected");
-    dispatchRmsNorm(this.arena.device, pass, resources, hidden, outputNorm.buffer, norm, hiddenSize, this.epsilon);
     const q8 = scratchQ8K(this.arena, hiddenSize, 1, cleanup, "output_norm.selected.q8k");
-    dispatchQ8KQuantize(this.arena.device, pass, resources, norm, q8, hiddenSize, 1);
+    dispatchRmsNormQ8KQuantize(this.arena.device, pass, resources, hidden, outputNorm.buffer, q8, hiddenSize, this.epsilon);
     const candidateCount = outputTop1CandidateCount(outputStripes);
 
-    const candidates = this.arena.createBuffer(
+    const candidates = this.arena.createScratchBuffer(
       "output.selected.candidates",
       candidateCount * 2 * Float32Array.BYTES_PER_ELEMENT,
       GPU_STORAGE,
     );
-    const selectedToken = this.arena.createBuffer(
+    const selectedToken = this.arena.createScratchBuffer(
       "output.selected.token",
       Uint32Array.BYTES_PER_ELEMENT,
       GPU_STORAGE | GPU_COPY_SRC,
@@ -1732,18 +1738,16 @@ export class Gemma4WebGpuSegmentRunner {
     const outputNorm = this.requireOutputNorm();
     const outputStripes = this.requireOutputStripes();
     const hiddenSize = this.manifest.embeddingLength;
-    const norm = scratchF32(this.arena, hiddenSize, cleanup, "output_norm.selected");
-    dispatchRmsNorm(this.arena.device, pass, resources, hidden, outputNorm.buffer, norm, hiddenSize, this.epsilon);
     const q8 = scratchQ8K(this.arena, hiddenSize, 1, cleanup, "output_norm.selected.q8k");
-    dispatchQ8KQuantize(this.arena.device, pass, resources, norm, q8, hiddenSize, 1);
+    dispatchRmsNormQ8KQuantize(this.arena.device, pass, resources, hidden, outputNorm.buffer, q8, hiddenSize, this.epsilon);
     const candidateCount = outputTop1CandidateCount(outputStripes);
 
-    const candidates = this.arena.createBuffer(
+    const candidates = this.arena.createScratchBuffer(
       "output.selected.candidates",
       candidateCount * 2 * Float32Array.BYTES_PER_ELEMENT,
       GPU_STORAGE,
     );
-    const selectedToken = this.arena.createBuffer(
+    const selectedToken = this.arena.createScratchBuffer(
       "output.selected.token",
       Uint32Array.BYTES_PER_ELEMENT,
       GPU_STORAGE | GPU_COPY_SRC,
@@ -1981,6 +1985,10 @@ function outputTop1CandidateCount(outputStripes: readonly OutputStripe[]): numbe
 
 function attentionKeyValueStart(tokenPosition: number, slidingWindow: number | undefined): number {
   return slidingWindow === undefined ? 0 : Math.max(0, tokenPosition + 1 - slidingWindow);
+}
+
+function bucketAttentionProbabilityTokenCount(tokenCount: number): number {
+  return Math.max(1, Math.ceil(tokenCount / 256) * 256);
 }
 
 function webGpuGpuTimingEnabled(): boolean {

@@ -56,6 +56,7 @@ export type WebGpuDeviceLike = {
     has: (feature: string) => boolean;
   };
   createBuffer: (descriptor: {
+    label?: string;
     size: number;
     usage: number;
     mappedAtCreation?: boolean;

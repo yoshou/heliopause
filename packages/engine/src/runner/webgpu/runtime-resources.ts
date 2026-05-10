@@ -1,4 +1,5 @@
-import type { WebGpuDeviceLike } from "./gpu-types";
+import type { WebGpuBufferLike, WebGpuDeviceLike } from "./gpu-types";
+import { GPU_COPY_DST, GPU_MAP_READ, GPU_UNIFORM } from "./gpu-constants";
 
 export type WebGpuRuntimeResourceStats = {
   shaderModuleHits: number;
@@ -19,6 +20,8 @@ export type WebGpuRuntimeResourceStats = {
   bindGroupCreateMs: number;
   bufferCreates: number;
   bufferCreateMs: number;
+  bufferCreateLabels: string;
+  bufferCreateLabelCounts: Record<string, number>;
 };
 
 export type WebGpuRuntimeResourceCache = {
@@ -37,7 +40,24 @@ type RuntimeResourceCacheState = WebGpuRuntimeResourceCache & {
   pipelineLayouts: Map<string, unknown>;
   computePipelines: Map<string, unknown>;
   bindGroups: Map<string, unknown>;
+  uniformBufferPools: Map<string, PooledUniformBuffer[]>;
+  readbackBufferPools: Map<string, PooledReadbackBuffer[]>;
   statsValue: WebGpuRuntimeResourceStats;
+  bufferCreateLabels: Map<string, number>;
+};
+
+type PooledUniformBuffer = ReturnType<WebGpuDeviceLike["createBuffer"]> & {
+  __heliopauseUniformPoolKey?: string;
+  __heliopauseInUniformPool?: boolean;
+  __heliopauseUniformPoolDestroyed?: boolean;
+};
+
+type PooledReadbackBuffer = WebGpuBufferLike & {
+  __heliopauseReadbackPoolKey?: string;
+  __heliopauseInReadbackPool?: boolean;
+  __heliopauseReadbackPoolDestroyed?: boolean;
+  __heliopauseReadbackMapPending?: boolean;
+  __heliopauseReadbackMapped?: boolean;
 };
 
 const emptyStats = (): WebGpuRuntimeResourceStats => ({
@@ -59,6 +79,8 @@ const emptyStats = (): WebGpuRuntimeResourceStats => ({
   bindGroupCreateMs: 0,
   bufferCreates: 0,
   bufferCreateMs: 0,
+  bufferCreateLabels: "",
+  bufferCreateLabelCounts: {},
 });
 
 export function installWebGpuRuntimeResourceCache(
@@ -77,9 +99,17 @@ export function installWebGpuRuntimeResourceCache(
     pipelineLayouts: new Map<string, unknown>(),
     computePipelines: new Map<string, unknown>(),
     bindGroups: new Map<string, unknown>(),
+    uniformBufferPools: new Map<string, PooledUniformBuffer[]>(),
+    readbackBufferPools: new Map<string, PooledReadbackBuffer[]>(),
+    bufferCreateLabels: new Map<string, number>(),
     statsValue: emptyStats(),
     stats() {
-      return { ...this.statsValue };
+      const bufferCreateLabelCounts = Object.fromEntries(this.bufferCreateLabels);
+      return {
+        ...this.statsValue,
+        bufferCreateLabels: formatBufferCreateLabels(bufferCreateLabelCounts),
+        bufferCreateLabelCounts,
+      };
     },
   };
 
@@ -91,12 +121,36 @@ export function installWebGpuRuntimeResourceCache(
   const createBindGroup = device.createBindGroup.bind(device);
 
   mutable.createBuffer = (descriptor) => {
+    const uniformPoolKey = uniformBufferPoolKey(descriptor);
+    const readbackPoolKey = readbackBufferPoolKey(descriptor);
+    if (uniformPoolKey) {
+      const pooled = state.uniformBufferPools.get(uniformPoolKey)?.pop();
+      if (pooled) {
+        pooled.__heliopauseInUniformPool = false;
+        return pooled;
+      }
+    }
+    if (readbackPoolKey) {
+      const pooled = state.readbackBufferPools.get(readbackPoolKey)?.pop();
+      if (pooled) {
+        pooled.__heliopauseInReadbackPool = false;
+        return pooled;
+      }
+    }
     const start = nowMs();
     try {
-      return createBuffer(descriptor);
+      const created = createBuffer(descriptor);
+      if (uniformPoolKey) {
+        return installUniformBufferPoolRelease(created, uniformPoolKey, state);
+      }
+      if (readbackPoolKey) {
+        return installReadbackBufferPoolRelease(created, readbackPoolKey, state);
+      }
+      return created;
     } finally {
       state.statsValue.bufferCreates += 1;
       state.statsValue.bufferCreateMs += nowMs() - start;
+      recordBufferCreateLabel(descriptor, state);
     }
   };
 
@@ -160,10 +214,25 @@ export function installWebGpuRuntimeResourceCache(
   };
 
   mutable.createBindGroup = (descriptor) => {
+    const key = bindGroupKey(descriptor, state);
+    if (key) {
+      const cached = state.bindGroups.get(key);
+      if (cached) {
+        state.statsValue.bindGroupHits += 1;
+        return cached;
+      }
+    }
     state.statsValue.bindGroupMisses += 1;
     const start = nowMs();
     try {
-      return createBindGroup(descriptor);
+      const created = createBindGroup(descriptor);
+      if (key) {
+        if (state.bindGroups.size > 8192) {
+          state.bindGroups.clear();
+        }
+        state.bindGroups.set(key, created);
+      }
+      return created;
     } finally {
       state.statsValue.bindGroupCreates += 1;
       state.statsValue.bindGroupCreateMs += nowMs() - start;
@@ -174,10 +243,129 @@ export function installWebGpuRuntimeResourceCache(
   return state;
 }
 
+function bindGroupKey(descriptor: unknown, state: RuntimeResourceCacheState): string | undefined {
+  if (!isRecord(descriptor) || !Array.isArray(descriptor.entries) || !isRecord(descriptor.layout)) {
+    return undefined;
+  }
+  let key = `l${objectId(descriptor.layout, state)}`;
+  for (const entry of descriptor.entries) {
+    if (!isRecord(entry) || typeof entry.binding !== "number" || !isRecord(entry.resource)) {
+      return undefined;
+    }
+    const buffer = entry.resource.buffer;
+    if (!isGpuBufferLike(buffer)) {
+      return undefined;
+    }
+    const offset = typeof entry.resource.offset === "number" ? entry.resource.offset : 0;
+    const size = typeof entry.resource.size === "number" ? entry.resource.size : 0;
+    key += `|${entry.binding}:${objectId(buffer, state)}:${offset}:${size}`;
+  }
+  return key;
+}
+
+function uniformBufferPoolKey(descriptor: {
+  size: number;
+  usage: number;
+  mappedAtCreation?: boolean;
+}): string | undefined {
+  if (descriptor.mappedAtCreation) {
+    return undefined;
+  }
+  const isUniformCopyDst = (descriptor.usage & GPU_UNIFORM) !== 0 && (descriptor.usage & GPU_COPY_DST) !== 0;
+  if (!isUniformCopyDst || descriptor.size > 256) {
+    return undefined;
+  }
+  return `${descriptor.usage}:${descriptor.size}`;
+}
+
+function readbackBufferPoolKey(descriptor: {
+  size: number;
+  usage: number;
+  mappedAtCreation?: boolean;
+}): string | undefined {
+  if (descriptor.mappedAtCreation || descriptor.usage !== (GPU_MAP_READ | GPU_COPY_DST)) {
+    return undefined;
+  }
+  return `${descriptor.usage}:${descriptor.size}`;
+}
+
+function installUniformBufferPoolRelease(
+  buffer: ReturnType<WebGpuDeviceLike["createBuffer"]>,
+  key: string,
+  state: RuntimeResourceCacheState,
+): PooledUniformBuffer {
+  const pooled = buffer as PooledUniformBuffer;
+  const destroy = buffer.destroy?.bind(buffer);
+  pooled.__heliopauseUniformPoolKey = key;
+  pooled.destroy = () => {
+    if (pooled.__heliopauseUniformPoolDestroyed || pooled.__heliopauseInUniformPool) {
+      return;
+    }
+    if (!destroy) {
+      return;
+    }
+    pooled.__heliopauseInUniformPool = true;
+    const targetPool = state.uniformBufferPools.get(key);
+    if (targetPool) {
+      targetPool.push(pooled);
+    } else {
+      state.uniformBufferPools.set(key, [pooled]);
+    }
+  };
+  return pooled;
+}
+
+function installReadbackBufferPoolRelease(
+  buffer: ReturnType<WebGpuDeviceLike["createBuffer"]>,
+  key: string,
+  state: RuntimeResourceCacheState,
+): PooledReadbackBuffer {
+  const pooled = buffer as PooledReadbackBuffer;
+  const mapAsync = buffer.mapAsync.bind(buffer);
+  const unmap = buffer.unmap.bind(buffer);
+  const destroy = buffer.destroy?.bind(buffer);
+  pooled.__heliopauseReadbackPoolKey = key;
+  pooled.mapAsync = async (mode) => {
+    pooled.__heliopauseReadbackMapPending = true;
+    try {
+      await mapAsync(mode);
+      pooled.__heliopauseReadbackMapped = true;
+    } finally {
+      pooled.__heliopauseReadbackMapPending = false;
+    }
+  };
+  pooled.unmap = () => {
+    try {
+      unmap();
+    } finally {
+      pooled.__heliopauseReadbackMapped = false;
+    }
+  };
+  pooled.destroy = () => {
+    if (pooled.__heliopauseReadbackPoolDestroyed || pooled.__heliopauseInReadbackPool) {
+      return;
+    }
+    if (pooled.__heliopauseReadbackMapPending || pooled.__heliopauseReadbackMapped) {
+      pooled.__heliopauseReadbackPoolDestroyed = true;
+      destroy?.();
+      return;
+    }
+    pooled.__heliopauseInReadbackPool = true;
+    const targetPool = state.readbackBufferPools.get(key);
+    if (targetPool) {
+      targetPool.push(pooled);
+    } else {
+      state.readbackBufferPools.set(key, [pooled]);
+    }
+  };
+  return pooled;
+}
+
 export function diffWebGpuRuntimeResourceStats(
   after: WebGpuRuntimeResourceStats,
   before: WebGpuRuntimeResourceStats,
 ): WebGpuRuntimeResourceStats {
+  const bufferCreateLabelCounts = diffCounts(after.bufferCreateLabelCounts, before.bufferCreateLabelCounts);
   return {
     shaderModuleHits: after.shaderModuleHits - before.shaderModuleHits,
     shaderModuleMisses: after.shaderModuleMisses - before.shaderModuleMisses,
@@ -197,6 +385,8 @@ export function diffWebGpuRuntimeResourceStats(
     bindGroupCreateMs: after.bindGroupCreateMs - before.bindGroupCreateMs,
     bufferCreates: after.bufferCreates - before.bufferCreates,
     bufferCreateMs: after.bufferCreateMs - before.bufferCreateMs,
+    bufferCreateLabels: formatBufferCreateLabels(bufferCreateLabelCounts),
+    bufferCreateLabelCounts,
   };
 }
 
@@ -228,6 +418,59 @@ function stableKey(value: unknown, state: RuntimeResourceCacheState): string {
     return `{${keys.map((key) => `${JSON.stringify(key)}:${stableKey(record[key], state)}`).join(",")}}`;
   }
   return String(value);
+}
+
+function recordBufferCreateLabel(
+  descriptor: {
+    label?: string;
+    size: number;
+    usage: number;
+  },
+  state: RuntimeResourceCacheState,
+): void {
+  if (!webGpuBufferCreateLabelTimingEnabled()) {
+    return;
+  }
+  const label = descriptor.label ?? `usage:${descriptor.usage}:size:${descriptor.size}`;
+  state.bufferCreateLabels.set(label, (state.bufferCreateLabels.get(label) ?? 0) + 1);
+}
+
+function formatBufferCreateLabels(labels: Record<string, number>): string {
+  const entries = Object.entries(labels).filter(([, count]) => count > 0);
+  if (!webGpuBufferCreateLabelTimingEnabled() || entries.length === 0) {
+    return "";
+  }
+  return entries
+    .sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0]))
+    .slice(0, 32)
+    .map(([label, count]) => `${label}=${count}`)
+    .join(";");
+}
+
+function diffCounts(after: Record<string, number>, before: Record<string, number>): Record<string, number> {
+  const diff: Record<string, number> = {};
+  for (const [label, afterCount] of Object.entries(after)) {
+    const count = afterCount - (before[label] ?? 0);
+    if (count > 0) {
+      diff[label] = count;
+    }
+  }
+  return diff;
+}
+
+function webGpuBufferCreateLabelTimingEnabled(): boolean {
+  return (globalThis as { __heliopauseDisableWebGpuBufferCreateLabels?: unknown }).__heliopauseDisableWebGpuBufferCreateLabels !== true;
+}
+
+function isGpuBufferLike(value: unknown): value is WebGpuBufferLike {
+  return isRecord(value) &&
+    typeof value.getMappedRange === "function" &&
+    typeof value.unmap === "function" &&
+    typeof value.mapAsync === "function";
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
 }
 
 function objectId(value: object, state: RuntimeResourceCacheState): number {

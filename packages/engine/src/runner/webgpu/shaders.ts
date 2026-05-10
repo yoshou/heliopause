@@ -511,6 +511,48 @@ fn main(@builtin(local_invocation_id) localId: vec3<u32>) {
 }
 `;
 
+export const RMS_NORM_RESIDUAL_ADD_SCALE_WGSL = `
+struct Params {
+  epsilon: f32,
+  length: u32,
+  _pad0: u32,
+  _pad1: u32,
+};
+
+@group(0) @binding(0) var<storage, read> inputValues: array<f32>;
+@group(0) @binding(1) var<storage, read> weightValues: array<f32>;
+@group(0) @binding(2) var<storage, read> residualValues: array<f32>;
+@group(0) @binding(3) var<storage, read> scaleValue: array<f32>;
+@group(0) @binding(4) var<uniform> params: Params;
+@group(0) @binding(5) var<storage, read_write> outputValues: array<f32>;
+
+var<workgroup> rmsResidualScaleReduceValues: array<f32, 256>;
+
+@compute @workgroup_size(256, 1, 1)
+fn main(@builtin(local_invocation_id) localId: vec3<u32>) {
+  let lane = localId.x;
+  var localSum = 0.0;
+  for (var index = lane; index < params.length; index = index + 256u) {
+    let value = inputValues[index];
+    localSum = localSum + value * value;
+  }
+  rmsResidualScaleReduceValues[lane] = localSum;
+  workgroupBarrier();
+  for (var stride = 128u; stride > 0u; stride = stride / 2u) {
+    if (lane < stride) {
+      rmsResidualScaleReduceValues[lane] = rmsResidualScaleReduceValues[lane] + rmsResidualScaleReduceValues[lane + stride];
+    }
+    workgroupBarrier();
+  }
+  let meanSquare = rmsResidualScaleReduceValues[0];
+  let normScale = inverseSqrt(meanSquare / f32(params.length) + params.epsilon);
+  let outputScale = scaleValue[0];
+  for (var index = lane; index < params.length; index = index + 256u) {
+    outputValues[index] = (residualValues[index] + inputValues[index] * normScale * weightValues[index]) * outputScale;
+  }
+}
+`;
+
 export const FULL_QUERY_NORM_ROPE_WGSL = `
 struct Params {
   epsilon: f32,
@@ -913,6 +955,88 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     return;
   }
   outputValues[index] = gelu(gateValues[index]) * upValues[index];
+}
+`;
+
+export const GEGLU_SLICE_WGSL = `
+struct Params {
+  length: u32,
+  rightOffset: u32,
+  _pad0: u32,
+  _pad1: u32,
+};
+
+@group(0) @binding(0) var<storage, read> gateValues: array<f32>;
+@group(0) @binding(1) var<storage, read> rightValues: array<f32>;
+@group(0) @binding(2) var<uniform> params: Params;
+@group(0) @binding(3) var<storage, read_write> outputValues: array<f32>;
+
+fn f16BitsToF32(bits: u32) -> f32 {
+  let sign = select(1.0, -1.0, (bits & 0x8000u) != 0u);
+  let exponent = (bits >> 10u) & 31u;
+  let fraction = bits & 1023u;
+  if (exponent == 0u) {
+    return sign * exp2(-14.0) * (f32(fraction) / 1024.0);
+  }
+  if (exponent == 31u) {
+    return sign * 65504.0;
+  }
+  return sign * exp2(f32(exponent) - 15.0) * (1.0 + f32(fraction) / 1024.0);
+}
+
+fn f32ToF16Bits(value: f32) -> u32 {
+  let bits = bitcast<u32>(value);
+  let sign = (bits >> 16u) & 0x8000u;
+  let absBits = bits & 0x7fffffffu;
+  if (absBits == 0u) {
+    return sign;
+  }
+  if (absBits >= 0x7f800000u) {
+    return sign | 0x7c00u;
+  }
+  var exponent = i32((absBits >> 23u) & 255u) - 127 + 15;
+  let mantissa = absBits & 0x7fffffu;
+  if (exponent <= 0) {
+    if (exponent < -10) {
+      return sign;
+    }
+    let shifted = (mantissa | 0x800000u) >> u32(1 - exponent);
+    return sign | ((shifted + 0x1000u) >> 13u);
+  }
+  var halfMantissa = (mantissa + 0x1000u) >> 13u;
+  if (halfMantissa == 0x400u) {
+    halfMantissa = 0u;
+    exponent = exponent + 1;
+  }
+  if (exponent >= 31) {
+    return sign | 0x7c00u;
+  }
+  return sign | (u32(exponent) << 10u) | halfMantissa;
+}
+
+fn castF16(value: f32) -> f32 {
+  return f16BitsToF32(f32ToF16Bits(value));
+}
+
+fn gelu(value: f32) -> f32 {
+  if (value <= -10.0) {
+    return 0.0;
+  }
+  if (value >= 10.0) {
+    return value;
+  }
+  let x = castF16(value);
+  let inner = sqrt(2.0 / 3.141592653589793) * x * (1.0 + 0.044715 * x * x);
+  return castF16(0.5 * x * (1.0 + tanh(inner)));
+}
+
+@compute @workgroup_size(256, 1, 1)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let index = id.x;
+  if (index >= params.length) {
+    return;
+  }
+  outputValues[index] = gelu(gateValues[index]) * rightValues[params.rightOffset + index];
 }
 `;
 

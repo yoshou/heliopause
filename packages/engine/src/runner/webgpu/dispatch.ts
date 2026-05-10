@@ -11,6 +11,7 @@ import {
   createFullKvUpdateResources,
   createFullQueryResources,
   createGegluResources,
+  createGegluSliceResources,
   createGeluResources,
   createKMatMulBindResources,
   createQ8_0MatMulBindResources,
@@ -23,6 +24,7 @@ import {
   createRmsNormResources,
   createRmsNormQ8KQuantizeResources,
   createRmsNormResidualAddResources,
+  createRmsNormResidualAddScaleResources,
   createScaleResources,
   createSelectTop1CandidateResources,
   createSigmoidMulResources,
@@ -236,6 +238,25 @@ export function dispatchRmsNormResidualAdd(
   epsilon: number,
 ): void {
   const resource = createRmsNormResidualAddResources(device, input, weight, residual, output, length, epsilon);
+  resources.push(resource);
+  pass.setPipeline(resource.pipeline);
+  pass.setBindGroup(0, resource.bindGroup);
+  pass.dispatchWorkgroups(1);
+}
+
+export function dispatchRmsNormResidualAddScale(
+  device: WebGpuDeviceLike,
+  pass: WebGpuComputePassLike,
+  resources: Array<{ destroy: () => void }>,
+  input: WebGpuBufferLike,
+  weight: WebGpuBufferLike,
+  residual: WebGpuBufferLike,
+  scale: WebGpuBufferLike,
+  output: WebGpuBufferLike,
+  length: number,
+  epsilon: number,
+): void {
+  const resource = createRmsNormResidualAddScaleResources(device, input, weight, residual, scale, output, length, epsilon);
   resources.push(resource);
   pass.setPipeline(resource.pipeline);
   pass.setBindGroup(0, resource.bindGroup);
@@ -497,6 +518,23 @@ export function dispatchGeglu(
   length: number,
 ): void {
   const resource = createGegluResources(device, gate, up, output, length);
+  resources.push(resource);
+  pass.setPipeline(resource.pipeline);
+  pass.setBindGroup(0, resource.bindGroup);
+  pass.dispatchWorkgroups(Math.ceil(length / 256));
+}
+
+export function dispatchGegluSlice(
+  device: WebGpuDeviceLike,
+  pass: WebGpuComputePassLike,
+  resources: Array<{ destroy: () => void }>,
+  gate: WebGpuBufferLike,
+  right: WebGpuBufferLike,
+  output: WebGpuBufferLike,
+  length: number,
+  rightOffset: number,
+): void {
+  const resource = createGegluSliceResources(device, gate, right, output, length, rightOffset);
   resources.push(resource);
   pass.setPipeline(resource.pipeline);
   pass.setBindGroup(0, resource.bindGroup);
