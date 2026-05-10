@@ -136,7 +136,6 @@ export async function runWebGpuSmokeTest(): Promise<WebGpuSmokeTest> {
       pass.end();
       encoder.copyBufferToBuffer(outputBuffer, 0, readbackBuffer, 0, input.byteLength);
       device.queue.submit([encoder.finish()]);
-      await device.queue.onSubmittedWorkDone?.();
       await readbackBuffer.mapAsync(GPU_MAP_READ);
       const output = Array.from(new Float32Array(readbackBuffer.getMappedRange()).slice());
       readbackBuffer.unmap();

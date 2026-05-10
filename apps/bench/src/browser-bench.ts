@@ -219,6 +219,7 @@ export async function runBrowserBench(
     }
   }
 
+  logBrowserBenchTimings(results);
   return {
     environment,
     results,
@@ -245,6 +246,24 @@ export function defaultBrowserBenchCaseIds(): BrowserBenchCaseId[] {
 
 export function defaultBrowserBenchSizes(): BrowserBenchSize[] {
   return [...DEFAULT_SIZES];
+}
+
+function logBrowserBenchTimings(results: readonly BrowserBenchResult[]): void {
+  if (typeof console === "undefined") {
+    return;
+  }
+  console.table(results.map((result) => ({
+    case: result.caseName,
+    size: result.size,
+    backend: result.backend,
+    variant: result.variant,
+    status: result.status,
+    meanMs: roundMs(result.meanMs),
+    gpuMeanMs: result.gpuMeanMs === undefined ? undefined : roundMs(result.gpuMeanMs),
+    totalMs: roundMs(result.totalMs),
+    iterations: result.iterations,
+    opsPerSecond: Math.round(result.opsPerSecond * 10) / 10,
+  })));
 }
 
 function buildBenchTasks(caseIds: readonly BrowserBenchCaseId[], sizes: readonly BrowserBenchSize[]): BenchTask[] {
@@ -802,7 +821,6 @@ async function prepareWebGpuMatMulTimestamp(
       encoder.resolveQuerySet(querySet, 0, 2, resolveBuffer, 0);
       encoder.copyBufferToBuffer(resolveBuffer, 0, readbackBuffer, 0, 2 * BigUint64Array.BYTES_PER_ELEMENT);
       device.queue.submit([encoder.finish()]);
-      await device.queue.onSubmittedWorkDone?.();
       await readbackBuffer.mapAsync(1);
       const timestamps = new BigUint64Array(readbackBuffer.getMappedRange()).slice();
       readbackBuffer.unmap();
@@ -1083,6 +1101,10 @@ function checksum(values: Float32Array): number {
     sum += (values[index] ?? 0) * ((index % 17) + 1);
   }
   return sum;
+}
+
+function roundMs(value: number): number {
+  return Math.round(value * 1000) / 1000;
 }
 
 function quantizedWeightBytes(type: QuantizedType, inputSize: number, rowCount: number): Uint8Array {

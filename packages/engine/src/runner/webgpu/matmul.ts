@@ -110,7 +110,6 @@ export async function matMulQ8_0WebGpu(
     pass.end();
     encoder.copyBufferToBuffer(outputBuffer, 0, readbackBuffer, 0, outputLength * Float32Array.BYTES_PER_ELEMENT);
     device.queue.submit([encoder.finish()]);
-    await device.queue.onSubmittedWorkDone?.();
     await readbackBuffer.mapAsync(GPU_MAP_READ);
     const output = new Float32Array(readbackBuffer.getMappedRange()).slice();
     readbackBuffer.unmap();
@@ -221,7 +220,6 @@ export async function matMulQ4_KWebGpu(
     pass.end();
     encoder.copyBufferToBuffer(outputBuffer, 0, readbackBuffer, 0, outputLength * Float32Array.BYTES_PER_ELEMENT);
     device.queue.submit([encoder.finish()]);
-    await device.queue.onSubmittedWorkDone?.();
     await readbackBuffer.mapAsync(GPU_MAP_READ);
     const output = new Float32Array(readbackBuffer.getMappedRange()).slice();
     readbackBuffer.unmap();
@@ -333,7 +331,6 @@ export async function matMulQ5_KWebGpu(
     pass.end();
     encoder.copyBufferToBuffer(outputBuffer, 0, readbackBuffer, 0, outputLength * Float32Array.BYTES_PER_ELEMENT);
     device.queue.submit([encoder.finish()]);
-    await device.queue.onSubmittedWorkDone?.();
     await readbackBuffer.mapAsync(GPU_MAP_READ);
     const output = new Float32Array(readbackBuffer.getMappedRange()).slice();
     readbackBuffer.unmap();
@@ -441,7 +438,6 @@ export async function matMulQ6_KWebGpu(
     pass.end();
     encoder.copyBufferToBuffer(outputBuffer, 0, readbackBuffer, 0, outputLength * Float32Array.BYTES_PER_ELEMENT);
     device.queue.submit([encoder.finish()]);
-    await device.queue.onSubmittedWorkDone?.();
     await readbackBuffer.mapAsync(GPU_MAP_READ);
     const output = new Float32Array(readbackBuffer.getMappedRange()).slice();
     readbackBuffer.unmap();
@@ -518,7 +514,6 @@ export async function matMulTop1WebGpuQuantizedResident(
     pass.end();
     encoder.copyBufferToBuffer(topBuffer, 0, readbackBuffer, 0, 2 * Float32Array.BYTES_PER_ELEMENT);
     resident.device.queue.submit([encoder.finish()]);
-    await resident.device.queue.onSubmittedWorkDone?.();
     await readbackBuffer.mapAsync(GPU_MAP_READ);
     const mapped = new Float32Array(readbackBuffer.getMappedRange()).slice();
     readbackBuffer.unmap();
@@ -606,7 +601,6 @@ export async function matMulSwiGluWebGpuResident(
     pass.end();
     encoder.copyBufferToBuffer(swigluBuffer, 0, readbackBuffer, 0, outputLength * Float32Array.BYTES_PER_ELEMENT);
     gate.device.queue.submit([encoder.finish()]);
-    await gate.device.queue.onSubmittedWorkDone?.();
     await readbackBuffer.mapAsync(GPU_MAP_READ);
     const output = new Float32Array(readbackBuffer.getMappedRange()).slice();
     readbackBuffer.unmap();
@@ -706,7 +700,6 @@ export async function matMulSwiGluDownWebGpuResident(
     pass.end();
     encoder.copyBufferToBuffer(outputBuffer, 0, readbackBuffer, 0, outputLength * Float32Array.BYTES_PER_ELEMENT);
     gate.device.queue.submit([encoder.finish()]);
-    await gate.device.queue.onSubmittedWorkDone?.();
     await readbackBuffer.mapAsync(GPU_MAP_READ);
     const output = new Float32Array(readbackBuffer.getMappedRange()).slice();
     readbackBuffer.unmap();
@@ -823,7 +816,6 @@ export async function matMulSsmNormGateOutWebGpuResident(
     pass.end();
     encoder.copyBufferToBuffer(outputBuffer, 0, readbackBuffer, 0, outputLength * Float32Array.BYTES_PER_ELEMENT);
     z.device.queue.submit([encoder.finish()]);
-    await z.device.queue.onSubmittedWorkDone?.();
     await readbackBuffer.mapAsync(GPU_MAP_READ);
     const output = new Float32Array(readbackBuffer.getMappedRange()).slice();
     readbackBuffer.unmap();
@@ -938,7 +930,6 @@ export async function matMulQkvConvWebGpuResident(
     offset += vLength * Float32Array.BYTES_PER_ELEMENT;
     encoder.copyBufferToBuffer(newStateBuffer, 0, readbackBuffer, offset, stateLength * Float32Array.BYTES_PER_ELEMENT);
     qkv.device.queue.submit([encoder.finish()]);
-    await qkv.device.queue.onSubmittedWorkDone?.();
     await readbackBuffer.mapAsync(GPU_MAP_READ);
     const mapped = new Float32Array(readbackBuffer.getMappedRange()).slice();
     readbackBuffer.unmap();
@@ -1086,7 +1077,6 @@ export async function fullAttentionDecodeOutWebGpuResident(
     pass.end();
     encoder.copyBufferToBuffer(outputBuffer, 0, readbackBuffer, 0, out.rowCount * Float32Array.BYTES_PER_ELEMENT);
     out.device.queue.submit([encoder.finish()]);
-    await out.device.queue.onSubmittedWorkDone?.();
     await readbackBuffer.mapAsync(GPU_MAP_READ);
     const output = new Float32Array(readbackBuffer.getMappedRange()).slice();
     readbackBuffer.unmap();
@@ -1314,7 +1304,6 @@ async function dispatchMatMulReadback(
   pass.end();
   encoder.copyBufferToBuffer(outputBuffer, 0, readbackBuffer, 0, outputLength * Float32Array.BYTES_PER_ELEMENT);
   device.queue.submit([encoder.finish()]);
-  await device.queue.onSubmittedWorkDone?.();
   await readbackBuffer.mapAsync(GPU_MAP_READ);
   const output = new Float32Array(readbackBuffer.getMappedRange()).slice();
   readbackBuffer.unmap();

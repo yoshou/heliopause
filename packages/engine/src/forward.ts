@@ -160,6 +160,7 @@ async function prefillGemma4HybridWebGpu(
       }),
     );
     updateNextPosition(state, positions, tokenIds.length);
+    logWebGpuRunnerTiming(session, "prefill");
     return {
       hidden: new Float32Array(),
       state,
@@ -190,6 +191,7 @@ async function prefillGemma4HybridWebGpu(
     }),
   );
   updateNextPosition(state, positions, tokenIds.length);
+  logWebGpuRunnerTiming(session, "prefill");
 
   const result: PrefillResult = {
     hidden: new Float32Array(),
@@ -223,6 +225,7 @@ async function decodeGemma4HybridWebGpu(
       }),
     );
     state.nextPosition = Math.max(state.nextPosition, position + 1);
+    logWebGpuRunnerTiming(session, "decode");
     return {
       hidden: new Float32Array(),
       state,
@@ -253,6 +256,7 @@ async function decodeGemma4HybridWebGpu(
     }),
   );
   state.nextPosition = Math.max(state.nextPosition, position + 1);
+  logWebGpuRunnerTiming(session, "decode");
   return {
     hidden: new Float32Array(),
     state,
@@ -317,4 +321,153 @@ function tokenPositionsFromMrope(positions: Int32Array, tokenCount: number): Int
     return positions.slice(0, tokenCount);
   }
   throw new Error(`Expected ${tokenCount} or ${tokenCount * 4} positions, got ${positions.length}`);
+}
+
+function logWebGpuRunnerTiming(session: Gemma4ModelSession, phase: "prefill" | "decode"): void {
+  if (typeof console === "undefined") {
+    return;
+  }
+  const stats = session.cacheStats().executionProviderStats;
+  if (typeof stats.webgpuRunnerCreateMs !== "number") {
+    return;
+  }
+  const row: WebGpuRunnerTimingRow = {
+    phase,
+    runnerCreateMs: roundMs(stats.webgpuRunnerCreateMs),
+    runtimeInitMs: roundMs(numberStat(stats.webgpuRuntimeInitMs)),
+    firstRunTotalMs: roundMs(numberStat(stats.webgpuFirstRunTotalMs)),
+    steadyRunMs: roundMs(numberStat(stats.webgpuSteadyRunMs)),
+    runtimeResizeMs: roundMs(numberStat(stats.webgpuRuntimeResizeMs)),
+    submitCount: numberStat(stats.webgpuSubmitCount),
+    blockingWaitCount: numberStat(stats.webgpuBlockingWaitCount),
+    readbackCount: numberStat(stats.webgpuReadbackCount),
+    pipelineHit: numberStat(stats.webgpuComputePipelineCacheHits),
+    pipelineMiss: numberStat(stats.webgpuComputePipelineCacheMisses),
+    bindGroupHit: numberStat(stats.webgpuBindGroupCacheHits),
+    bindGroupMiss: numberStat(stats.webgpuBindGroupCacheMisses),
+    lastRunDurationMs: roundMs(stats.webgpuLastRunDurationMs),
+    lastRunSubmitCount: numberStat(stats.webgpuLastRunSubmitCount),
+    lastRunReadbackCount: numberStat(stats.webgpuLastRunReadbackCount),
+    lastRunBindGroupCreates: numberStat(stats.webgpuLastRunBindGroupCreates),
+    lastRunBindGroupCreateMs: roundMs(stats.webgpuLastRunBindGroupCreateMs),
+    lastRunBufferCreates: numberStat(stats.webgpuLastRunBufferCreates),
+    lastRunBufferCreateMs: roundMs(stats.webgpuLastRunBufferCreateMs),
+    lastRunEncodeMs: roundMs(stats.webgpuLastRunEncodeMs),
+    lastRunSubmitMs: roundMs(stats.webgpuLastRunSubmitMs),
+    lastRunReadbackWaitMs: roundMs(stats.webgpuLastRunReadbackWaitMs),
+    lastRunPipelineHit: numberStat(stats.webgpuLastRunComputePipelineHits),
+    lastRunPipelineMiss: numberStat(stats.webgpuLastRunComputePipelineMisses),
+    lastRunBindGroupHit: numberStat(stats.webgpuLastRunBindGroupHits),
+    lastRunBindGroupMiss: numberStat(stats.webgpuLastRunBindGroupMisses),
+    lastRunLayoutHit: numberStat(stats.webgpuLastRunBindGroupLayoutHits),
+    lastRunLayoutMiss: numberStat(stats.webgpuLastRunBindGroupLayoutMisses),
+  };
+  const global = webGpuTimingGlobal();
+  global.__heliopauseWebGpuTimings ??= [];
+  global.__heliopauseWebGpuTimings.push(row);
+  global.__heliopauseWebGpuTimingsTsv = () => webGpuTimingRowsToTsv(global.__heliopauseWebGpuTimings ?? []);
+  if (!global.__heliopauseWebGpuTimingCopyHintShown) {
+    global.__heliopauseWebGpuTimingCopyHintShown = true;
+    console.log(
+      "[heliopause] WebGPU timings are buffered for copying. " +
+        "Use copy(globalThis.__heliopauseWebGpuTimingsTsv()) or " +
+        "copy(JSON.stringify(globalThis.__heliopauseWebGpuTimings, null, 2)).",
+    );
+  }
+  if (global.__heliopauseWebGpuTimingFlush !== undefined) {
+    clearTimeout(global.__heliopauseWebGpuTimingFlush);
+  }
+  global.__heliopauseWebGpuTimingFlush = setTimeout(() => {
+    const rows = global.__heliopauseWebGpuTimings ?? [];
+    console.log(`[heliopause-webgpu-timings.tsv]\n${webGpuTimingRowsToTsv(rows)}`);
+  }, 1000);
+}
+
+type WebGpuRunnerTimingRow = {
+  phase: "prefill" | "decode";
+  runnerCreateMs: number;
+  runtimeInitMs: number;
+  firstRunTotalMs: number;
+  steadyRunMs: number;
+  runtimeResizeMs: number;
+  submitCount: number;
+  blockingWaitCount: number;
+  readbackCount: number;
+  pipelineHit: number;
+  pipelineMiss: number;
+  bindGroupHit: number;
+  bindGroupMiss: number;
+  lastRunDurationMs: number;
+  lastRunSubmitCount: number;
+  lastRunReadbackCount: number;
+  lastRunBindGroupCreates: number;
+  lastRunBindGroupCreateMs: number;
+  lastRunBufferCreates: number;
+  lastRunBufferCreateMs: number;
+  lastRunEncodeMs: number;
+  lastRunSubmitMs: number;
+  lastRunReadbackWaitMs: number;
+  lastRunPipelineHit: number;
+  lastRunPipelineMiss: number;
+  lastRunBindGroupHit: number;
+  lastRunBindGroupMiss: number;
+  lastRunLayoutHit: number;
+  lastRunLayoutMiss: number;
+};
+
+type WebGpuTimingGlobal = typeof globalThis & {
+  __heliopauseWebGpuTimings?: WebGpuRunnerTimingRow[];
+  __heliopauseWebGpuTimingsTsv?: () => string;
+  __heliopauseWebGpuTimingFlush?: ReturnType<typeof setTimeout>;
+  __heliopauseWebGpuTimingCopyHintShown?: boolean;
+};
+
+function webGpuTimingGlobal(): WebGpuTimingGlobal {
+  return globalThis as WebGpuTimingGlobal;
+}
+
+function webGpuTimingRowsToTsv(rows: readonly WebGpuRunnerTimingRow[]): string {
+  const headers: Array<keyof WebGpuRunnerTimingRow> = [
+    "phase",
+    "runnerCreateMs",
+    "runtimeInitMs",
+    "firstRunTotalMs",
+    "steadyRunMs",
+    "runtimeResizeMs",
+    "submitCount",
+    "blockingWaitCount",
+    "readbackCount",
+    "pipelineHit",
+    "pipelineMiss",
+    "bindGroupHit",
+    "bindGroupMiss",
+    "lastRunDurationMs",
+    "lastRunSubmitCount",
+    "lastRunReadbackCount",
+    "lastRunBindGroupCreates",
+    "lastRunBindGroupCreateMs",
+    "lastRunBufferCreates",
+    "lastRunBufferCreateMs",
+    "lastRunEncodeMs",
+    "lastRunSubmitMs",
+    "lastRunReadbackWaitMs",
+    "lastRunPipelineHit",
+    "lastRunPipelineMiss",
+    "lastRunBindGroupHit",
+    "lastRunBindGroupMiss",
+    "lastRunLayoutHit",
+    "lastRunLayoutMiss",
+  ];
+  return [
+    headers.join("\t"),
+    ...rows.map((row) => headers.map((header) => String(row[header])).join("\t")),
+  ].join("\n");
+}
+
+function numberStat(value: unknown): number {
+  return typeof value === "number" ? value : 0;
+}
+
+function roundMs(value: unknown): number {
+  return Math.round(numberStat(value) * 1000) / 1000;
 }

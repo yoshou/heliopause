@@ -44,6 +44,12 @@ import {
   type Gemma4GpuLayer,
   type OutputStripe,
 } from "./segment-layer-loader";
+import {
+  diffWebGpuRuntimeResourceStats,
+  installWebGpuRuntimeResourceCache,
+  runtimeResourceCreateMs,
+  type WebGpuRuntimeResourceCache,
+} from "./runtime-resources";
 import type { WebGpuBufferLike, WebGpuComputePassLike, WebGpuTopToken } from "./gpu-types";
 
 export type Gemma4WebGpuSegmentRunnerOptions = {
@@ -83,14 +89,56 @@ export type Gemma4WebGpuRunOptions = {
 
 export type Gemma4WebGpuRuntimeStats = {
   webgpuLazyLoadMs: number;
+  webgpuRunnerCreateMs: number;
+  webgpuRuntimeInitMs: number;
+  webgpuRuntimeResizeMs: number;
+  webgpuFirstRunTotalMs: number;
+  webgpuSteadyRunMs: number;
+  webgpuSteadyRunCount: number;
   webgpuResidentBytes: number;
   webgpuReadbackBytes: number;
+  webgpuReadbackCount: number;
   webgpuSelectedTokenReadbacks: number;
+  webgpuSubmitCount: number;
+  webgpuBlockingWaitCount: number;
+  webgpuDeferredCleanupCount: number;
   webgpuBoundaryUploads: number;
   webgpuTokenIdInputBatches: number;
   webgpuTokenIdInputTokens: number;
   webgpuInputPreparationSupported: boolean;
   webgpuInputPreparationUnsupportedReason: string;
+  webgpuShaderModuleCacheHits: number;
+  webgpuShaderModuleCacheMisses: number;
+  webgpuBindGroupLayoutCacheHits: number;
+  webgpuBindGroupLayoutCacheMisses: number;
+  webgpuPipelineLayoutCacheHits: number;
+  webgpuPipelineLayoutCacheMisses: number;
+  webgpuComputePipelineCacheHits: number;
+  webgpuComputePipelineCacheMisses: number;
+  webgpuBindGroupCacheHits: number;
+  webgpuBindGroupCacheMisses: number;
+  webgpuBindGroupCreates: number;
+  webgpuBufferCreates: number;
+  webgpuLastRunDurationMs: number;
+  webgpuLastRunSubmitCount: number;
+  webgpuLastRunReadbackCount: number;
+  webgpuLastRunBindGroupCreates: number;
+  webgpuLastRunBindGroupCreateMs: number;
+  webgpuLastRunBufferCreates: number;
+  webgpuLastRunBufferCreateMs: number;
+  webgpuLastRunEncodeMs: number;
+  webgpuLastRunSubmitMs: number;
+  webgpuLastRunReadbackWaitMs: number;
+  webgpuLastRunShaderModuleHits: number;
+  webgpuLastRunShaderModuleMisses: number;
+  webgpuLastRunBindGroupLayoutHits: number;
+  webgpuLastRunBindGroupLayoutMisses: number;
+  webgpuLastRunPipelineLayoutHits: number;
+  webgpuLastRunPipelineLayoutMisses: number;
+  webgpuLastRunComputePipelineHits: number;
+  webgpuLastRunComputePipelineMisses: number;
+  webgpuLastRunBindGroupHits: number;
+  webgpuLastRunBindGroupMisses: number;
 };
 
 type FullAttentionGpuLayerState = {
@@ -136,6 +184,30 @@ export class Gemma4WebGpuSegmentRunner {
   private boundaryUploads = 0;
   private tokenIdInputBatches = 0;
   private tokenIdInputTokens = 0;
+  private runtimeResourceCache?: WebGpuRuntimeResourceCache;
+  private runtimeResourcesInitialized = false;
+  private runtimeInitMs = 0;
+  private runtimeResizeMs = 0;
+  private firstRunTotalMs = 0;
+  private steadyRunMs = 0;
+  private steadyRunCount = 0;
+  private hasRecordedFirstRun = false;
+  private submitCount = 0;
+  private blockingWaitCount = 0;
+  private readbackCount = 0;
+  private deferredCleanupCount = 0;
+  private lastRunStats = {
+    durationMs: 0,
+    submitCount: 0,
+    readbackCount: 0,
+    encodeMs: 0,
+    submitMs: 0,
+    readbackWaitMs: 0,
+    resourceStats: undefined as ReturnType<WebGpuRuntimeResourceCache["stats"]> | undefined,
+  };
+  private activeRunEncodeMs = 0;
+  private activeRunSubmitMs = 0;
+  private activeRunReadbackWaitMs = 0;
 
   private constructor(
     arena: GpuMemoryArena,
@@ -227,17 +299,160 @@ export class Gemma4WebGpuSegmentRunner {
   }
 
   runtimeStats(): Gemma4WebGpuRuntimeStats {
+    const resourceStats = this.runtimeResourceCache?.stats();
     return {
       webgpuLazyLoadMs: this.lazyLoadMs,
+      webgpuRunnerCreateMs: this.lazyLoadMs,
+      webgpuRuntimeInitMs: this.runtimeInitMs,
+      webgpuRuntimeResizeMs: this.runtimeResizeMs,
+      webgpuFirstRunTotalMs: this.firstRunTotalMs,
+      webgpuSteadyRunMs: this.steadyRunMs,
+      webgpuSteadyRunCount: this.steadyRunCount,
       webgpuResidentBytes: this.residentBytes,
       webgpuReadbackBytes: this.readbackBytes,
+      webgpuReadbackCount: this.readbackCount,
       webgpuSelectedTokenReadbacks: this.selectedTokenReadbacks,
+      webgpuSubmitCount: this.submitCount,
+      webgpuBlockingWaitCount: this.blockingWaitCount,
+      webgpuDeferredCleanupCount: this.deferredCleanupCount,
       webgpuBoundaryUploads: this.boundaryUploads,
       webgpuTokenIdInputBatches: this.tokenIdInputBatches,
       webgpuTokenIdInputTokens: this.tokenIdInputTokens,
       webgpuInputPreparationSupported: this.gpuInputPreparationSupport().supported,
       webgpuInputPreparationUnsupportedReason: this.gpuInputPreparationSupport().reason,
+      webgpuShaderModuleCacheHits: resourceStats?.shaderModuleHits ?? 0,
+      webgpuShaderModuleCacheMisses: resourceStats?.shaderModuleMisses ?? 0,
+      webgpuBindGroupLayoutCacheHits: resourceStats?.bindGroupLayoutHits ?? 0,
+      webgpuBindGroupLayoutCacheMisses: resourceStats?.bindGroupLayoutMisses ?? 0,
+      webgpuPipelineLayoutCacheHits: resourceStats?.pipelineLayoutHits ?? 0,
+      webgpuPipelineLayoutCacheMisses: resourceStats?.pipelineLayoutMisses ?? 0,
+      webgpuComputePipelineCacheHits: resourceStats?.computePipelineHits ?? 0,
+      webgpuComputePipelineCacheMisses: resourceStats?.computePipelineMisses ?? 0,
+      webgpuBindGroupCacheHits: resourceStats?.bindGroupHits ?? 0,
+      webgpuBindGroupCacheMisses: resourceStats?.bindGroupMisses ?? 0,
+      webgpuBindGroupCreates: resourceStats?.bindGroupCreates ?? 0,
+      webgpuBufferCreates: resourceStats?.bufferCreates ?? 0,
+      webgpuLastRunDurationMs: this.lastRunStats.durationMs,
+      webgpuLastRunSubmitCount: this.lastRunStats.submitCount,
+      webgpuLastRunReadbackCount: this.lastRunStats.readbackCount,
+      webgpuLastRunBindGroupCreates: this.lastRunStats.resourceStats?.bindGroupCreates ?? 0,
+      webgpuLastRunBindGroupCreateMs: this.lastRunStats.resourceStats?.bindGroupCreateMs ?? 0,
+      webgpuLastRunBufferCreates: this.lastRunStats.resourceStats?.bufferCreates ?? 0,
+      webgpuLastRunBufferCreateMs: this.lastRunStats.resourceStats?.bufferCreateMs ?? 0,
+      webgpuLastRunEncodeMs: this.lastRunStats.encodeMs,
+      webgpuLastRunSubmitMs: this.lastRunStats.submitMs,
+      webgpuLastRunReadbackWaitMs: this.lastRunStats.readbackWaitMs,
+      webgpuLastRunShaderModuleHits: this.lastRunStats.resourceStats?.shaderModuleHits ?? 0,
+      webgpuLastRunShaderModuleMisses: this.lastRunStats.resourceStats?.shaderModuleMisses ?? 0,
+      webgpuLastRunBindGroupLayoutHits: this.lastRunStats.resourceStats?.bindGroupLayoutHits ?? 0,
+      webgpuLastRunBindGroupLayoutMisses: this.lastRunStats.resourceStats?.bindGroupLayoutMisses ?? 0,
+      webgpuLastRunPipelineLayoutHits: this.lastRunStats.resourceStats?.pipelineLayoutHits ?? 0,
+      webgpuLastRunPipelineLayoutMisses: this.lastRunStats.resourceStats?.pipelineLayoutMisses ?? 0,
+      webgpuLastRunComputePipelineHits: this.lastRunStats.resourceStats?.computePipelineHits ?? 0,
+      webgpuLastRunComputePipelineMisses: this.lastRunStats.resourceStats?.computePipelineMisses ?? 0,
+      webgpuLastRunBindGroupHits: this.lastRunStats.resourceStats?.bindGroupHits ?? 0,
+      webgpuLastRunBindGroupMisses: this.lastRunStats.resourceStats?.bindGroupMisses ?? 0,
     };
+  }
+
+  ensureRuntimeResources(): void {
+    if (this.runtimeResourcesInitialized) {
+      return;
+    }
+    const startMs = nowMs();
+    this.runtimeResourceCache = installWebGpuRuntimeResourceCache(this.arena.device);
+    this.runtimeInitMs += nowMs() - startMs;
+    this.runtimeResourcesInitialized = true;
+  }
+
+  private beginRuntimeRun(): {
+    startMs: number;
+    firstRun: boolean;
+    submitCount: number;
+    readbackCount: number;
+    resourceStats?: ReturnType<WebGpuRuntimeResourceCache["stats"]>;
+  } {
+    this.activeRunEncodeMs = 0;
+    this.activeRunSubmitMs = 0;
+    this.activeRunReadbackWaitMs = 0;
+    return {
+      startMs: nowMs(),
+      firstRun: !this.hasRecordedFirstRun,
+      submitCount: this.submitCount,
+      readbackCount: this.readbackCount,
+      resourceStats: this.runtimeResourceCache?.stats(),
+    };
+  }
+
+  private endRuntimeRun(run: {
+    startMs: number;
+    firstRun: boolean;
+    submitCount: number;
+    readbackCount: number;
+    resourceStats?: ReturnType<WebGpuRuntimeResourceCache["stats"]>;
+  }): void {
+    const durationMs = nowMs() - run.startMs;
+    const after = this.runtimeResourceCache?.stats();
+    const resourceDelta = after && run.resourceStats
+      ? diffWebGpuRuntimeResourceStats(after, run.resourceStats)
+      : undefined;
+    this.lastRunStats = {
+      durationMs,
+      submitCount: this.submitCount - run.submitCount,
+      readbackCount: this.readbackCount - run.readbackCount,
+      encodeMs: this.activeRunEncodeMs,
+      submitMs: this.activeRunSubmitMs,
+      readbackWaitMs: this.activeRunReadbackWaitMs,
+      resourceStats: resourceDelta,
+    };
+    if (run.firstRun) {
+      if (resourceDelta) {
+        this.runtimeInitMs += runtimeResourceCreateMs(resourceDelta);
+      }
+      this.firstRunTotalMs = durationMs;
+      this.hasRecordedFirstRun = true;
+      return;
+    }
+    this.steadyRunMs = durationMs;
+    this.steadyRunCount += 1;
+  }
+
+  private submitCommandBuffer(commandBuffer: unknown): void {
+    const startMs = nowMs();
+    try {
+      this.arena.device.queue.submit([commandBuffer]);
+      this.submitCount += 1;
+    } finally {
+      this.activeRunSubmitMs += nowMs() - startMs;
+    }
+  }
+
+  private async mapReadback(buffer: WebGpuBufferLike): Promise<void> {
+    const startMs = nowMs();
+    try {
+      await buffer.mapAsync(GPU_MAP_READ);
+    } finally {
+      this.activeRunReadbackWaitMs += nowMs() - startMs;
+    }
+  }
+
+  private deferResourceCleanup(...groups: ReadonlyArray<ReadonlyArray<GpuResource>>): void {
+    const items = groups.flat().filter((item) => item.destroy);
+    if (items.length === 0) {
+      return;
+    }
+    this.deferredCleanupCount += 1;
+    const destroyItems = () => {
+      for (let index = items.length - 1; index >= 0; index -= 1) {
+        items[index]?.destroy?.();
+      }
+    };
+    const done = this.arena.device.queue.onSubmittedWorkDone?.();
+    if (!done) {
+      destroyItems();
+      return;
+    }
+    void done.then(destroyItems, destroyItems);
   }
 
   supportsGpuInputPreparation(): boolean {
@@ -276,36 +491,46 @@ export class Gemma4WebGpuSegmentRunner {
     state: Gemma4WebGpuStateLike,
     options: Gemma4WebGpuRunOptions = {},
   ): Promise<Gemma4WebGpuTokenResult> {
-    const prepared = await this.prepareGpuInput(tokenIds);
-    const tokenCount = this.assertTokenIdBatch(tokenIds, positions);
-    this.tokenIdInputBatches += 1;
-    this.tokenIdInputTokens += tokenCount;
-    let topTokens: WebGpuTopToken[] | undefined;
-    let selectedTokenId: number | undefined;
+    this.ensureRuntimeResources();
+    const runtimeRun = this.beginRuntimeRun();
     try {
-      for (let tokenIndex = 0; tokenIndex < tokenCount; tokenIndex += 1) {
-        const tokenPositions = tokenPositionsFromBatch(positions, tokenIndex, tokenCount);
-        const computeTopK = options.computeTopK === true && tokenIndex === tokenCount - 1;
-        const computeSelectedToken = options.computeSelectedToken === true && tokenIndex === tokenCount - 1;
-        const result = await this.runTokenFromBoundary(prepared.hidden, tokenIndex, tokenPositions, state, {
-          ...options,
-          computeTopK,
-          computeSelectedToken,
-          perLayerInputsBuffer: prepared.perLayerInputs,
-          sourceTokenCount: tokenCount,
-          sourceTokenIndex: tokenIndex,
-        });
-        if (computeSelectedToken) {
-          selectedTokenId = result.selectedTokenId;
+      const prepared = await this.prepareGpuInput(tokenIds);
+      const tokenCount = this.assertTokenIdBatch(tokenIds, positions);
+      this.tokenIdInputBatches += 1;
+      this.tokenIdInputTokens += tokenCount;
+      let topTokens: WebGpuTopToken[] | undefined;
+      let selectedTokenId: number | undefined;
+      try {
+        for (let tokenIndex = 0; tokenIndex < tokenCount; tokenIndex += 1) {
+          const tokenPositions = tokenPositionsFromBatch(positions, tokenIndex, tokenCount);
+          const computeTopK = options.computeTopK === true && tokenIndex === tokenCount - 1;
+          const computeSelectedToken = options.computeSelectedToken === true && tokenIndex === tokenCount - 1;
+          const result = await this.runTokenFromBoundary(prepared.hidden, tokenIndex, tokenPositions, state, {
+            ...options,
+            computeTopK,
+            computeSelectedToken,
+            perLayerInputsBuffer: prepared.perLayerInputs,
+            sourceTokenCount: tokenCount,
+            sourceTokenIndex: tokenIndex,
+          });
+          if (computeSelectedToken) {
+            selectedTokenId = result.selectedTokenId;
+          }
+          if (computeTopK) {
+            topTokens = result.topTokens;
+          }
         }
-        if (computeTopK) {
-          topTokens = result.topTokens;
+      } finally {
+        if (options.computeTopK === true || options.computeSelectedToken === true) {
+          prepared.destroy();
+        } else {
+          this.deferResourceCleanup([{ destroy: prepared.destroy }]);
         }
       }
+      return { selectedTokenId, topTokens };
     } finally {
-      prepared.destroy();
+      this.endRuntimeRun(runtimeRun);
     }
-    return { selectedTokenId, topTokens };
   }
 
   async runToken(
@@ -314,24 +539,34 @@ export class Gemma4WebGpuSegmentRunner {
     state: Gemma4WebGpuStateLike,
     options: Gemma4WebGpuRunOptions = {},
   ): Promise<Gemma4WebGpuTokenResult> {
-    if (inputHidden.length !== this.manifest.embeddingLength) {
-      throw new Error(`WebGPU segment input shape mismatch: ${inputHidden.length}`);
-    }
-    const boundary = this.arena.createBuffer(
-      "segment boundary hidden",
-      inputHidden.byteLength,
-      GPU_STORAGE | GPU_COPY_DST,
-    );
-    this.arena.device.queue.writeBuffer(boundary, 0, inputHidden);
-    this.boundaryUploads += 1;
+    this.ensureRuntimeResources();
+    const runtimeRun = this.beginRuntimeRun();
     try {
-      return await this.runTokenFromBoundary(boundary, 0, positions, state, {
-        ...options,
-        sourceTokenCount: 1,
-        sourceTokenIndex: 0,
-      });
+      if (inputHidden.length !== this.manifest.embeddingLength) {
+        throw new Error(`WebGPU segment input shape mismatch: ${inputHidden.length}`);
+      }
+      const boundary = this.arena.createBuffer(
+        "segment boundary hidden",
+        inputHidden.byteLength,
+        GPU_STORAGE | GPU_COPY_DST,
+      );
+      this.arena.device.queue.writeBuffer(boundary, 0, inputHidden);
+      this.boundaryUploads += 1;
+      try {
+        return await this.runTokenFromBoundary(boundary, 0, positions, state, {
+          ...options,
+          sourceTokenCount: 1,
+          sourceTokenIndex: 0,
+        });
+      } finally {
+        if (options.computeTopK === true || options.computeSelectedToken === true) {
+          boundary.destroy?.();
+        } else {
+          this.deferResourceCleanup([boundary]);
+        }
+      }
     } finally {
-      boundary.destroy?.();
+      this.endRuntimeRun(runtimeRun);
     }
   }
 
@@ -341,24 +576,30 @@ export class Gemma4WebGpuSegmentRunner {
     state: Gemma4WebGpuStateLike,
     options: Gemma4WebGpuRunOptions = {},
   ): Promise<Gemma4WebGpuHiddenResult> {
-    if (inputHidden.length !== this.manifest.embeddingLength) {
-      throw new Error(`WebGPU segment input shape mismatch: ${inputHidden.length}`);
-    }
-    const boundary = this.arena.createBuffer(
-      "segment boundary hidden",
-      inputHidden.byteLength,
-      GPU_STORAGE | GPU_COPY_DST,
-    );
-    this.arena.device.queue.writeBuffer(boundary, 0, inputHidden);
-    this.boundaryUploads += 1;
+    this.ensureRuntimeResources();
+    const runtimeRun = this.beginRuntimeRun();
     try {
-      return await this.runTokenFromBoundaryHidden(boundary, 0, positions, state, {
-        ...options,
-        sourceTokenCount: 1,
-        sourceTokenIndex: 0,
-      });
+      if (inputHidden.length !== this.manifest.embeddingLength) {
+        throw new Error(`WebGPU segment input shape mismatch: ${inputHidden.length}`);
+      }
+      const boundary = this.arena.createBuffer(
+        "segment boundary hidden",
+        inputHidden.byteLength,
+        GPU_STORAGE | GPU_COPY_DST,
+      );
+      this.arena.device.queue.writeBuffer(boundary, 0, inputHidden);
+      this.boundaryUploads += 1;
+      try {
+        return await this.runTokenFromBoundaryHidden(boundary, 0, positions, state, {
+          ...options,
+          sourceTokenCount: 1,
+          sourceTokenIndex: 0,
+        });
+      } finally {
+        boundary.destroy?.();
+      }
     } finally {
-      boundary.destroy?.();
+      this.endRuntimeRun(runtimeRun);
     }
   }
 
@@ -368,39 +609,49 @@ export class Gemma4WebGpuSegmentRunner {
     state: Gemma4WebGpuStateLike,
     options: Gemma4WebGpuRunOptions = {},
   ): Promise<Gemma4WebGpuTokenResult> {
-    const tokenCount = this.assertBatchedHidden(inputHidden, positions);
-    const boundary = this.arena.createBuffer(
-      "segment boundary hidden batch",
-      inputHidden.byteLength,
-      GPU_STORAGE | GPU_COPY_DST,
-    );
-    this.arena.device.queue.writeBuffer(boundary, 0, inputHidden);
-    this.boundaryUploads += 1;
-    let topTokens: WebGpuTopToken[] | undefined;
-    let selectedTokenId: number | undefined;
+    this.ensureRuntimeResources();
+    const runtimeRun = this.beginRuntimeRun();
     try {
-      for (let tokenIndex = 0; tokenIndex < tokenCount; tokenIndex += 1) {
-        const tokenPositions = tokenPositionsFromBatch(positions, tokenIndex, tokenCount);
-        const computeTopK = options.computeTopK === true && tokenIndex === tokenCount - 1;
-        const computeSelectedToken = options.computeSelectedToken === true && tokenIndex === tokenCount - 1;
-        const result = await this.runTokenFromBoundary(boundary, tokenIndex, tokenPositions, state, {
-          ...options,
-          computeTopK,
-          computeSelectedToken,
-          sourceTokenCount: tokenCount,
-          sourceTokenIndex: tokenIndex,
-        });
-        if (computeSelectedToken) {
-          selectedTokenId = result.selectedTokenId;
+      const tokenCount = this.assertBatchedHidden(inputHidden, positions);
+      const boundary = this.arena.createBuffer(
+        "segment boundary hidden batch",
+        inputHidden.byteLength,
+        GPU_STORAGE | GPU_COPY_DST,
+      );
+      this.arena.device.queue.writeBuffer(boundary, 0, inputHidden);
+      this.boundaryUploads += 1;
+      let topTokens: WebGpuTopToken[] | undefined;
+      let selectedTokenId: number | undefined;
+      try {
+        for (let tokenIndex = 0; tokenIndex < tokenCount; tokenIndex += 1) {
+          const tokenPositions = tokenPositionsFromBatch(positions, tokenIndex, tokenCount);
+          const computeTopK = options.computeTopK === true && tokenIndex === tokenCount - 1;
+          const computeSelectedToken = options.computeSelectedToken === true && tokenIndex === tokenCount - 1;
+          const result = await this.runTokenFromBoundary(boundary, tokenIndex, tokenPositions, state, {
+            ...options,
+            computeTopK,
+            computeSelectedToken,
+            sourceTokenCount: tokenCount,
+            sourceTokenIndex: tokenIndex,
+          });
+          if (computeSelectedToken) {
+            selectedTokenId = result.selectedTokenId;
+          }
+          if (computeTopK) {
+            topTokens = result.topTokens;
+          }
         }
-        if (computeTopK) {
-          topTokens = result.topTokens;
+      } finally {
+        if (options.computeTopK === true || options.computeSelectedToken === true) {
+          boundary.destroy?.();
+        } else {
+          this.deferResourceCleanup([boundary]);
         }
       }
+      return { selectedTokenId, topTokens };
     } finally {
-      boundary.destroy?.();
+      this.endRuntimeRun(runtimeRun);
     }
-    return { selectedTokenId, topTokens };
   }
 
   async runTokensHidden(
@@ -409,48 +660,54 @@ export class Gemma4WebGpuSegmentRunner {
     state: Gemma4WebGpuStateLike,
     options: Gemma4WebGpuRunOptions = {},
   ): Promise<Gemma4WebGpuHiddenResult> {
-    const tokenCount = this.assertBatchedHidden(inputHidden, positions);
-    const boundary = this.arena.createBuffer(
-      "segment boundary hidden batch",
-      inputHidden.byteLength,
-      GPU_STORAGE | GPU_COPY_DST,
-    );
-    this.arena.device.queue.writeBuffer(boundary, 0, inputHidden);
-    this.boundaryUploads += 1;
-    const outputTokenCount = this.segmentEndLayerExclusive === this.manifest.blockCount && tokenCount > 1
-      ? 1
-      : tokenCount;
-    const hidden = new Float32Array(outputTokenCount * this.manifest.embeddingLength);
-    let topTokens: WebGpuTopToken[] | undefined;
-    let selectedTokenId: number | undefined;
+    this.ensureRuntimeResources();
+    const runtimeRun = this.beginRuntimeRun();
     try {
-      for (let tokenIndex = 0; tokenIndex < tokenCount; tokenIndex += 1) {
-        const tokenPositions = tokenPositionsFromBatch(positions, tokenIndex, tokenCount);
-        const computeTopK = options.computeTopK === true && tokenIndex === tokenCount - 1;
-        const computeSelectedToken = options.computeSelectedToken === true && tokenIndex === tokenCount - 1;
-        const result = await this.runTokenFromBoundaryHidden(boundary, tokenIndex, tokenPositions, state, {
-          ...options,
-          computeTopK,
-          computeSelectedToken,
-          sourceTokenCount: tokenCount,
-          sourceTokenIndex: tokenIndex,
-        });
-        if (outputTokenCount === tokenCount) {
-          hidden.set(result.hidden, tokenIndex * this.manifest.embeddingLength);
-        } else if (tokenIndex === tokenCount - 1) {
-          hidden.set(result.hidden);
+      const tokenCount = this.assertBatchedHidden(inputHidden, positions);
+      const boundary = this.arena.createBuffer(
+        "segment boundary hidden batch",
+        inputHidden.byteLength,
+        GPU_STORAGE | GPU_COPY_DST,
+      );
+      this.arena.device.queue.writeBuffer(boundary, 0, inputHidden);
+      this.boundaryUploads += 1;
+      const outputTokenCount = this.segmentEndLayerExclusive === this.manifest.blockCount && tokenCount > 1
+        ? 1
+        : tokenCount;
+      const hidden = new Float32Array(outputTokenCount * this.manifest.embeddingLength);
+      let topTokens: WebGpuTopToken[] | undefined;
+      let selectedTokenId: number | undefined;
+      try {
+        for (let tokenIndex = 0; tokenIndex < tokenCount; tokenIndex += 1) {
+          const tokenPositions = tokenPositionsFromBatch(positions, tokenIndex, tokenCount);
+          const computeTopK = options.computeTopK === true && tokenIndex === tokenCount - 1;
+          const computeSelectedToken = options.computeSelectedToken === true && tokenIndex === tokenCount - 1;
+          const result = await this.runTokenFromBoundaryHidden(boundary, tokenIndex, tokenPositions, state, {
+            ...options,
+            computeTopK,
+            computeSelectedToken,
+            sourceTokenCount: tokenCount,
+            sourceTokenIndex: tokenIndex,
+          });
+          if (outputTokenCount === tokenCount) {
+            hidden.set(result.hidden, tokenIndex * this.manifest.embeddingLength);
+          } else if (tokenIndex === tokenCount - 1) {
+            hidden.set(result.hidden);
+          }
+          if (computeTopK) {
+            topTokens = result.topTokens;
+          }
+          if (computeSelectedToken) {
+            selectedTokenId = result.selectedTokenId;
+          }
         }
-        if (computeTopK) {
-          topTokens = result.topTokens;
-        }
-        if (computeSelectedToken) {
-          selectedTokenId = result.selectedTokenId;
-        }
+      } finally {
+        boundary.destroy?.();
       }
+      return { hidden, selectedTokenId, topTokens };
     } finally {
-      boundary.destroy?.();
+      this.endRuntimeRun(runtimeRun);
     }
-    return { hidden, selectedTokenId, topTokens };
   }
 
   private async runTokenFromBoundary(
@@ -502,6 +759,7 @@ export class Gemma4WebGpuSegmentRunner {
     cleanup.push(hidden);
     let perLayerInputs: WebGpuBufferLike | undefined;
 
+    const encodeStartMs = nowMs();
     const encoder = this.arena.device.createCommandEncoder();
     const pass = encoder.beginComputePass();
     this.dispatchGatherRowsScale(pass, resources, input.tokenEmbedding, tokenIdBuffer, hidden, {
@@ -591,11 +849,9 @@ export class Gemma4WebGpuSegmentRunner {
     }
 
     pass.end();
-    this.arena.device.queue.submit([encoder.finish()]);
-    await this.arena.device.queue.onSubmittedWorkDone?.();
-    for (const resource of resources) {
-      resource.destroy();
-    }
+    this.activeRunEncodeMs += nowMs() - encodeStartMs;
+    this.submitCommandBuffer(encoder.finish());
+    this.deferResourceCleanup(resources);
 
     return {
       hidden,
@@ -707,6 +963,7 @@ export class Gemma4WebGpuSegmentRunner {
     const gpuState = this.ensureGpuState(state);
     const cleanup: GpuResource[] = [];
     const resources: Array<{ destroy: () => void }> = [];
+    const encodeStartMs = nowMs();
     const encoder = this.arena.device.createCommandEncoder();
     const pass = encoder.beginComputePass();
     let hiddenReadback: WebGpuBufferLike | undefined;
@@ -771,12 +1028,24 @@ export class Gemma4WebGpuSegmentRunner {
           Uint32Array.BYTES_PER_ELEMENT,
         );
       }
-      this.arena.device.queue.submit([encoder.finish()]);
-      await this.arena.device.queue.onSubmittedWorkDone?.();
+      this.activeRunEncodeMs += nowMs() - encodeStartMs;
+      this.submitCommandBuffer(encoder.finish());
+
+      if (!hiddenReadback && !topReadback && !selectedTokenReadback) {
+        this.deferResourceCleanup(resources, cleanup);
+        resources.length = 0;
+        cleanup.length = 0;
+        return {
+          hidden: new Float32Array(),
+          selectedTokenId: undefined,
+          topTokens: undefined,
+        };
+      }
 
       const hidden = readHidden ? new Float32Array(this.manifest.embeddingLength) : new Float32Array();
       if (hiddenReadback) {
-        await hiddenReadback.mapAsync(GPU_MAP_READ);
+        this.readbackCount += 1;
+        await this.mapReadback(hiddenReadback);
         hidden.set(new Float32Array(hiddenReadback.getMappedRange()).slice());
         hiddenReadback.unmap();
         hiddenReadback.destroy?.();
@@ -786,7 +1055,8 @@ export class Gemma4WebGpuSegmentRunner {
 
       let topTokens: WebGpuTopToken[] | undefined;
       if (topReadback) {
-        await topReadback.mapAsync(GPU_MAP_READ);
+        this.readbackCount += 1;
+        await this.mapReadback(topReadback);
         const values = new Float32Array(topReadback.getMappedRange()).slice();
         topReadback.unmap();
         topReadback.destroy?.();
@@ -797,7 +1067,8 @@ export class Gemma4WebGpuSegmentRunner {
 
       let selectedTokenId: number | undefined;
       if (selectedTokenReadback) {
-        await selectedTokenReadback.mapAsync(GPU_MAP_READ);
+        this.readbackCount += 1;
+        await this.mapReadback(selectedTokenReadback);
         selectedTokenId = new Uint32Array(selectedTokenReadback.getMappedRange()).slice()[0] ?? 0;
         selectedTokenReadback.unmap();
         selectedTokenReadback.destroy?.();
