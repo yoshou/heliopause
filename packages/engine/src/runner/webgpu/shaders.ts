@@ -541,35 +541,50 @@ fn ropeFactor(index: u32) -> f32 {
   return freqFactors[index];
 }
 
-@compute @workgroup_size(1, 1, 1)
-fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-  let head = id.x;
-  if (head >= params.headCount) {
-    return;
+fn ropeTheta(pairIndex: u32) -> f32 {
+  let thetaScale = pow(params.freqBase, -2.0 / f32(params.ropeDims));
+  var theta = params.position;
+  for (var index = 0u; index < pairIndex; index = index + 1u) {
+    theta = theta * thetaScale;
   }
+  return theta;
+}
+
+var<workgroup> queryReduceValues: array<f32, 256>;
+
+@compute @workgroup_size(256, 1, 1)
+fn main(@builtin(workgroup_id) workgroupId: vec3<u32>, @builtin(local_invocation_id) localId: vec3<u32>) {
+  let head = workgroupId.x;
+  let lane = localId.x;
   let qBase = head * params.headSize;
   let outBase = head * params.headSize;
   var meanSquare = 0.0;
-  for (var dim = 0u; dim < params.headSize; dim = dim + 1u) {
+  for (var dim = lane; dim < params.headSize; dim = dim + 256u) {
     let value = qValues[qBase + dim];
     meanSquare = meanSquare + value * value;
   }
-  let scale = inverseSqrt(meanSquare / f32(params.headSize) + params.epsilon);
-  for (var dim = 0u; dim < params.headSize; dim = dim + 1u) {
+  queryReduceValues[lane] = meanSquare;
+  workgroupBarrier();
+  for (var stride = 128u; stride > 0u; stride = stride / 2u) {
+    if (lane < stride) {
+      queryReduceValues[lane] = queryReduceValues[lane] + queryReduceValues[lane + stride];
+    }
+    workgroupBarrier();
+  }
+  let scale = inverseSqrt(queryReduceValues[0] / f32(params.headSize) + params.epsilon);
+  for (var dim = lane; dim < params.headSize; dim = dim + 256u) {
     queryValues[outBase + dim] = normed(head, dim, scale);
   }
-  let thetaScale = pow(params.freqBase, -2.0 / f32(params.ropeDims));
-  var theta = params.position;
-  for (var i0 = 0u; i0 < params.ropeDims; i0 = i0 + 2u) {
-    let ic = i0 / 2u;
+  let ropePairCount = params.ropeDims / 2u;
+  for (var ic = lane; ic < ropePairCount; ic = ic + 256u) {
     let x0 = normed(head, ic, scale);
-    let x1 = normed(head, params.ropeDims / 2u + ic, scale);
+    let x1 = normed(head, ropePairCount + ic, scale);
+    let theta = ropeTheta(ic);
     let thetaWithFactor = theta / ropeFactor(ic);
     let cosTheta = cos(thetaWithFactor);
     let sinTheta = sin(thetaWithFactor);
     queryValues[outBase + ic] = x0 * cosTheta - x1 * sinTheta;
-    queryValues[outBase + params.ropeDims / 2u + ic] = x0 * sinTheta + x1 * cosTheta;
-    theta = theta * thetaScale;
+    queryValues[outBase + ropePairCount + ic] = x0 * sinTheta + x1 * cosTheta;
   }
 }
 `;
@@ -608,46 +623,69 @@ fn ropeFactor(index: u32) -> f32 {
   return freqFactors[index];
 }
 
-@compute @workgroup_size(1, 1, 1)
-fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-  let head = id.x;
-  if (head >= params.headCount) {
-    return;
+fn ropeTheta(pairIndex: u32) -> f32 {
+  let thetaScale = pow(params.freqBase, -2.0 / f32(params.ropeDims));
+  var theta = params.position;
+  for (var index = 0u; index < pairIndex; index = index + 1u) {
+    theta = theta * thetaScale;
   }
+  return theta;
+}
+
+var<workgroup> kvReduceValues: array<f32, 256>;
+
+@compute @workgroup_size(256, 1, 1)
+fn main(@builtin(workgroup_id) workgroupId: vec3<u32>, @builtin(local_invocation_id) localId: vec3<u32>) {
+  let head = workgroupId.x;
+  let lane = localId.x;
   let base = head * params.headSize;
   var meanSquare = 0.0;
-  for (var dim = 0u; dim < params.headSize; dim = dim + 1u) {
+  for (var dim = lane; dim < params.headSize; dim = dim + 256u) {
     let value = kProjectionValues[base + dim];
     meanSquare = meanSquare + value * value;
   }
-  let scale = inverseSqrt(meanSquare / f32(params.headSize) + params.epsilon);
+  kvReduceValues[lane] = meanSquare;
+  workgroupBarrier();
+  for (var stride = 128u; stride > 0u; stride = stride / 2u) {
+    if (lane < stride) {
+      kvReduceValues[lane] = kvReduceValues[lane] + kvReduceValues[lane + stride];
+    }
+    workgroupBarrier();
+  }
+  let scale = inverseSqrt(kvReduceValues[0] / f32(params.headSize) + params.epsilon);
   let keyBase = (params.tokenPosition * params.headCount + head) * params.headSize;
-  for (var dim = 0u; dim < params.headSize; dim = dim + 1u) {
+  for (var dim = lane; dim < params.headSize; dim = dim + 256u) {
     keyCache[keyBase + dim] = normed(head, dim, scale);
   }
   var valueMeanSquare = 0.0;
   let valueBase = head * params.valueSize;
-  for (var dim = 0u; dim < params.valueSize; dim = dim + 1u) {
+  for (var dim = lane; dim < params.valueSize; dim = dim + 256u) {
     let value = vProjectionValues[valueBase + dim];
     valueMeanSquare = valueMeanSquare + value * value;
   }
-  let valueScale = inverseSqrt(valueMeanSquare / f32(params.valueSize) + params.epsilon);
-  for (var dim = 0u; dim < params.valueSize; dim = dim + 1u) {
+  kvReduceValues[lane] = valueMeanSquare;
+  workgroupBarrier();
+  for (var stride = 128u; stride > 0u; stride = stride / 2u) {
+    if (lane < stride) {
+      kvReduceValues[lane] = kvReduceValues[lane] + kvReduceValues[lane + stride];
+    }
+    workgroupBarrier();
+  }
+  let valueScale = inverseSqrt(kvReduceValues[0] / f32(params.valueSize) + params.epsilon);
+  for (var dim = lane; dim < params.valueSize; dim = dim + 256u) {
     valueCache[(dim * params.headCount + head) * params.contextLength + params.tokenPosition] =
       vProjectionValues[valueBase + dim] * valueScale;
   }
-  let thetaScale = pow(params.freqBase, -2.0 / f32(params.ropeDims));
-  var theta = params.position;
-  for (var i0 = 0u; i0 < params.ropeDims; i0 = i0 + 2u) {
-    let ic = i0 / 2u;
+  let ropePairCount = params.ropeDims / 2u;
+  for (var ic = lane; ic < ropePairCount; ic = ic + 256u) {
     let x0 = normed(head, ic, scale);
-    let x1 = normed(head, params.ropeDims / 2u + ic, scale);
+    let x1 = normed(head, ropePairCount + ic, scale);
+    let theta = ropeTheta(ic);
     let thetaWithFactor = theta / ropeFactor(ic);
     let cosTheta = cos(thetaWithFactor);
     let sinTheta = sin(thetaWithFactor);
     keyCache[keyBase + ic] = x0 * cosTheta - x1 * sinTheta;
-    keyCache[keyBase + params.ropeDims / 2u + ic] = x0 * sinTheta + x1 * cosTheta;
-    theta = theta * thetaScale;
+    keyCache[keyBase + ropePairCount + ic] = x0 * sinTheta + x1 * cosTheta;
   }
 }
 `;
@@ -1513,25 +1551,30 @@ fn f32ToF16Bits(value: f32) -> u32 {
   return sign | (u32(exponent) << 10u) | halfMantissa;
 }
 
-@compute @workgroup_size(1, 1, 1)
-fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-  let column = id.x;
-  let block = id.y;
-  if (column >= params.columnCount || block >= params.blockCount) {
-    return;
-  }
+var<workgroup> q8_0AbsValues: array<f32, 32>;
+
+@compute @workgroup_size(32, 1, 1)
+fn main(@builtin(workgroup_id) workgroupId: vec3<u32>, @builtin(local_invocation_id) localId: vec3<u32>) {
+  let column = workgroupId.x;
+  let block = workgroupId.y;
+  let lane = localId.x;
   let base = column * params.inputSize + block * 32u;
-  var amax = 0.0;
-  for (var index = 0u; index < 32u; index = index + 1u) {
-    amax = max(amax, abs(inputValues[base + index]));
+  q8_0AbsValues[lane] = abs(inputValues[base + lane]);
+  workgroupBarrier();
+  for (var stride = 16u; stride > 0u; stride = stride / 2u) {
+    if (lane < stride) {
+      q8_0AbsValues[lane] = max(q8_0AbsValues[lane], q8_0AbsValues[lane + stride]);
+    }
+    workgroupBarrier();
   }
   let blockIndex = column * params.blockCount + block;
+  let amax = q8_0AbsValues[0];
   let scale = f16BitsToF32(f32ToF16Bits(amax / 127.0));
-  outputScales[blockIndex] = scale;
-  let inverseScale = select(0.0, 1.0 / scale, scale != 0.0);
-  for (var index = 0u; index < 32u; index = index + 1u) {
-    outputQs[base + index] = i32(round(inputValues[base + index] * inverseScale));
+  if (lane == 0u) {
+    outputScales[blockIndex] = scale;
   }
+  let inverseScale = select(0.0, 1.0 / scale, scale != 0.0);
+  outputQs[base + lane] = i32(round(inputValues[base + lane] * inverseScale));
 }
 `;
 
@@ -1678,24 +1721,34 @@ struct Params {
 @group(0) @binding(2) var<uniform> params: Params;
 @group(0) @binding(3) var<storage, read_write> outputValues: array<f32>;
 
-@compute @workgroup_size(1, 1, 1)
-fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-  let qHead = id.x;
-  let dim = id.y;
-  if (qHead >= params.queryHeadCount || dim >= params.valueSize) {
-    return;
-  }
+var<workgroup> attentionApplyValues: array<f32, 256>;
+
+@compute @workgroup_size(256, 1, 1)
+fn main(@builtin(workgroup_id) workgroupId: vec3<u32>, @builtin(local_invocation_id) localId: vec3<u32>) {
+  let qHead = workgroupId.x;
+  let dim = workgroupId.y;
+  let lane = localId.x;
   let groupSize = params.queryHeadCount / params.keyValueHeadCount;
   let kvHead = qHead / groupSize;
   var weighted = 0.0;
   let probabilityOffset = qHead * params.keyValueTokenCount;
-  for (var keyToken = params.keyValueStart; keyToken < params.keyValueTokenCount; keyToken = keyToken + 1u) {
+  for (var keyToken = params.keyValueStart + lane; keyToken < params.keyValueTokenCount; keyToken = keyToken + 256u) {
     let probability = probabilityValues[probabilityOffset + keyToken];
     let valueIndex = (dim * params.keyValueHeadCount + kvHead) * params.contextLength + keyToken;
     weighted = weighted + probability * valueValues[valueIndex];
   }
-  let outputIndex = qHead * params.valueSize + dim;
-  outputValues[outputIndex] = weighted;
+  attentionApplyValues[lane] = weighted;
+  workgroupBarrier();
+  for (var stride = 128u; stride > 0u; stride = stride / 2u) {
+    if (lane < stride) {
+      attentionApplyValues[lane] = attentionApplyValues[lane] + attentionApplyValues[lane + stride];
+    }
+    workgroupBarrier();
+  }
+  if (lane == 0u) {
+    let outputIndex = qHead * params.valueSize + dim;
+    outputValues[outputIndex] = attentionApplyValues[0];
+  }
 }
 `;
 
