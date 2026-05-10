@@ -422,15 +422,27 @@ struct Params {
 @group(0) @binding(2) var<uniform> params: Params;
 @group(0) @binding(3) var<storage, read_write> outputValues: array<f32>;
 
-@compute @workgroup_size(1, 1, 1)
-fn main() {
-  var meanSquare = 0.0;
-  for (var index = 0u; index < params.length; index = index + 1u) {
+var<workgroup> rmsReduceValues: array<f32, 256>;
+
+@compute @workgroup_size(256, 1, 1)
+fn main(@builtin(local_invocation_id) localId: vec3<u32>) {
+  let lane = localId.x;
+  var localSum = 0.0;
+  for (var index = lane; index < params.length; index = index + 256u) {
     let value = inputValues[index];
-    meanSquare = meanSquare + value * value;
+    localSum = localSum + value * value;
   }
+  rmsReduceValues[lane] = localSum;
+  workgroupBarrier();
+  for (var stride = 128u; stride > 0u; stride = stride / 2u) {
+    if (lane < stride) {
+      rmsReduceValues[lane] = rmsReduceValues[lane] + rmsReduceValues[lane + stride];
+    }
+    workgroupBarrier();
+  }
+  let meanSquare = rmsReduceValues[0];
   let scale = inverseSqrt(meanSquare / f32(params.length) + params.epsilon);
-  for (var index = 0u; index < params.length; index = index + 1u) {
+  for (var index = lane; index < params.length; index = index + 256u) {
     outputValues[index] = inputValues[index] * scale * weightValues[index];
   }
 }
@@ -964,6 +976,30 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 }
 `;
 
+export const RESIDUAL_ADD_SCALE_WGSL = `
+struct Params {
+  length: u32,
+  _pad0: u32,
+  _pad1: u32,
+  _pad2: u32,
+};
+
+@group(0) @binding(0) var<storage, read> leftValues: array<f32>;
+@group(0) @binding(1) var<storage, read> rightValues: array<f32>;
+@group(0) @binding(2) var<storage, read> scaleValue: array<f32>;
+@group(0) @binding(3) var<uniform> params: Params;
+@group(0) @binding(4) var<storage, read_write> outputValues: array<f32>;
+
+@compute @workgroup_size(256, 1, 1)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let index = id.x;
+  if (index >= params.length) {
+    return;
+  }
+  outputValues[index] = (leftValues[index] + rightValues[index]) * scaleValue[0];
+}
+`;
+
 export const F16_CAST_WGSL = `
 struct Params {
   length: u32,
@@ -1125,6 +1161,66 @@ fn main() {
 }
 `;
 
+export const TOP1_CHUNK_WGSL = `
+struct Params {
+  rowCount: u32,
+  rowOffset: u32,
+  candidateOffset: u32,
+  _pad0: u32,
+};
+
+@group(0) @binding(0) var<storage, read> logits: array<f32>;
+@group(0) @binding(1) var<uniform> params: Params;
+@group(0) @binding(2) var<storage, read_write> outputValues: array<f32>;
+
+var<workgroup> bestValues: array<f32, 256>;
+var<workgroup> bestIds: array<u32, 256>;
+
+fn betterValue(leftValue: f32, leftId: u32, rightValue: f32, rightId: u32) -> bool {
+  return leftValue > rightValue || (leftValue == rightValue && leftId < rightId);
+}
+
+@compute @workgroup_size(256, 1, 1)
+fn main(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocation_id) local: vec3<u32>) {
+  let lane = local.x;
+  let row = group.x * 256u + lane;
+  var value = -3.4028234663852886e38;
+  var tokenId = params.rowOffset + row;
+  if (row < params.rowCount) {
+    value = logits[row];
+  } else {
+    tokenId = 4294967295u;
+  }
+  bestValues[lane] = value;
+  bestIds[lane] = tokenId;
+  workgroupBarrier();
+
+  var stride = 128u;
+  loop {
+    if (lane < stride) {
+      let otherLane = lane + stride;
+      let otherValue = bestValues[otherLane];
+      let otherId = bestIds[otherLane];
+      if (betterValue(otherValue, otherId, bestValues[lane], bestIds[lane])) {
+        bestValues[lane] = otherValue;
+        bestIds[lane] = otherId;
+      }
+    }
+    workgroupBarrier();
+    if (stride == 1u) {
+      break;
+    }
+    stride = stride / 2u;
+  }
+
+  if (lane == 0u) {
+    let outputBase = params.candidateOffset + group.x * 2u;
+    outputValues[outputBase] = f32(bestIds[0]);
+    outputValues[outputBase + 1u] = bestValues[0];
+  }
+}
+`;
+
 export const SELECT_TOP1_CANDIDATE_WGSL = `
 struct Params {
   candidateCount: u32,
@@ -1167,46 +1263,296 @@ struct Params {
 @group(0) @binding(3) var<storage, read_write> outputBsums: array<i32>;
 @group(0) @binding(4) var<uniform> params: Params;
 
-@compute @workgroup_size(1, 1, 1)
-fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-  let column = id.x;
-  let block = id.y;
+var<workgroup> q8AbsValues: array<f32, 256>;
+var<workgroup> q8Values: array<f32, 256>;
+var<workgroup> q8Indices: array<u32, 256>;
+var<workgroup> q8Quants: array<i32, 256>;
+
+@compute @workgroup_size(256, 1, 1)
+fn main(
+  @builtin(workgroup_id) workgroupId: vec3<u32>,
+  @builtin(local_invocation_id) localId: vec3<u32>,
+) {
+  let column = workgroupId.x;
+  let block = workgroupId.y;
+  let lane = localId.x;
   if (column >= params.columnCount || block >= params.blockCount) {
     return;
   }
   let base = column * params.inputSize + block * 256u;
-  var maxValue = 0.0;
-  var amax = 0.0;
-  for (var index = 0u; index < 256u; index = index + 1u) {
-    let value = inputValues[base + index];
-    let absValue = abs(value);
-    if (absValue > amax) {
-      amax = absValue;
-      maxValue = value;
+  let value = inputValues[base + lane];
+  q8AbsValues[lane] = abs(value);
+  q8Values[lane] = value;
+  q8Indices[lane] = lane;
+  workgroupBarrier();
+
+  for (var stride = 128u; stride > 0u; stride = stride / 2u) {
+    if (lane < stride) {
+      let otherLane = lane + stride;
+      let otherAbs = q8AbsValues[otherLane];
+      let otherIndex = q8Indices[otherLane];
+      if (otherAbs > q8AbsValues[lane] || (otherAbs == q8AbsValues[lane] && otherIndex < q8Indices[lane])) {
+        q8AbsValues[lane] = otherAbs;
+        q8Values[lane] = q8Values[otherLane];
+        q8Indices[lane] = otherIndex;
+      }
     }
+    workgroupBarrier();
   }
+
+  let amax = q8AbsValues[0];
+  let maxValue = q8Values[0];
   let blockIndex = column * params.blockCount + block;
-  if (amax == 0.0) {
-    outputScales[blockIndex] = 0.0;
-    for (var index = 0u; index < 256u; index = index + 1u) {
-      outputQs[base + index] = 0;
+  var inverseScale = 0.0;
+  if (amax != 0.0) {
+    inverseScale = -127.0 / maxValue;
+  }
+  if (lane == 0u) {
+    var scale = 0.0;
+    if (amax != 0.0) {
+      scale = 1.0 / inverseScale;
     }
-    for (var group = 0u; group < 16u; group = group + 1u) {
-      outputBsums[blockIndex * 16u + group] = 0;
+    outputScales[blockIndex] = scale;
+  }
+  var q = 0i;
+  if (amax != 0.0) {
+    q = min(127i, i32(round(inverseScale * value)));
+  }
+  q8Quants[lane] = q;
+  outputQs[base + lane] = q;
+  workgroupBarrier();
+
+  if (lane < 16u) {
+    var sum = 0i;
+    for (var index = 0u; index < 16u; index = index + 1u) {
+      sum = sum + q8Quants[lane * 16u + index];
     }
+    outputBsums[blockIndex * 16u + lane] = sum;
+  }
+}
+`;
+
+export const F16_Q8_K_QUANTIZE_WGSL = `
+struct Params {
+  inputSize: u32,
+  columnCount: u32,
+  blockCount: u32,
+  _pad0: u32,
+};
+
+@group(0) @binding(0) var<storage, read> inputValues: array<f32>;
+@group(0) @binding(1) var<storage, read_write> outputScales: array<f32>;
+@group(0) @binding(2) var<storage, read_write> outputQs: array<i32>;
+@group(0) @binding(3) var<storage, read_write> outputBsums: array<i32>;
+@group(0) @binding(4) var<uniform> params: Params;
+
+var<workgroup> q8AbsValues: array<f32, 256>;
+var<workgroup> q8Values: array<f32, 256>;
+var<workgroup> q8Indices: array<u32, 256>;
+var<workgroup> q8Quants: array<i32, 256>;
+
+fn f16BitsToF32(bits: u32) -> f32 {
+  let sign = select(1.0, -1.0, (bits & 0x8000u) != 0u);
+  let exponent = (bits >> 10u) & 31u;
+  let fraction = bits & 1023u;
+  if (exponent == 0u) {
+    return sign * exp2(-14.0) * (f32(fraction) / 1024.0);
+  }
+  if (exponent == 31u) {
+    return sign * 65504.0;
+  }
+  return sign * exp2(f32(exponent) - 15.0) * (1.0 + f32(fraction) / 1024.0);
+}
+
+fn f32ToF16Bits(value: f32) -> u32 {
+  let bits = bitcast<u32>(value);
+  let sign = (bits >> 16u) & 0x8000u;
+  let absBits = bits & 0x7fffffffu;
+  if (absBits == 0u) {
+    return sign;
+  }
+  if (absBits >= 0x7f800000u) {
+    return sign | 0x7c00u;
+  }
+  var exponent = i32((absBits >> 23u) & 255u) - 127 + 15;
+  let mantissa = absBits & 0x7fffffu;
+  if (exponent <= 0) {
+    if (exponent < -10) {
+      return sign;
+    }
+    let shifted = (mantissa | 0x800000u) >> u32(1 - exponent);
+    return sign | ((shifted + 0x1000u) >> 13u);
+  }
+  var halfMantissa = (mantissa + 0x1000u) >> 13u;
+  if (halfMantissa == 0x400u) {
+    halfMantissa = 0u;
+    exponent = exponent + 1;
+  }
+  if (exponent >= 31) {
+    return sign | 0x7c00u;
+  }
+  return sign | (u32(exponent) << 10u) | halfMantissa;
+}
+
+fn f16Rounded(value: f32) -> f32 {
+  return f16BitsToF32(f32ToF16Bits(value));
+}
+
+@compute @workgroup_size(256, 1, 1)
+fn main(
+  @builtin(workgroup_id) workgroupId: vec3<u32>,
+  @builtin(local_invocation_id) localId: vec3<u32>,
+) {
+  let column = workgroupId.x;
+  let block = workgroupId.y;
+  let lane = localId.x;
+  if (column >= params.columnCount || block >= params.blockCount) {
     return;
   }
-  let inverseScale = -127.0 / maxValue;
-  outputScales[blockIndex] = 1.0 / inverseScale;
-  for (var group = 0u; group < 16u; group = group + 1u) {
-    var sum = 0i;
-    for (var lane = 0u; lane < 16u; lane = lane + 1u) {
-      let index = group * 16u + lane;
-      let q = min(127i, i32(round(inverseScale * inputValues[base + index])));
-      outputQs[base + index] = q;
-      sum = sum + q;
+  let base = column * params.inputSize + block * 256u;
+  let value = f16Rounded(inputValues[base + lane]);
+  q8AbsValues[lane] = abs(value);
+  q8Values[lane] = value;
+  q8Indices[lane] = lane;
+  workgroupBarrier();
+
+  for (var stride = 128u; stride > 0u; stride = stride / 2u) {
+    if (lane < stride) {
+      let otherLane = lane + stride;
+      let otherAbs = q8AbsValues[otherLane];
+      let otherIndex = q8Indices[otherLane];
+      if (otherAbs > q8AbsValues[lane] || (otherAbs == q8AbsValues[lane] && otherIndex < q8Indices[lane])) {
+        q8AbsValues[lane] = otherAbs;
+        q8Values[lane] = q8Values[otherLane];
+        q8Indices[lane] = otherIndex;
+      }
     }
-    outputBsums[blockIndex * 16u + group] = sum;
+    workgroupBarrier();
+  }
+
+  let amax = q8AbsValues[0];
+  let maxValue = q8Values[0];
+  let blockIndex = column * params.blockCount + block;
+  var inverseScale = 0.0;
+  if (amax != 0.0) {
+    inverseScale = -127.0 / maxValue;
+  }
+  if (lane == 0u) {
+    var scale = 0.0;
+    if (amax != 0.0) {
+      scale = 1.0 / inverseScale;
+    }
+    outputScales[blockIndex] = scale;
+  }
+  var q = 0i;
+  if (amax != 0.0) {
+    q = min(127i, i32(round(inverseScale * value)));
+  }
+  q8Quants[lane] = q;
+  outputQs[base + lane] = q;
+  workgroupBarrier();
+
+  if (lane < 16u) {
+    var sum = 0i;
+    for (var index = 0u; index < 16u; index = index + 1u) {
+      sum = sum + q8Quants[lane * 16u + index];
+    }
+    outputBsums[blockIndex * 16u + lane] = sum;
+  }
+}
+`;
+
+export const RMS_NORM_Q8_K_QUANTIZE_WGSL = `
+struct Params {
+  epsilon: f32,
+  length: u32,
+  blockCount: u32,
+  _pad0: u32,
+};
+
+@group(0) @binding(0) var<storage, read> inputValues: array<f32>;
+@group(0) @binding(1) var<storage, read> weightValues: array<f32>;
+@group(0) @binding(2) var<storage, read_write> outputScales: array<f32>;
+@group(0) @binding(3) var<storage, read_write> outputQs: array<i32>;
+@group(0) @binding(4) var<storage, read_write> outputBsums: array<i32>;
+@group(0) @binding(5) var<uniform> params: Params;
+
+var<workgroup> rmsQ8ReduceValues: array<f32, 256>;
+var<workgroup> rmsQ8AbsValues: array<f32, 256>;
+var<workgroup> rmsQ8Values: array<f32, 256>;
+var<workgroup> rmsQ8Indices: array<u32, 256>;
+var<workgroup> rmsQ8Quants: array<i32, 256>;
+
+@compute @workgroup_size(256, 1, 1)
+fn main(@builtin(local_invocation_id) localId: vec3<u32>) {
+  let lane = localId.x;
+  var localSum = 0.0;
+  for (var index = lane; index < params.length; index = index + 256u) {
+    let value = inputValues[index];
+    localSum = localSum + value * value;
+  }
+  rmsQ8ReduceValues[lane] = localSum;
+  workgroupBarrier();
+  for (var stride = 128u; stride > 0u; stride = stride / 2u) {
+    if (lane < stride) {
+      rmsQ8ReduceValues[lane] = rmsQ8ReduceValues[lane] + rmsQ8ReduceValues[lane + stride];
+    }
+    workgroupBarrier();
+  }
+
+  let meanSquare = rmsQ8ReduceValues[0];
+  let rmsScale = inverseSqrt(meanSquare / f32(params.length) + params.epsilon);
+  for (var block = 0u; block < params.blockCount; block = block + 1u) {
+    let index = block * 256u + lane;
+    let value = inputValues[index] * rmsScale * weightValues[index];
+    rmsQ8AbsValues[lane] = abs(value);
+    rmsQ8Values[lane] = value;
+    rmsQ8Indices[lane] = lane;
+    workgroupBarrier();
+
+    for (var stride = 128u; stride > 0u; stride = stride / 2u) {
+      if (lane < stride) {
+        let otherLane = lane + stride;
+        let otherAbs = rmsQ8AbsValues[otherLane];
+        let otherIndex = rmsQ8Indices[otherLane];
+        if (otherAbs > rmsQ8AbsValues[lane] || (otherAbs == rmsQ8AbsValues[lane] && otherIndex < rmsQ8Indices[lane])) {
+          rmsQ8AbsValues[lane] = otherAbs;
+          rmsQ8Values[lane] = rmsQ8Values[otherLane];
+          rmsQ8Indices[lane] = otherIndex;
+        }
+      }
+      workgroupBarrier();
+    }
+
+    let amax = rmsQ8AbsValues[0];
+    let maxValue = rmsQ8Values[0];
+    var inverseScale = 0.0;
+    if (amax != 0.0) {
+      inverseScale = -127.0 / maxValue;
+    }
+    if (lane == 0u) {
+      var scale = 0.0;
+      if (amax != 0.0) {
+        scale = 1.0 / inverseScale;
+      }
+      outputScales[block] = scale;
+    }
+    var q = 0i;
+    if (amax != 0.0) {
+      q = min(127i, i32(round(inverseScale * value)));
+    }
+    rmsQ8Quants[lane] = q;
+    outputQs[index] = q;
+    workgroupBarrier();
+
+    if (lane < 16u) {
+      var sum = 0i;
+      for (var offset = 0u; offset < 16u; offset = offset + 1u) {
+        sum = sum + rmsQ8Quants[lane * 16u + offset];
+      }
+      outputBsums[block * 16u + lane] = sum;
+    }
+    workgroupBarrier();
   }
 }
 `;
@@ -1431,7 +1777,7 @@ struct Params {
   keyValueTokenCount: u32,
   contextLength: u32,
   tokenPosition: u32,
-  slidingWindow: u32,
+  keyValueStart: u32,
 };
 
 @group(0) @binding(0) var<storage, read> queryValues: array<f32>;
@@ -1483,18 +1829,10 @@ fn f32ToF16Bits(value: f32) -> u32 {
 }
 
 fn queryValue(index: u32) -> f32 {
-  return f16BitsToF32(f32ToF16Bits(queryValues[index]));
+  return queryValues[index];
 }
 
 fn attentionScore(qHead: u32, kvHead: u32, keyToken: u32) -> f32 {
-  let minPosition = select(
-    0u,
-    params.tokenPosition + 1u - params.slidingWindow,
-    params.slidingWindow != 0u && params.tokenPosition + 1u > params.slidingWindow,
-  );
-  if (keyToken > params.tokenPosition || keyToken < minPosition) {
-    return -3.4028234663852886e38;
-  }
   let queryOffset = qHead * params.headSize;
   let keyOffset = (keyToken * params.keyValueHeadCount + kvHead) * params.headSize;
   var dot = 0.0;
@@ -1504,29 +1842,56 @@ fn attentionScore(qHead: u32, kvHead: u32, keyToken: u32) -> f32 {
   return dot * params.scale;
 }
 
-@compute @workgroup_size(1, 1, 1)
-fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-  let qHead = id.x;
-  if (qHead >= params.queryHeadCount) {
-    return;
-  }
-  let groupSize = params.queryHeadCount / params.keyValueHeadCount;
-  let kvHead = qHead / groupSize;
-  var maxScore = -3.4028234663852886e38;
-  for (var keyToken = 0u; keyToken < params.keyValueTokenCount; keyToken = keyToken + 1u) {
-    maxScore = max(maxScore, attentionScore(qHead, kvHead, keyToken));
-  }
-  var sum = 0.0;
-  for (var keyToken = 0u; keyToken < params.keyValueTokenCount; keyToken = keyToken + 1u) {
-    let probability = exp(attentionScore(qHead, kvHead, keyToken) - maxScore);
-    probabilityValues[qHead * params.keyValueTokenCount + keyToken] = probability;
-    sum = sum + probability;
-  }
-  for (var keyToken = 0u; keyToken < params.keyValueTokenCount; keyToken = keyToken + 1u) {
-    let index = qHead * params.keyValueTokenCount + keyToken;
-    probabilityValues[index] = probabilityValues[index] / sum;
-  }
-}
+	var<workgroup> reduceValues: array<f32, 256>;
+
+	@compute @workgroup_size(256, 1, 1)
+	fn main(
+	  @builtin(workgroup_id) workgroupId: vec3<u32>,
+	  @builtin(local_invocation_id) localId: vec3<u32>,
+	) {
+	  let qHead = workgroupId.x;
+	  let lane = localId.x;
+	  if (qHead >= params.queryHeadCount) {
+	    return;
+	  }
+	  let groupSize = params.queryHeadCount / params.keyValueHeadCount;
+	  let kvHead = qHead / groupSize;
+	  let probabilityOffset = qHead * params.keyValueTokenCount;
+	  var localMax = -3.4028234663852886e38;
+	  for (var keyToken = params.keyValueStart + lane; keyToken < params.keyValueTokenCount; keyToken = keyToken + 256u) {
+	    let score = attentionScore(qHead, kvHead, keyToken);
+	    probabilityValues[probabilityOffset + keyToken] = score;
+	    localMax = max(localMax, score);
+	  }
+	  reduceValues[lane] = localMax;
+	  workgroupBarrier();
+	  for (var stride = 128u; stride > 0u; stride = stride / 2u) {
+	    if (lane < stride) {
+	      reduceValues[lane] = max(reduceValues[lane], reduceValues[lane + stride]);
+	    }
+	    workgroupBarrier();
+	  }
+	  let maxScore = reduceValues[0];
+	  var localSum = 0.0;
+	  for (var keyToken = params.keyValueStart + lane; keyToken < params.keyValueTokenCount; keyToken = keyToken + 256u) {
+	    let probability = exp(probabilityValues[probabilityOffset + keyToken] - maxScore);
+	    probabilityValues[probabilityOffset + keyToken] = probability;
+	    localSum = localSum + probability;
+	  }
+	  reduceValues[lane] = localSum;
+	  workgroupBarrier();
+	  for (var stride = 128u; stride > 0u; stride = stride / 2u) {
+	    if (lane < stride) {
+	      reduceValues[lane] = reduceValues[lane] + reduceValues[lane + stride];
+	    }
+	    workgroupBarrier();
+	  }
+	  let sum = reduceValues[0];
+	  for (var keyToken = params.keyValueStart + lane; keyToken < params.keyValueTokenCount; keyToken = keyToken + 256u) {
+	    let index = probabilityOffset + keyToken;
+	    probabilityValues[index] = probabilityValues[index] / sum;
+	  }
+	}
 `;
 
 export const FULL_ATTENTION_APPLY_WGSL = `
@@ -1537,7 +1902,7 @@ struct Params {
   keyValueHeadCount: u32,
   keyValueTokenCount: u32,
   contextLength: u32,
-  _pad0: u32,
+  keyValueStart: u32,
   _pad1: u32,
 };
 
@@ -1557,7 +1922,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   let kvHead = qHead / groupSize;
   var weighted = 0.0;
   let probabilityOffset = qHead * params.keyValueTokenCount;
-  for (var keyToken = 0u; keyToken < params.keyValueTokenCount; keyToken = keyToken + 1u) {
+  for (var keyToken = params.keyValueStart; keyToken < params.keyValueTokenCount; keyToken = keyToken + 1u) {
     let probability = probabilityValues[probabilityOffset + keyToken];
     let valueIndex = (dim * params.keyValueHeadCount + kvHead) * params.contextLength + keyToken;
     weighted = weighted + probability * valueValues[valueIndex];

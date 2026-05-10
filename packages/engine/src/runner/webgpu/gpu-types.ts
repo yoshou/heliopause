@@ -33,8 +33,12 @@ export type NavigatorWithWebGpu = Navigator & {
 
 export type WebGpuAdapterLike = {
   requestDevice?: (descriptor?: {
+    requiredFeatures?: string[];
     requiredLimits?: Record<string, number>;
   }) => Promise<WebGpuDeviceLike>;
+  features?: {
+    has: (feature: string) => boolean;
+  };
   info?: {
     description?: string;
     vendor?: string;
@@ -48,6 +52,9 @@ export type WebGpuAdapterLike = {
 };
 
 export type WebGpuDeviceLike = {
+  features?: {
+    has: (feature: string) => boolean;
+  };
   createBuffer: (descriptor: {
     size: number;
     usage: number;
@@ -58,6 +65,7 @@ export type WebGpuDeviceLike = {
   createPipelineLayout: (descriptor: unknown) => unknown;
   createComputePipeline: (descriptor: unknown) => unknown;
   createBindGroup: (descriptor: unknown) => unknown;
+  createQuerySet?: (descriptor: { type: "timestamp"; count: number }) => WebGpuQuerySetLike;
   createCommandEncoder: () => WebGpuCommandEncoderLike;
   queue: {
     writeBuffer: (
@@ -80,7 +88,7 @@ export type WebGpuBufferLike = {
 };
 
 export type WebGpuCommandEncoderLike = {
-  beginComputePass: () => WebGpuComputePassLike;
+  beginComputePass: (descriptor?: unknown) => WebGpuComputePassLike;
   copyBufferToBuffer: (
     source: WebGpuBufferLike,
     sourceOffset: number,
@@ -88,7 +96,18 @@ export type WebGpuCommandEncoderLike = {
     destinationOffset: number,
     size: number,
   ) => void;
+  resolveQuerySet?: (
+    querySet: WebGpuQuerySetLike,
+    firstQuery: number,
+    queryCount: number,
+    destination: WebGpuBufferLike,
+    destinationOffset: number,
+  ) => void;
   finish: () => unknown;
+};
+
+export type WebGpuQuerySetLike = {
+  destroy?: () => void;
 };
 
 export type WebGpuComputePassLike = {

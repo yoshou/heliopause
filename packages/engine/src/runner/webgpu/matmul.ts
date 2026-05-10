@@ -2,6 +2,7 @@ import { GPU_COPY_DST, GPU_COPY_SRC, GPU_MAP_READ, GPU_STORAGE, GPU_UNIFORM, GPU
 import { bindBuffer, storageBuffer, storageEntry } from "./gpu-bindings";
 import { assertStorageBindingFits, webGpuDevice } from "./gpu-device";
 import {
+  createF16CastResources,
   createFullAttentionApplyResources,
   createFullAttentionScoreResources,
   createKMatMulBindResources,
@@ -989,6 +990,7 @@ export async function fullAttentionDecodeOutWebGpuResident(
   }
 
   const queryBuffer = storageBuffer(out.device, query.byteLength, GPU_COPY_DST);
+  const queryF16Buffer = storageBuffer(out.device, query.byteLength, 0);
   const keyBuffer = storageBuffer(out.device, keyCache.byteLength, GPU_COPY_DST);
   const valueBuffer = storageBuffer(out.device, valueCache.byteLength, GPU_COPY_DST);
   const gateBuffer = storageBuffer(out.device, gate.byteLength, GPU_COPY_DST);
@@ -1014,9 +1016,10 @@ export async function fullAttentionDecodeOutWebGpuResident(
     out.device.queue.writeBuffer(valueBuffer, 0, valueCache);
     out.device.queue.writeBuffer(gateBuffer, 0, gate);
 
+    const queryF16Resources = createF16CastResources(out.device, queryBuffer, queryF16Buffer, hiddenSize);
     const scoreResources = createFullAttentionScoreResources(
       out.device,
-      queryBuffer,
+      queryF16Buffer,
       keyBuffer,
       probabilitiesBuffer,
       {
@@ -1036,6 +1039,7 @@ export async function fullAttentionDecodeOutWebGpuResident(
         keyValueTokenCount: options.keyValueTokenCount,
         contextLength: options.contextLength,
         scale: options.scale,
+        keyValueStart: 0,
       },
     );
     const gateResources = createSigmoidMulResources(
@@ -1059,6 +1063,9 @@ export async function fullAttentionDecodeOutWebGpuResident(
 
     const encoder = out.device.createCommandEncoder();
     const pass = encoder.beginComputePass();
+    pass.setPipeline(queryF16Resources.pipeline);
+    pass.setBindGroup(0, queryF16Resources.bindGroup);
+    pass.dispatchWorkgroups(Math.ceil(hiddenSize / 256));
     pass.setPipeline(scoreResources.pipeline);
     pass.setBindGroup(0, scoreResources.bindGroup);
     pass.dispatchWorkgroups(queryHeadCount);
@@ -1081,6 +1088,7 @@ export async function fullAttentionDecodeOutWebGpuResident(
     const output = new Float32Array(readbackBuffer.getMappedRange()).slice();
     readbackBuffer.unmap();
     scoreResources.destroy();
+    queryF16Resources.destroy();
     applyResources.destroy();
     gateResources.destroy();
     quantizeResources.destroy();
@@ -1088,6 +1096,7 @@ export async function fullAttentionDecodeOutWebGpuResident(
     return output;
   } finally {
     queryBuffer.destroy?.();
+    queryF16Buffer.destroy?.();
     keyBuffer.destroy?.();
     valueBuffer.destroy?.();
     gateBuffer.destroy?.();

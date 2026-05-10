@@ -227,9 +227,22 @@ async function requestWebGpuDevice(): Promise<WebGpuDeviceLike | undefined> {
   if (!adapter?.requestDevice) {
     return undefined;
   }
-  return adapter.requestDevice({
-    requiredLimits: requestedDeviceLimits(adapter.limits),
-  });
+  const requiredLimits = requestedDeviceLimits(adapter.limits);
+  if (webGpuGpuTimingEnabled() && adapter.features?.has("timestamp-query")) {
+    try {
+      return await adapter.requestDevice({
+        requiredFeatures: ["timestamp-query"],
+        requiredLimits,
+      });
+    } catch {
+      // Timestamp profiling is optional; keep WebGPU execution available without it.
+    }
+  }
+  return adapter.requestDevice({ requiredLimits });
+}
+
+function webGpuGpuTimingEnabled(): boolean {
+  return (globalThis as { __heliopauseDisableWebGpuGpuTiming?: unknown }).__heliopauseDisableWebGpuGpuTiming !== true;
 }
 
 function requestedDeviceLimits(limits: WebGpuAdapterLike["limits"]): Record<string, number> {

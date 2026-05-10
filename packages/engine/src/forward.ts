@@ -355,6 +355,14 @@ function logWebGpuRunnerTiming(session: Gemma4ModelSession, phase: "prefill" | "
     lastRunEncodeMs: roundMs(stats.webgpuLastRunEncodeMs),
     lastRunSubmitMs: roundMs(stats.webgpuLastRunSubmitMs),
     lastRunReadbackWaitMs: roundMs(stats.webgpuLastRunReadbackWaitMs),
+    lastRunReadbackWaitMinusGpuPassMs: roundMs(stats.webgpuLastRunReadbackWaitMinusGpuPassMs),
+    lastRunTimestampReadbackWaitMs: roundMs(stats.webgpuLastRunTimestampReadbackWaitMs),
+    lastRunGpuPassMs: roundMs(stats.webgpuLastRunGpuPassMs),
+    lastRunGpuSections: stringStat(stats.webgpuLastRunGpuSections),
+    lastRunGpuTimingStatus: stringStat(stats.webgpuLastRunGpuTimingStatus),
+    lastRunReadbackBytes: numberStat(stats.webgpuLastRunReadbackBytes),
+    lastRunDispatchCount: numberStat(stats.webgpuLastRunDispatchCount),
+    lastRunSelectedTokenId: numberStat(stats.webgpuLastRunSelectedTokenId),
     lastRunPipelineHit: numberStat(stats.webgpuLastRunComputePipelineHits),
     lastRunPipelineMiss: numberStat(stats.webgpuLastRunComputePipelineMisses),
     lastRunBindGroupHit: numberStat(stats.webgpuLastRunBindGroupHits),
@@ -407,6 +415,14 @@ type WebGpuRunnerTimingRow = {
   lastRunEncodeMs: number;
   lastRunSubmitMs: number;
   lastRunReadbackWaitMs: number;
+  lastRunReadbackWaitMinusGpuPassMs: number;
+  lastRunTimestampReadbackWaitMs: number;
+  lastRunGpuPassMs: number;
+  lastRunGpuSections: string;
+  lastRunGpuTimingStatus: string;
+  lastRunReadbackBytes: number;
+  lastRunDispatchCount: number;
+  lastRunSelectedTokenId: number;
   lastRunPipelineHit: number;
   lastRunPipelineMiss: number;
   lastRunBindGroupHit: number;
@@ -451,6 +467,14 @@ function webGpuTimingRowsToTsv(rows: readonly WebGpuRunnerTimingRow[]): string {
     "lastRunEncodeMs",
     "lastRunSubmitMs",
     "lastRunReadbackWaitMs",
+    "lastRunReadbackWaitMinusGpuPassMs",
+    "lastRunTimestampReadbackWaitMs",
+    "lastRunGpuPassMs",
+    "lastRunGpuSections",
+    "lastRunGpuTimingStatus",
+    "lastRunReadbackBytes",
+    "lastRunDispatchCount",
+    "lastRunSelectedTokenId",
     "lastRunPipelineHit",
     "lastRunPipelineMiss",
     "lastRunBindGroupHit",
@@ -466,6 +490,10 @@ function webGpuTimingRowsToTsv(rows: readonly WebGpuRunnerTimingRow[]): string {
 
 function numberStat(value: unknown): number {
   return typeof value === "number" ? value : 0;
+}
+
+function stringStat(value: unknown): string {
+  return typeof value === "string" ? value : "";
 }
 
 function roundMs(value: unknown): number {

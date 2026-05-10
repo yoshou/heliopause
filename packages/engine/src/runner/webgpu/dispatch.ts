@@ -4,6 +4,7 @@ import {
   createDeltaGateResources,
   createElementwiseMulResources,
   createF16CastResources,
+  createF16Q8KQuantizeResources,
   createF32GatherRowsScaleResources,
   createF32MatMulResources,
   createFullAttentionApplyResources,
@@ -20,7 +21,9 @@ import {
   createQ8KQuantizeResources,
   createPreparePerLayerInputsResources,
   createResidualAddResources,
+  createResidualAddScaleResources,
   createRmsNormResources,
+  createRmsNormQ8KQuantizeResources,
   createScaleResources,
   createSelectTop1CandidateResources,
   createSigmoidMulResources,
@@ -28,6 +31,7 @@ import {
   createSwiGluResources,
   createTokenSliceResources,
   createTopKResources,
+  createTop1ChunkResources,
 } from "./kernel-resources";
 
 export function dispatchKMatMul(
@@ -100,6 +104,22 @@ export function dispatchQ8KQuantize(
   pass.dispatchWorkgroups(columnCount, inputSize / 256);
 }
 
+export function dispatchF16Q8KQuantize(
+  device: WebGpuDeviceLike,
+  pass: WebGpuComputePassLike,
+  resources: Array<{ destroy: () => void }>,
+  input: WebGpuBufferLike,
+  q8: Q8KBuffers,
+  inputSize: number,
+  columnCount: number,
+): void {
+  const resource = createF16Q8KQuantizeResources(device, input, q8.scale, q8.qs, q8.bsums, inputSize, columnCount, inputSize / 256);
+  resources.push(resource);
+  pass.setPipeline(resource.pipeline);
+  pass.setBindGroup(0, resource.bindGroup);
+  pass.dispatchWorkgroups(columnCount, inputSize / 256);
+}
+
 export function dispatchQ8_0Quantize(
   device: WebGpuDeviceLike,
   pass: WebGpuComputePassLike,
@@ -134,6 +154,23 @@ export function dispatchRmsNorm(
   pass.dispatchWorkgroups(1);
 }
 
+export function dispatchRmsNormQ8KQuantize(
+  device: WebGpuDeviceLike,
+  pass: WebGpuComputePassLike,
+  resources: Array<{ destroy: () => void }>,
+  input: WebGpuBufferLike,
+  weight: WebGpuBufferLike,
+  q8: Q8KBuffers,
+  length: number,
+  epsilon: number,
+): void {
+  const resource = createRmsNormQ8KQuantizeResources(device, input, weight, q8.scale, q8.qs, q8.bsums, length, epsilon);
+  resources.push(resource);
+  pass.setPipeline(resource.pipeline);
+  pass.setBindGroup(0, resource.bindGroup);
+  pass.dispatchWorkgroups(1);
+}
+
 export function dispatchResidualAdd(
   device: WebGpuDeviceLike,
   pass: WebGpuComputePassLike,
@@ -144,6 +181,23 @@ export function dispatchResidualAdd(
   length: number,
 ): void {
   const resource = createResidualAddResources(device, left, right, output, length);
+  resources.push(resource);
+  pass.setPipeline(resource.pipeline);
+  pass.setBindGroup(0, resource.bindGroup);
+  pass.dispatchWorkgroups(Math.ceil(length / 256));
+}
+
+export function dispatchResidualAddScale(
+  device: WebGpuDeviceLike,
+  pass: WebGpuComputePassLike,
+  resources: Array<{ destroy: () => void }>,
+  left: WebGpuBufferLike,
+  right: WebGpuBufferLike,
+  scale: WebGpuBufferLike,
+  output: WebGpuBufferLike,
+  length: number,
+): void {
+  const resource = createResidualAddScaleResources(device, left, right, scale, output, length);
   resources.push(resource);
   pass.setPipeline(resource.pipeline);
   pass.setBindGroup(0, resource.bindGroup);
@@ -227,6 +281,27 @@ export function dispatchTopK(
   }
 }
 
+export function dispatchTop1Chunks(
+  device: WebGpuDeviceLike,
+  pass: WebGpuComputePassLike,
+  resources: Array<{ destroy: () => void }>,
+  logits: WebGpuBufferLike,
+  output: WebGpuBufferLike,
+  options: {
+    rowCount: number;
+    rowOffset: number;
+    candidateOffset: number;
+  },
+): number {
+  const groupCount = Math.ceil(options.rowCount / TOP1_CHUNK_SIZE);
+  const resource = createTop1ChunkResources(device, logits, output, options);
+  resources.push(resource);
+  pass.setPipeline(resource.pipeline);
+  pass.setBindGroup(0, resource.bindGroup);
+  pass.dispatchWorkgroups(groupCount);
+  return groupCount;
+}
+
 export function dispatchSelectTop1Candidate(
   device: WebGpuDeviceLike,
   pass: WebGpuComputePassLike,
@@ -241,6 +316,8 @@ export function dispatchSelectTop1Candidate(
   pass.setBindGroup(0, resource.bindGroup);
   pass.dispatchWorkgroups(1);
 }
+
+export const TOP1_CHUNK_SIZE = 256;
 
 export function dispatchTokenSlice(
   device: WebGpuDeviceLike,
@@ -571,6 +648,7 @@ export function dispatchFullAttentionApply(
     keyValueTokenCount: number;
     contextLength: number;
     scale: number;
+    keyValueStart?: number;
   },
 ): void {
   const resource = createFullAttentionApplyResources(device, value, probabilities, output, options);
