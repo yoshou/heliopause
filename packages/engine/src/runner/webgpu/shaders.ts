@@ -1163,46 +1163,6 @@ fn main(@builtin(workgroup_id) workgroupId: vec3<u32>, @builtin(local_invocation
 }
 `;
 
-export const DELTA_GATE_WGSL = `
-struct Params {
-  valueHeadCount: u32,
-  tokenCount: u32,
-  _pad0: u32,
-  _pad1: u32,
-};
-
-@group(0) @binding(0) var<storage, read> alphaValues: array<f32>;
-@group(0) @binding(1) var<storage, read> betaValues: array<f32>;
-@group(0) @binding(2) var<storage, read> dtBias: array<f32>;
-@group(0) @binding(3) var<storage, read> ssmA: array<f32>;
-@group(0) @binding(4) var<uniform> params: Params;
-@group(0) @binding(5) var<storage, read_write> gateValues: array<f32>;
-@group(0) @binding(6) var<storage, read_write> betaSigmoidValues: array<f32>;
-
-fn softplus(value: f32) -> f32 {
-  if (value > 20.0) {
-    return value;
-  }
-  if (value < -20.0) {
-    return exp(value);
-  }
-  return log(1.0 + exp(value));
-}
-
-@compute @workgroup_size(1, 1, 1)
-fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-  let head = id.x;
-  let token = id.y;
-  if (head >= params.valueHeadCount || token >= params.tokenCount) {
-    return;
-  }
-  let index = token * params.valueHeadCount + head;
-  gateValues[index] = softplus(alphaValues[index] + dtBias[head]) * ssmA[head];
-  let beta = betaValues[index];
-  betaSigmoidValues[index] = 1.0 / (1.0 + exp(-beta));
-}
-`;
-
 export const TOP1_WGSL = `
 struct Params {
   rowCount: u32,
@@ -1575,139 +1535,6 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 }
 `;
 
-export const SSM_NORM_GATE_WGSL = `
-struct Params {
-  epsilon: f32,
-  rowCount: u32,
-  columnCount: u32,
-  _pad0: u32,
-};
-
-@group(0) @binding(0) var<storage, read> deltaValues: array<f32>;
-@group(0) @binding(1) var<storage, read> zValues: array<f32>;
-@group(0) @binding(2) var<storage, read> normWeights: array<f32>;
-@group(0) @binding(3) var<uniform> params: Params;
-@group(0) @binding(4) var<storage, read_write> outputValues: array<f32>;
-
-@compute @workgroup_size(1, 1, 1)
-fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-  let column = id.x;
-  if (column >= params.columnCount) {
-    return;
-  }
-  let base = column * params.rowCount;
-  var meanSquare = 0.0;
-  for (var row = 0u; row < params.rowCount; row = row + 1u) {
-    let value = deltaValues[base + row];
-    meanSquare = meanSquare + value * value;
-  }
-  let scale = inverseSqrt(meanSquare / f32(params.rowCount) + params.epsilon);
-  for (var row = 0u; row < params.rowCount; row = row + 1u) {
-    let index = base + row;
-    let z = zValues[index];
-    outputValues[index] = deltaValues[index] * scale * normWeights[row] * (z / (1.0 + exp(-z)));
-  }
-}
-`;
-
-export const QKV_CONV_SPLIT_WGSL = `
-struct Params {
-  tokenCount: u32,
-  convDim: u32,
-  kernelSize: u32,
-  stateSize: u32,
-  groupCount: u32,
-  valueDim: u32,
-  _pad0: u32,
-  _pad1: u32,
-};
-
-@group(0) @binding(0) var<storage, read> qkvValues: array<f32>;
-@group(0) @binding(1) var<storage, read> convState: array<f32>;
-@group(0) @binding(2) var<storage, read> convKernel: array<f32>;
-@group(0) @binding(3) var<uniform> params: Params;
-@group(0) @binding(4) var<storage, read_write> qValues: array<f32>;
-@group(0) @binding(5) var<storage, read_write> kValues: array<f32>;
-@group(0) @binding(6) var<storage, read_write> vValues: array<f32>;
-@group(0) @binding(7) var<storage, read_write> newConvState: array<f32>;
-
-fn convInputValue(channel: u32, inputIndex: u32) -> f32 {
-  let history = params.kernelSize - 1u;
-  if (inputIndex < history) {
-    return convState[channel * history + inputIndex];
-  }
-  let token = inputIndex - history;
-  return qkvValues[token * params.convDim + channel];
-}
-
-fn convSilu(channel: u32, token: u32) -> f32 {
-  var sum = 0.0;
-  for (var k = 0u; k < params.kernelSize; k = k + 1u) {
-    sum = sum + convInputValue(channel, token + k) * convKernel[channel * params.kernelSize + k];
-  }
-  return sum / (1.0 + exp(-sum));
-}
-
-@compute @workgroup_size(1, 1, 1)
-fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-  let work = id.x;
-  let mode = id.y;
-  let keyDim = params.stateSize * params.groupCount;
-  let history = params.kernelSize - 1u;
-  if (mode == 0u) {
-    let rowCount = params.tokenCount * params.groupCount;
-    if (work >= rowCount) {
-      return;
-    }
-    let token = work / params.groupCount;
-    let group = work - token * params.groupCount;
-    var qSum = 0.0;
-    var kSum = 0.0;
-    for (var index = 0u; index < params.stateSize; index = index + 1u) {
-      let channel = group * params.stateSize + index;
-      let q = convSilu(channel, token);
-      let k = convSilu(keyDim + channel, token);
-      qSum = qSum + q * q;
-      kSum = kSum + k * k;
-    }
-    let qScale = 1.0 / max(sqrt(qSum), 0.000001);
-    let kScale = 1.0 / max(sqrt(kSum), 0.000001);
-    for (var index = 0u; index < params.stateSize; index = index + 1u) {
-      let channel = group * params.stateSize + index;
-      let outIndex = token * keyDim + group * params.stateSize + index;
-      qValues[outIndex] = convSilu(channel, token) * qScale;
-      kValues[outIndex] = convSilu(keyDim + channel, token) * kScale;
-    }
-    return;
-  }
-  if (mode == 1u) {
-    let valueHeadCount = params.valueDim / params.stateSize;
-    let rowCount = params.tokenCount * valueHeadCount;
-    if (work >= rowCount) {
-      return;
-    }
-    let token = work / valueHeadCount;
-    let head = work - token * valueHeadCount;
-    for (var index = 0u; index < params.stateSize; index = index + 1u) {
-      let valueIndex = head * params.stateSize + index;
-      let channel = keyDim * 2u + valueIndex;
-      vValues[token * params.valueDim + valueIndex] = convSilu(channel, token);
-    }
-    return;
-  }
-  if (mode == 2u) {
-    if (work >= params.convDim) {
-      return;
-    }
-    for (var index = 0u; index < history; index = index + 1u) {
-      let source = params.tokenCount + index;
-      newConvState[work * history + index] = convInputValue(work, source);
-    }
-  }
-}
-`;
-
-
 export const FULL_ATTENTION_SCORE_WGSL = `
 struct Params {
   scale: f32,
@@ -1782,56 +1609,56 @@ fn attentionScore(qHead: u32, kvHead: u32, keyToken: u32) -> f32 {
   return dot * params.scale;
 }
 
-	var<workgroup> reduceValues: array<f32, 256>;
+var<workgroup> reduceValues: array<f32, 256>;
 
-	@compute @workgroup_size(256, 1, 1)
-	fn main(
-	  @builtin(workgroup_id) workgroupId: vec3<u32>,
-	  @builtin(local_invocation_id) localId: vec3<u32>,
-	) {
-	  let qHead = workgroupId.x;
-	  let lane = localId.x;
-	  if (qHead >= params.queryHeadCount) {
-	    return;
-	  }
-	  let groupSize = params.queryHeadCount / params.keyValueHeadCount;
-	  let kvHead = qHead / groupSize;
-	  let probabilityOffset = qHead * params.keyValueTokenCount;
-	  var localMax = -3.4028234663852886e38;
-	  for (var keyToken = params.keyValueStart + lane; keyToken < params.keyValueTokenCount; keyToken = keyToken + 256u) {
-	    let score = attentionScore(qHead, kvHead, keyToken);
-	    probabilityValues[probabilityOffset + keyToken] = score;
-	    localMax = max(localMax, score);
-	  }
-	  reduceValues[lane] = localMax;
-	  workgroupBarrier();
-	  for (var stride = 128u; stride > 0u; stride = stride / 2u) {
-	    if (lane < stride) {
-	      reduceValues[lane] = max(reduceValues[lane], reduceValues[lane + stride]);
-	    }
-	    workgroupBarrier();
-	  }
-	  let maxScore = reduceValues[0];
-	  var localSum = 0.0;
-	  for (var keyToken = params.keyValueStart + lane; keyToken < params.keyValueTokenCount; keyToken = keyToken + 256u) {
-	    let probability = exp(probabilityValues[probabilityOffset + keyToken] - maxScore);
-	    probabilityValues[probabilityOffset + keyToken] = probability;
-	    localSum = localSum + probability;
-	  }
-	  reduceValues[lane] = localSum;
-	  workgroupBarrier();
-	  for (var stride = 128u; stride > 0u; stride = stride / 2u) {
-	    if (lane < stride) {
-	      reduceValues[lane] = reduceValues[lane] + reduceValues[lane + stride];
-	    }
-	    workgroupBarrier();
-	  }
-	  let sum = reduceValues[0];
-	  for (var keyToken = params.keyValueStart + lane; keyToken < params.keyValueTokenCount; keyToken = keyToken + 256u) {
-	    let index = probabilityOffset + keyToken;
-	    probabilityValues[index] = probabilityValues[index] / sum;
-	  }
-	}
+@compute @workgroup_size(256, 1, 1)
+fn main(
+  @builtin(workgroup_id) workgroupId: vec3<u32>,
+  @builtin(local_invocation_id) localId: vec3<u32>,
+) {
+  let qHead = workgroupId.x;
+  let lane = localId.x;
+  if (qHead >= params.queryHeadCount) {
+    return;
+  }
+  let groupSize = params.queryHeadCount / params.keyValueHeadCount;
+  let kvHead = qHead / groupSize;
+  let probabilityOffset = qHead * params.keyValueTokenCount;
+  var localMax = -3.4028234663852886e38;
+  for (var keyToken = params.keyValueStart + lane; keyToken < params.keyValueTokenCount; keyToken = keyToken + 256u) {
+    let score = attentionScore(qHead, kvHead, keyToken);
+    probabilityValues[probabilityOffset + keyToken] = score;
+    localMax = max(localMax, score);
+  }
+  reduceValues[lane] = localMax;
+  workgroupBarrier();
+  for (var stride = 128u; stride > 0u; stride = stride / 2u) {
+    if (lane < stride) {
+      reduceValues[lane] = max(reduceValues[lane], reduceValues[lane + stride]);
+    }
+    workgroupBarrier();
+  }
+  let maxScore = reduceValues[0];
+  var localSum = 0.0;
+  for (var keyToken = params.keyValueStart + lane; keyToken < params.keyValueTokenCount; keyToken = keyToken + 256u) {
+    let probability = exp(probabilityValues[probabilityOffset + keyToken] - maxScore);
+    probabilityValues[probabilityOffset + keyToken] = probability;
+    localSum = localSum + probability;
+  }
+  reduceValues[lane] = localSum;
+  workgroupBarrier();
+  for (var stride = 128u; stride > 0u; stride = stride / 2u) {
+    if (lane < stride) {
+      reduceValues[lane] = reduceValues[lane] + reduceValues[lane + stride];
+    }
+    workgroupBarrier();
+  }
+  let sum = reduceValues[0];
+  for (var keyToken = params.keyValueStart + lane; keyToken < params.keyValueTokenCount; keyToken = keyToken + 256u) {
+    let index = probabilityOffset + keyToken;
+    probabilityValues[index] = probabilityValues[index] / sum;
+  }
+}
 `;
 
 export const FULL_ATTENTION_APPLY_WGSL = `

@@ -25,15 +25,12 @@ import {
   SCALE_WGSL,
   F16_CAST_WGSL,
   F32_MATMUL_WGSL,
-  DELTA_GATE_WGSL,
   TOP1_WGSL,
   TOP1_CHUNK_WGSL,
   SELECT_TOP1_CANDIDATE_WGSL,
   Q8_K_QUANTIZE_WGSL,
   RMS_NORM_Q8_K_QUANTIZE_WGSL,
   Q8_0_QUANTIZE_WGSL,
-  SSM_NORM_GATE_WGSL,
-  QKV_CONV_SPLIT_WGSL,
   FULL_ATTENTION_SCORE_WGSL,
   FULL_ATTENTION_APPLY_WGSL,
   Q4_K_DUAL_MATMUL_WGSL,
@@ -556,63 +553,6 @@ export function createRmsNormQ8KQuantizeResources(
   };
 }
 
-export function createDeltaGateResources(
-  device: WebGpuDeviceLike,
-  alphaBuffer: WebGpuBufferLike,
-  betaBuffer: WebGpuBufferLike,
-  dtBiasBuffer: WebGpuBufferLike,
-  ssmABuffer: WebGpuBufferLike,
-  gateBuffer: WebGpuBufferLike,
-  betaSigmoidBuffer: WebGpuBufferLike,
-  valueHeadCount: number,
-  tokenCount: number,
-): { pipeline: unknown; bindGroup: unknown; destroy: () => void } {
-  const params = new Uint32Array([valueHeadCount, tokenCount, 0, 0]);
-  const paramsBuffer = device.createBuffer({
-    size: params.byteLength,
-    usage: GPU_UNIFORM | GPU_COPY_DST,
-  });
-  device.queue.writeBuffer(paramsBuffer, 0, params);
-  const bindGroupLayout = device.createBindGroupLayout({
-    entries: [
-      storageEntry(0, "read-only-storage"),
-      storageEntry(1, "read-only-storage"),
-      storageEntry(2, "read-only-storage"),
-      storageEntry(3, "read-only-storage"),
-      {
-        binding: 4,
-        visibility: GPU_SHADER_STAGE_COMPUTE,
-        buffer: { type: "uniform" },
-      },
-      storageEntry(5, "storage"),
-      storageEntry(6, "storage"),
-    ],
-  });
-  const pipeline = device.createComputePipeline({
-    layout: device.createPipelineLayout({ bindGroupLayouts: [bindGroupLayout] }),
-    compute: {
-      module: device.createShaderModule({ code: DELTA_GATE_WGSL }),
-      entryPoint: "main",
-    },
-  });
-  return {
-    pipeline,
-    bindGroup: device.createBindGroup({
-      layout: bindGroupLayout,
-      entries: [
-        bindBuffer(0, alphaBuffer),
-        bindBuffer(1, betaBuffer),
-        bindBuffer(2, dtBiasBuffer),
-        bindBuffer(3, ssmABuffer),
-        bindBuffer(4, paramsBuffer),
-        bindBuffer(5, gateBuffer),
-        bindBuffer(6, betaSigmoidBuffer),
-      ],
-    }),
-    destroy: () => paramsBuffer.destroy?.(),
-  };
-}
-
 export function createTop1Resources(
   device: WebGpuDeviceLike,
   logitsBuffer: WebGpuBufferLike,
@@ -744,136 +684,6 @@ export function createQ8_0QuantizeResources(
         bindBuffer(1, scaleBuffer),
         bindBuffer(2, qsBuffer),
         bindBuffer(3, paramsBuffer),
-      ],
-    }),
-    destroy: () => paramsBuffer.destroy?.(),
-  };
-}
-
-export function createSsmNormGateResources(
-  device: WebGpuDeviceLike,
-  deltaBuffer: WebGpuBufferLike,
-  zBuffer: WebGpuBufferLike,
-  normWeightBuffer: WebGpuBufferLike,
-  outputBuffer: WebGpuBufferLike,
-  rowCount: number,
-  columnCount: number,
-  epsilon: number,
-): { pipeline: unknown; bindGroup: unknown; destroy: () => void } {
-  const paramsF32 = new Float32Array([epsilon, 0, 0, 0]);
-  const paramsU32 = new Uint32Array(paramsF32.buffer);
-  paramsU32[1] = rowCount;
-  paramsU32[2] = columnCount;
-  const paramsBuffer = device.createBuffer({
-    size: paramsU32.byteLength,
-    usage: GPU_UNIFORM | GPU_COPY_DST,
-  });
-  device.queue.writeBuffer(paramsBuffer, 0, paramsU32);
-  const bindGroupLayout = device.createBindGroupLayout({
-    entries: [
-      storageEntry(0, "read-only-storage"),
-      storageEntry(1, "read-only-storage"),
-      storageEntry(2, "read-only-storage"),
-      {
-        binding: 3,
-        visibility: GPU_SHADER_STAGE_COMPUTE,
-        buffer: { type: "uniform" },
-      },
-      storageEntry(4, "storage"),
-    ],
-  });
-  const pipeline = device.createComputePipeline({
-    layout: device.createPipelineLayout({ bindGroupLayouts: [bindGroupLayout] }),
-    compute: {
-      module: device.createShaderModule({ code: SSM_NORM_GATE_WGSL }),
-      entryPoint: "main",
-    },
-  });
-  return {
-    pipeline,
-    bindGroup: device.createBindGroup({
-      layout: bindGroupLayout,
-      entries: [
-        bindBuffer(0, deltaBuffer),
-        bindBuffer(1, zBuffer),
-        bindBuffer(2, normWeightBuffer),
-        bindBuffer(3, paramsBuffer),
-        bindBuffer(4, outputBuffer),
-      ],
-    }),
-    destroy: () => paramsBuffer.destroy?.(),
-  };
-}
-
-export function createQkvConvResources(
-  device: WebGpuDeviceLike,
-  qkvBuffer: WebGpuBufferLike,
-  convStateBuffer: WebGpuBufferLike,
-  convKernelBuffer: WebGpuBufferLike,
-  qBuffer: WebGpuBufferLike,
-  kBuffer: WebGpuBufferLike,
-  vBuffer: WebGpuBufferLike,
-  newStateBuffer: WebGpuBufferLike,
-  options: {
-    tokenCount: number;
-    convDim: number;
-    kernelSize: number;
-    stateSize: number;
-    groupCount: number;
-    valueDim: number;
-  },
-): { pipeline: unknown; bindGroup: unknown; destroy: () => void } {
-  const params = new Uint32Array([
-    options.tokenCount,
-    options.convDim,
-    options.kernelSize,
-    options.stateSize,
-    options.groupCount,
-    options.valueDim,
-    0,
-    0,
-  ]);
-  const paramsBuffer = device.createBuffer({
-    size: params.byteLength,
-    usage: GPU_UNIFORM | GPU_COPY_DST,
-  });
-  device.queue.writeBuffer(paramsBuffer, 0, params);
-  const bindGroupLayout = device.createBindGroupLayout({
-    entries: [
-      storageEntry(0, "read-only-storage"),
-      storageEntry(1, "read-only-storage"),
-      storageEntry(2, "read-only-storage"),
-      {
-        binding: 3,
-        visibility: GPU_SHADER_STAGE_COMPUTE,
-        buffer: { type: "uniform" },
-      },
-      storageEntry(4, "storage"),
-      storageEntry(5, "storage"),
-      storageEntry(6, "storage"),
-      storageEntry(7, "storage"),
-    ],
-  });
-  const pipeline = device.createComputePipeline({
-    layout: device.createPipelineLayout({ bindGroupLayouts: [bindGroupLayout] }),
-    compute: {
-      module: device.createShaderModule({ code: QKV_CONV_SPLIT_WGSL }),
-      entryPoint: "main",
-    },
-  });
-  return {
-    pipeline,
-    bindGroup: device.createBindGroup({
-      layout: bindGroupLayout,
-      entries: [
-        bindBuffer(0, qkvBuffer),
-        bindBuffer(1, convStateBuffer),
-        bindBuffer(2, convKernelBuffer),
-        bindBuffer(3, paramsBuffer),
-        bindBuffer(4, qBuffer),
-        bindBuffer(5, kBuffer),
-        bindBuffer(6, vBuffer),
-        bindBuffer(7, newStateBuffer),
       ],
     }),
     destroy: () => paramsBuffer.destroy?.(),

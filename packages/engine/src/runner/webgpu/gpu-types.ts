@@ -133,13 +133,6 @@ export type WebGpuF32TensorHandle = {
   destroy: () => void;
 };
 
-export type WebGpuQkvConvResult = {
-  q: Float32Array;
-  k: Float32Array;
-  v: Float32Array;
-  newConvState: Float32Array;
-};
-
 export type WebGpuTopToken = {
   id: number;
   value: number;

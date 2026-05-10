@@ -1,7 +1,6 @@
 import type { WebGpuBufferLike, WebGpuComputePassLike, WebGpuDeviceLike } from "./gpu-types";
 import type { Q8_0Buffers, Q8KBuffers, QuantizedHandle } from "./arena";
 import {
-  createDeltaGateResources,
   createDualQ4KMatMulBindResources,
   createElementwiseMulResources,
   createF16CastResources,
@@ -14,7 +13,6 @@ import {
   createGegluResources,
   createGeluResources,
   createKMatMulBindResources,
-  createQkvConvResources,
   createQ8_0MatMulBindResources,
   createQuantizedGatherRowsScaleResources,
   createQ8_0QuantizeResources,
@@ -28,7 +26,6 @@ import {
   createScaleResources,
   createSelectTop1CandidateResources,
   createSigmoidMulResources,
-  createSsmNormGateResources,
   createSwiGluResources,
   createTokenSliceResources,
   createTopKResources,
@@ -582,72 +579,6 @@ export function dispatchF16Cast(
   pass.setPipeline(resource.pipeline);
   pass.setBindGroup(0, resource.bindGroup);
   pass.dispatchWorkgroups(Math.ceil(length / 256));
-}
-
-export function dispatchQkvConv(
-  device: WebGpuDeviceLike,
-  pass: WebGpuComputePassLike,
-  resources: Array<{ destroy: () => void }>,
-  qkv: WebGpuBufferLike,
-  convState: WebGpuBufferLike,
-  convKernel: WebGpuBufferLike,
-  q: WebGpuBufferLike,
-  k: WebGpuBufferLike,
-  v: WebGpuBufferLike,
-  nextConv: WebGpuBufferLike,
-  options: {
-    tokenCount: number;
-    convDim: number;
-    kernelSize: number;
-    stateSize: number;
-    groupCount: number;
-    valueDim: number;
-  },
-): void {
-  const resource = createQkvConvResources(device, qkv, convState, convKernel, q, k, v, nextConv, options);
-  resources.push(resource);
-  pass.setPipeline(resource.pipeline);
-  pass.setBindGroup(0, resource.bindGroup);
-  pass.dispatchWorkgroups(Math.max(options.groupCount, options.valueDim / options.stateSize, options.convDim), 3);
-}
-
-export function dispatchDeltaGate(
-  device: WebGpuDeviceLike,
-  pass: WebGpuComputePassLike,
-  resources: Array<{ destroy: () => void }>,
-  alpha: WebGpuBufferLike,
-  beta: WebGpuBufferLike,
-  dtBias: WebGpuBufferLike,
-  ssmA: WebGpuBufferLike,
-  gate: WebGpuBufferLike,
-  betaSigmoid: WebGpuBufferLike,
-  valueHeadCount: number,
-  tokenCount: number,
-): void {
-  const resource = createDeltaGateResources(device, alpha, beta, dtBias, ssmA, gate, betaSigmoid, valueHeadCount, tokenCount);
-  resources.push(resource);
-  pass.setPipeline(resource.pipeline);
-  pass.setBindGroup(0, resource.bindGroup);
-  pass.dispatchWorkgroups(valueHeadCount, tokenCount);
-}
-
-export function dispatchSsmNormGate(
-  device: WebGpuDeviceLike,
-  pass: WebGpuComputePassLike,
-  resources: Array<{ destroy: () => void }>,
-  delta: WebGpuBufferLike,
-  z: WebGpuBufferLike,
-  normWeight: WebGpuBufferLike,
-  output: WebGpuBufferLike,
-  rowCount: number,
-  columnCount: number,
-  epsilon: number,
-): void {
-  const resource = createSsmNormGateResources(device, delta, z, normWeight, output, rowCount, columnCount, epsilon);
-  resources.push(resource);
-  pass.setPipeline(resource.pipeline);
-  pass.setBindGroup(0, resource.bindGroup);
-  pass.dispatchWorkgroups(columnCount);
 }
 
 export function dispatchFullAttentionScore(
