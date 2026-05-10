@@ -1,4 +1,4 @@
-import type { Qwen35ModelManifest } from "../model";
+import type { Gemma4ModelManifest } from "../model";
 import type { ForwardRunnerNode } from "./graph";
 import {
   CpuLayerSegmentNode,
@@ -10,8 +10,8 @@ import {
   WebGpuLayerSegmentNode,
 } from "./webgpu/nodes";
 
-export function buildQwen35CpuOnlyForwardGraph(
-  manifest: Qwen35ModelManifest,
+export function buildGemma4CpuOnlyForwardGraph(
+  manifest: Gemma4ModelManifest,
   tokenIds: readonly number[],
   options: { includeOutput?: boolean; outputTopK?: number } = {},
 ): ForwardRunnerNode[] {
@@ -28,8 +28,8 @@ export function buildQwen35CpuOnlyForwardGraph(
   return nodes;
 }
 
-export function buildQwen35ManualSegmentForwardGraph(
-  manifest: Qwen35ModelManifest,
+export function buildGemma4ManualSegmentForwardGraph(
+  manifest: Gemma4ModelManifest,
   tokenIds: readonly number[],
   segment: { startLayer: number; endLayerExclusive: number },
   options: { includeOutput?: boolean; outputTopK?: number } = {},
@@ -68,7 +68,7 @@ function maybeCpuLayerSegmentNode(
 }
 
 function validateLayerSegment(
-  manifest: Qwen35ModelManifest,
+  manifest: Gemma4ModelManifest,
   segment: { startLayer: number; endLayerExclusive: number },
 ): void {
   if (

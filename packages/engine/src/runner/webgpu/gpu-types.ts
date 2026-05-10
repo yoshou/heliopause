@@ -121,11 +121,6 @@ export type WebGpuQkvConvResult = {
   newConvState: Float32Array;
 };
 
-export type WebGpuGatedDeltaNetResult = {
-  output: Float32Array;
-  newState: Float32Array;
-};
-
 export type WebGpuTopToken = {
   id: number;
   value: number;

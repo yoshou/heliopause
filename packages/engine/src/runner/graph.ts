@@ -1,8 +1,8 @@
-import type { Qwen35ModelManifest } from "../model";
+import type { Gemma4ModelManifest } from "../model";
 import type {
   ForwardTrace,
-  Qwen35InferenceState,
-  Qwen35ModelSession,
+  Gemma4InferenceState,
+  Gemma4ModelSession,
   OutputResult,
 } from "../runtime";
 
@@ -31,9 +31,9 @@ export type ForwardValue =
   | ForwardOutputValue;
 
 export type ForwardGraphContext = {
-  session: Qwen35ModelSession;
-  manifest: Qwen35ModelManifest;
-  state: Qwen35InferenceState;
+  session: Gemma4ModelSession;
+  manifest: Gemma4ModelManifest;
+  state: Gemma4InferenceState;
   positions: Int32Array;
   phase: "prefill" | "decode";
   trace?: ForwardTrace;

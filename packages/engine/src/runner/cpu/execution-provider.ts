@@ -1,24 +1,24 @@
 import type {
   ForwardTrace,
-  Qwen35ModelSession,
+  Gemma4ModelSession,
   OutputResult,
 } from "../../runtime";
-import { forwardQwen35Output } from "./layers";
+import { forwardGemma4Output } from "./layers";
 import {
-  Qwen35CpuSegmentRunner,
-  type Qwen35CpuSegmentRunnerOptions,
+  Gemma4CpuSegmentRunner,
+  type Gemma4CpuSegmentRunnerOptions,
 } from "./segment-runner";
 
-export function qwen35CpuSegmentRunner(
-  options: Qwen35CpuSegmentRunnerOptions,
-): Qwen35CpuSegmentRunner {
-  return new Qwen35CpuSegmentRunner(options);
+export function gemma4CpuSegmentRunner(
+  options: Gemma4CpuSegmentRunnerOptions,
+): Gemma4CpuSegmentRunner {
+  return new Gemma4CpuSegmentRunner(options);
 }
 
-export function qwen35CpuOutput(
-  session: Qwen35ModelSession,
+export function gemma4CpuOutput(
+  session: Gemma4ModelSession,
   hidden: Float32Array,
   options: { topK: number; trace?: ForwardTrace },
 ): Promise<OutputResult> {
-  return forwardQwen35Output(session, hidden, options);
+  return forwardGemma4Output(session, hidden, options);
 }

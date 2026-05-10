@@ -1,13 +1,13 @@
 export { checkWebGpuSupport, runWebGpuSmokeTest } from "./gpu-device";
-export { planQwen35RunnerPlacement, qwen35WebGpuPlanningProvider } from "./planning";
-export { Qwen35WebGpuSegmentRunner } from "./segment-runner";
+export { planGemma4RunnerPlacement, gemma4WebGpuPlanningProvider } from "./planning";
+export { Gemma4WebGpuSegmentRunner } from "./segment-runner";
 export type {
   WebGpuSmokeTest,
   WebGpuSupport,
 } from "./gpu-types";
 export type {
-  Qwen35WebGpuHiddenResult,
-  Qwen35WebGpuSegmentRunnerOptions,
-  Qwen35WebGpuStateLike,
-  Qwen35WebGpuTokenResult,
+  Gemma4WebGpuHiddenResult,
+  Gemma4WebGpuSegmentRunnerOptions,
+  Gemma4WebGpuStateLike,
+  Gemma4WebGpuTokenResult,
 } from "./segment-runner";

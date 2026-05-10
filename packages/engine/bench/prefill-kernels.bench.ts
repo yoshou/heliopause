@@ -1,17 +1,10 @@
 import { performance } from "node:perf_hooks";
 
+import { gqaAttention } from "../src/ops.ts";
 import {
-  gatedDeltaNet,
-  gqaAttention,
-  ssmConv1d,
-  type GatedDeltaNetOptions,
-} from "../src/ops.ts";
-import {
-  gatedDeltaNetWasm,
   gqaAttentionWasm,
   matMulQuantizedWasm,
   prefillWasmBackend,
-  ssmConv1dWasm,
 } from "../src/runner/cpu/wasm-kernels.ts";
 import {
   quantizeQ8_0,
@@ -38,26 +31,6 @@ console.log(`prefill kernel benchmark`);
 console.log(`backend=${backend} minMs=${minimumMs} warmup=${warmupIterations}`);
 
 for (const size of [
-  { name: "smoke", channelCount: 128, tokenCount: 8, kernelSize: 4 },
-  { name: "medium", channelCount: 2048, tokenCount: 64, kernelSize: 4 },
-  { name: "large", channelCount: 4096, tokenCount: 256, kernelSize: 4 },
-]) {
-  const inputWindow = size.kernelSize - 1 + size.tokenCount;
-  const convInput = sequence(size.channelCount * inputWindow, 0x1000 + size.tokenCount);
-  const kernel = sequence(size.channelCount * size.kernelSize, 0x2000 + size.channelCount);
-  const shape = `channels=${size.channelCount} tokens=${size.tokenCount} kernel=${size.kernelSize}`;
-
-  printResult(await runBench(`ts:ssmConv1d:${size.name}`, shape, () =>
-    ssmConv1d(convInput, kernel, size.channelCount, size.tokenCount, size.kernelSize),
-  ));
-
-  printResult(await runBench(`wasm-simd:ssmConv1d:${size.name}`, shape, async () =>
-    (await ssmConv1dWasm(convInput, kernel, size.channelCount, size.tokenCount, size.kernelSize)) ??
-      ssmConv1d(convInput, kernel, size.channelCount, size.tokenCount, size.kernelSize),
-  ));
-}
-
-for (const size of [
   { name: "smoke", type: "Q4_K" as const, inputSize: 256, rowCount: 256, columnCount: 4 },
   { name: "medium", type: "Q4_K" as const, inputSize: 1024, rowCount: 1024, columnCount: 16 },
   { name: "large", type: "Q4_K" as const, inputSize: 2048, rowCount: 2048, columnCount: 32 },
@@ -80,38 +53,6 @@ for (const size of [
   printResult(await runBench(`wasm-simd:matMul:${size.name}:${size.type}`, shape, async () =>
     (await matMulQuantizedWasm(size.type, weightBytes, inputColumns, size.inputSize, size.rowCount, size.columnCount)) ??
       matMulQuantizedTs(size.type, weightBytes, inputColumns, size.inputSize, size.rowCount, size.columnCount),
-  ));
-}
-
-for (const size of [
-  { name: "smoke", stateSize: 16, keyHeadCount: 2, valueHeadCount: 4, tokenCount: 8 },
-  { name: "medium", stateSize: 128, keyHeadCount: 4, valueHeadCount: 8, tokenCount: 32 },
-  { name: "large", stateSize: 128, keyHeadCount: 4, valueHeadCount: 16, tokenCount: 128 },
-]) {
-  const options: GatedDeltaNetOptions = {
-    stateSize: size.stateSize,
-    keyHeadCount: size.keyHeadCount,
-    valueHeadCount: size.valueHeadCount,
-    tokenCount: size.tokenCount,
-  };
-  const query = sequence(size.tokenCount * size.keyHeadCount * size.stateSize, 0x3000 + size.tokenCount);
-  const key = sequence(size.tokenCount * size.keyHeadCount * size.stateSize, 0x4000 + size.stateSize);
-  const value = sequence(size.tokenCount * size.valueHeadCount * size.stateSize, 0x5000 + size.valueHeadCount);
-  const gate = sequence(size.tokenCount * size.valueHeadCount, 0x6000 + size.tokenCount);
-  const beta = sequence(size.tokenCount * size.valueHeadCount, 0x7000 + size.valueHeadCount);
-  for (let index = 0; index < beta.length; index += 1) {
-    beta[index] = Math.abs(beta[index] ?? 0);
-  }
-  const state = sequence(size.valueHeadCount * size.stateSize * size.stateSize, 0x8000 + size.stateSize);
-  const shape = `state=${size.stateSize} kHeads=${size.keyHeadCount} vHeads=${size.valueHeadCount} tokens=${size.tokenCount}`;
-
-  printResult(await runBench(`ts:gatedDeltaNet:${size.name}`, shape, () =>
-    gatedDeltaNet(query, key, value, gate, beta, state, options).output,
-  ));
-
-  printResult(await runBench(`wasm-simd:gatedDeltaNet:${size.name}`, shape, async () =>
-    ((await gatedDeltaNetWasm(query, key, value, gate, beta, state, options)) ??
-      gatedDeltaNet(query, key, value, gate, beta, state, options)).output,
   ));
 }
 

@@ -1,10 +1,10 @@
 export {
   checkWebGpuSupport,
-  planQwen35RunnerPlacement,
-  qwen35WebGpuPlanningProvider,
-  Qwen35WebGpuSegmentRunner,
+  planGemma4RunnerPlacement,
+  gemma4WebGpuPlanningProvider,
+  Gemma4WebGpuSegmentRunner,
   type WebGpuSupport,
-  type Qwen35WebGpuSegmentRunnerOptions,
+  type Gemma4WebGpuSegmentRunnerOptions,
 } from "./runner/webgpu/index";
 
 export {
@@ -19,17 +19,17 @@ export {
 } from "./gguf";
 
 export {
-  auditQwen35TensorCoverage,
-  buildQwen35Manifest,
+  auditGemma4TensorCoverage,
+  buildGemma4Manifest,
   type ExpectedTensor,
-  type Qwen35LayerKind,
-  type Qwen35ModelManifest,
+  type Gemma4LayerKind,
+  type Gemma4ModelManifest,
   type TensorCoverageAudit,
 } from "./model";
 
 export {
-  decodeQwen35,
-  prefillQwen35,
+  decodeGemma4,
+  prefillGemma4,
   type DecodeOptions,
   type DecodeResult,
   type PrefillOptions,
@@ -37,28 +37,27 @@ export {
 } from "./forward";
 
 export {
-  createQwen35InferenceState,
-  createQwen35ModelSession,
-  cloneQwen35InferenceState,
+  createGemma4InferenceState,
+  createGemma4ModelSession,
+  cloneGemma4InferenceState,
   estimateWeightCacheBytes,
-  Qwen35ModelSession,
+  Gemma4ModelSession,
   type CacheStats,
   type ExecutionProviderConfig,
   type ForwardTrace,
-  type Qwen35FullAttentionCache,
-  type Qwen35InferenceState,
-  type Qwen35ModelInput,
-  type Qwen35ModelSessionOptions,
-  type Qwen35RecurrentCache,
+  type Gemma4FullAttentionCache,
+  type Gemma4InferenceState,
+  type Gemma4ModelInput,
+  type Gemma4ModelSessionOptions,
   type TimingEvent,
   type TimingPhase,
   type TimingSink,
 } from "./runtime";
 
-export { Qwen35CpuSegmentRunner } from "./runner/cpu/index";
+export { Gemma4CpuSegmentRunner } from "./runner/cpu/index";
 export type {
-  Qwen35CpuHiddenResult,
-  Qwen35CpuSegmentRunnerOptions,
+  Gemma4CpuHiddenResult,
+  Gemma4CpuSegmentRunnerOptions,
 } from "./runner/cpu/index";
 
 export {
@@ -97,29 +96,29 @@ export {
 } from "./quant";
 
 export {
-  buildQwen35Tokenizer,
-  type Qwen35Tokenizer,
+  buildGemma4Tokenizer,
+  type Gemma4Tokenizer,
 } from "./tokenizer";
 
 export {
-  applyQwen35ChatTemplate,
-  applyQwen35ChatGenerationPrompt,
+  applyGemma4ChatTemplate,
+  applyGemma4ChatGenerationPrompt,
   createFileGgufTensorReader,
-  createQwen35ChatSession,
-  DEFAULT_QWEN35_SYSTEM_PROMPT,
-  generateQwen35ChatTurn,
-  generateQwen35ChatCompletion,
+  createGemma4ChatSession,
+  DEFAULT_GEMMA4_SYSTEM_PROMPT,
+  generateGemma4ChatTurn,
+  generateGemma4ChatCompletion,
   getGgufModelName,
-  prefillQwen35ChatMessages,
-  stripQwen35Thinking,
+  prefillGemma4ChatMessages,
+  stripGemma4Thinking,
   type ChatMessage,
   type FileGgufTensorReaderOptions,
-  type Qwen35ChatCompletionChunk,
-  type Qwen35ChatCompletionOptions,
-  type Qwen35ChatPrefillOptions,
-  type Qwen35ChatTemplateOptions,
-  type Qwen35ChatTurnOptions,
-  type Qwen35ChatTurnResult,
+  type Gemma4ChatCompletionChunk,
+  type Gemma4ChatCompletionOptions,
+  type Gemma4ChatPrefillOptions,
+  type Gemma4ChatTemplateOptions,
+  type Gemma4ChatTurnOptions,
+  type Gemma4ChatTurnResult,
 } from "./chat";
 
 export {
@@ -133,23 +132,22 @@ export {
 } from "./runner/graph";
 
 export {
-  buildQwen35CpuOnlyForwardGraph,
-  buildQwen35ManualSegmentForwardGraph,
+  buildGemma4CpuOnlyForwardGraph,
+  buildGemma4ManualSegmentForwardGraph,
 } from "./runner/nodes";
 
 export {
-  auditQwen35RunnerPlacementCopies,
-  planQwen35ProviderPlacement,
-  type Qwen35RunnerCopyAuditObservation,
-  type Qwen35RunnerCopyAuditResult,
-  type Qwen35RunnerLayerPlacement,
-  type Qwen35RunnerPlacementPlan,
-  type Qwen35RunnerPlanningOptions,
-  type Qwen35RunnerPlanningProvider,
+  auditGemma4RunnerPlacementCopies,
+  planGemma4ProviderPlacement,
+  type Gemma4RunnerCopyAuditObservation,
+  type Gemma4RunnerCopyAuditResult,
+  type Gemma4RunnerLayerPlacement,
+  type Gemma4RunnerPlacementPlan,
+  type Gemma4RunnerPlanningOptions,
+  type Gemma4RunnerPlanningProvider,
 } from "./runner/planning";
 
 export {
-  gatedDeltaNet,
   l2NormRows,
   gqaAttention,
   matMulRows,
@@ -159,8 +157,6 @@ export {
   sigmoid,
   silu,
   softplus,
-  ssmConv1d,
-  type GatedDeltaNetOptions,
   type GqaAttentionOptions,
   type RopeMultiOptions,
 } from "./ops";

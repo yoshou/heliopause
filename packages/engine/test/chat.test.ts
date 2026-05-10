@@ -2,44 +2,44 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
-  applyQwen35ChatTemplate,
-  buildQwen35Tokenizer,
+  applyGemma4ChatTemplate,
+  buildGemma4Tokenizer,
   createFileGgufTensorReader,
-  createQwen35ModelSession,
-  generateQwen35ChatTurn,
-  generateQwen35ChatCompletion,
+  createGemma4ModelSession,
+  generateGemma4ChatTurn,
+  generateGemma4ChatCompletion,
   GgufTensorReader,
-  prefillQwen35ChatMessages,
-  stripQwen35Thinking,
+  prefillGemma4ChatMessages,
+  stripGemma4Thinking,
   type GgufMetadata,
 } from "../src/index.ts";
 
-test("Qwen35 chat template formats history and disables thinking by default", () => {
+test("Gemma4 chat template formats history and disables thinking by default", () => {
   assert.equal(
-    applyQwen35ChatTemplate([
+    applyGemma4ChatTemplate([
       { role: "system", content: "Be concise." },
       { role: "user", content: "Hello" },
       { role: "assistant", content: "Hi" },
     ]),
-    "<|im_start|>system\nBe concise.<|im_end|>\n" +
-      "<|im_start|>user\nHello<|im_end|>\n" +
-      "<|im_start|>assistant\nHi<|im_end|>\n" +
-      "<|im_start|>assistant\n<think>\n\n</think>\n\n",
+    "<|turn>system\nBe concise.<turn|>\n" +
+      "<|turn>user\nHello<turn|>\n" +
+      "<|turn>model\nHi<turn|>\n" +
+      "<|turn>model\n",
   );
 });
 
-test("Qwen35 chat template can leave thinking enabled", () => {
+test("Gemma4 chat template can leave thinking enabled", () => {
   assert.equal(
-    applyQwen35ChatTemplate([
+    applyGemma4ChatTemplate([
       { role: "user", content: "Hello" },
     ], { enableThinking: true }),
-    "<|im_start|>user\nHello<|im_end|>\n" +
-      "<|im_start|>assistant\n",
+    "<|turn>user\nHello<turn|>\n" +
+      "<|think|>\n<|turn>model\n",
   );
 });
 
-test("Qwen35 tokenizer preserves special chat tokens and detokenizes text", () => {
-  const tokenizer = buildQwen35Tokenizer(tokenizerGguf([
+test("Gemma4 tokenizer preserves special chat tokens and detokenizes text", () => {
+  const tokenizer = buildGemma4Tokenizer(tokenizerGguf([
     "H",
     "e",
     "l",
@@ -60,7 +60,40 @@ test("Qwen35 tokenizer preserves special chat tokens and detokenizes text", () =
   assert.equal(tokenizer.detokenize([10, 0, 11]), "<|im_start|>H<|im_end|>");
 });
 
-test("Qwen35 chat generation stops on im_end token", async () => {
+test("Gemma4 tokenizer accepts GGUF model metadata without pre field", () => {
+  const tokenizer = buildGemma4Tokenizer(tokenizerGguf([
+    "H",
+    "e",
+    "l",
+    "o",
+  ], undefined, { model: "gemma4", includePre: false }));
+
+  assert.deepEqual(tokenizer.tokenize("Hello"), [0, 1, 2, 2, 3]);
+  assert.equal(tokenizer.detokenize([0, 1, 2, 2, 3]), "Hello");
+});
+
+test("Gemma4 tokenizer uses SPM-style BPE and byte fallback for model metadata", () => {
+  const tokenizer = buildGemma4Tokenizer(tokenizerGguf([
+    "▁",
+    "H",
+    "i",
+    "▁H",
+    "▁Hi",
+    "<0xE3>",
+    "<0x81>",
+    "<0x82>",
+  ], undefined, {
+    model: "gemma4",
+    includePre: false,
+    merges: ["▁ H", "▁H i"],
+  }));
+
+  assert.deepEqual(tokenizer.tokenize(" Hi"), [4]);
+  assert.deepEqual(tokenizer.tokenize("あ"), [5, 6, 7]);
+  assert.equal(tokenizer.detokenize([4, 5, 6, 7]), " Hiあ");
+});
+
+test("Gemma4 chat generation stops on turn token", async () => {
   const tokenizer = {
     eosTokenId: 3,
     tokenize() {
@@ -70,13 +103,13 @@ test("Qwen35 chat generation stops on im_end token", async () => {
       return tokenIds.map((id) => id === 0 ? "A" : "").join("");
     },
     idToToken(id: number) {
-      return id === 0 ? "A" : id === 3 ? "<|im_end|>" : undefined;
+      return id === 0 ? "A" : id === 3 ? "<turn|>" : undefined;
     },
     tokenToId(token: string) {
-      return token === "<|im_end|>" ? 3 : undefined;
+      return token === "<turn|>" ? 3 : undefined;
     },
   };
-  const session = createQwen35ModelSession(tensorReaderFromTensors([
+  const session = createGemma4ModelSession(tensorReaderFromTensors([
     f32Tensor("token_embd.weight", [4, 12], new Float32Array([
       1, 0, 0, 0,
       0, 1, 0, 0,
@@ -109,7 +142,7 @@ test("Qwen35 chat generation stops on im_end token", async () => {
   ]));
 
   const chunks = [];
-  for await (const chunk of generateQwen35ChatCompletion(
+  for await (const chunk of generateGemma4ChatCompletion(
     session,
     tokenizer,
     [{ role: "user", content: "A" }],
@@ -121,16 +154,16 @@ test("Qwen35 chat generation stops on im_end token", async () => {
   assert.deepEqual(chunks.map((chunk) => chunk.text), ["A"]);
 });
 
-test("Qwen35 stateful chat turn pre-fills only the new turn suffix", async () => {
+test("Gemma4 stateful chat turn pre-fills only the new turn suffix", async () => {
   const tokenizedTexts: string[] = [];
   const tokenizer = {
     eosTokenId: 3,
     tokenize(text: string) {
       tokenizedTexts.push(text);
-      if (text === "<|im_end|>\n") {
+      if (text === "<turn|>\n") {
         return [3];
       }
-      if (text.startsWith("<|im_start|>assistant\n")) {
+      if (text.startsWith("<|turn>model\n")) {
         return [2];
       }
       return [1];
@@ -139,13 +172,13 @@ test("Qwen35 stateful chat turn pre-fills only the new turn suffix", async () =>
       return tokenIds.map((id) => id === 0 ? "A" : "").join("");
     },
     idToToken(id: number) {
-      return id === 0 ? "A" : id === 3 ? "<|im_end|>" : undefined;
+      return id === 0 ? "A" : id === 3 ? "<turn|>" : undefined;
     },
     tokenToId(token: string) {
-      return token === "<|im_end|>" ? 3 : undefined;
+      return token === "<turn|>" ? 3 : undefined;
     },
   };
-  const session = createQwen35ModelSession(tensorReaderFromTensors([
+  const session = createGemma4ModelSession(tensorReaderFromTensors([
     f32Tensor("token_embd.weight", [4, 12], new Float32Array([
       1, 0, 0, 0,
       0, 1, 0, 0,
@@ -170,7 +203,7 @@ test("Qwen35 stateful chat turn pre-fills only the new turn suffix", async () =>
   ]));
   const state = session.createInferenceState();
 
-  await prefillQwen35ChatMessages(
+  await prefillGemma4ChatMessages(
     session,
     tokenizer,
     state,
@@ -179,7 +212,7 @@ test("Qwen35 stateful chat turn pre-fills only the new turn suffix", async () =>
   assert.equal(state.nextPosition, 1);
 
   const chunks: string[] = [];
-  const result = await generateQwen35ChatTurn(
+  const result = await generateGemma4ChatTurn(
     session,
     tokenizer,
     state,
@@ -197,10 +230,10 @@ test("Qwen35 stateful chat turn pre-fills only the new turn suffix", async () =>
   assert.deepEqual(chunks, ["A"]);
   assert.equal(state.nextPosition, 5);
   assert.deepEqual(tokenizedTexts, [
-    "<|im_start|>system\nBe concise.<|im_end|>\n",
-    "<|im_start|>user\nHello<|im_end|>\n",
-    "<|im_start|>assistant\n<think>\n\n</think>\n\n",
-    "<|im_end|>\n",
+    "<|turn>system\nBe concise.<turn|>\n",
+    "<|turn>user\nHello<turn|>\n",
+    "<|turn>model\n",
+    "<turn|>\n",
   ]);
 });
 
@@ -224,20 +257,53 @@ test("file GGUF tensor reader uses File.slice ranges", async () => {
   assert.ok(reads.some((read) => read.end - read.start === tensorBytes.byteLength));
 });
 
-test("stripQwen35Thinking hides complete and partial thinking blocks", () => {
-  assert.equal(stripQwen35Thinking("<think>\nsecret\n</think>\n\nVisible"), "\n\nVisible");
-  assert.equal(stripQwen35Thinking("<think>\nsecret"), "");
+test("file GGUF tensor reader fully parses tokenizer arrays", async () => {
+  const fileBytes = tokenizerArrayGgufBytes(["a", "b", "c"], ["a b", "b c", "c d"]);
+  const reader = await createFileGgufTensorReader({
+    slice(start = 0, end = fileBytes.byteLength) {
+      return {
+        async arrayBuffer() {
+          return fileBytes.slice(start, end).buffer;
+        },
+      } as Blob;
+    },
+  }, { maxArraySample: 1 });
+
+  assert.deepEqual(reader.metadata.metadata["tokenizer.ggml.tokens"], {
+    type: "string",
+    length: 3,
+    sample: ["a", "b", "c"],
+    truncated: false,
+  });
+  assert.deepEqual(reader.metadata.metadata["tokenizer.ggml.merges"], {
+    type: "string",
+    length: 3,
+    sample: ["a b", "b c", "c d"],
+    truncated: false,
+  });
 });
 
-function tokenizerGguf(tokens: string[], eosTokenId?: number): GgufMetadata {
+test("stripGemma4Thinking hides complete and partial thinking blocks", () => {
+  assert.equal(stripGemma4Thinking("<think>\nsecret\n</think>\n\nVisible"), "\n\nVisible");
+  assert.equal(stripGemma4Thinking("<think>\nsecret"), "");
+  assert.equal(stripGemma4Thinking("Visible\n\n</think>\n<|im_end|>"), "Visible\n\n\n");
+  assert.equal(stripGemma4Thinking("Visible<turn|>\nignored"), "Visible");
+});
+
+function tokenizerGguf(
+  tokens: string[],
+  eosTokenId?: number,
+  options: { model?: string; includePre?: boolean; merges?: string[] } = {},
+): GgufMetadata {
+  const merges = options.merges ?? [];
   return {
     version: 3,
     tensorCount: 0,
     metadataCount: 0,
     dataStart: 0n,
     metadata: {
-      "tokenizer.ggml.model": "gpt2",
-      "tokenizer.ggml.pre": "qwen35",
+      "tokenizer.ggml.model": options.model ?? "gpt2",
+      ...(options.includePre === false ? {} : { "tokenizer.ggml.pre": "gemma4" }),
       "tokenizer.ggml.tokens": {
         type: "string",
         length: tokens.length,
@@ -246,8 +312,8 @@ function tokenizerGguf(tokens: string[], eosTokenId?: number): GgufMetadata {
       },
       "tokenizer.ggml.merges": {
         type: "string",
-        length: 0,
-        sample: [],
+        length: merges.length,
+        sample: merges,
         truncated: false,
       },
       ...(eosTokenId === undefined ? {} : { "tokenizer.ggml.eos_token_id": eosTokenId }),
@@ -283,30 +349,25 @@ function tensorReaderFromTensors(tensors: Array<{
     metadataCount: 0,
     dataStart: 0n,
     metadata: {
-      "general.architecture": "qwen35",
-      "qwen35.block_count": 0,
-      "qwen35.embedding_length": 4,
-      "qwen35.feed_forward_length": 8,
-      "qwen35.attention.head_count": 1,
-      "qwen35.attention.head_count_kv": 1,
-      "qwen35.attention.key_length": 2,
-      "qwen35.attention.value_length": 2,
-      "qwen35.context_length": 32,
-      "qwen35.full_attention_interval": 1,
-      "qwen35.rope.dimension_count": 2,
-      "qwen35.rope.dimension_sections": {
+      "general.architecture": "gemma4",
+      "gemma4.block_count": 0,
+      "gemma4.embedding_length": 4,
+      "gemma4.feed_forward_length": 8,
+      "gemma4.attention.head_count": 1,
+      "gemma4.attention.head_count_kv": 1,
+      "gemma4.attention.key_length": 2,
+      "gemma4.attention.value_length": 2,
+      "gemma4.context_length": 32,
+      "gemma4.full_attention_interval": 1,
+      "gemma4.rope.dimension_count": 2,
+      "gemma4.rope.dimension_sections": {
         type: "int32",
         length: 4,
         sample: [1, 1, 0, 0],
         truncated: false,
       },
-      "qwen35.rope.freq_base": 10000,
-      "qwen35.ssm.conv_kernel": 4,
-      "qwen35.ssm.group_count": 1,
-      "qwen35.ssm.inner_size": 2,
-      "qwen35.ssm.state_size": 2,
-      "qwen35.ssm.time_step_rank": 1,
-      "qwen35.attention.layer_norm_rms_epsilon": 1e-6,
+      "gemma4.rope.freq_base": 10000,
+      "gemma4.attention.layer_norm_rms_epsilon": 1e-6,
     },
     tensors: infos,
   }, {
@@ -337,6 +398,30 @@ function minimalGgufBytes(tensorBytes: Uint8Array): Uint8Array {
   writer.u64(0n);
   writer.align(32);
   writer.bytes(tensorBytes);
+  return writer.toBytes();
+}
+
+function tokenizerArrayGgufBytes(tokens: string[], merges: string[]): Uint8Array {
+  const writer = new ByteWriter();
+  writer.ascii("GGUF");
+  writer.u32(3);
+  writer.u64(0n);
+  writer.u64(2n);
+  writer.string("tokenizer.ggml.tokens");
+  writer.u32(9);
+  writer.u32(8);
+  writer.u64(BigInt(tokens.length));
+  for (const token of tokens) {
+    writer.string(token);
+  }
+  writer.string("tokenizer.ggml.merges");
+  writer.u32(9);
+  writer.u32(8);
+  writer.u64(BigInt(merges.length));
+  for (const merge of merges) {
+    writer.string(merge);
+  }
+  writer.align(32);
   return writer.toBytes();
 }
 

@@ -1,15 +1,15 @@
 import {
-  buildQwen35Tokenizer,
-  cloneQwen35InferenceState,
+  buildGemma4Tokenizer,
+  cloneGemma4InferenceState,
   createFileGgufTensorReader,
-  createQwen35ChatSession,
+  createGemma4ChatSession,
   estimateWeightCacheBytes,
-  generateQwen35ChatTurn,
+  generateGemma4ChatTurn,
   getGgufModelName,
-  prefillQwen35ChatMessages,
-  type Qwen35InferenceState,
-  type Qwen35ModelSession,
-  type Qwen35Tokenizer,
+  prefillGemma4ChatMessages,
+  type Gemma4InferenceState,
+  type Gemma4ModelSession,
+  type Gemma4Tokenizer,
 } from "@heliopause/engine";
 import type {
   EngineWorkerRequest,
@@ -24,15 +24,15 @@ const LOW_WEIGHT_CACHE_BYTES = 768 * 1024 * 1024;
 const FULL_WEIGHT_CACHE_LIMIT_BYTES = 32 * 1024 * 1024 * 1024;
 const FULL_WEIGHT_CACHE_HEADROOM = 1.25;
 
-let session: Qwen35ModelSession | undefined;
-let tokenizer: Qwen35Tokenizer | undefined;
-let currentState: Qwen35InferenceState | undefined;
+let session: Gemma4ModelSession | undefined;
+let tokenizer: Gemma4Tokenizer | undefined;
+let currentState: Gemma4InferenceState | undefined;
 let currentSystemPrompt: string | undefined;
 let activeGeneration:
   | {
       requestId: number;
       abortController: AbortController;
-      workingState?: Qwen35InferenceState;
+      workingState?: Gemma4InferenceState;
     }
   | undefined;
 
@@ -78,7 +78,7 @@ async function handleLoadModel(
     estimatedWeightCacheBytes,
     request.memoryInfo,
   );
-  const nextSession = createQwen35ChatSession(tensorReader, {
+  const nextSession = createGemma4ChatSession(tensorReader, {
     maxContextLength: CHAT_CONTEXT_LENGTH,
     maxWeightCacheBytes: resolvedMemoryProfile.maxWeightCacheBytes,
     executionProviders: [{
@@ -95,7 +95,7 @@ async function handleLoadModel(
       },
     }],
   });
-  const nextTokenizer = buildQwen35Tokenizer(tensorReader.metadata);
+  const nextTokenizer = buildGemma4Tokenizer(tensorReader.metadata);
 
   session = nextSession;
   tokenizer = nextTokenizer;
@@ -135,10 +135,10 @@ async function handleGenerateTurn(
 
     const workingState = session.executionProvider("webgpu")
       ? currentState
-      : cloneQwen35InferenceState(currentState);
+      : cloneGemma4InferenceState(currentState);
     activeGeneration.workingState = workingState;
 
-    await generateQwen35ChatTurn(
+    await generateGemma4ChatTurn(
       session,
       tokenizer,
       workingState,
@@ -199,7 +199,7 @@ async function resetChatState(systemPrompt: string, signal?: AbortSignal): Promi
     return;
   }
   const state = session.createInferenceState();
-  await prefillQwen35ChatMessages(
+  await prefillGemma4ChatMessages(
     session,
     tokenizer,
     state,

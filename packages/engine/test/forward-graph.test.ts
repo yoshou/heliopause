@@ -2,10 +2,9 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
-  buildQwen35Manifest,
-  createQwen35ModelSession,
+  buildGemma4Manifest,
+  createGemma4ModelSession,
   GgufTensorReader,
-  prefillQwen35,
 } from "../src/index.ts";
 import {
   ForwardGraphExecutor,
@@ -14,8 +13,8 @@ import {
   type ForwardRunnerNode,
 } from "../src/runner/graph.ts";
 import {
-  buildQwen35CpuOnlyForwardGraph,
-  buildQwen35ManualSegmentForwardGraph,
+  buildGemma4CpuOnlyForwardGraph,
+  buildGemma4ManualSegmentForwardGraph,
 } from "../src/runner/nodes.ts";
 
 test("forward graph topologically sorts dependency order", () => {
@@ -78,7 +77,7 @@ test("forward graph cleans produced WebGPU values when execution fails", async (
   assert.equal(destroyed, true);
 });
 
-test("CPU-only forward graph matches existing Qwen35 prefill output path", async () => {
+test("CPU-only forward graph produces fixed Gemma4 logits for synthetic tensors", async () => {
   const reader = tensorReaderFromTensors([
     f32Tensor("token_embd.weight", [4, 8], sequence(32)),
     f32Tensor("output_norm.weight", [4], new Float32Array([1, 1, 1, 1])),
@@ -88,46 +87,46 @@ test("CPU-only forward graph matches existing Qwen35 prefill output path", async
       0.3, -0.2, 0.4, -0.3,
     ])),
   ]);
-  const session = createQwen35ModelSession(reader);
+  const session = createGemma4ModelSession(reader);
   const state = session.createInferenceState();
   const tokenIds = [2];
   const positions = new Int32Array([0]);
-  const expected = await prefillQwen35(session, tokenIds, {
-    state,
-    positions,
-    computeLogits: true,
-    logitsTopK: 2,
-  });
-
-  const graphSession = createQwen35ModelSession(reader);
-  const graphState = graphSession.createInferenceState();
-  const graph = new ForwardGraphExecutor(buildQwen35CpuOnlyForwardGraph(graphSession.manifest, tokenIds, {
+  const graph = new ForwardGraphExecutor(buildGemma4CpuOnlyForwardGraph(session.manifest, tokenIds, {
     outputTopK: 2,
   }));
   const result = await graph.run({
-    session: graphSession,
-    manifest: graphSession.manifest,
-    state: graphState,
+    session,
+    manifest: session.manifest,
+    state,
     positions,
     phase: "prefill",
   });
   const output = result.values.get("output");
 
   assert.equal(output?.kind, "output");
-  assert.deepEqual(Array.from(output.result.logits), Array.from(expected.logits ?? []));
-  assert.deepEqual(output.result.topTokens, expected.topTokens);
+  assertFloatArrayClose(output.result.logits, new Float32Array([
+    -0.16329389810562134,
+    0.5715285539627075,
+    -0.5715285539627075,
+  ]), 2e-5);
+  assert.deepEqual(output.result.topTokens.map((token) => token.id), [1, 0]);
+  assertFloatArrayClose(
+    Float32Array.from(output.result.topTokens.map((token) => token.value)),
+    new Float32Array([0.5715285539627075, -0.16329389810562134]),
+    2e-5,
+  );
 });
 
 test("manual WebGPU segment graph is explicit and leaves transfer test-only", () => {
-  const manifest = buildQwen35Manifest({
+  const manifest = buildGemma4Manifest({
     ...minimalGguf(),
     metadata: {
       ...minimalGguf().metadata,
-      "qwen35.block_count": 3,
-      "qwen35.full_attention_interval": 2,
+      "gemma4.block_count": 3,
+      "gemma4.full_attention_interval": 2,
     },
   });
-  const nodes = buildQwen35ManualSegmentForwardGraph(
+  const nodes = buildGemma4ManualSegmentForwardGraph(
     manifest,
     [1],
     { startLayer: 1, endLayerExclusive: 2 },
@@ -156,7 +155,7 @@ function node(id: string, deps: string[] = []): ForwardRunnerNode {
 
 function emptyContext(): ForwardGraphContext {
   const reader = tensorReaderFromTensors([]);
-  const session = createQwen35ModelSession(reader);
+  const session = createGemma4ModelSession(reader);
   return {
     session,
     manifest: session.manifest,
@@ -166,6 +165,16 @@ function emptyContext(): ForwardGraphContext {
   };
 }
 
+function assertFloatArrayClose(actual: Float32Array, expected: Float32Array, tolerance: number): void {
+  assert.equal(actual.length, expected.length);
+  for (let index = 0; index < actual.length; index += 1) {
+    assert.ok(
+      Math.abs((actual[index] ?? 0) - (expected[index] ?? 0)) <= tolerance,
+      `index ${index}: expected ${expected[index]}, got ${actual[index]}`,
+    );
+  }
+}
+
 function minimalGguf() {
   return {
     version: 3,
@@ -173,30 +182,25 @@ function minimalGguf() {
     metadataCount: 14,
     dataStart: 0n,
     metadata: {
-      "general.architecture": "qwen35",
-      "qwen35.block_count": 0,
-      "qwen35.embedding_length": 4,
-      "qwen35.feed_forward_length": 8,
-      "qwen35.attention.head_count": 1,
-      "qwen35.attention.head_count_kv": 1,
-      "qwen35.attention.key_length": 2,
-      "qwen35.attention.value_length": 2,
-      "qwen35.context_length": 16,
-      "qwen35.full_attention_interval": 1,
-      "qwen35.attention.layer_norm_rms_epsilon": 1e-6,
-      "qwen35.rope.dimension_count": 2,
-      "qwen35.rope.dimension_sections": {
+      "general.architecture": "gemma4",
+      "gemma4.block_count": 0,
+      "gemma4.embedding_length": 4,
+      "gemma4.feed_forward_length": 8,
+      "gemma4.attention.head_count": 1,
+      "gemma4.attention.head_count_kv": 1,
+      "gemma4.attention.key_length": 2,
+      "gemma4.attention.value_length": 2,
+      "gemma4.context_length": 16,
+      "gemma4.full_attention_interval": 1,
+      "gemma4.attention.layer_norm_rms_epsilon": 1e-6,
+      "gemma4.rope.dimension_count": 2,
+      "gemma4.rope.dimension_sections": {
         type: "int32",
         length: 4,
         sample: [1, 1, 0, 0],
         truncated: false,
       },
-      "qwen35.rope.freq_base": 10000,
-      "qwen35.ssm.conv_kernel": 4,
-      "qwen35.ssm.group_count": 1,
-      "qwen35.ssm.inner_size": 2,
-      "qwen35.ssm.state_size": 2,
-      "qwen35.ssm.time_step_rank": 1,
+      "gemma4.rope.freq_base": 10000,
     },
     tensors: [],
   };

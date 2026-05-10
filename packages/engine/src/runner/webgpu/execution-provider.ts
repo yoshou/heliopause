@@ -1,39 +1,39 @@
-import type { Qwen35InferenceState, Qwen35ModelSession } from "../../runtime";
-import { QWEN35_WEBGPU_MEMORY_LIMIT_BYTES } from "./gpu-constants";
-import { Qwen35WebGpuSegmentRunner } from "./segment-runner";
+import type { Gemma4InferenceState, Gemma4ModelSession } from "../../runtime";
+import { GEMMA4_WEBGPU_MEMORY_LIMIT_BYTES } from "./gpu-constants";
+import { Gemma4WebGpuSegmentRunner } from "./segment-runner";
 
-const segmentRunners = new WeakMap<Qwen35ModelSession, Promise<Qwen35WebGpuSegmentRunner>>();
+const segmentRunners = new WeakMap<Gemma4ModelSession, Promise<Gemma4WebGpuSegmentRunner>>();
 
-export type Qwen35WebGpuExecutionProviderOptions = {
+export type Gemma4WebGpuExecutionProviderOptions = {
   memoryLimitBytes: number;
   segmentStartLayer?: number;
 };
 
-export function webGpuExecutionProviderEnabled(session: Qwen35ModelSession): boolean {
+export function webGpuExecutionProviderEnabled(session: Gemma4ModelSession): boolean {
   return session.executionProvider("webgpu") !== undefined;
 }
 
 export function webGpuExecutionProviderOptions(
-  session: Qwen35ModelSession,
-): Qwen35WebGpuExecutionProviderOptions | undefined {
+  session: Gemma4ModelSession,
+): Gemma4WebGpuExecutionProviderOptions | undefined {
   const config = session.executionProvider("webgpu");
   if (!config) {
     return undefined;
   }
   return {
-    memoryLimitBytes: numberOption(config.options, "memoryLimitBytes") ?? QWEN35_WEBGPU_MEMORY_LIMIT_BYTES,
+    memoryLimitBytes: numberOption(config.options, "memoryLimitBytes") ?? GEMMA4_WEBGPU_MEMORY_LIMIT_BYTES,
     segmentStartLayer: numberOption(config.options, "segmentStartLayer"),
   };
 }
 
-export function qwen35WebGpuSegmentRunner(
-  session: Qwen35ModelSession,
-  state: Qwen35InferenceState,
+export function gemma4WebGpuSegmentRunner(
+  session: Gemma4ModelSession,
+  state: Gemma4InferenceState,
   options: { segmentStartLayer?: number } = {},
-): Promise<Qwen35WebGpuSegmentRunner> {
+): Promise<Gemma4WebGpuSegmentRunner> {
   const providerOptions = webGpuExecutionProviderOptions(session);
   if (!providerOptions) {
-    throw new Error("WebGPU segment runner is not enabled for this Qwen35 session.");
+    throw new Error("WebGPU segment runner is not enabled for this Gemma4 session.");
   }
   let runner = segmentRunners.get(session);
   if (!runner) {
@@ -41,7 +41,7 @@ export function qwen35WebGpuSegmentRunner(
     if (segmentStartLayer === undefined) {
       throw new Error("WebGPU segment planning selected no layers.");
     }
-    runner = Qwen35WebGpuSegmentRunner.create({
+    runner = Gemma4WebGpuSegmentRunner.create({
       tensorReader: session.tensorReader,
       manifest: session.manifest,
       epsilon: session.epsilon,

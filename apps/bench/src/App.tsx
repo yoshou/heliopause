@@ -19,15 +19,10 @@ type RunState =
 
 const CASE_LABELS: Record<BrowserBenchCaseId, string> = {
   "matmul": "Matmul",
-  "ssm-conv": "SSM conv",
-  "gated-delta-net": "Gated DeltaNet",
   "gqa-attention": "GQA attention",
   "swiglu": "SwiGLU",
   "swiglu-down": "SwiGLU + down",
-  "qkv-conv": "QKV + conv",
-  "ssm-norm-gate-out": "SSM norm/gate/out",
   "full-attention-decode-out": "Full attention decode/out",
-  "recurrent-decode": "Recurrent decode",
   "top-token": "Top token",
 };
 

@@ -3,21 +3,17 @@ import {
   runWebGpuSmokeTest,
   type WebGpuSupport,
 } from "../../../packages/engine/src/runner/webgpu/index";
-import { createWebGpuF32TensorHandle, createWebGpuQuantizedWeightHandle } from "../../../packages/engine/src/runner/webgpu/quantized-handles";
+import { createWebGpuQuantizedWeightHandle } from "../../../packages/engine/src/runner/webgpu/quantized-handles";
 import {
   fullAttentionDecodeOutWebGpuResident,
-  gatedDeltaNetWebGpu,
   matMulQ4_KWebGpu,
   matMulQ5_KWebGpu,
   matMulQ6_KWebGpu,
   matMulQ8_0WebGpu,
-  matMulQkvConvWebGpuResident,
-  matMulSsmNormGateOutWebGpuResident,
   matMulSwiGluDownWebGpuResident,
   matMulSwiGluWebGpuResident,
   matMulTop1WebGpuQuantizedResident,
   matMulWebGpuQuantizedResident,
-  recurrentAttentionDecodeWebGpuResident,
 } from "../../../packages/engine/src/runner/webgpu/matmul";
 import { GPU_COPY_DST } from "../../../packages/engine/src/runner/webgpu/gpu-constants";
 import { storageBuffer } from "../../../packages/engine/src/runner/webgpu/gpu-bindings";
@@ -30,25 +26,18 @@ import {
 } from "../../../packages/engine/src/runner/webgpu/quantized-handles";
 import type { WebGpuBufferLike, WebGpuComputePassLike, WebGpuDeviceLike, WebGpuQuantizedWeightHandleInternal } from "../../../packages/engine/src/runner/webgpu/gpu-types";
 import {
-  gatedDeltaNet,
   gqaAttention,
-  l2NormRows,
   sigmoid,
   silu,
-  ssmConv1d,
-  softplus,
-  type GatedDeltaNetOptions,
   type GqaAttentionOptions,
 } from "../../../packages/engine/src/ops";
 import {
   createWasmQuantizedWeightHandle,
-  gatedDeltaNetWasm,
   gqaAttentionWasm,
   matMulQuantizedWasm,
   matMulQuantizedWasmResident,
   prefillWasmBackend,
   releaseWasmQuantizedWeightHandle,
-  ssmConv1dWasm,
   type WasmQuantizedWeightHandle,
 } from "../../../packages/engine/src/runner/cpu/wasm-kernels";
 import {
@@ -66,15 +55,10 @@ export type BrowserBenchSize = "small" | "medium" | "large";
 
 export type BrowserBenchCaseId =
   | "matmul"
-  | "ssm-conv"
-  | "gated-delta-net"
   | "gqa-attention"
   | "swiglu"
   | "swiglu-down"
-  | "qkv-conv"
-  | "ssm-norm-gate-out"
   | "full-attention-decode-out"
-  | "recurrent-decode"
   | "top-token";
 
 export type BrowserBenchBackend =
@@ -169,15 +153,10 @@ type QuantizedType = "Q4_K" | "Q5_K" | "Q6_K" | "Q8_0";
 
 const DEFAULT_CASES: BrowserBenchCaseId[] = [
   "matmul",
-  "ssm-conv",
-  "gated-delta-net",
   "gqa-attention",
   "swiglu",
   "swiglu-down",
-  "qkv-conv",
-  "ssm-norm-gate-out",
   "full-attention-decode-out",
-  "recurrent-decode",
   "top-token",
 ];
 const DEFAULT_SIZES: BrowserBenchSize[] = ["small", "medium"];
@@ -277,24 +256,14 @@ function buildBenchTasks(caseIds: readonly BrowserBenchCaseId[], sizes: readonly
           tasks.push(createMatMulTask(size, type, false));
           tasks.push(createMatMulTask(size, type, true));
         }
-      } else if (caseId === "ssm-conv") {
-        tasks.push(createSsmConvTask(size));
-      } else if (caseId === "gated-delta-net") {
-        tasks.push(createGatedDeltaTask(size));
       } else if (caseId === "gqa-attention") {
         tasks.push(createGqaAttentionTask(size));
       } else if (caseId === "swiglu") {
         tasks.push(createSwiGluTask(size));
       } else if (caseId === "swiglu-down") {
         tasks.push(createSwiGluDownTask(size));
-      } else if (caseId === "qkv-conv") {
-        tasks.push(createQkvConvTask(size));
-      } else if (caseId === "ssm-norm-gate-out") {
-        tasks.push(createSsmNormGateOutTask(size));
       } else if (caseId === "full-attention-decode-out") {
         tasks.push(createFullAttentionDecodeOutTask(size));
-      } else if (caseId === "recurrent-decode") {
-        tasks.push(createRecurrentDecodeTask(size));
       } else {
         tasks.push(createTopTokenTask(size));
       }
@@ -366,65 +335,6 @@ function createMatMulTask(sizeName: BrowserBenchSize, type: QuantizedType, resid
             run: () => runWebGpuMatMul(type, weightBytes, inputColumns, size.inputSize, size.rowCount, size.columnCount),
           },
         ],
-  };
-}
-
-function createSsmConvTask(sizeName: BrowserBenchSize): BenchTask {
-  const size = ssmConvShape(sizeName);
-  const inputWindow = size.kernelSize - 1 + size.tokenCount;
-  const convInput = sequence(size.channelCount * inputWindow, seedFor("ssm", sizeName, 1));
-  const kernel = sequence(size.channelCount * size.kernelSize, seedFor("ssm", sizeName, 2));
-  return {
-    caseId: "ssm-conv",
-    caseName: "SSM conv1d",
-    size: sizeName,
-    shape: `channels=${size.channelCount} tokens=${size.tokenCount} kernel=${size.kernelSize}`,
-    tolerance: 1e-4,
-    relativeTolerance: 1e-4,
-    referenceBackend: "wasm",
-    reference: async () => (await ssmConv1dWasm(convInput, kernel, size.channelCount, size.tokenCount, size.kernelSize)) ??
-      ssmConv1d(convInput, kernel, size.channelCount, size.tokenCount, size.kernelSize),
-    candidates: [
-      {
-        backend: "ts-reference",
-        variant: "standalone",
-        run: async () => ssmConv1d(convInput, kernel, size.channelCount, size.tokenCount, size.kernelSize),
-      },
-    ],
-  };
-}
-
-function createGatedDeltaTask(sizeName: BrowserBenchSize): BenchTask {
-  const options = gatedDeltaShape(sizeName);
-  const query = sequence(options.tokenCount * options.keyHeadCount * options.stateSize, seedFor("gdn", sizeName, 1));
-  const key = sequence(query.length, seedFor("gdn", sizeName, 2));
-  const value = sequence(options.tokenCount * options.valueHeadCount * options.stateSize, seedFor("gdn", sizeName, 3));
-  const gate = sequence(options.tokenCount * options.valueHeadCount, seedFor("gdn", sizeName, 4));
-  const beta = positive(sequence(options.tokenCount * options.valueHeadCount, seedFor("gdn", sizeName, 5)));
-  const state = sequence(options.valueHeadCount * options.stateSize * options.stateSize, seedFor("gdn", sizeName, 6));
-  const reference = async () => flattenGatedDeltaResult(
-    (await gatedDeltaNetWasm(query, key, value, gate, beta, state, options)) ??
-      gatedDeltaNet(query, key, value, gate, beta, state, options),
-  );
-  return {
-    caseId: "gated-delta-net",
-    caseName: "Gated DeltaNet",
-    size: sizeName,
-    shape: `state=${options.stateSize} kHeads=${options.keyHeadCount} vHeads=${options.valueHeadCount} tokens=${options.tokenCount}`,
-    tolerance: 5e-3,
-    relativeTolerance: 1e-4,
-    referenceBackend: "wasm",
-    reference,
-    candidates: [
-      {
-        backend: "webgpu",
-        variant: "standalone",
-        run: async () => {
-          const result = await gatedDeltaNetWebGpu(query, key, value, gate, beta, state, options);
-          return result ? flattenGatedDeltaResult(result) : undefined;
-        },
-      },
-    ],
   };
 }
 
@@ -537,84 +447,6 @@ function createSwiGluDownTask(sizeName: BrowserBenchSize): BenchTask {
   };
 }
 
-function createQkvConvTask(sizeName: BrowserBenchSize): BenchTask {
-  const size = qkvConvShape(sizeName);
-  const input = sequence(size.inputSize * size.tokenCount, seedFor("qkv", sizeName, 1));
-  const convState = sequence((size.kernelSize - 1) * size.convDim, seedFor("qkv", sizeName, 2));
-  const convKernel = sequence(size.kernelSize * size.convDim, seedFor("qkv", sizeName, 3));
-  const qkvBytes = quantizedWeightBytes("Q4_K", size.inputSize, size.convDim);
-  return {
-    caseId: "qkv-conv",
-    caseName: "QKV + conv fused",
-    size: sizeName,
-    shape: `input=${size.inputSize} conv=${size.convDim} tokens=${size.tokenCount} kernel=${size.kernelSize}`,
-    tolerance: 1.5e-1,
-    relativeTolerance: 1e-4,
-    referenceBackend: "wasm",
-    reference: async () => flattenQkvConvResult(await qkvConvReference(qkvBytes, input, convState, convKernel, size)),
-    candidates: [
-      {
-        backend: "webgpu-resident",
-        variant: "fused",
-        prepare: async () => {
-          const handle = await createWebGpuQuantizedWeightHandle("Q4_K", qkvBytes, size.inputSize, size.convDim);
-          if (!handle) {
-            return undefined;
-          }
-          return {
-            run: async () => {
-            const result = await matMulQkvConvWebGpuResident(handle, input, convState, convKernel, size);
-            return result ? flattenQkvConvResult(result) : undefined;
-            },
-            teardown: () => handle.destroy(),
-          };
-        },
-      },
-    ],
-  };
-}
-
-function createSsmNormGateOutTask(sizeName: BrowserBenchSize): BenchTask {
-  const size = ssmOutShape(sizeName);
-  const attnNorm = sequence(size.inputSize * size.columnCount, seedFor("ssmout", sizeName, 1));
-  const delta = sequence(size.hiddenSize * size.columnCount, seedFor("ssmout", sizeName, 2));
-  const normWeight = positive(sequence(size.hiddenSize, seedFor("ssmout", sizeName, 3)));
-  const zBytes = quantizedWeightBytes("Q4_K", size.inputSize, size.hiddenSize);
-  const outBytes = quantizedWeightBytes("Q8_0", size.hiddenSize, size.outputSize);
-  return {
-    caseId: "ssm-norm-gate-out",
-    caseName: "SSM norm/gate/out fused",
-    size: sizeName,
-    shape: `input=${size.inputSize} hidden=${size.hiddenSize} output=${size.outputSize} cols=${size.columnCount}`,
-    tolerance: 1.5e-1,
-    relativeTolerance: 1e-4,
-    referenceBackend: "wasm",
-    reference: async () => ssmNormGateOutReference(zBytes, outBytes, attnNorm, delta, normWeight, size),
-    candidates: [
-      {
-        backend: "webgpu-resident",
-        variant: "fused",
-        prepare: async () => {
-          const z = await createWebGpuQuantizedWeightHandle("Q4_K", zBytes, size.inputSize, size.hiddenSize);
-          const out = await createWebGpuQuantizedWeightHandle("Q8_0", outBytes, size.hiddenSize, size.outputSize);
-          if (!z || !out) {
-            z?.destroy();
-            out?.destroy();
-            return undefined;
-          }
-          return {
-            run: () => matMulSsmNormGateOutWebGpuResident(z, out, attnNorm, delta, normWeight, size.epsilon, size.columnCount),
-            teardown: () => {
-              z.destroy();
-              out.destroy();
-            },
-          };
-        },
-      },
-    ],
-  };
-}
-
 function createFullAttentionDecodeOutTask(sizeName: BrowserBenchSize): BenchTask {
   const size = fullAttentionShape(sizeName);
   const hiddenSize = size.headSize * size.queryHeadCount;
@@ -644,97 +476,6 @@ function createFullAttentionDecodeOutTask(sizeName: BrowserBenchSize): BenchTask
           return {
             run: () => fullAttentionDecodeOutWebGpuResident(out, query, key, value, gate, size),
             teardown: () => out.destroy(),
-          };
-        },
-      },
-    ],
-  };
-}
-
-function createRecurrentDecodeTask(sizeName: BrowserBenchSize): BenchTask {
-  const size = recurrentShape(sizeName);
-  const input = sequence(size.inputSize, seedFor("rec", sizeName, 1));
-  const convState = sequence((size.kernelSize - 1) * size.convDim, seedFor("rec", sizeName, 2));
-  const recurrentState = sequence(size.valueHeadCount * size.stateSize * size.stateSize, seedFor("rec", sizeName, 3));
-  const qkvBytes = quantizedWeightBytes("Q4_K", size.inputSize, size.convDim);
-  const zBytes = quantizedWeightBytes("Q5_K", size.inputSize, size.valueDim);
-  const outBytes = quantizedWeightBytes("Q8_0", size.valueDim, size.outputSize);
-  const alpha = sequence(size.inputSize * size.valueHeadCount, seedFor("rec", sizeName, 4));
-  const beta = sequence(size.inputSize * size.valueHeadCount, seedFor("rec", sizeName, 5));
-  const convKernel = sequence(size.convDim * size.kernelSize, seedFor("rec", sizeName, 6));
-  const dtBias = sequence(size.valueHeadCount, seedFor("rec", sizeName, 7));
-  const ssmA = negative(sequence(size.valueHeadCount, seedFor("rec", sizeName, 8)));
-  const normWeight = positive(sequence(size.stateSize, seedFor("rec", sizeName, 9)));
-  return {
-    caseId: "recurrent-decode",
-    caseName: "recurrent decode fused",
-    size: sizeName,
-    shape: `input=${size.inputSize} state=${size.stateSize} groups=${size.groupCount} vHeads=${size.valueHeadCount}`,
-    tolerance: 2.5e-1,
-    relativeTolerance: 1e-4,
-    referenceBackend: "wasm",
-    reference: async () => flattenRecurrentResult(await recurrentDecodeReference({
-      qkvBytes,
-      zBytes,
-      outBytes,
-      alpha,
-      beta,
-      convKernel,
-      dtBias,
-      ssmA,
-      normWeight,
-      input,
-      convState,
-      recurrentState,
-      size,
-    })),
-    candidates: [
-      {
-        backend: "webgpu-resident",
-        variant: "fused",
-        prepare: async () => {
-          const qkv = await createWebGpuQuantizedWeightHandle("Q4_K", qkvBytes, size.inputSize, size.convDim);
-          const z = await createWebGpuQuantizedWeightHandle("Q5_K", zBytes, size.inputSize, size.valueDim);
-          const out = await createWebGpuQuantizedWeightHandle("Q8_0", outBytes, size.valueDim, size.outputSize);
-          const alphaHandle = await createWebGpuF32TensorHandle(alpha);
-          const betaHandle = await createWebGpuF32TensorHandle(beta);
-          const convKernelHandle = await createWebGpuF32TensorHandle(convKernel);
-          const dtBiasHandle = await createWebGpuF32TensorHandle(dtBias);
-          const ssmAHandle = await createWebGpuF32TensorHandle(ssmA);
-          const normWeightHandle = await createWebGpuF32TensorHandle(normWeight);
-          const handles = [qkv, z, out, alphaHandle, betaHandle, convKernelHandle, dtBiasHandle, ssmAHandle, normWeightHandle];
-          if (handles.some((handle) => !handle)) {
-            for (const handle of handles) {
-              handle?.destroy();
-            }
-            return undefined;
-          }
-          return {
-            run: async () => {
-              const result = await recurrentAttentionDecodeWebGpuResident(
-                {
-                  qkv: qkv!,
-                  z: z!,
-                  out: out!,
-                  alpha: alphaHandle!,
-                  beta: betaHandle!,
-                  convKernel: convKernelHandle!,
-                  dtBias: dtBiasHandle!,
-                  ssmA: ssmAHandle!,
-                  normWeight: normWeightHandle!,
-                },
-                input,
-                convState,
-                recurrentState,
-                size,
-              );
-              return result ? flattenRecurrentResult(result) : undefined;
-            },
-            teardown: () => {
-              for (const handle of handles) {
-                handle?.destroy();
-              }
-            },
           };
         },
       },
@@ -1270,104 +1011,6 @@ async function swigluDownReference(
   return matMulReference("Q6_K", downBytes, hidden, size.hiddenSize, size.outputSize, size.columnCount);
 }
 
-async function qkvConvReference(
-  qkvBytes: Uint8Array,
-  input: Float32Array,
-  convState: Float32Array,
-  convKernel: Float32Array,
-  size: ReturnType<typeof qkvConvShape>,
-): Promise<{ q: Float32Array; k: Float32Array; v: Float32Array; newConvState: Float32Array }> {
-  const qkv = await matMulReference("Q4_K", qkvBytes, input, size.inputSize, size.convDim, size.tokenCount);
-  return qkvConvSplitReference(qkv, convState, convKernel, size);
-}
-
-function qkvConvSplitReference(
-  qkv: Float32Array,
-  convState: Float32Array,
-  convKernel: Float32Array,
-  size: ReturnType<typeof qkvConvShape>,
-): { q: Float32Array; k: Float32Array; v: Float32Array; newConvState: Float32Array } {
-  const keyDim = size.stateSize * size.groupCount;
-  const valueHeadCount = size.valueDim / size.stateSize;
-  const history = size.kernelSize - 1;
-  const q = new Float32Array(keyDim * size.tokenCount);
-  const k = new Float32Array(keyDim * size.tokenCount);
-  const v = new Float32Array(size.valueDim * size.tokenCount);
-  const newConvState = new Float32Array(history * size.convDim);
-  const convValue = (channel: number, inputIndex: number): number => {
-    if (inputIndex < history) {
-      return convState[channel * history + inputIndex] ?? 0;
-    }
-    return qkv[(inputIndex - history) * size.convDim + channel] ?? 0;
-  };
-  const convSilu = (channel: number, token: number): number => {
-    let sum = 0;
-    for (let index = 0; index < size.kernelSize; index += 1) {
-      sum += convValue(channel, token + index) * (convKernel[channel * size.kernelSize + index] ?? 0);
-    }
-    return sum / (1 + Math.exp(-sum));
-  };
-  for (let token = 0; token < size.tokenCount; token += 1) {
-    for (let group = 0; group < size.groupCount; group += 1) {
-      const qRow = new Float32Array(size.stateSize);
-      const kRow = new Float32Array(size.stateSize);
-      for (let index = 0; index < size.stateSize; index += 1) {
-        qRow[index] = convSilu(group * size.stateSize + index, token);
-        kRow[index] = convSilu(keyDim + group * size.stateSize + index, token);
-      }
-      const qNorm = l2NormRows(qRow, size.stateSize, 1e-6);
-      const kNorm = l2NormRows(kRow, size.stateSize, 1e-6);
-      q.set(qNorm, token * keyDim + group * size.stateSize);
-      k.set(kNorm, token * keyDim + group * size.stateSize);
-    }
-    for (let head = 0; head < valueHeadCount; head += 1) {
-      for (let index = 0; index < size.stateSize; index += 1) {
-        const valueIndex = head * size.stateSize + index;
-        v[token * size.valueDim + valueIndex] = convSilu(keyDim * 2 + valueIndex, token);
-      }
-    }
-  }
-  for (let channel = 0; channel < size.convDim; channel += 1) {
-    for (let index = 0; index < history; index += 1) {
-      newConvState[channel * history + index] = convValue(channel, size.tokenCount + index);
-    }
-  }
-  return { q, k, v, newConvState };
-}
-
-async function ssmNormGateOutReference(
-  zBytes: Uint8Array,
-  outBytes: Uint8Array,
-  attnNorm: Float32Array,
-  delta: Float32Array,
-  normWeight: Float32Array,
-  size: ReturnType<typeof ssmOutShape>,
-): Promise<Float32Array> {
-  const z = await matMulReference("Q4_K", zBytes, attnNorm, size.inputSize, size.hiddenSize, size.columnCount);
-  const gated = ssmNormGateReference(delta, z, normWeight, size.hiddenSize, size.columnCount, size.epsilon);
-  return matMulReference("Q8_0", outBytes, gated, size.hiddenSize, size.outputSize, size.columnCount);
-}
-
-function ssmNormGateReference(
-  delta: Float32Array,
-  z: Float32Array,
-  normWeight: Float32Array,
-  rowCount: number,
-  columnCount: number,
-  epsilon: number,
-): Float32Array {
-  const output = new Float32Array(delta.length);
-  for (let column = 0; column < columnCount; column += 1) {
-    const base = column * rowCount;
-    const normalized = rmsNormRow(delta.subarray(base, base + rowCount), normWeight, epsilon);
-    for (let row = 0; row < rowCount; row += 1) {
-      const gate = z[base + row] ?? 0;
-      output[base + row] = normalized[row]! * (gate / (1 + Math.exp(-gate)));
-    }
-  }
-  return output;
-}
-
 async function fullAttentionDecodeOutReference(
   outBytes: Uint8Array,
   query: Float32Array,
@@ -1391,51 +1034,6 @@ async function fullAttentionDecodeOutReference(
   return matMulReference("Q4_K", outBytes, gated, size.headSize * size.queryHeadCount, size.outputSize, 1);
 }
 
-async function recurrentDecodeReference(params: {
-  qkvBytes: Uint8Array;
-  zBytes: Uint8Array;
-  outBytes: Uint8Array;
-  alpha: Float32Array;
-  beta: Float32Array;
-  convKernel: Float32Array;
-  dtBias: Float32Array;
-  ssmA: Float32Array;
-  normWeight: Float32Array;
-  input: Float32Array;
-  convState: Float32Array;
-  recurrentState: Float32Array;
-  size: ReturnType<typeof recurrentShape>;
-}): Promise<{ attention: Float32Array; newConvState: Float32Array; newRecurrentState: Float32Array }> {
-  const qkv = await matMulReference("Q4_K", params.qkvBytes, params.input, params.size.inputSize, params.size.convDim, 1);
-  const z = await matMulReference("Q5_K", params.zBytes, params.input, params.size.inputSize, params.size.valueDim, 1);
-  const alpha = f32MatMul(params.alpha, params.input, params.size.inputSize, params.size.valueHeadCount, 1);
-  const beta = f32MatMul(params.beta, params.input, params.size.inputSize, params.size.valueHeadCount, 1);
-  const qkvConv = qkvConvSplitReference(qkv, params.convState, params.convKernel, {
-    inputSize: params.size.inputSize,
-    convDim: params.size.convDim,
-    tokenCount: 1,
-    kernelSize: params.size.kernelSize,
-    stateSize: params.size.stateSize,
-    groupCount: params.size.groupCount,
-    valueDim: params.size.valueDim,
-  });
-  const gate = multiply(softplus(addBias(alpha, params.dtBias)), params.ssmA);
-  const betaSigmoid = sigmoid(beta);
-  const delta = gatedDeltaNet(qkvConv.q, qkvConv.k, qkvConv.v, gate, betaSigmoid, params.recurrentState, {
-    stateSize: params.size.stateSize,
-    keyHeadCount: params.size.groupCount,
-    valueHeadCount: params.size.valueHeadCount,
-    tokenCount: 1,
-  });
-  const gated = ssmNormGateReference(delta.output, z, params.normWeight, params.size.stateSize, params.size.valueHeadCount, params.size.epsilon);
-  const attention = await matMulReference("Q8_0", params.outBytes, gated, params.size.valueDim, params.size.outputSize, 1);
-  return {
-    attention,
-    newConvState: qkvConv.newConvState,
-    newRecurrentState: delta.newState,
-  };
-}
-
 async function topTokenReference(
   weightBytes: Uint8Array,
   input: Float32Array,
@@ -1455,67 +1053,10 @@ async function topTokenReference(
   return new Float32Array([bestId, bestValue]);
 }
 
-function f32MatMul(weightRows: Float32Array, inputColumns: Float32Array, inputSize: number, rowCount: number, columnCount: number): Float32Array {
-  const output = new Float32Array(rowCount * columnCount);
-  for (let column = 0; column < columnCount; column += 1) {
-    for (let row = 0; row < rowCount; row += 1) {
-      let sum = 0;
-      for (let index = 0; index < inputSize; index += 1) {
-        sum += (weightRows[row * inputSize + index] ?? 0) * (inputColumns[column * inputSize + index] ?? 0);
-      }
-      output[column * rowCount + row] = sum;
-    }
-  }
-  return output;
-}
-
-function addBias(values: Float32Array, bias: Float32Array): Float32Array {
-  const output = new Float32Array(values.length);
-  for (let index = 0; index < values.length; index += 1) {
-    output[index] = (values[index] ?? 0) + (bias[index % bias.length] ?? 0);
-  }
-  return output;
-}
-
 function multiply(left: Float32Array, right: Float32Array): Float32Array {
   const output = new Float32Array(left.length);
   for (let index = 0; index < left.length; index += 1) {
     output[index] = (left[index] ?? 0) * (right[index] ?? 0);
-  }
-  return output;
-}
-
-function rmsNormRow(input: Float32Array, weight: Float32Array, epsilon: number): Float32Array {
-  let sumSquares = 0;
-  for (const value of input) {
-    sumSquares += value * value;
-  }
-  const scale = 1 / Math.sqrt(sumSquares / input.length + epsilon);
-  const output = new Float32Array(input.length);
-  for (let index = 0; index < input.length; index += 1) {
-    output[index] = (input[index] ?? 0) * scale * (weight[index] ?? 0);
-  }
-  return output;
-}
-
-function flattenGatedDeltaResult(result: { output: Float32Array; newState: Float32Array }): Float32Array {
-  return concatFloat32([result.output, result.newState]);
-}
-
-function flattenQkvConvResult(result: { q: Float32Array; k: Float32Array; v: Float32Array; newConvState: Float32Array }): Float32Array {
-  return concatFloat32([result.q, result.k, result.v, result.newConvState]);
-}
-
-function flattenRecurrentResult(result: { attention: Float32Array; newConvState: Float32Array; newRecurrentState: Float32Array }): Float32Array {
-  return concatFloat32([result.attention, result.newConvState, result.newRecurrentState]);
-}
-
-function concatFloat32(values: readonly Float32Array[]): Float32Array {
-  const output = new Float32Array(values.reduce((sum, value) => sum + value.length, 0));
-  let offset = 0;
-  for (const value of values) {
-    output.set(value, offset);
-    offset += value.length;
   }
   return output;
 }
@@ -1598,22 +1139,6 @@ function sequence(length: number, seed: number): Float32Array {
   return output;
 }
 
-function positive(values: Float32Array): Float32Array {
-  const output = new Float32Array(values.length);
-  for (let index = 0; index < values.length; index += 1) {
-    output[index] = Math.abs(values[index] ?? 0) + 0.01;
-  }
-  return output;
-}
-
-function negative(values: Float32Array): Float32Array {
-  const output = new Float32Array(values.length);
-  for (let index = 0; index < values.length; index += 1) {
-    output[index] = -Math.abs(values[index] ?? 0) - 0.01;
-  }
-  return output;
-}
-
 function causalMask(tokenCount: number, keyValueTokenCount: number): Float32Array {
   const output = new Float32Array(tokenCount * keyValueTokenCount);
   for (let token = 0; token < tokenCount; token += 1) {
@@ -1632,26 +1157,6 @@ function matMulShape(size: BrowserBenchSize): { inputSize: number; rowCount: num
     return { inputSize: 1024, rowCount: 1024, columnCount: 8 };
   }
   return { inputSize: 256, rowCount: 256, columnCount: 4 };
-}
-
-function ssmConvShape(size: BrowserBenchSize): { channelCount: number; tokenCount: number; kernelSize: number } {
-  if (size === "large") {
-    return { channelCount: 4096, tokenCount: 128, kernelSize: 4 };
-  }
-  if (size === "medium") {
-    return { channelCount: 2048, tokenCount: 64, kernelSize: 4 };
-  }
-  return { channelCount: 128, tokenCount: 8, kernelSize: 4 };
-}
-
-function gatedDeltaShape(size: BrowserBenchSize): GatedDeltaNetOptions {
-  if (size === "large") {
-    return { stateSize: 128, keyHeadCount: 4, valueHeadCount: 16, tokenCount: 64 };
-  }
-  if (size === "medium") {
-    return { stateSize: 64, keyHeadCount: 4, valueHeadCount: 8, tokenCount: 32 };
-  }
-  return { stateSize: 16, keyHeadCount: 2, valueHeadCount: 4, tokenCount: 8 };
 }
 
 function gqaShape(size: BrowserBenchSize): Required<GqaAttentionOptions> {
@@ -1674,29 +1179,6 @@ function ffnShape(size: BrowserBenchSize): { inputSize: number; hiddenSize: numb
   return { inputSize: 256, hiddenSize: 512, outputSize: 256, columnCount: 4 };
 }
 
-function qkvConvShape(size: BrowserBenchSize): {
-  inputSize: number;
-  convDim: number;
-  tokenCount: number;
-  kernelSize: number;
-  stateSize: number;
-  groupCount: number;
-  valueDim: number;
-} {
-  if (size === "large") {
-    return { inputSize: 2048, convDim: 3072, tokenCount: 64, kernelSize: 4, stateSize: 128, groupCount: 4, valueDim: 2048 };
-  }
-  if (size === "medium") {
-    return { inputSize: 1024, convDim: 1536, tokenCount: 32, kernelSize: 4, stateSize: 64, groupCount: 4, valueDim: 1024 };
-  }
-  return { inputSize: 256, convDim: 256, tokenCount: 8, kernelSize: 4, stateSize: 32, groupCount: 2, valueDim: 128 };
-}
-
-function ssmOutShape(size: BrowserBenchSize): { inputSize: number; hiddenSize: number; outputSize: number; columnCount: number; epsilon: number } {
-  const ffn = ffnShape(size);
-  return { inputSize: ffn.inputSize, hiddenSize: ffn.inputSize, outputSize: ffn.outputSize, columnCount: ffn.columnCount, epsilon: 1e-6 };
-}
-
 function fullAttentionShape(size: BrowserBenchSize): {
   headSize: number;
   queryHeadCount: number;
@@ -1713,26 +1195,6 @@ function fullAttentionShape(size: BrowserBenchSize): {
     return { headSize: 64, queryHeadCount: 8, keyValueHeadCount: 2, keyValueTokenCount: 64, contextLength: 64, scale: 1 / Math.sqrt(64), outputSize: 512 };
   }
   return { headSize: 64, queryHeadCount: 4, keyValueHeadCount: 2, keyValueTokenCount: 16, contextLength: 16, scale: 1 / Math.sqrt(64), outputSize: 256 };
-}
-
-function recurrentShape(size: BrowserBenchSize): {
-  inputSize: number;
-  outputSize: number;
-  convDim: number;
-  kernelSize: number;
-  stateSize: number;
-  groupCount: number;
-  valueHeadCount: number;
-  valueDim: number;
-  epsilon: number;
-} {
-  if (size === "large") {
-    return { inputSize: 2048, outputSize: 2048, convDim: 3072, kernelSize: 4, stateSize: 128, groupCount: 4, valueHeadCount: 16, valueDim: 2048, epsilon: 1e-6 };
-  }
-  if (size === "medium") {
-    return { inputSize: 1024, outputSize: 1024, convDim: 1536, kernelSize: 4, stateSize: 64, groupCount: 4, valueHeadCount: 16, valueDim: 1024, epsilon: 1e-6 };
-  }
-  return { inputSize: 256, outputSize: 256, convDim: 256, kernelSize: 4, stateSize: 32, groupCount: 2, valueHeadCount: 4, valueDim: 128, epsilon: 1e-6 };
 }
 
 function seedFor(name: string, size: BrowserBenchSize, salt: number): number {

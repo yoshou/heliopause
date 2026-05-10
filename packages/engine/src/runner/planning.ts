@@ -1,16 +1,16 @@
 import type { GgufMetadata, GgufTensorInfo } from "../gguf";
-import type { Qwen35LayerKind, Qwen35ModelManifest } from "../model";
+import type { Gemma4LayerKind, Gemma4ModelManifest } from "../model";
 import { tensorByteLength } from "../tensor-reader";
 
-export type Qwen35RunnerExecutionMode = "off" | "verify" | "enabled";
+export type Gemma4RunnerExecutionMode = "off" | "verify" | "enabled";
 
-export type Qwen35RunnerPlanStatus =
+export type Gemma4RunnerPlanStatus =
   | "off"
   | "unavailable"
   | "blocked"
   | "planned";
 
-export type Qwen35RunnerProviderSupport =
+export type Gemma4RunnerProviderSupport =
   | {
       available: true;
       [key: string]: unknown;
@@ -21,17 +21,17 @@ export type Qwen35RunnerProviderSupport =
       error?: string;
     };
 
-export type Qwen35RunnerLayerPlacement = {
+export type Gemma4RunnerLayerPlacement = {
   layer: number;
-  layerKind: Qwen35LayerKind;
+  layerKind: Gemma4LayerKind;
   weightBytes: number;
   cacheBytes: number;
   totalBytes: number;
 };
 
-export type Qwen35RunnerPlacementPlan = {
-  status: Qwen35RunnerPlanStatus;
-  mode: Qwen35RunnerExecutionMode;
+export type Gemma4RunnerPlacementPlan = {
+  status: Gemma4RunnerPlanStatus;
+  mode: Gemma4RunnerExecutionMode;
   memoryLimitBytes: number;
   enabled: false;
   reason?: string;
@@ -46,7 +46,7 @@ export type Qwen35RunnerPlacementPlan = {
   gpuCacheBytes: number;
   estimatedResidentBytes: number;
   remainingBytes: number;
-  selectedLayers: Qwen35RunnerLayerPlacement[];
+  selectedLayers: Gemma4RunnerLayerPlacement[];
   copyAuditExpectations: {
     decodeTensorReads: 0;
     segmentIntermediateReadbacks: 0;
@@ -56,7 +56,7 @@ export type Qwen35RunnerPlacementPlan = {
   };
 };
 
-export type Qwen35RunnerCopyAuditObservation = {
+export type Gemma4RunnerCopyAuditObservation = {
   decodeTensorReads: number;
   segmentIntermediateReadbacks: number;
   logitsReadbacks: number;
@@ -64,21 +64,21 @@ export type Qwen35RunnerCopyAuditObservation = {
   tokenReadbacks: number;
 };
 
-export type Qwen35RunnerCopyAuditResult = {
+export type Gemma4RunnerCopyAuditResult = {
   ok: boolean;
   errors: string[];
-  expected: Qwen35RunnerPlacementPlan["copyAuditExpectations"];
-  observed: Qwen35RunnerCopyAuditObservation;
+  expected: Gemma4RunnerPlacementPlan["copyAuditExpectations"];
+  observed: Gemma4RunnerCopyAuditObservation;
 };
 
-export type Qwen35RunnerPlanningOptions = {
-  mode?: Qwen35RunnerExecutionMode;
+export type Gemma4RunnerPlanningOptions = {
+  mode?: Gemma4RunnerExecutionMode;
   memoryLimitBytes?: number;
   contextLength?: number;
-  support?: Qwen35RunnerProviderSupport;
+  support?: Gemma4RunnerProviderSupport;
 };
 
-export type Qwen35RunnerPlanningProvider = {
+export type Gemma4RunnerPlanningProvider = {
   name: string;
   defaultMemoryLimitBytes: number;
   fixedBytes: number;
@@ -86,23 +86,23 @@ export type Qwen35RunnerPlanningProvider = {
   outputTensorNames: readonly string[];
   offReason: string;
   blockedByMemoryReason: string;
-  unavailableReason: (support: Qwen35RunnerProviderSupport) => string;
+  unavailableReason: (support: Gemma4RunnerProviderSupport) => string;
   plannedReason: string;
   layerPlacement: (params: {
     tensorsByName: ReadonlyMap<string, GgufTensorInfo>;
-    manifest: Qwen35ModelManifest;
+    manifest: Gemma4ModelManifest;
     layer: number;
     contextLength: number;
-  }) => Qwen35RunnerLayerPlacement;
-  copyAuditExpectations: (selectedLayerCount: number) => Qwen35RunnerPlacementPlan["copyAuditExpectations"];
+  }) => Gemma4RunnerLayerPlacement;
+  copyAuditExpectations: (selectedLayerCount: number) => Gemma4RunnerPlacementPlan["copyAuditExpectations"];
 };
 
-export function planQwen35ProviderPlacement(
-  provider: Qwen35RunnerPlanningProvider,
+export function planGemma4ProviderPlacement(
+  provider: Gemma4RunnerPlanningProvider,
   gguf: GgufMetadata,
-  manifest: Qwen35ModelManifest,
-  options: Qwen35RunnerPlanningOptions = {},
-): Qwen35RunnerPlacementPlan {
+  manifest: Gemma4ModelManifest,
+  options: Gemma4RunnerPlanningOptions = {},
+): Gemma4RunnerPlacementPlan {
   const mode = options.mode ?? "off";
   const memoryLimitBytes = options.memoryLimitBytes ?? provider.defaultMemoryLimitBytes;
   const contextLength = Math.min(
@@ -140,7 +140,7 @@ export function planQwen35ProviderPlacement(
   }
 
   let selectedBytes = outputBytes + provider.fixedBytes + provider.scratchBytes;
-  const selectedLayers: Qwen35RunnerLayerPlacement[] = [];
+  const selectedLayers: Gemma4RunnerLayerPlacement[] = [];
 
   if (selectedBytes > memoryLimitBytes) {
     return emptyPlan(provider, {
@@ -192,10 +192,10 @@ export function planQwen35ProviderPlacement(
   };
 }
 
-export function auditQwen35RunnerPlacementCopies(
-  plan: Qwen35RunnerPlacementPlan,
-  observed: Qwen35RunnerCopyAuditObservation,
-): Qwen35RunnerCopyAuditResult {
+export function auditGemma4RunnerPlacementCopies(
+  plan: Gemma4RunnerPlacementPlan,
+  observed: Gemma4RunnerCopyAuditObservation,
+): Gemma4RunnerCopyAuditResult {
   const expected = plan.copyAuditExpectations;
   const errors: string[] = [];
 
@@ -232,12 +232,12 @@ export function auditQwen35RunnerPlacementCopies(
 }
 
 function buildLayerPlans(
-  provider: Qwen35RunnerPlanningProvider,
+  provider: Gemma4RunnerPlanningProvider,
   tensorsByName: ReadonlyMap<string, GgufTensorInfo>,
-  manifest: Qwen35ModelManifest,
+  manifest: Gemma4ModelManifest,
   contextLength: number,
-): Map<number, Qwen35RunnerLayerPlacement> {
-  const plans = new Map<number, Qwen35RunnerLayerPlacement>();
+): Map<number, Gemma4RunnerLayerPlacement> {
+  const plans = new Map<number, Gemma4RunnerLayerPlacement>();
   for (let layer = 0; layer < manifest.blockCount; layer += 1) {
     plans.set(layer, provider.layerPlacement({
       tensorsByName,
@@ -255,16 +255,16 @@ function tensorBytes(tensorsByName: ReadonlyMap<string, GgufTensorInfo>, name: s
 }
 
 function emptyPlan(
-  provider: Qwen35RunnerPlanningProvider,
+  provider: Gemma4RunnerPlanningProvider,
   params: {
-    status: Qwen35RunnerPlanStatus;
-    mode: Qwen35RunnerExecutionMode;
+    status: Gemma4RunnerPlanStatus;
+    mode: Gemma4RunnerExecutionMode;
     memoryLimitBytes: number;
     reason: string;
     outputBytes: number;
     blockCount: number;
   },
-): Qwen35RunnerPlacementPlan {
+): Gemma4RunnerPlacementPlan {
   const estimatedResidentBytes = params.outputBytes + provider.fixedBytes + provider.scratchBytes;
   return {
     status: params.status,

@@ -2,17 +2,13 @@ import {
   type GgmlTypeName,
 } from "../../gguf";
 import {
-  gatedDeltaNet,
   gqaAttention,
-  l2NormRows,
   rmsNorm,
-  ropeMultiMropeNeox,
-  sigmoid,
-  silu,
-  softplus,
-  ssmConv1d,
 } from "../../ops";
 import {
+  dequantizeRow,
+  float16ToFloat32,
+  float32ToFloat16,
   quantizeQ8_0,
   quantizeQ8_K,
   vecDotIQ4_XS_Q8_K,
@@ -25,31 +21,28 @@ import {
   tensorByteLength,
 } from "../../tensor-reader";
 import {
-  type Qwen35ModelManifest,
+  type Gemma4LayerKind,
+  type Gemma4ModelManifest,
 } from "../../model";
 import {
   type ForwardTrace,
-  type Qwen35FullAttentionCache,
-  type Qwen35InferenceState,
-  type Qwen35ModelInput,
-  type Qwen35ModelSession,
+  type Gemma4FullAttentionCache,
+  type Gemma4InferenceState,
+  type Gemma4ModelInput,
+  type Gemma4ModelSession,
   type OutputResult,
-  type Qwen35RecurrentCache,
   modelSession,
   requiredFullAttentionCache,
-  requiredRecurrentCache,
   timedAsync,
   timedSync,
   topK,
 } from "../../runtime";
 import {
-  gatedDeltaNetWasm,
   gqaAttentionWasm,
   matMulQuantizedMultiWasm,
   matMulQuantizedWasm,
   matMulQuantizedWasmResident,
   matMulQuantizedWasmResidentMulti,
-  ssmConv1dWasm,
   type QuantizedMatMulInput,
   type WasmQuantizedWeightHandle,
 } from "./wasm-kernels";
@@ -65,358 +58,278 @@ import type {
   WasmShardedQuantizedWeightHandle,
 } from "./thread-pool";
 
-export async function forwardQwen35RecurrentLayer(
-  model: Qwen35ModelInput,
-  manifest: Qwen35ModelManifest,
-  state: Qwen35InferenceState,
-  layer: number,
-  input: Float32Array,
-  epsilon = modelSession(model).epsilon,
+export type Gemma4PreparedInput = {
+  hidden: Float32Array;
+  perLayerInputs?: Float32Array;
+};
+
+export async function prepareGemma4Input(
+  model: Gemma4ModelInput,
+  tokenIds: readonly number[],
   trace?: ForwardTrace,
-): Promise<Float32Array> {
+): Promise<Gemma4PreparedInput> {
   const session = modelSession(model);
-  const cache = requiredRecurrentCache(state, layer);
-  const tokenCount = input.length / manifest.embeddingLength;
-  const convDim =
-    manifest.ssm.stateSize * manifest.ssm.groupCount * 2 +
-    manifest.ssm.stateSize * manifest.ssm.timeStepRank;
-  const valueDim = manifest.ssm.stateSize * manifest.ssm.timeStepRank;
+  const manifest = session.manifest;
+  const tokenCount = tokenIds.length;
+  const hidden = await timedAsync(trace, "embedding read", async () => {
+    const rows = await session.readEmbeddingRows(tokenIds);
+    const scale = Math.sqrt(manifest.embeddingLength);
+    for (let index = 0; index < rows.length; index += 1) {
+      rows[index] = Math.fround((rows[index] ?? 0) * scale);
+    }
+    return rows;
+  });
 
-  const attnNorm = await timedAsync(
-    trace,
-    "recurrent norm",
-    async () => rmsNormRows(
-      input,
-      await readF32ModelTensor(session, `blk.${layer}.attn_norm.weight`),
-      epsilon,
-    ),
-    { layer, layerKind: "recurrent" },
-  );
-  const recurrentProjectionNames = [
-    `blk.${layer}.attn_qkv.weight`,
-    `blk.${layer}.ssm_alpha.weight`,
-    `blk.${layer}.ssm_beta.weight`,
-    `blk.${layer}.attn_gate.weight`,
-  ] as const;
-  const recurrentQuantizedProjectionNames = [
-    recurrentProjectionNames[0],
-    recurrentProjectionNames[3],
-  ] as const;
-  const recurrentProjectionBatch = await timedAsync(
-    trace,
-    "recurrent quantized projection batch",
-    () => matMulQwen35WeightBatch(session, recurrentQuantizedProjectionNames, attnNorm, trace),
-    { layer, layerKind: "recurrent" },
-  );
-  const qkv = recurrentProjectionBatch?.[0] ?? await timedAsync(
-    trace,
-    "recurrent projection qkv",
-    () => matMulQwen35Weight(session, recurrentProjectionNames[0], attnNorm, trace),
-    { layer, layerKind: "recurrent", weightName: recurrentProjectionNames[0] },
-  );
-  const [alpha, beta] = await timedAsync(
-    trace,
-    "recurrent projection alpha/beta",
-    () => matMulF32WeightPair(session, recurrentProjectionNames[1], recurrentProjectionNames[2], attnNorm),
-    { layer, layerKind: "recurrent" },
-  );
-  const z = recurrentProjectionBatch?.[1] ?? await timedAsync(
-    trace,
-    "recurrent projection z",
-    () => matMulQwen35Weight(session, recurrentProjectionNames[3], attnNorm, trace),
-    { layer, layerKind: "recurrent", weightName: recurrentProjectionNames[3] },
-  );
-  const convInput = timedSync(
-    trace,
-    "conv input compose",
-    () => composeConvInput(cache.conv, qkv, convDim, tokenCount, manifest.ssm.convKernel),
-    { layer, layerKind: "recurrent" },
-  );
-  const convKernel = await readF32ModelTensor(session, `blk.${layer}.ssm_conv1d.weight`);
-  const convRaw = await timedAsync(
-    trace,
-    "conv kernel",
-    async () => (await ssmConv1dWasm(
-      convInput,
-      convKernel,
-      convDim,
-      tokenCount,
-      manifest.ssm.convKernel,
-    )) ?? ssmConv1d(
-      convInput,
-      convKernel,
-      convDim,
-      tokenCount,
-      manifest.ssm.convKernel,
-    ),
-    { layer, layerKind: "recurrent" },
-  );
-  timedSync(
-    trace,
-    "conv state update",
-    () => updateConvState(cache, convInput, convDim, tokenCount, manifest.ssm.convKernel),
-    { layer, layerKind: "recurrent" },
-  );
-  const convSilu = silu(convRaw);
-  const qConv = l2NormRows(
-    sliceConvChannels(convSilu, convDim, tokenCount, 0, manifest.ssm.stateSize * manifest.ssm.groupCount),
-    manifest.ssm.stateSize,
-    1e-6,
-  );
-  const kConv = l2NormRows(
-    sliceConvChannels(
-      convSilu,
-      convDim,
-      tokenCount,
-      manifest.ssm.stateSize * manifest.ssm.groupCount,
-      manifest.ssm.stateSize * manifest.ssm.groupCount,
-    ),
-    manifest.ssm.stateSize,
-    1e-6,
-  );
-  const vConv = sliceConvChannels(
-    convSilu,
-    convDim,
-    tokenCount,
-    manifest.ssm.stateSize * manifest.ssm.groupCount * 2,
-    valueDim,
-  );
-  const gate = recurrentDeltaGate(
-    alpha,
-    await readF32ModelTensor(session, `blk.${layer}.ssm_dt.bias`),
-    await readF32ModelTensor(session, `blk.${layer}.ssm_a`),
-  );
-  const betaSigmoid = sigmoid(beta);
-  const delta = await timedAsync(
-    trace,
-    "Gated DeltaNet",
-    async () => (await gatedDeltaNetWasm(
-      qConv,
-      kConv,
-      vConv,
-      gate,
-      betaSigmoid,
-      cache.state,
-      {
-        stateSize: manifest.ssm.stateSize,
-        keyHeadCount: manifest.ssm.groupCount,
-        valueHeadCount: manifest.ssm.timeStepRank,
-        tokenCount,
-      },
-    )) ?? gatedDeltaNet(
-      qConv,
-      kConv,
-      vConv,
-      gate,
-      betaSigmoid,
-      cache.state,
-      {
-        stateSize: manifest.ssm.stateSize,
-        keyHeadCount: manifest.ssm.groupCount,
-        valueHeadCount: manifest.ssm.timeStepRank,
-        tokenCount,
-      },
-    ),
-    { layer, layerKind: "recurrent" },
-  );
-  cache.state = delta.newState;
+  if (manifest.perLayerEmbeddingLength <= 0 || tokenCount === 0) {
+    return { hidden };
+  }
 
-  const ssmNormWeight = await readF32ModelTensor(session, `blk.${layer}.ssm_norm.weight`);
-  const finalOutput = timedSync(trace, "SSM norm/gate", () => {
-    const output = new Float32Array(delta.output.length);
-    for (let row = 0; row < delta.output.length / ssmNormWeight.length; row += 1) {
-      const offset = row * ssmNormWeight.length;
-      const normalized = rmsNorm(delta.output.slice(offset, offset + ssmNormWeight.length), ssmNormWeight, epsilon);
-      for (let index = 0; index < ssmNormWeight.length; index += 1) {
-        const gateValue = z[offset + index] ?? 0;
-        output[offset + index] = normalized[index] * (gateValue / (1 + Math.exp(-gateValue)));
+  const perLayerInputs = await timedAsync(trace, "per-layer input projection", async () => {
+    const perLayerLength = manifest.perLayerEmbeddingLength;
+    const totalPerLayerLength = perLayerLength * manifest.blockCount;
+    const tokenRows = await readTensorRows(session, "per_layer_token_embd.weight", tokenIds);
+    const tokenScale = Math.sqrt(perLayerLength);
+    for (let index = 0; index < tokenRows.length; index += 1) {
+      tokenRows[index] = Math.fround((tokenRows[index] ?? 0) * tokenScale);
+    }
+
+    const projected = await matMulGemma4Weight(session, "per_layer_model_proj.weight", hidden, trace);
+    const projectionScale = 1 / Math.sqrt(manifest.embeddingLength);
+    const normWeight = await readF32ModelTensor(session, "per_layer_proj_norm.weight");
+    const output = new Float32Array(manifest.blockCount * tokenCount * perLayerLength);
+    for (let token = 0; token < tokenCount; token += 1) {
+      for (let layer = 0; layer < manifest.blockCount; layer += 1) {
+        const sourceOffset = token * totalPerLayerLength + layer * perLayerLength;
+        const projectedSlice = new Float32Array(perLayerLength);
+        for (let index = 0; index < perLayerLength; index += 1) {
+          projectedSlice[index] = Math.fround((projected[sourceOffset + index] ?? 0) * projectionScale);
+        }
+        const projectedNorm = rmsNorm(projectedSlice, normWeight, session.epsilon);
+        const targetOffset = (layer * tokenCount + token) * perLayerLength;
+        for (let index = 0; index < perLayerLength; index += 1) {
+          output[targetOffset + index] = Math.fround(
+            Math.fround((tokenRows[sourceOffset + index] ?? 0) + (projectedNorm[index] ?? 0)) *
+              Math.SQRT1_2,
+          );
+        }
       }
     }
     return output;
-  }, { layer, layerKind: "recurrent" });
+  });
 
-  const attention = await timedAsync(
-    trace,
-    "SSM out projection",
-    () => matMulQ8_0Weight(session, `blk.${layer}.ssm_out.weight`, finalOutput, trace),
-    { layer, layerKind: "recurrent", weightName: `blk.${layer}.ssm_out.weight` },
-  );
-  return timedAsync(
-    trace,
-    "FFN",
-    () => forwardQwen35Ffn(session, layer, residualAdd(input, attention), epsilon, trace),
-    { layer, layerKind: "recurrent" },
-  );
+  return { hidden, perLayerInputs };
 }
 
-export async function forwardQwen35FullAttentionLayer(
-  model: Qwen35ModelInput,
-  manifest: Qwen35ModelManifest,
-  state: Qwen35InferenceState,
+export async function forwardGemma4AttentionLayer(
+  model: Gemma4ModelInput,
+  manifest: Gemma4ModelManifest,
+  state: Gemma4InferenceState,
   layer: number,
   input: Float32Array,
   positions: Int32Array,
+  perLayerInputs?: Float32Array,
   epsilon = modelSession(model).epsilon,
   trace?: ForwardTrace,
 ): Promise<Float32Array> {
   const session = modelSession(model);
-  const cache = requiredFullAttentionCache(state, layer);
+  const kind = manifest.layerKinds[layer] ?? "sliding-attention";
+  const cacheLayer = manifest.layerHasKv[layer] ? layer : manifest.kvSourceLayers[layer] ?? layer;
+  const cache = requiredFullAttentionCache(state, cacheLayer);
   const tokenCount = input.length / manifest.embeddingLength;
   const tokenPositions = tokenPositionsFromMrope(positions, tokenCount);
+  for (const position of tokenPositions) {
+    if (position < 0 || position >= state.contextLength) {
+      throw new Error(`Position ${position} is outside context length ${state.contextLength}`);
+    }
+  }
+  const headSize = manifest.layerKeyLengths[layer] ?? manifest.keyLength;
+  const valueSize = manifest.layerValueLengths[layer] ?? manifest.valueLength;
+  const queryDim = manifest.headCount * headSize;
+  const valueDim = manifest.headCount * valueSize;
+  const freqFactors = await readRopeFreqFactors(session, kind);
+
   const attnNorm = await timedAsync(
     trace,
-    "full attention norm",
-    async () => rmsNormRows(
-      input,
-      await readF32ModelTensor(session, `blk.${layer}.attn_norm.weight`),
-      epsilon,
-    ),
-    { layer, layerKind: "full-attention" },
+    "attention norm",
+    async () => rmsNormRows(input, await readF32ModelTensor(session, `blk.${layer}.attn_norm.weight`), epsilon),
+    { layer, layerKind: kind },
   );
-  const fullProjectionNames = [
-    `blk.${layer}.attn_q.weight`,
-    `blk.${layer}.attn_k.weight`,
-    `blk.${layer}.attn_v.weight`,
-  ] as const;
-  const fullProjectionBatch = await timedAsync(
+  const q = await timedAsync(
     trace,
-    "full attention projection batch",
-    () => matMulQwen35WeightBatch(session, fullProjectionNames, attnNorm, trace),
-    { layer, layerKind: "full-attention" },
+    "attention projection q",
+    () => matMulGemma4Weight(session, `blk.${layer}.attn_q.weight`, attnNorm, trace),
+    { layer, layerKind: kind, weightName: `blk.${layer}.attn_q.weight` },
   );
-  const qFull = fullProjectionBatch?.[0] ?? await timedAsync(
-    trace,
-    "full attention projection q",
-    () => matMulQwen35Weight(session, fullProjectionNames[0], attnNorm, trace),
-    { layer, layerKind: "full-attention", weightName: fullProjectionNames[0] },
-  );
-  const q = sliceFullAttentionQ(qFull, manifest.headCount, manifest.keyLength, tokenCount);
-  const gate = sliceFullAttentionGate(qFull, manifest.headCount, manifest.keyLength, tokenCount);
-  const kProjection = fullProjectionBatch?.[1] ?? await timedAsync(
-    trace,
-    "full attention projection k",
-    () => matMulQwen35Weight(session, fullProjectionNames[1], attnNorm, trace),
-    { layer, layerKind: "full-attention", weightName: fullProjectionNames[1] },
-  );
-  const vProjection = fullProjectionBatch?.[2] ?? await timedAsync(
-    trace,
-    "full attention projection v",
-    () => matMulQwen35Weight(session, fullProjectionNames[2], attnNorm, trace),
-    { layer, layerKind: "full-attention", weightName: fullProjectionNames[2] },
-  );
+  if (q.length !== tokenCount * queryDim) {
+    throw new Error(`Q projection shape mismatch for layer ${layer}: ${q.length}`);
+  }
   const qNorm = await timedAsync(
     trace,
     "q norm",
-    async () => normHeads(
-      q,
-      await readF32ModelTensor(session, `blk.${layer}.attn_q_norm.weight`),
-      epsilon,
-    ),
-    { layer, layerKind: "full-attention" },
+    async () => normHeads(q, await readF32ModelTensor(session, `blk.${layer}.attn_q_norm.weight`), epsilon),
+    { layer, layerKind: kind },
   );
-  const kNorm = await timedAsync(
+  const qRope = timedSync(
     trace,
-    "k norm",
-    async () => normHeads(
-      kProjection,
-      await readF32ModelTensor(session, `blk.${layer}.attn_k_norm.weight`),
-      epsilon,
-    ),
-    { layer, layerKind: "full-attention" },
+    "RoPE q",
+    () => ropeNeox(qNorm, {
+      headSize,
+      headCount: manifest.headCount,
+      tokenCount,
+      positions: tokenPositions,
+      nDims: ropeDimensionCount(manifest, kind),
+      freqBase: ropeFreqBase(manifest, kind),
+      freqFactors,
+    }),
+    { layer, layerKind: kind },
   );
-  const ropeCommon = {
-    headSize: manifest.keyLength,
-    tokenCount,
-    positions: mropePositions(positions, tokenCount),
-    nDims: manifest.rope.dimensionCount,
-    sections: manifest.rope.dimensionSections,
-    freqBase: manifest.rope.freqBase,
-    nCtxOrig: manifest.contextLength,
-  };
-  const qRope = timedSync(trace, "RoPE q", () => ropeMultiMropeNeox(qNorm, {
-    ...ropeCommon,
-    headCount: manifest.headCount,
-  }), { layer, layerKind: "full-attention" });
-  const kRope = timedSync(trace, "RoPE k", () => ropeMultiMropeNeox(kNorm, {
-    ...ropeCommon,
-    headCount: manifest.headCountKv,
-  }), { layer, layerKind: "full-attention" });
-  timedSync(
-    trace,
-    "KV cache update",
-    () => updateFullAttentionCache(cache, kRope, vProjection, tokenPositions, manifest, state.contextLength),
-    { layer, layerKind: "full-attention" },
-  );
-  const keyValueTokenCount = Math.min(
-    state.contextLength,
-    Math.max(...Array.from(tokenPositions)) + 1,
-  );
+
+  if (manifest.layerHasKv[layer]) {
+    const [kProjection, vProjection] = await Promise.all([
+      timedAsync(
+        trace,
+        "attention projection k",
+        () => matMulGemma4Weight(session, `blk.${layer}.attn_k.weight`, attnNorm, trace),
+        { layer, layerKind: kind, weightName: `blk.${layer}.attn_k.weight` },
+      ),
+      timedAsync(
+        trace,
+        "attention projection v",
+        () => matMulGemma4Weight(session, `blk.${layer}.attn_v.weight`, attnNorm, trace),
+        { layer, layerKind: kind, weightName: `blk.${layer}.attn_v.weight` },
+      ),
+    ]);
+    const kNorm = await timedAsync(
+      trace,
+      "k norm",
+      async () => normHeads(kProjection, await readF32ModelTensor(session, `blk.${layer}.attn_k_norm.weight`), epsilon),
+      { layer, layerKind: kind },
+    );
+    const vNorm = timedSync(
+      trace,
+      "v norm",
+      () => rmsNormRowsNoWeight(vProjection, valueSize, epsilon),
+      { layer, layerKind: kind },
+    );
+    const kRope = timedSync(
+      trace,
+      "RoPE k",
+      () => ropeNeox(kNorm, {
+        headSize,
+        headCount: manifest.headCountKv,
+        tokenCount,
+        positions: tokenPositions,
+        nDims: ropeDimensionCount(manifest, kind),
+        freqBase: ropeFreqBase(manifest, kind),
+        freqFactors,
+      }),
+      { layer, layerKind: kind },
+    );
+    timedSync(
+      trace,
+      "KV cache update",
+      () => updateFullAttentionCache(cache, kRope, vNorm, tokenPositions, manifest.headCountKv, state.contextLength),
+      { layer, layerKind: kind },
+    );
+  }
+
+  const keyValueTokenCount = Math.min(state.contextLength, Math.max(...Array.from(tokenPositions)) + 1);
   const mask = timedSync(
     trace,
     "attention mask",
-    () => causalMask(tokenPositions, keyValueTokenCount),
-    { layer, layerKind: "full-attention" },
+    () => causalMask(tokenPositions, keyValueTokenCount, kind === "sliding-attention" ? manifest.slidingWindow : undefined),
+    { layer, layerKind: kind },
   );
-  const attentionOptions = {
-    headSize: manifest.keyLength,
-    queryHeadCount: manifest.headCount,
-    keyValueHeadCount: manifest.headCountKv,
-    tokenCount,
-    keyValueTokenCount,
-    scale: 1 / Math.sqrt(manifest.keyLength),
-    mask,
-    valueLayout: "dim-head-token" as const,
-    quantizeQueryForScore: "f16" as const,
-  };
   const compactValue = timedSync(
     trace,
     "value compact",
-    () => compactValueCache(cache.value, keyValueTokenCount, manifest, state.contextLength),
-    { layer, layerKind: "full-attention" },
+    () => compactValueCache(cache.value, keyValueTokenCount, manifest.headCountKv, cache.valueLength, state.contextLength),
+    { layer, layerKind: kind },
   );
   const attention = await timedAsync(
     trace,
     "GQA attention",
     async () => (await gqaAttentionWasm(
       qRope,
-      cache.key.subarray(0, keyValueTokenCount * manifest.headCountKv * manifest.keyLength),
+      cache.key.subarray(0, keyValueTokenCount * manifest.headCountKv * cache.keyLength),
       compactValue,
-      attentionOptions,
+      {
+        headSize,
+        queryHeadCount: manifest.headCount,
+        keyValueHeadCount: manifest.headCountKv,
+        tokenCount,
+        keyValueTokenCount,
+        scale: 1,
+        mask,
+        valueLayout: "dim-head-token",
+        quantizeQueryForScore: "f16",
+      },
     )) ?? gqaAttention(
       qRope,
-      cache.key.subarray(0, keyValueTokenCount * manifest.headCountKv * manifest.keyLength),
+      cache.key.subarray(0, keyValueTokenCount * manifest.headCountKv * cache.keyLength),
       compactValue,
-      attentionOptions,
+      {
+        headSize,
+        queryHeadCount: manifest.headCount,
+        keyValueHeadCount: manifest.headCountKv,
+        tokenCount,
+        keyValueTokenCount,
+        scale: 1,
+        mask,
+        valueLayout: "dim-head-token",
+        quantizeQueryForScore: "f16",
+      },
     ),
-    { layer, layerKind: "full-attention" },
+    { layer, layerKind: kind },
   );
-  const gated = timedSync(trace, "attention gate", () => {
-    const gateSigmoid = sigmoid(gate);
-    const output = new Float32Array(attention.length);
-    for (let index = 0; index < output.length; index += 1) {
-      output[index] = (attention[index] ?? 0) * (gateSigmoid[index] ?? 0);
-    }
-    return output;
-  }, { layer, layerKind: "full-attention" });
-  const output = await timedAsync(
+  if (attention.length !== tokenCount * valueDim) {
+    throw new Error(`Attention output shape mismatch for layer ${layer}: ${attention.length}`);
+  }
+  const attentionForOutput = timedSync(
     trace,
-    "full attention output projection",
-    () => matMulQwen35Weight(session, `blk.${layer}.attn_output.weight`, gated, trace),
-    { layer, layerKind: "full-attention", weightName: `blk.${layer}.attn_output.weight` },
+    "attention output f16 cast",
+    () => castF16Rows(attention),
+    { layer, layerKind: kind },
   );
-  const residual = layer === manifest.blockCount - 1
-    ? residualAdd(input, output).slice(input.length - manifest.embeddingLength)
-    : residualAdd(input, output);
-  return timedAsync(
+
+  const attentionOutput = await timedAsync(
     trace,
-    "FFN",
-    () => forwardQwen35Ffn(session, layer, residual, epsilon, trace),
-    { layer, layerKind: "full-attention" },
+    "attention output projection",
+    () => matMulGemma4Weight(session, `blk.${layer}.attn_output.weight`, attentionForOutput, trace),
+    { layer, layerKind: kind, weightName: `blk.${layer}.attn_output.weight` },
   );
+  const attentionPostNorm = await timedAsync(
+    trace,
+    "attention post norm",
+    async () => rmsNormRows(attentionOutput, await readF32ModelTensor(session, `blk.${layer}.post_attention_norm.weight`), epsilon),
+    { layer, layerKind: kind },
+  );
+  const attentionResidual = residualAdd(input, attentionPostNorm);
+  const ffn = await forwardGemma4Ffn(session, manifest, layer, attentionResidual, epsilon, trace);
+  const enriched = await applyPerLayerInput(session, manifest, layer, ffn, tokenCount, perLayerInputs, epsilon, trace);
+  const scaled = await timedAsync(
+    trace,
+    "layer output scale",
+    async () => {
+      const scale = (await readF32ModelTensor(session, `blk.${layer}.layer_output_scale.weight`))[0] ?? 1;
+      const output = new Float32Array(enriched.length);
+      for (let index = 0; index < output.length; index += 1) {
+        output[index] = Math.fround((enriched[index] ?? 0) * scale);
+      }
+      return output;
+    },
+    { layer, layerKind: kind },
+  );
+
+  return layer === manifest.blockCount - 1 && tokenCount > 1
+    ? scaled.slice(scaled.length - manifest.embeddingLength)
+    : scaled;
 }
 
-export async function forwardQwen35Output(
-  model: Qwen35ModelInput,
+export const forwardGemma4FullAttentionLayer = forwardGemma4AttentionLayer;
+
+export async function forwardGemma4Output(
+  model: Gemma4ModelInput,
   hidden: Float32Array,
   options: {
     topK?: number;
@@ -427,92 +340,183 @@ export async function forwardQwen35Output(
   const norm = await timedAsync(
     options.trace,
     "final norm",
-    async () => rmsNorm(
+    async () => rmsNormRows(
       hidden,
       await readF32ModelTensor(session, "output_norm.weight"),
       session.epsilon,
     ),
   );
+  const outputWeight = session.tensorReader.metadata.tensors.some((tensor) => tensor.name === "output.weight")
+    ? "output.weight"
+    : "token_embd.weight";
   const logits = await timedAsync(
     options.trace,
     "output logits",
-    () => matMulQwen35Weight(session, "output.weight", norm, options.trace),
-    { weightName: "output.weight" },
+    () => matMulGemma4Weight(session, outputWeight, norm, options.trace),
+    { weightName: outputWeight },
   );
+  const softcap = session.manifest.finalLogitSoftcap;
+  if (softcap !== undefined && softcap > 0) {
+    for (let index = 0; index < logits.length; index += 1) {
+      logits[index] = Math.fround(Math.tanh((logits[index] ?? 0) / softcap) * softcap);
+    }
+  }
   return {
     logits,
     topTokens: topK(logits, options.topK ?? 10),
   };
 }
 
-async function forwardQwen35Ffn(
-  session: Qwen35ModelSession,
+async function forwardGemma4Ffn(
+  session: Gemma4ModelSession,
+  manifest: Gemma4ModelManifest,
   layer: number,
   residual: Float32Array,
   epsilon: number,
   trace?: ForwardTrace,
 ): Promise<Float32Array> {
-  const postNorm = await timedAsync(
+  const ffnNorm = await timedAsync(
     trace,
-    "FFN post norm",
-    async () => rmsNormRows(
-      residual,
-      await readF32ModelTensor(session, `blk.${layer}.post_attention_norm.weight`),
-      epsilon,
-    ),
+    "FFN norm",
+    async () => rmsNormRows(residual, await readF32ModelTensor(session, `blk.${layer}.ffn_norm.weight`), epsilon),
     { layer },
   );
   const gateUpBatch = await timedAsync(
     trace,
     "FFN gate/up projection batch",
-    () => matMulQwen35WeightBatch(session, [`blk.${layer}.ffn_gate.weight`, `blk.${layer}.ffn_up.weight`], postNorm, trace),
+    () => matMulGemma4WeightBatch(session, [`blk.${layer}.ffn_gate.weight`, `blk.${layer}.ffn_up.weight`], ffnNorm, trace),
     { layer },
   );
   const gate = gateUpBatch?.[0] ?? await timedAsync(
     trace,
     "FFN gate projection",
-    () => matMulQwen35Weight(session, `blk.${layer}.ffn_gate.weight`, postNorm, trace),
+    () => matMulGemma4Weight(session, `blk.${layer}.ffn_gate.weight`, ffnNorm, trace),
     { layer, weightName: `blk.${layer}.ffn_gate.weight` },
   );
   const up = gateUpBatch?.[1] ?? await timedAsync(
     trace,
     "FFN up projection",
-    () => matMulQwen35Weight(session, `blk.${layer}.ffn_up.weight`, postNorm, trace),
+    () => matMulGemma4Weight(session, `blk.${layer}.ffn_up.weight`, ffnNorm, trace),
     { layer, weightName: `blk.${layer}.ffn_up.weight` },
   );
-  const swiglu = timedSync(trace, "FFN SwiGLU", () => {
+  const gated = timedSync(trace, "FFN GeGLU", () => {
     const output = new Float32Array(gate.length);
     for (let index = 0; index < output.length; index += 1) {
-      const gateValue = gate[index] ?? 0;
-      output[index] = (gateValue / (1 + Math.exp(-gateValue))) * (up[index] ?? 0);
+      output[index] = Math.fround(gelu(gate[index] ?? 0) * (up[index] ?? 0));
     }
     return output;
   }, { layer });
   const ffnOut = await timedAsync(
     trace,
     "FFN down projection",
-    () => matMulQwen35Weight(session, `blk.${layer}.ffn_down.weight`, swiglu, trace),
+    () => matMulGemma4Weight(session, `blk.${layer}.ffn_down.weight`, gated, trace),
     { layer, weightName: `blk.${layer}.ffn_down.weight` },
   );
-  return timedSync(trace, "FFN residual add", () => residualAdd(residual, ffnOut), { layer });
+  const postNorm = await timedAsync(
+    trace,
+    "FFN post norm",
+    async () => rmsNormRows(ffnOut, await readF32ModelTensor(session, `blk.${layer}.post_ffw_norm.weight`), epsilon),
+    { layer },
+  );
+  if (postNorm.length !== residual.length || postNorm.length % manifest.embeddingLength !== 0) {
+    throw new Error(`FFN output shape mismatch for layer ${layer}: ${postNorm.length}`);
+  }
+  return residualAdd(residual, postNorm);
+}
+
+async function applyPerLayerInput(
+  session: Gemma4ModelSession,
+  manifest: Gemma4ModelManifest,
+  layer: number,
+  input: Float32Array,
+  tokenCount: number,
+  perLayerInputs: Float32Array | undefined,
+  epsilon: number,
+  trace?: ForwardTrace,
+): Promise<Float32Array> {
+  if (manifest.perLayerEmbeddingLength <= 0 || !perLayerInputs) {
+    return input;
+  }
+  const perLayerLength = manifest.perLayerEmbeddingLength;
+  const gate = await timedAsync(
+    trace,
+    "per-layer input gate",
+    async () => {
+      const projected = await matMulGemma4Weight(session, `blk.${layer}.inp_gate.weight`, input, trace);
+      for (let index = 0; index < projected.length; index += 1) {
+        projected[index] = gelu(projected[index] ?? 0);
+      }
+      return projected;
+    },
+    { layer },
+  );
+  const mixed = timedSync(trace, "per-layer input mix", () => {
+    const output = new Float32Array(gate.length);
+    const sourceBase = layer * tokenCount * perLayerLength;
+    for (let token = 0; token < tokenCount; token += 1) {
+      for (let index = 0; index < perLayerLength; index += 1) {
+        const offset = token * perLayerLength + index;
+        output[offset] = Math.fround((gate[offset] ?? 0) * (perLayerInputs[sourceBase + offset] ?? 0));
+      }
+    }
+    return output;
+  }, { layer });
+  const projected = await timedAsync(
+    trace,
+    "per-layer output projection",
+    () => matMulGemma4Weight(session, `blk.${layer}.proj.weight`, mixed, trace),
+    { layer, weightName: `blk.${layer}.proj.weight` },
+  );
+  const norm = await timedAsync(
+    trace,
+    "per-layer post norm",
+    async () => rmsNormRows(projected, await readF32ModelTensor(session, `blk.${layer}.post_norm.weight`), epsilon),
+    { layer },
+  );
+  return residualAdd(input, norm);
 }
 
 async function readF32ModelTensor(
-  session: Qwen35ModelSession,
+  session: Gemma4ModelSession,
   name: string,
 ): Promise<Float32Array> {
   return session.readF32Tensor(name);
 }
 
-async function matMulQwen35Weight(
-  session: Qwen35ModelSession,
+async function readTensorRows(
+  session: Gemma4ModelSession,
+  tensorName: string,
+  rowIds: readonly number[],
+): Promise<Float32Array> {
+  const tensor = session.getTensor(tensorName);
+  const rowElements = tensor.dimensions[0] ?? 0;
+  const rowCount = tensor.dimensions[1] ?? 0;
+  const rowByteLength = tensorByteLength({ ...tensor, dimensions: [rowElements] });
+  const rows = new Float32Array(rowElements * rowIds.length);
+  for (let index = 0; index < rowIds.length; index += 1) {
+    const rowId = rowIds[index] ?? 0;
+    if (rowId < 0 || rowId >= rowCount) {
+      throw new Error(`${tensorName} row ${rowId} is outside ${rowCount}`);
+    }
+    const rowBytes = await session.tensorReader.readTensorRange({
+      tensor,
+      offset: BigInt(rowByteLength * rowId),
+      length: rowByteLength,
+    });
+    rows.set(dequantizeRow(tensor.type, rowBytes, rowElements), index * rowElements);
+  }
+  return rows;
+}
+
+export async function matMulGemma4Weight(
+  session: Gemma4ModelSession,
   weightName: string,
   inputColumns: Float32Array,
   trace?: ForwardTrace,
 ): Promise<Float32Array> {
   const tensor = session.getTensor(weightName);
-  if (tensor.type === "F32") {
-    return matMulF32Rows(session, weightName, inputColumns);
+  if (tensor.type === "F32" || tensor.type === "F16" || tensor.type === "BF16") {
+    return matMulDenseRows(session, weightName, inputColumns);
   }
   if (tensor.type === "Q4_K" || tensor.type === "Q5_K" || tensor.type === "Q6_K" || tensor.type === "IQ4_XS") {
     return matMulKQ8K(session, weightName, inputColumns, tensor.type, trace);
@@ -520,8 +524,8 @@ async function matMulQwen35Weight(
   throw new Error(`${weightName} has unsupported matmul type ${tensor.type}`);
 }
 
-async function matMulQwen35WeightBatch(
-  session: Qwen35ModelSession,
+async function matMulGemma4WeightBatch(
+  session: Gemma4ModelSession,
   weightNames: readonly string[],
   inputColumns: Float32Array,
   trace?: ForwardTrace,
@@ -613,13 +617,7 @@ async function matMulQwen35WeightBatch(
         outputs[index] = await timedAsync(
           trace,
           "WASM resident matmul wrapper",
-          () => matMulQuantizedWasmResident(
-            handle,
-            inputColumns,
-            inputSize,
-            handle.rowCount,
-            columnCount,
-          ),
+          () => matMulQuantizedWasmResident(handle, inputColumns, inputSize, handle.rowCount, columnCount),
         );
       }
     }
@@ -660,8 +658,8 @@ function isQuantizedMatmulWasmType(
   return type === "Q4_K" || type === "Q5_K" || type === "Q6_K" || type === "IQ4_XS" || type === "Q8_0";
 }
 
-async function matMulF32Rows(
-  session: Qwen35ModelSession,
+async function matMulDenseRows(
+  session: Gemma4ModelSession,
   weightName: string,
   inputColumns: Float32Array,
 ): Promise<Float32Array> {
@@ -669,84 +667,26 @@ async function matMulF32Rows(
   const inputSize = tensor.dimensions[0] ?? 0;
   const rowCount = tensor.dimensions[1] ?? 0;
   const columnCount = inputColumns.length / inputSize;
-  const weight = await readF32ModelTensor(session, weightName);
-  if (weight.length !== inputSize * rowCount) {
-    throw new Error(`${weightName} shape mismatch: expected ${inputSize * rowCount}, got ${weight.length}`);
-  }
-
+  const bytes = await session.readWeightBytes(weightName);
+  const rowByteLength = tensorByteLength({ ...tensor, dimensions: [inputSize] });
   const output = new Float32Array(rowCount * columnCount);
-  for (let column = 0; column < columnCount; column += 1) {
-    const inputOffset = column * inputSize;
-    const outputOffset = column * rowCount;
-    for (let row = 0; row < rowCount; row += 1) {
-      const weightOffset = row * inputSize;
+  for (let row = 0; row < rowCount; row += 1) {
+    const rowBytes = bytes.subarray(row * rowByteLength, (row + 1) * rowByteLength);
+    const weight = dequantizeRow(tensor.type, rowBytes, inputSize);
+    for (let column = 0; column < columnCount; column += 1) {
+      const inputOffset = column * inputSize;
       let sum = 0;
       for (let index = 0; index < inputSize; index += 1) {
-        sum = Math.fround(
-          sum + Math.fround((weight[weightOffset + index] ?? 0) * (inputColumns[inputOffset + index] ?? 0)),
-        );
+        sum = Math.fround(sum + Math.fround((weight[index] ?? 0) * (inputColumns[inputOffset + index] ?? 0)));
       }
-      output[outputOffset + row] = sum;
+      output[column * rowCount + row] = sum;
     }
   }
   return output;
 }
 
-async function matMulF32WeightPair(
-  session: Qwen35ModelSession,
-  leftWeightName: string,
-  rightWeightName: string,
-  inputColumns: Float32Array,
-): Promise<[Float32Array, Float32Array]> {
-  const leftTensor = session.getTensor(leftWeightName);
-  const rightTensor = session.getTensor(rightWeightName);
-  if (leftTensor.type !== "F32" || rightTensor.type !== "F32") {
-    throw new Error(`${leftWeightName} and ${rightWeightName} must both be F32`);
-  }
-  const inputSize = leftTensor.dimensions[0] ?? 0;
-  const rowCount = leftTensor.dimensions[1] ?? 0;
-  if (
-    inputSize <= 0 ||
-    rowCount <= 0 ||
-    rightTensor.dimensions[0] !== inputSize ||
-    rightTensor.dimensions[1] !== rowCount ||
-    inputColumns.length % inputSize !== 0
-  ) {
-    throw new Error(`${leftWeightName} and ${rightWeightName} shape mismatch`);
-  }
-  const columnCount = inputColumns.length / inputSize;
-  const [leftWeight, rightWeight] = await Promise.all([
-    readF32ModelTensor(session, leftWeightName),
-    readF32ModelTensor(session, rightWeightName),
-  ]);
-  const expectedLength = inputSize * rowCount;
-  if (leftWeight.length !== expectedLength || rightWeight.length !== expectedLength) {
-    throw new Error(`${leftWeightName} and ${rightWeightName} tensor length mismatch`);
-  }
-
-  const leftOutput = new Float32Array(rowCount * columnCount);
-  const rightOutput = new Float32Array(rowCount * columnCount);
-  for (let column = 0; column < columnCount; column += 1) {
-    const inputOffset = column * inputSize;
-    const outputOffset = column * rowCount;
-    for (let row = 0; row < rowCount; row += 1) {
-      const weightOffset = row * inputSize;
-      let leftSum = 0;
-      let rightSum = 0;
-      for (let index = 0; index < inputSize; index += 1) {
-        const input = inputColumns[inputOffset + index] ?? 0;
-        leftSum = Math.fround(leftSum + Math.fround((leftWeight[weightOffset + index] ?? 0) * input));
-        rightSum = Math.fround(rightSum + Math.fround((rightWeight[weightOffset + index] ?? 0) * input));
-      }
-      leftOutput[outputOffset + row] = leftSum;
-      rightOutput[outputOffset + row] = rightSum;
-    }
-  }
-  return [leftOutput, rightOutput];
-}
-
 async function matMulKQ8K(
-  session: Qwen35ModelSession,
+  session: Gemma4ModelSession,
   weightName: string,
   inputColumns: Float32Array,
   type: Extract<GgmlTypeName, "Q4_K" | "Q5_K" | "Q6_K" | "IQ4_XS">,
@@ -756,22 +696,13 @@ async function matMulKQ8K(
   const inputSize = tensor.dimensions[0] ?? 0;
   const rowCount = tensor.dimensions[1] ?? 0;
   const columnCount = inputColumns.length / inputSize;
-  const rowByteLength = tensorByteLength({
-    ...tensor,
-    dimensions: [inputSize],
-  });
+  const rowByteLength = tensorByteLength({ ...tensor, dimensions: [inputSize] });
   const shardedWasmHandle = await readWasmShardedWeightHandle(session, weightName, type, inputSize, rowCount);
   if (shardedWasmHandle) {
     const wasm = await timedAsync(
       trace,
       "WASM threaded resident matmul wrapper",
-      () => matMulWasmShardedWeightHandle(
-        shardedWasmHandle,
-        inputColumns,
-        inputSize,
-        rowCount,
-        columnCount,
-      ),
+      () => matMulWasmShardedWeightHandle(shardedWasmHandle, inputColumns, inputSize, rowCount, columnCount),
       { weightName },
     );
     if (wasm) {
@@ -783,13 +714,7 @@ async function matMulKQ8K(
     const wasm = await timedAsync(
       trace,
       "WASM resident matmul wrapper",
-      () => matMulQuantizedWasmResident(
-        wasmHandle,
-        inputColumns,
-        inputSize,
-        rowCount,
-        columnCount,
-      ),
+      () => matMulQuantizedWasmResident(wasmHandle, inputColumns, inputSize, rowCount, columnCount),
       { weightName },
     );
     if (wasm) {
@@ -800,14 +725,7 @@ async function matMulKQ8K(
   const wasm = await timedAsync(
     trace,
     "WASM matmul wrapper",
-    () => matMulQuantizedWasm(
-      type,
-      weightBytes,
-      inputColumns,
-      inputSize,
-      rowCount,
-      columnCount,
-    ),
+    () => matMulQuantizedWasm(type, weightBytes, inputColumns, inputSize, rowCount, columnCount),
     { weightName },
   );
   if (wasm) {
@@ -818,8 +736,7 @@ async function matMulKQ8K(
   for (let column = 0; column < columnCount; column += 1) {
     const q8 = quantizeQ8_K(inputColumns.slice(column * inputSize, (column + 1) * inputSize));
     for (let row = 0; row < rowCount; row += 1) {
-      const rowOffset = row * rowByteLength;
-      const rowBytes = weightBytes.subarray(rowOffset, rowOffset + rowByteLength);
+      const rowBytes = weightBytes.subarray(row * rowByteLength, (row + 1) * rowByteLength);
       if (type === "Q4_K") {
         output[column * rowCount + row] = vecDotQ4_K_Q8_K(rowBytes, q8);
       } else if (type === "Q5_K") {
@@ -836,7 +753,7 @@ async function matMulKQ8K(
 }
 
 async function matMulQ8_0Weight(
-  session: Qwen35ModelSession,
+  session: Gemma4ModelSession,
   weightName: string,
   inputColumns: Float32Array,
   trace?: ForwardTrace,
@@ -848,76 +765,27 @@ async function matMulQ8_0Weight(
   const inputSize = tensor.dimensions[0] ?? 0;
   const rowCount = tensor.dimensions[1] ?? 0;
   const columnCount = inputColumns.length / inputSize;
-  const rowByteLength = tensorByteLength({
-    ...tensor,
-    dimensions: [inputSize],
-  });
-  const shardedWasmHandle = await readWasmShardedWeightHandle(session, weightName, "Q8_0", inputSize, rowCount);
-  if (shardedWasmHandle) {
-    const wasm = await timedAsync(
-      trace,
-      "WASM threaded resident matmul wrapper",
-      () => matMulWasmShardedWeightHandle(
-        shardedWasmHandle,
-        inputColumns,
-        inputSize,
-        rowCount,
-        columnCount,
-      ),
-      { weightName },
-    );
-    if (wasm) {
-      return wasm;
-    }
-  }
-  const wasmHandle = await readWasmWeightHandle(session, weightName, "Q8_0", inputSize, rowCount);
-  if (wasmHandle) {
-    const wasm = await timedAsync(
-      trace,
-      "WASM resident matmul wrapper",
-      () => matMulQuantizedWasmResident(
-        wasmHandle,
-        inputColumns,
-        inputSize,
-        rowCount,
-        columnCount,
-      ),
-      { weightName },
-    );
-    if (wasm) {
-      return wasm;
-    }
-  }
+  const rowByteLength = tensorByteLength({ ...tensor, dimensions: [inputSize] });
   const weightBytes = await session.readWeightBytes(weightName);
   const wasm = await timedAsync(
     trace,
     "WASM matmul wrapper",
-    () => matMulQuantizedWasm(
-      "Q8_0",
-      weightBytes,
-      inputColumns,
-      inputSize,
-      rowCount,
-      columnCount,
-    ),
+    () => matMulQuantizedWasm("Q8_0", weightBytes, inputColumns, inputSize, rowCount, columnCount),
     { weightName },
   );
   if (wasm) {
     return wasm;
   }
   const output = new Float32Array(rowCount * columnCount);
-
   for (let column = 0; column < columnCount; column += 1) {
     const q8 = quantizeQ8_0(inputColumns.slice(column * inputSize, (column + 1) * inputSize));
     for (let row = 0; row < rowCount; row += 1) {
-      const rowOffset = row * rowByteLength;
       output[column * rowCount + row] = vecDotQ8_0_Q8_0(
-        weightBytes.subarray(rowOffset, rowOffset + rowByteLength),
+        weightBytes.subarray(row * rowByteLength, (row + 1) * rowByteLength),
         q8,
       );
     }
   }
-
   return output;
 }
 
@@ -926,6 +794,23 @@ function rmsNormRows(input: Float32Array, weight: Float32Array, epsilon: number)
   for (let row = 0; row < input.length / weight.length; row += 1) {
     const offset = row * weight.length;
     output.set(rmsNorm(input.slice(offset, offset + weight.length), weight, epsilon), offset);
+  }
+  return output;
+}
+
+function rmsNormRowsNoWeight(input: Float32Array, rowSize: number, epsilon: number): Float32Array {
+  const output = new Float32Array(input.length);
+  for (let row = 0; row < input.length / rowSize; row += 1) {
+    const offset = row * rowSize;
+    let sumSquares = 0;
+    for (let index = 0; index < rowSize; index += 1) {
+      const value = input[offset + index] ?? 0;
+      sumSquares += value * value;
+    }
+    const scale = 1 / Math.sqrt(sumSquares / rowSize + epsilon);
+    for (let index = 0; index < rowSize; index += 1) {
+      output[offset + index] = Math.fround((input[offset + index] ?? 0) * scale);
+    }
   }
   return output;
 }
@@ -941,125 +826,6 @@ function residualAdd(left: Float32Array, right: Float32Array): Float32Array {
   return output;
 }
 
-function composeConvInput(
-  convState: Float32Array,
-  qkv: Float32Array,
-  channelCount: number,
-  tokenCount: number,
-  kernelSize: number,
-): Float32Array {
-  const history = kernelSize - 1;
-  const inputWindow = history + tokenCount;
-  if (convState.length !== history * channelCount) {
-    throw new Error(`Conv state shape mismatch: ${convState.length}`);
-  }
-  if (qkv.length !== tokenCount * channelCount) {
-    throw new Error(`Conv QKV shape mismatch: ${qkv.length}`);
-  }
-  const output = new Float32Array(channelCount * inputWindow);
-  for (let channel = 0; channel < channelCount; channel += 1) {
-    const outputOffset = channel * inputWindow;
-    const stateOffset = channel * history;
-    for (let index = 0; index < history; index += 1) {
-      output[outputOffset + index] = convState[stateOffset + index] ?? 0;
-    }
-    for (let token = 0; token < tokenCount; token += 1) {
-      output[outputOffset + history + token] = qkv[token * channelCount + channel] ?? 0;
-    }
-  }
-  return output;
-}
-
-function updateConvState(
-  cache: Qwen35RecurrentCache,
-  convInput: Float32Array,
-  channelCount: number,
-  tokenCount: number,
-  kernelSize: number,
-): void {
-  const history = kernelSize - 1;
-  const inputWindow = history + tokenCount;
-  for (let channel = 0; channel < channelCount; channel += 1) {
-    const source = channel * inputWindow + tokenCount;
-    const target = channel * history;
-    cache.conv.set(convInput.subarray(source, source + history), target);
-  }
-}
-
-function sliceConvChannels(
-  conv: Float32Array,
-  channelCount: number,
-  tokenCount: number,
-  channelOffset: number,
-  length: number,
-): Float32Array {
-  const output = new Float32Array(length * tokenCount);
-  for (let token = 0; token < tokenCount; token += 1) {
-    output.set(
-      conv.slice(token * channelCount + channelOffset, token * channelCount + channelOffset + length),
-      token * length,
-    );
-  }
-  return output;
-}
-
-function recurrentDeltaGate(alpha: Float32Array, dtBias: Float32Array, ssmA: Float32Array): Float32Array {
-  const alphaBiased = new Float32Array(alpha.length);
-  for (let token = 0; token < alpha.length / dtBias.length; token += 1) {
-    for (let index = 0; index < dtBias.length; index += 1) {
-      alphaBiased[token * dtBias.length + index] =
-        (alpha[token * dtBias.length + index] ?? 0) + (dtBias[index] ?? 0);
-    }
-  }
-  const alphaSoftplus = softplus(alphaBiased);
-  const gate = new Float32Array(alpha.length);
-  for (let token = 0; token < alphaSoftplus.length / ssmA.length; token += 1) {
-    for (let index = 0; index < ssmA.length; index += 1) {
-      gate[token * ssmA.length + index] =
-        (alphaSoftplus[token * ssmA.length + index] ?? 0) * (ssmA[index] ?? 0);
-    }
-  }
-  return gate;
-}
-
-function sliceFullAttentionQ(
-  qFull: Float32Array,
-  headCount: number,
-  headSize: number,
-  tokenCount: number,
-): Float32Array {
-  const rowSize = headCount * headSize * 2;
-  const qSize = headCount * headSize;
-  const output = new Float32Array(qSize * tokenCount);
-  for (let token = 0; token < tokenCount; token += 1) {
-    for (let head = 0; head < headCount; head += 1) {
-      const source = token * rowSize + head * headSize * 2;
-      const target = token * qSize + head * headSize;
-      output.set(qFull.slice(source, source + headSize), target);
-    }
-  }
-  return output;
-}
-
-function sliceFullAttentionGate(
-  qFull: Float32Array,
-  headCount: number,
-  headSize: number,
-  tokenCount: number,
-): Float32Array {
-  const rowSize = headCount * headSize * 2;
-  const gateSize = headCount * headSize;
-  const output = new Float32Array(gateSize * tokenCount);
-  for (let token = 0; token < tokenCount; token += 1) {
-    for (let head = 0; head < headCount; head += 1) {
-      const source = token * rowSize + head * headSize * 2 + headSize;
-      const target = token * gateSize + head * headSize;
-      output.set(qFull.slice(source, source + headSize), target);
-    }
-  }
-  return output;
-}
-
 function normHeads(input: Float32Array, weight: Float32Array, epsilon: number): Float32Array {
   const output = new Float32Array(input.length);
   for (let row = 0; row < input.length / weight.length; row += 1) {
@@ -1070,11 +836,11 @@ function normHeads(input: Float32Array, weight: Float32Array, epsilon: number): 
 }
 
 function updateFullAttentionCache(
-  cache: Qwen35FullAttentionCache,
+  cache: Gemma4FullAttentionCache,
   key: Float32Array,
   value: Float32Array,
   positions: Int32Array,
-  manifest: Qwen35ModelManifest,
+  headCountKv: number,
   contextLength: number,
 ): void {
   const tokenCount = positions.length;
@@ -1083,39 +849,28 @@ function updateFullAttentionCache(
     if (position < 0 || position >= contextLength) {
       throw new Error(`Position ${position} is outside context length ${contextLength}`);
     }
-    for (let head = 0; head < manifest.headCountKv; head += 1) {
-      for (let dim = 0; dim < manifest.keyLength; dim += 1) {
-        const currentOffset = (token * manifest.headCountKv + head) * manifest.keyLength + dim;
-        cache.key[(position * manifest.headCountKv + head) * manifest.keyLength + dim] =
-          key[currentOffset] ?? 0;
-        cache.value[(dim * manifest.headCountKv + head) * contextLength + position] =
-          value[currentOffset] ?? 0;
+    for (let head = 0; head < headCountKv; head += 1) {
+      for (let dim = 0; dim < cache.keyLength; dim += 1) {
+        cache.key[(position * headCountKv + head) * cache.keyLength + dim] =
+          key[(token * headCountKv + head) * cache.keyLength + dim] ?? 0;
+      }
+      for (let dim = 0; dim < cache.valueLength; dim += 1) {
+        cache.value[(dim * headCountKv + head) * contextLength + position] =
+          value[(token * headCountKv + head) * cache.valueLength + dim] ?? 0;
       }
     }
   }
 }
 
-function causalMask(positions: Int32Array, keyValueTokenCount: number): Float32Array {
+function causalMask(positions: Int32Array, keyValueTokenCount: number, slidingWindow?: number): Float32Array {
   const output = new Float32Array(positions.length * keyValueTokenCount);
   for (let token = 0; token < positions.length; token += 1) {
     const position = positions[token] ?? 0;
+    const minPosition = slidingWindow === undefined ? 0 : Math.max(0, position - slidingWindow + 1);
     for (let keyToken = 0; keyToken < keyValueTokenCount; keyToken += 1) {
-      output[token * keyValueTokenCount + keyToken] = keyToken <= position ? 0 : -Infinity;
+      output[token * keyValueTokenCount + keyToken] =
+        keyToken <= position && keyToken >= minPosition ? 0 : -Infinity;
     }
-  }
-  return output;
-}
-
-function mropePositions(positions: Int32Array, tokenCount: number): Int32Array {
-  if (positions.length === tokenCount * 4) {
-    return positions;
-  }
-  if (positions.length !== tokenCount) {
-    throw new Error(`Expected ${tokenCount} or ${tokenCount * 4} positions, got ${positions.length}`);
-  }
-  const output = new Int32Array(tokenCount * 4);
-  for (let section = 0; section < 4; section += 1) {
-    output.set(positions, section * tokenCount);
   }
   return output;
 }
@@ -1133,17 +888,114 @@ function tokenPositionsFromMrope(positions: Int32Array, tokenCount: number): Int
 function compactValueCache(
   value: Float32Array,
   keyValueTokenCount: number,
-  manifest: Qwen35ModelManifest,
+  headCountKv: number,
+  valueSize: number,
   contextLength: number,
 ): Float32Array {
-  const output = new Float32Array(manifest.keyLength * manifest.headCountKv * keyValueTokenCount);
-  for (let dim = 0; dim < manifest.keyLength; dim += 1) {
-    for (let head = 0; head < manifest.headCountKv; head += 1) {
+  const output = new Float32Array(valueSize * headCountKv * keyValueTokenCount);
+  for (let dim = 0; dim < valueSize; dim += 1) {
+    for (let head = 0; head < headCountKv; head += 1) {
       for (let token = 0; token < keyValueTokenCount; token += 1) {
-        output[(dim * manifest.headCountKv + head) * keyValueTokenCount + token] =
-          value[(dim * manifest.headCountKv + head) * contextLength + token] ?? 0;
+        output[(dim * headCountKv + head) * keyValueTokenCount + token] =
+          value[(dim * headCountKv + head) * contextLength + token] ?? 0;
       }
     }
   }
   return output;
+}
+
+function castF16Rows(input: Float32Array): Float32Array {
+  const output = new Float32Array(input.length);
+  for (let index = 0; index < input.length; index += 1) {
+    output[index] = float16ToFloat32(float32ToFloat16(input[index] ?? 0));
+  }
+  return output;
+}
+
+function ropeNeox(
+  input: Float32Array,
+  options: {
+    headSize: number;
+    headCount: number;
+    tokenCount: number;
+    positions: Int32Array;
+    nDims: number;
+    freqBase: number;
+    freqFactors?: Float32Array;
+  },
+): Float32Array {
+  const { headSize, headCount, tokenCount, positions, nDims, freqBase, freqFactors } = options;
+  if (input.length !== headSize * headCount * tokenCount) {
+    throw new Error(`RoPE input shape mismatch: ${input.length}`);
+  }
+  if (nDims > headSize || nDims % 2 !== 0) {
+    throw new Error(`Invalid RoPE dimension count: ${nDims}`);
+  }
+  if (freqFactors && freqFactors.length < nDims / 2) {
+    throw new Error(`RoPE freq_factors length mismatch: ${freqFactors.length} < ${nDims / 2}`);
+  }
+  const output = new Float32Array(input);
+  const thetaScale = Math.pow(freqBase, -2 / nDims);
+  for (let token = 0; token < tokenCount; token += 1) {
+    const position = positions[token] ?? 0;
+    for (let head = 0; head < headCount; head += 1) {
+      const rowOffset = (token * headCount + head) * headSize;
+      let theta = position;
+      for (let i0 = 0; i0 < nDims; i0 += 2) {
+        const index = i0 / 2;
+        const x0 = input[rowOffset + index] ?? 0;
+        const x1 = input[rowOffset + nDims / 2 + index] ?? 0;
+        const thetaWithFactor = theta / (freqFactors?.[index] ?? 1);
+        const cosTheta = Math.cos(thetaWithFactor);
+        const sinTheta = Math.sin(thetaWithFactor);
+        output[rowOffset + index] = Math.fround(Math.fround(x0 * cosTheta) - Math.fround(x1 * sinTheta));
+        output[rowOffset + nDims / 2 + index] = Math.fround(Math.fround(x0 * sinTheta) + Math.fround(x1 * cosTheta));
+        theta = Math.fround(theta * thetaScale);
+      }
+    }
+  }
+  return output;
+}
+
+function ropeDimensionCount(manifest: Gemma4ModelManifest, kind: Gemma4LayerKind): number {
+  return kind === "sliding-attention"
+    ? manifest.rope.slidingDimensionCount
+    : manifest.rope.fullDimensionCount;
+}
+
+function ropeFreqBase(manifest: Gemma4ModelManifest, kind: Gemma4LayerKind): number {
+  return kind === "sliding-attention"
+    ? manifest.rope.slidingFreqBase
+    : manifest.rope.fullFreqBase;
+}
+
+async function readRopeFreqFactors(session: Gemma4ModelSession, kind: Gemma4LayerKind): Promise<Float32Array | undefined> {
+  if (kind === "sliding-attention") {
+    return undefined;
+  }
+  try {
+    const tensor = session.getTensor("rope_freqs.weight");
+    if (tensor.type !== "F32") {
+      return undefined;
+    }
+  } catch {
+    return undefined;
+  }
+  return session.readF32Tensor("rope_freqs.weight");
+}
+
+function gelu(value: number): number {
+  if (value <= -10) {
+    return 0;
+  }
+  if (value >= 10) {
+    return value;
+  }
+  const x = float16ToFloat32(float32ToFloat16(value));
+  const inner = Math.fround(
+    Math.fround(Math.sqrt(2 / Math.PI) * x) *
+      Math.fround(1 + Math.fround(0.044715 * Math.fround(x * x))),
+  );
+  const activated = Math.fround(Math.fround(0.5 * x) * Math.fround(1 + Math.tanh(inner)));
+  return float16ToFloat32(float32ToFloat16(activated));
 }

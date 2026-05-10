@@ -5,41 +5,47 @@ import {
   getMetadataString,
 } from "./gguf";
 
-export type Qwen35Tokenizer = {
+export type Gemma4Tokenizer = {
   bosTokenId?: number;
   eosTokenId?: number;
-  tokenize(input: string): number[];
+  tokenize(input: string, options?: { addBos?: boolean }): number[];
   detokenize(tokenIds: readonly number[]): string;
   idToToken(id: number): string | undefined;
   tokenToId(token: string): number | undefined;
 };
 
-const QWEN35_PATTERN =
+const GEMMA4_PATTERN =
   /(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+/gu;
 
-export function buildQwen35Tokenizer(gguf: GgufMetadata): Qwen35Tokenizer {
+const GEMMA4_SPM_BPE_PATTERN = /[^\n]+|\n+/gu;
+
+type Gemma4TokenizerKind = "gpt2-byte-bpe" | "gemma4-spm-bpe";
+
+export function buildGemma4Tokenizer(gguf: GgufMetadata): Gemma4Tokenizer {
   const model = getMetadataString(gguf.metadata, "tokenizer.ggml.model");
   const pre = getMetadataString(gguf.metadata, "tokenizer.ggml.pre");
   const addBos = gguf.metadata["tokenizer.ggml.add_bos_token"] === true;
   const bosId = getMetadataNumber(gguf.metadata, "tokenizer.ggml.bos_token_id");
   const eosId = getMetadataNumber(gguf.metadata, "tokenizer.ggml.eos_token_id");
 
-  if (model !== "gpt2" || pre !== "qwen35") {
+  const tokenizerKind = gemma4TokenizerKind(model, pre);
+  if (!tokenizerKind) {
     throw new Error(`Unsupported tokenizer metadata: model=${model ?? "missing"} pre=${pre ?? "missing"}`);
   }
 
   const tokens = requiredStringArray(gguf.metadata["tokenizer.ggml.tokens"], "tokenizer.ggml.tokens");
   const merges = requiredStringArray(gguf.metadata["tokenizer.ggml.merges"], "tokenizer.ggml.merges");
+  const tokenTypes = optionalNumberArray(gguf.metadata["tokenizer.ggml.token_type"]);
   const tokenToId = new Map(tokens.map((token, index) => [token, index]));
   const specialTokens = tokens
-    .filter((token) => token.startsWith("<|") && token.endsWith("|>"))
+    .filter((token, index) => isSpecialToken(token, tokenTypes?.[index]))
     .sort((left, right) => right.length - left.length);
   const ranks = new Map<string, number>();
 
   merges.forEach((merge, index) => {
-    const split = merge.split(" ");
-    if (split.length === 2) {
-      ranks.set(pairKey(split[0] ?? "", split[1] ?? ""), index);
+    const pair = parseMerge(merge, tokenizerKind);
+    if (pair) {
+      ranks.set(pairKey(pair[0], pair[1]), index);
     }
   });
 
@@ -49,16 +55,20 @@ export function buildQwen35Tokenizer(gguf: GgufMetadata): Qwen35Tokenizer {
   return {
     bosTokenId: bosId,
     eosTokenId: eosId,
-    tokenize(input) {
+    tokenize(input, options = {}) {
       const ids: number[] = [];
-      if (addBos) {
+      if (options.addBos ?? addBos) {
         if (bosId === undefined) {
           throw new Error("tokenizer.ggml.add_bos_token is true but bos id is missing");
         }
         ids.push(bosId);
       }
 
-      ids.push(...tokenizeText(input, tokenToId, ranks, byteEncoder, specialTokens));
+      ids.push(...(
+        tokenizerKind === "gemma4-spm-bpe"
+          ? tokenizeGemma4SpmBpeText(input, tokenToId, ranks, specialTokens)
+          : tokenizeGpt2ByteBpeText(input, tokenToId, ranks, byteEncoder, specialTokens)
+      ));
 
       return ids;
     },
@@ -78,19 +88,27 @@ export function buildQwen35Tokenizer(gguf: GgufMetadata): Qwen35Tokenizer {
         if (token === undefined) {
           throw new Error(`Unknown token id: ${id}`);
         }
-        if (isSpecialToken(token)) {
+        if (isSpecialToken(token, tokenTypes?.[id])) {
           flushBytes();
           output.push(token);
           continue;
         }
-        for (const char of Array.from(token)) {
-          const byte = byteDecoder.get(char);
-          if (byte === undefined) {
-            flushBytes();
-            output.push(char);
-          } else {
-            pendingBytes.push(byte);
+        const fallbackByte = tokenizerKind === "gemma4-spm-bpe" ? byteFallbackValue(token) : undefined;
+        if (fallbackByte !== undefined) {
+          pendingBytes.push(fallbackByte);
+          continue;
+        }
+        const text = tokenizerKind === "gemma4-spm-bpe" ? token.replaceAll("▁", " ") : token;
+        for (const char of Array.from(text)) {
+          if (tokenizerKind === "gpt2-byte-bpe") {
+            const byte = byteDecoder.get(char);
+            if (byte !== undefined) {
+              pendingBytes.push(byte);
+              continue;
+            }
           }
+          flushBytes();
+          output.push(char);
         }
       }
       flushBytes();
@@ -105,7 +123,25 @@ export function buildQwen35Tokenizer(gguf: GgufMetadata): Qwen35Tokenizer {
   };
 }
 
-function tokenizeText(
+function gemma4TokenizerKind(model: string | undefined, pre: string | undefined): Gemma4TokenizerKind | undefined {
+  if (model === "gpt2" && pre === "gemma4") {
+    return "gpt2-byte-bpe";
+  }
+  if (model === "gemma4" && pre === undefined) {
+    return "gemma4-spm-bpe";
+  }
+  return undefined;
+}
+
+function parseMerge(merge: string, tokenizerKind: Gemma4TokenizerKind): [string, string] | undefined {
+  const separatorIndex = tokenizerKind === "gemma4-spm-bpe" ? merge.indexOf(" ", 1) : merge.indexOf(" ");
+  if (separatorIndex < 0) {
+    return undefined;
+  }
+  return [merge.slice(0, separatorIndex), merge.slice(separatorIndex + 1)];
+}
+
+function tokenizeGpt2ByteBpeText(
   input: string,
   tokenToId: Map<string, number>,
   ranks: Map<string, number>,
@@ -136,7 +172,7 @@ function tokenizeText(
     }
 
     const chunk = input.slice(offset, nextSpecial);
-    for (const piece of chunk.match(QWEN35_PATTERN) ?? []) {
+    for (const piece of chunk.match(GEMMA4_PATTERN) ?? []) {
       const encoded = Array.from(new TextEncoder().encode(piece), (byte) => byteEncoder[byte]).join("");
       for (const token of applyBpe(encoded, ranks)) {
         const id = tokenToId.get(token);
@@ -149,6 +185,68 @@ function tokenizeText(
     offset = nextSpecial;
   }
 
+  return ids;
+}
+
+function tokenizeGemma4SpmBpeText(
+  input: string,
+  tokenToId: Map<string, number>,
+  ranks: Map<string, number>,
+  specialTokens: readonly string[],
+): number[] {
+  const ids: number[] = [];
+  let offset = 0;
+
+  while (offset < input.length) {
+    const special = specialTokens.find((token) => input.startsWith(token, offset));
+    if (special) {
+      const id = tokenToId.get(special);
+      if (id === undefined) {
+        throw new Error(`Unknown special token: ${special}`);
+      }
+      ids.push(id);
+      offset += special.length;
+      continue;
+    }
+
+    let nextSpecial = input.length;
+    for (const token of specialTokens) {
+      const index = input.indexOf(token, offset);
+      if (index >= 0 && index < nextSpecial) {
+        nextSpecial = index;
+      }
+    }
+
+    const chunk = input.slice(offset, nextSpecial).replaceAll(" ", "▁");
+    for (const piece of chunk.match(GEMMA4_SPM_BPE_PATTERN) ?? []) {
+      const tokens = piece.indexOf("\n") >= 0 && piece.replaceAll("\n", "") === "" && tokenToId.has(piece)
+        ? [piece]
+        : applyBpe(Array.from(piece).join(""), ranks);
+      for (const token of tokens) {
+        const id = tokenToId.get(token);
+        if (id !== undefined) {
+          ids.push(id);
+          continue;
+        }
+        ids.push(...byteFallbackTokenIds(token, tokenToId));
+      }
+    }
+    offset = nextSpecial;
+  }
+
+  return ids;
+}
+
+function byteFallbackTokenIds(token: string, tokenToId: Map<string, number>): number[] {
+  const ids: number[] = [];
+  for (const byte of new TextEncoder().encode(token)) {
+    const fallbackToken = `<0x${byte.toString(16).toUpperCase().padStart(2, "0")}>`;
+    const id = tokenToId.get(fallbackToken);
+    if (id === undefined) {
+      throw new Error(`BPE produced unknown token and byte fallback is missing: ${token}`);
+    }
+    ids.push(id);
+  }
   return ids;
 }
 
@@ -200,12 +298,36 @@ function requiredStringArray(value: GgufMetadataValue | undefined, key: string):
   return strings;
 }
 
+function optionalNumberArray(value: GgufMetadataValue | undefined): number[] | undefined {
+  if (
+    typeof value !== "object" ||
+    value === null ||
+    !("sample" in value) ||
+    value.truncated ||
+    value.sample.length !== value.length
+  ) {
+    return undefined;
+  }
+
+  const numbers = value.sample.filter((item): item is number => typeof item === "number");
+  return numbers.length === value.length ? numbers : undefined;
+}
+
 function pairKey(left: string, right: string): string {
   return `${left}\u0000${right}`;
 }
 
-function isSpecialToken(token: string): boolean {
-  return token.startsWith("<|") && token.endsWith("|>");
+function isSpecialToken(token: string, tokenType?: number): boolean {
+  if (tokenType !== undefined) {
+    return (tokenType === 3 || tokenType === 4) && byteFallbackValue(token) === undefined;
+  }
+  return ((token.startsWith("<") && token.endsWith(">")) || (token.startsWith("[") && token.endsWith("]"))) &&
+    byteFallbackValue(token) === undefined;
+}
+
+function byteFallbackValue(token: string): number | undefined {
+  const match = /^<0x([0-9A-Fa-f]{2})>$/.exec(token);
+  return match ? Number.parseInt(match[1] ?? "0", 16) : undefined;
 }
 
 function buildByteEncoder(): string[] {

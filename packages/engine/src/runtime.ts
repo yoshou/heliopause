@@ -9,24 +9,20 @@ import {
   tensorByteLength,
 } from "./tensor-reader";
 import {
-  buildQwen35Manifest,
-  type Qwen35LayerKind,
-  type Qwen35ModelManifest,
+  buildGemma4Manifest,
+  type Gemma4LayerKind,
+  type Gemma4ModelManifest,
 } from "./model";
 
-export type Qwen35FullAttentionCache = {
+export type Gemma4FullAttentionCache = {
   key: Float32Array;
   value: Float32Array;
+  keyLength: number;
+  valueLength: number;
 };
 
-export type Qwen35RecurrentCache = {
-  conv: Float32Array;
-  state: Float32Array;
-};
-
-export type Qwen35InferenceState = {
-  recurrent: Map<number, Qwen35RecurrentCache>;
-  fullAttention: Map<number, Qwen35FullAttentionCache>;
+export type Gemma4InferenceState = {
+  fullAttention: Map<number, Gemma4FullAttentionCache>;
   contextLength: number;
   nextPosition: number;
 };
@@ -36,7 +32,7 @@ export type OutputResult = {
   topTokens: Array<{ id: number; value: number }>;
 };
 
-export type Qwen35ModelSessionOptions = {
+export type Gemma4ModelSessionOptions = {
   maxContextLength?: number;
   maxWeightCacheBytes?: number;
   executionProviders?: readonly ExecutionProviderConfig[];
@@ -54,7 +50,7 @@ export type TimingEvent = {
   section: string;
   durationMs: number;
   layer?: number;
-  layerKind?: Qwen35LayerKind;
+  layerKind?: Gemma4LayerKind;
   weightName?: string;
   tokenIndex?: number;
 };
@@ -80,9 +76,9 @@ export type CacheStats = {
 
 export type ExecutionProviderStats = Record<string, number | boolean | string>;
 
-export class Qwen35ModelSession {
+export class Gemma4ModelSession {
   readonly tensorReader: GgufTensorReader;
-  readonly manifest: Qwen35ModelManifest;
+  readonly manifest: Gemma4ModelManifest;
   readonly epsilon: number;
 
   private readonly maxContextLength?: number;
@@ -99,13 +95,13 @@ export class Qwen35ModelSession {
 
   constructor(
     tensorReader: GgufTensorReader,
-    options: Qwen35ModelSessionOptions = {},
+    options: Gemma4ModelSessionOptions = {},
   ) {
     this.tensorReader = tensorReader;
-    this.manifest = buildQwen35Manifest(tensorReader.metadata);
+    this.manifest = buildGemma4Manifest(tensorReader.metadata);
     this.epsilon = requiredMetadataNumber(
       tensorReader,
-      "qwen35.attention.layer_norm_rms_epsilon",
+      "gemma4.attention.layer_norm_rms_epsilon",
     );
     this.maxContextLength = options.maxContextLength;
     this.maxWeightCacheBytes = options.maxWeightCacheBytes ?? 256 * 1024 * 1024;
@@ -115,8 +111,8 @@ export class Qwen35ModelSession {
     }));
   }
 
-  createInferenceState(): Qwen35InferenceState {
-    return createQwen35InferenceState(this.manifest, {
+  createInferenceState(): Gemma4InferenceState {
+    return createGemma4InferenceState(this.manifest, {
       contextLength: this.maxContextLength === undefined
         ? this.manifest.contextLength
         : Math.min(this.manifest.contextLength, this.maxContextLength),
@@ -239,76 +235,61 @@ export function estimateWeightCacheBytes(tensorReader: GgufTensorReader): number
   return total;
 }
 
-export function createQwen35ModelSession(
+export function createGemma4ModelSession(
   tensorReader: GgufTensorReader,
-  options: Qwen35ModelSessionOptions = {},
-): Qwen35ModelSession {
-  return new Qwen35ModelSession(tensorReader, options);
+  options: Gemma4ModelSessionOptions = {},
+): Gemma4ModelSession {
+  return new Gemma4ModelSession(tensorReader, options);
 }
 
-export type Qwen35ModelInput = GgufTensorReader | Qwen35ModelSession;
+export type Gemma4ModelInput = GgufTensorReader | Gemma4ModelSession;
 
-export function createQwen35InferenceState(
-  manifest: Qwen35ModelManifest,
+export function createGemma4InferenceState(
+  manifest: Gemma4ModelManifest,
   options: { contextLength?: number } = {},
-): Qwen35InferenceState {
-  const recurrent = new Map<number, Qwen35RecurrentCache>();
-  const fullAttention = new Map<number, Qwen35FullAttentionCache>();
+): Gemma4InferenceState {
+  const fullAttention = new Map<number, Gemma4FullAttentionCache>();
   const contextLength = options.contextLength ?? manifest.contextLength;
-  const convDim =
-    manifest.ssm.stateSize * manifest.ssm.groupCount * 2 +
-    manifest.ssm.stateSize * manifest.ssm.timeStepRank;
-  const recurrentStateSize =
-    manifest.ssm.stateSize * manifest.ssm.stateSize * manifest.ssm.timeStepRank;
-  const fullCacheSize = contextLength * manifest.headCountKv * manifest.keyLength;
-
-  for (const layer of manifest.recurrentLayers) {
-    recurrent.set(layer, {
-      conv: new Float32Array((manifest.ssm.convKernel - 1) * convDim),
-      state: new Float32Array(recurrentStateSize),
-    });
-  }
-
-  for (const layer of manifest.fullAttentionLayers) {
+  for (let layer = 0; layer < manifest.blockCount; layer += 1) {
+    if (!manifest.layerHasKv[layer]) {
+      continue;
+    }
+    const keyLength = manifest.layerKeyLengths[layer] ?? manifest.keyLength;
+    const valueLength = manifest.layerValueLengths[layer] ?? manifest.valueLength;
     fullAttention.set(layer, {
-      key: new Float32Array(fullCacheSize),
-      value: new Float32Array(fullCacheSize),
+      key: new Float32Array(contextLength * manifest.headCountKv * keyLength),
+      value: new Float32Array(contextLength * manifest.headCountKv * valueLength),
+      keyLength,
+      valueLength,
     });
   }
 
-  return { recurrent, fullAttention, contextLength, nextPosition: 0 };
+  return { fullAttention, contextLength, nextPosition: 0 };
 }
 
-export function cloneQwen35InferenceState(state: Qwen35InferenceState): Qwen35InferenceState {
-  const recurrent = new Map<number, Qwen35RecurrentCache>();
-  const fullAttention = new Map<number, Qwen35FullAttentionCache>();
-
-  for (const [layer, cache] of state.recurrent) {
-    recurrent.set(layer, {
-      conv: cache.conv.slice(),
-      state: cache.state.slice(),
-    });
-  }
+export function cloneGemma4InferenceState(state: Gemma4InferenceState): Gemma4InferenceState {
+  const fullAttention = new Map<number, Gemma4FullAttentionCache>();
 
   for (const [layer, cache] of state.fullAttention) {
     fullAttention.set(layer, {
       key: cache.key.slice(),
       value: cache.value.slice(),
+      keyLength: cache.keyLength,
+      valueLength: cache.valueLength,
     });
   }
 
   return {
-    recurrent,
     fullAttention,
     contextLength: state.contextLength,
     nextPosition: state.nextPosition,
   };
 }
 
-export function modelSession(model: Qwen35ModelInput): Qwen35ModelSession {
-  return model instanceof Qwen35ModelSession
+export function modelSession(model: Gemma4ModelInput): Gemma4ModelSession {
+  return model instanceof Gemma4ModelSession
     ? model
-    : new Qwen35ModelSession(model);
+    : new Gemma4ModelSession(model);
 }
 
 export function requiredMetadataNumber(tensorReader: GgufTensorReader, key: string): number {
@@ -319,15 +300,7 @@ export function requiredMetadataNumber(tensorReader: GgufTensorReader, key: stri
   return value;
 }
 
-export function requiredRecurrentCache(state: Qwen35InferenceState, layer: number): Qwen35RecurrentCache {
-  const cache = state.recurrent.get(layer);
-  if (!cache) {
-    throw new Error(`Missing recurrent cache for layer ${layer}`);
-  }
-  return cache;
-}
-
-export function requiredFullAttentionCache(state: Qwen35InferenceState, layer: number): Qwen35FullAttentionCache {
+export function requiredFullAttentionCache(state: Gemma4InferenceState, layer: number): Gemma4FullAttentionCache {
   const cache = state.fullAttention.get(layer);
   if (!cache) {
     throw new Error(`Missing full-attention cache for layer ${layer}`);

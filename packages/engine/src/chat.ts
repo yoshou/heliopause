@@ -4,27 +4,27 @@ import {
   type GgufByteReader,
 } from "./gguf";
 import {
-  createQwen35ModelSession,
-  type Qwen35InferenceState,
-  type Qwen35ModelSession,
-  type Qwen35ModelSessionOptions,
+  createGemma4ModelSession,
+  type Gemma4InferenceState,
+  type Gemma4ModelSession,
+  type Gemma4ModelSessionOptions,
 } from "./runtime";
 import {
-  decodeQwen35,
-  prefillQwen35,
+  decodeGemma4,
+  prefillGemma4,
 } from "./forward";
 import {
   GgufTensorReader,
   type GgufTensorReadTrace,
 } from "./tensor-reader";
-import type { Qwen35Tokenizer } from "./tokenizer";
+import type { Gemma4Tokenizer } from "./tokenizer";
 
 export type ChatMessage = {
   role: "system" | "user" | "assistant";
   content: string;
 };
 
-export type Qwen35ChatTemplateOptions = {
+export type Gemma4ChatTemplateOptions = {
   addGenerationPrompt?: boolean;
   enableThinking?: boolean;
 };
@@ -35,68 +35,66 @@ export type FileGgufTensorReaderOptions = {
   onRead?: GgufTensorReadTrace;
 };
 
-export type Qwen35ChatCompletionOptions = {
+export type Gemma4ChatCompletionOptions = {
   maxNewTokens?: number;
   stopTokenIds?: readonly number[];
   signal?: AbortSignal;
-  onToken?: (chunk: Qwen35ChatCompletionChunk) => void;
+  onToken?: (chunk: Gemma4ChatCompletionChunk) => void;
 };
 
-export type Qwen35ChatPrefillOptions = {
+export type Gemma4ChatPrefillOptions = {
   signal?: AbortSignal;
 };
 
-export type Qwen35ChatTurnOptions = Qwen35ChatCompletionOptions;
+export type Gemma4ChatTurnOptions = Gemma4ChatCompletionOptions;
 
-export type Qwen35ChatTurnResult = {
+export type Gemma4ChatTurnResult = {
   content: string;
   finishReason: "stop" | "length";
-  state: Qwen35InferenceState;
+  state: Gemma4InferenceState;
 };
 
-export type Qwen35ChatCompletionChunk = {
+export type Gemma4ChatCompletionChunk = {
   tokenId: number;
   token: string;
   text: string;
   content: string;
 };
 
-export const DEFAULT_QWEN35_SYSTEM_PROMPT =
+export const DEFAULT_GEMMA4_SYSTEM_PROMPT =
   "You are Heliopause, a helpful local assistant running entirely on this device.";
 
 const DEFAULT_MAX_NEW_TOKENS = 256;
 const DEFAULT_GGUF_PARSE_BUFFER_BYTES = 16 * 1024 * 1024;
+const TOKENIZER_ARRAY_METADATA_KEYS = [
+  "tokenizer.ggml.tokens",
+  "tokenizer.ggml.merges",
+] as const;
 
-export function applyQwen35ChatTemplate(
+export function applyGemma4ChatTemplate(
   messages: readonly ChatMessage[],
-  options: Qwen35ChatTemplateOptions = {},
+  options: Gemma4ChatTemplateOptions = {},
 ): string {
   const addGenerationPrompt = options.addGenerationPrompt ?? true;
   const enableThinking = options.enableThinking ?? false;
   let output = "";
 
   for (const message of messages) {
-    output += `<|im_start|>${message.role}\n${message.content.trim()}<|im_end|>\n`;
+    const role = message.role === "assistant" ? "model" : message.role;
+    output += `<|turn>${role}\n${message.content.trim()}<turn|>\n`;
   }
 
   if (addGenerationPrompt) {
-    output += "<|im_start|>assistant\n";
-    if (!enableThinking) {
-      output += "<think>\n\n</think>\n\n";
-    }
+    output += enableThinking ? "<|think|>\n<|turn>model\n" : "<|turn>model\n";
   }
 
   return output;
 }
 
-export function applyQwen35ChatGenerationPrompt(
-  options: Pick<Qwen35ChatTemplateOptions, "enableThinking"> = {},
+export function applyGemma4ChatGenerationPrompt(
+  options: Pick<Gemma4ChatTemplateOptions, "enableThinking"> = {},
 ): string {
-  let output = "<|im_start|>assistant\n";
-  if (!(options.enableThinking ?? false)) {
-    output += "<think>\n\n</think>\n\n";
-  }
-  return output;
+  return (options.enableThinking ?? false) ? "<|think|>\n<|turn>model\n" : "<|turn>model\n";
 }
 
 export async function createFileGgufTensorReader(
@@ -110,56 +108,57 @@ export async function createFileGgufTensorReader(
   );
   const gguf = await parseGguf(parseReader, {
     maxArraySample: options.maxArraySample ?? 300000,
+    completeArrayKeys: TOKENIZER_ARRAY_METADATA_KEYS,
   });
   return new GgufTensorReader(gguf, byteReader, { onRead: options.onRead });
 }
 
-export function createQwen35ChatSession(
+export function createGemma4ChatSession(
   tensorReader: GgufTensorReader,
-  options: Qwen35ModelSessionOptions = {},
-): Qwen35ModelSession {
-  return createQwen35ModelSession(tensorReader, options);
+  options: Gemma4ModelSessionOptions = {},
+): Gemma4ModelSession {
+  return createGemma4ModelSession(tensorReader, options);
 }
 
-export async function prefillQwen35ChatMessages(
-  session: Qwen35ModelSession,
-  tokenizer: Qwen35Tokenizer,
-  state: Qwen35InferenceState,
+export async function prefillGemma4ChatMessages(
+  session: Gemma4ModelSession,
+  tokenizer: Gemma4Tokenizer,
+  state: Gemma4InferenceState,
   messages: readonly ChatMessage[],
-  options: Qwen35ChatPrefillOptions = {},
-): Promise<Qwen35InferenceState> {
-  const prompt = applyQwen35ChatTemplate(messages, { addGenerationPrompt: false });
-  await prefillQwen35ChatText(session, tokenizer, state, prompt, {
+  options: Gemma4ChatPrefillOptions = {},
+): Promise<Gemma4InferenceState> {
+  const prompt = applyGemma4ChatTemplate(messages, { addGenerationPrompt: false });
+  await prefillGemma4ChatText(session, tokenizer, state, prompt, {
     signal: options.signal,
     requireGenerationSlot: false,
   });
   return state;
 }
 
-export async function generateQwen35ChatTurn(
-  session: Qwen35ModelSession,
-  tokenizer: Qwen35Tokenizer,
-  state: Qwen35InferenceState,
+export async function generateGemma4ChatTurn(
+  session: Gemma4ModelSession,
+  tokenizer: Gemma4Tokenizer,
+  state: Gemma4InferenceState,
   userContent: string,
-  options: Qwen35ChatTurnOptions = {},
-): Promise<Qwen35ChatTurnResult> {
+  options: Gemma4ChatTurnOptions = {},
+): Promise<Gemma4ChatTurnResult> {
   throwIfAborted(options.signal);
 
-  await prefillQwen35ChatText(
+  await prefillGemma4ChatText(
     session,
     tokenizer,
     state,
-    applyQwen35ChatTemplate([{ role: "user", content: userContent }], {
+    applyGemma4ChatTemplate([{ role: "user", content: userContent }], {
       addGenerationPrompt: false,
     }),
     { signal: options.signal, requireGenerationSlot: true },
   );
 
-  const promptPrefill = await prefillQwen35ChatText(
+  const promptPrefill = await prefillGemma4ChatText(
     session,
     tokenizer,
     state,
-    applyQwen35ChatGenerationPrompt(),
+    applyGemma4ChatGenerationPrompt(),
     {
       signal: options.signal,
       computeLogits: true,
@@ -174,12 +173,14 @@ export async function generateQwen35ChatTurn(
 
   const stopTokenIds = new Set([
     tokenizer.eosTokenId,
+    tokenizer.tokenToId("<turn|>"),
+    tokenizer.tokenToId("<eos>"),
     tokenizer.tokenToId("<|im_end|>"),
     ...(options.stopTokenIds ?? []),
   ].filter((id): id is number => typeof id === "number"));
   const maxNewTokens = options.maxNewTokens ?? DEFAULT_MAX_NEW_TOKENS;
   let content = "";
-  let finishReason: Qwen35ChatTurnResult["finishReason"] = "length";
+  let finishReason: Gemma4ChatTurnResult["finishReason"] = "length";
 
   for (let index = 0; index < maxNewTokens; index += 1) {
     throwIfAborted(options.signal);
@@ -194,7 +195,7 @@ export async function generateQwen35ChatTurn(
       break;
     }
 
-    const decode = await decodeQwen35(session, tokenId, {
+    const decode = await decodeGemma4(session, tokenId, {
       state,
       logitsTopK: 1,
     });
@@ -207,7 +208,7 @@ export async function generateQwen35ChatTurn(
 
     const token = tokenizer.idToToken(tokenId) ?? "";
     const text = tokenizer.detokenize([tokenId]);
-    content += text;
+    content = sanitizeGemma4ChatOutput(content + text);
 
     options.onToken?.({
       tokenId,
@@ -218,7 +219,7 @@ export async function generateQwen35ChatTurn(
   }
 
   if (state.nextPosition < state.contextLength) {
-    await prefillQwen35ChatText(session, tokenizer, state, "<|im_end|>\n", {
+    await prefillGemma4ChatText(session, tokenizer, state, "<turn|>\n", {
       signal: options.signal,
       requireGenerationSlot: false,
     });
@@ -227,19 +228,21 @@ export async function generateQwen35ChatTurn(
   return { content, finishReason, state };
 }
 
-export async function* generateQwen35ChatCompletion(
-  session: Qwen35ModelSession,
-  tokenizer: Qwen35Tokenizer,
+export async function* generateGemma4ChatCompletion(
+  session: Gemma4ModelSession,
+  tokenizer: Gemma4Tokenizer,
   messages: readonly ChatMessage[],
-  options: Qwen35ChatCompletionOptions = {},
-): AsyncGenerator<Qwen35ChatCompletionChunk, string> {
+  options: Gemma4ChatCompletionOptions = {},
+): AsyncGenerator<Gemma4ChatCompletionChunk, string> {
   throwIfAborted(options.signal);
 
-  const prompt = applyQwen35ChatTemplate(messages);
+  const prompt = applyGemma4ChatTemplate(messages);
   const promptTokenIds = tokenizer.tokenize(prompt);
   const state = session.createInferenceState();
   const stopTokenIds = new Set([
     tokenizer.eosTokenId,
+    tokenizer.tokenToId("<turn|>"),
+    tokenizer.tokenToId("<eos>"),
     tokenizer.tokenToId("<|im_end|>"),
     ...(options.stopTokenIds ?? []),
   ].filter((id): id is number => typeof id === "number"));
@@ -251,7 +254,7 @@ export async function* generateQwen35ChatCompletion(
     );
   }
 
-  const prefill = await prefillQwen35(session, promptTokenIds, {
+  const prefill = await prefillGemma4(session, promptTokenIds, {
     state,
     computeLogits: true,
     logitsTopK: 1,
@@ -273,7 +276,7 @@ export async function* generateQwen35ChatCompletion(
 
     const token = tokenizer.idToToken(tokenId) ?? "";
     const text = tokenizer.detokenize([tokenId]);
-    content += text;
+    content = sanitizeGemma4ChatOutput(content + text);
 
     const chunk = {
       tokenId,
@@ -284,7 +287,7 @@ export async function* generateQwen35ChatCompletion(
     options.onToken?.(chunk);
     yield chunk;
 
-    const decode = await decodeQwen35(session, tokenId, {
+    const decode = await decodeGemma4(session, tokenId, {
       state,
       logitsTopK: 1,
     });
@@ -298,10 +301,10 @@ export async function* generateQwen35ChatCompletion(
   return content;
 }
 
-async function prefillQwen35ChatText(
-  session: Qwen35ModelSession,
-  tokenizer: Qwen35Tokenizer,
-  state: Qwen35InferenceState,
+async function prefillGemma4ChatText(
+  session: Gemma4ModelSession,
+  tokenizer: Gemma4Tokenizer,
+  state: Gemma4InferenceState,
   text: string,
   options: {
     signal?: AbortSignal;
@@ -309,13 +312,13 @@ async function prefillQwen35ChatText(
     requireGenerationSlot?: boolean;
   } = {},
 ): Promise<{
-  state: Qwen35InferenceState;
+  state: Gemma4InferenceState;
   logits?: Float32Array;
   topTokens?: Array<{ id: number; value: number }>;
 }> {
   throwIfAborted(options.signal);
 
-  const tokenIds = tokenizer.tokenize(text);
+  const tokenIds = tokenizer.tokenize(text, { addBos: state.nextPosition === 0 });
   if (tokenIds.length === 0) {
     return { state };
   }
@@ -328,7 +331,7 @@ async function prefillQwen35ChatText(
     );
   }
 
-  return prefillQwen35(session, tokenIds, {
+  return prefillGemma4(session, tokenIds, {
     state,
     positions: Int32Array.from(
       { length: tokenIds.length },
@@ -339,19 +342,40 @@ async function prefillQwen35ChatText(
   });
 }
 
-export function stripQwen35Thinking(content: string): string {
+export function stripGemma4Thinking(content: string): string {
   let output = content;
   while (true) {
     const start = output.indexOf("<think>");
     if (start < 0) {
-      return output;
+      return sanitizeGemma4ChatOutput(output);
     }
     const end = output.indexOf("</think>", start);
     if (end < 0) {
-      return output.slice(0, start).trimStart();
+      return sanitizeGemma4ChatOutput(output.slice(0, start).trimStart());
     }
     output = `${output.slice(0, start)}${output.slice(end + "</think>".length)}`;
   }
+}
+
+function sanitizeGemma4ChatOutput(content: string): string {
+  const stopMarkers = ["<turn|>", "<|im_end|>", "<eos>"];
+  let output = content;
+  for (const marker of stopMarkers) {
+    const index = output.indexOf(marker);
+    if (index >= 0) {
+      output = output.slice(0, index);
+    }
+  }
+  output = output.replaceAll("</think>", "");
+  while (true) {
+    const start = output.indexOf("<|channel>");
+    if (start < 0) {
+      break;
+    }
+    const end = output.indexOf("<channel|>", start);
+    output = end < 0 ? output.slice(0, start) : `${output.slice(0, start)}${output.slice(end + "<channel|>".length)}`;
+  }
+  return output;
 }
 
 export function getGgufModelName(reader: GgufTensorReader): string {

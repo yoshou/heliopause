@@ -37,139 +37,6 @@ pub unsafe extern "C" fn hp_dealloc(ptr: *mut u8, byte_len: usize) {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn hp_ssm_conv1d_f32(
-    conv_input_ptr: *const f32,
-    conv_input_len: usize,
-    kernel_ptr: *const f32,
-    kernel_len: usize,
-    channel_count: usize,
-    token_count: usize,
-    kernel_size: usize,
-    output_ptr: *mut f32,
-    output_len: usize,
-) -> i32 {
-    let input_window = kernel_size.saturating_sub(1).saturating_add(token_count);
-    if conv_input_len != input_window.saturating_mul(channel_count)
-        || kernel_len != kernel_size.saturating_mul(channel_count)
-        || output_len != channel_count.saturating_mul(token_count)
-    {
-        return ERR_SHAPE;
-    }
-
-    let conv_input = slice::from_raw_parts(conv_input_ptr, conv_input_len);
-    let kernel = slice::from_raw_parts(kernel_ptr, kernel_len);
-    let output = slice::from_raw_parts_mut(output_ptr, output_len);
-
-    for token in 0..token_count {
-        for channel in 0..channel_count {
-            let input_offset = channel * input_window + token;
-            let kernel_offset = channel * kernel_size;
-            let mut sum = 0.0_f32;
-            for k in 0..kernel_size {
-                sum = (sum + conv_input[input_offset + k] * kernel[kernel_offset + k]).round_to_f32();
-            }
-            output[token * channel_count + channel] = sum;
-        }
-    }
-
-    OK
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn hp_gated_delta_net_f32(
-    query_ptr: *const f32,
-    query_len: usize,
-    key_ptr: *const f32,
-    key_len: usize,
-    value_ptr: *const f32,
-    value_len: usize,
-    gate_ptr: *const f32,
-    gate_len: usize,
-    beta_ptr: *const f32,
-    beta_len: usize,
-    state_ptr: *const f32,
-    state_len: usize,
-    state_size: usize,
-    key_head_count: usize,
-    value_head_count: usize,
-    token_count: usize,
-    output_ptr: *mut f32,
-    output_len: usize,
-    new_state_ptr: *mut f32,
-    new_state_len: usize,
-) -> i32 {
-    if query_len != token_count.saturating_mul(key_head_count).saturating_mul(state_size)
-        || key_len != token_count.saturating_mul(key_head_count).saturating_mul(state_size)
-        || value_len != token_count.saturating_mul(value_head_count).saturating_mul(state_size)
-        || gate_len != token_count.saturating_mul(value_head_count)
-        || beta_len != token_count.saturating_mul(value_head_count)
-        || state_len != value_head_count.saturating_mul(state_size).saturating_mul(state_size)
-        || output_len != token_count.saturating_mul(value_head_count).saturating_mul(state_size)
-        || new_state_len != state_len
-    {
-        return ERR_SHAPE;
-    }
-    if key_head_count == 0 || value_head_count % key_head_count != 0 {
-        return ERR_HEADS;
-    }
-
-    let query = slice::from_raw_parts(query_ptr, query_len);
-    let key = slice::from_raw_parts(key_ptr, key_len);
-    let value = slice::from_raw_parts(value_ptr, value_len);
-    let gate = slice::from_raw_parts(gate_ptr, gate_len);
-    let beta = slice::from_raw_parts(beta_ptr, beta_len);
-    let state = slice::from_raw_parts(state_ptr, state_len);
-    let output = slice::from_raw_parts_mut(output_ptr, output_len);
-    let new_state = slice::from_raw_parts_mut(new_state_ptr, new_state_len);
-
-    new_state.copy_from_slice(state);
-    let mut delta = vec![0.0_f32; state_size];
-    let scale = (1.0_f32 / (state_size as f32).sqrt()).round_to_f32();
-
-    for value_head in 0..value_head_count {
-        let key_head = value_head % key_head_count;
-        let state_offset = value_head * state_size * state_size;
-
-        for token in 0..token_count {
-            let q_offset = (token * key_head_count + key_head) * state_size;
-            let k_offset = q_offset;
-            let v_offset = (token * value_head_count + value_head) * state_size;
-            let gate_value = gate[token * value_head_count + value_head];
-            let beta_value = beta[token * value_head_count + value_head];
-            let exp_gate = (gate_value as f64).exp() as f32;
-
-            for index in 0..state_size * state_size {
-                new_state[state_offset + index] = (new_state[state_offset + index] * exp_gate).round_to_f32();
-            }
-
-            for j in 0..state_size {
-                let row_offset = state_offset + j * state_size;
-                let sum = dot_f32(&new_state[row_offset..row_offset + state_size], &key[k_offset..k_offset + state_size]);
-                delta[j] = ((value[v_offset + j] - sum).round_to_f32() * beta_value).round_to_f32();
-            }
-
-            for j in 0..state_size {
-                let row_offset = state_offset + j * state_size;
-                let delta_value = delta[j];
-                for i in 0..state_size {
-                    new_state[row_offset + i] =
-                        (new_state[row_offset + i] + (key[k_offset + i] * delta_value).round_to_f32()).round_to_f32();
-                }
-            }
-
-            let output_offset = (token * value_head_count + value_head) * state_size;
-            for j in 0..state_size {
-                let row_offset = state_offset + j * state_size;
-                let sum = dot_f32(&new_state[row_offset..row_offset + state_size], &query[q_offset..q_offset + state_size]);
-                output[output_offset + j] = (sum * scale).round_to_f32();
-            }
-        }
-    }
-
-    OK
-}
-
-#[no_mangle]
 pub unsafe extern "C" fn hp_matmul_quantized_f32(
     type_id: i32,
     weight_ptr: *const u8,
@@ -708,18 +575,6 @@ pub unsafe extern "C" fn hp_gqa_attention_f32(
     }
 
     OK
-}
-
-fn dot_f32(left: &[f32], right: &[f32]) -> f32 {
-    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
-    unsafe {
-        return dot_f32_simd(left, right);
-    }
-
-    #[cfg(not(all(target_arch = "wasm32", target_feature = "simd128")))]
-    {
-        dot_f32_scalar(left, right)
-    }
 }
 
 struct QuantizedQ8K {
@@ -1516,41 +1371,6 @@ fn float32_to_float16(value: f32) -> u16 {
     }
 
     sign | ((half_exponent as u16) << 10) | ((rounded_mantissa >> 13) as u16)
-}
-
-#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
-unsafe fn dot_f32_simd(left: &[f32], right: &[f32]) -> f32 {
-    let mut index = 0;
-    let mut sum = 0.0_f32;
-    while index + 4 <= left.len() {
-        let a = v128_load(left.as_ptr().add(index) as *const v128);
-        let b = v128_load(right.as_ptr().add(index) as *const v128);
-        let products = f32x4_mul(a, b);
-        let p0 = f32x4_extract_lane::<0>(products);
-        let p1 = f32x4_extract_lane::<1>(products);
-        let p2 = f32x4_extract_lane::<2>(products);
-        let p3 = f32x4_extract_lane::<3>(products);
-        sum = (sum + p0).round_to_f32();
-        sum = (sum + p1).round_to_f32();
-        sum = (sum + p2).round_to_f32();
-        sum = (sum + p3).round_to_f32();
-        index += 4;
-    }
-
-    while index < left.len() {
-        sum = (sum + (left[index] * right[index]).round_to_f32()).round_to_f32();
-        index += 1;
-    }
-    sum
-}
-
-#[cfg(not(all(target_arch = "wasm32", target_feature = "simd128")))]
-fn dot_f32_scalar(left: &[f32], right: &[f32]) -> f32 {
-    let mut sum = 0.0_f32;
-    for index in 0..left.len() {
-        sum = (sum + (left[index] * right[index]).round_to_f32()).round_to_f32();
-    }
-    sum
 }
 
 trait RoundToF32 {

@@ -1,5 +1,5 @@
-export { Qwen35CpuSegmentRunner } from "./segment-runner";
+export { Gemma4CpuSegmentRunner } from "./segment-runner";
 export type {
-  Qwen35CpuHiddenResult,
-  Qwen35CpuSegmentRunnerOptions,
+  Gemma4CpuHiddenResult,
+  Gemma4CpuSegmentRunnerOptions,
 } from "./segment-runner";

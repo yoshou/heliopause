@@ -6,7 +6,7 @@ import {
   type ForwardValue,
   requireCpuHidden,
 } from "../graph";
-import { Qwen35WebGpuSegmentRunner } from "./segment-runner";
+import { Gemma4WebGpuSegmentRunner } from "./segment-runner";
 
 export class WebGpuLayerSegmentNode implements ForwardRunnerNode {
   readonly id: string;
@@ -15,7 +15,7 @@ export class WebGpuLayerSegmentNode implements ForwardRunnerNode {
 
   private readonly startLayer: number;
   private readonly endLayerExclusive: number;
-  private runnerPromise?: Promise<Qwen35WebGpuSegmentRunner>;
+  private runnerPromise?: Promise<Gemma4WebGpuSegmentRunner>;
 
   constructor(
     startLayer: number,
@@ -31,7 +31,7 @@ export class WebGpuLayerSegmentNode implements ForwardRunnerNode {
 
   async run(context: ForwardGraphContext, inputs: ReadonlyMap<string, ForwardValue>): Promise<ForwardProviderHiddenValue> {
     const input = requireCpuHidden(inputs, this.deps[0] ?? "");
-    this.runnerPromise ??= Qwen35WebGpuSegmentRunner.create({
+    this.runnerPromise ??= Gemma4WebGpuSegmentRunner.create({
       tensorReader: context.session.tensorReader,
       manifest: context.manifest,
       epsilon: context.session.epsilon,

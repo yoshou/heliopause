@@ -1,7 +1,7 @@
 import { ChangeEvent, FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import {
-  DEFAULT_QWEN35_SYSTEM_PROMPT,
-  stripQwen35Thinking,
+  DEFAULT_GEMMA4_SYSTEM_PROMPT,
+  stripGemma4Thinking,
 } from "@heliopause/engine";
 import type {
   EngineWorkerRequest,
@@ -44,7 +44,7 @@ type PendingRequest =
 function App() {
   const [model, setModel] = useState<ModelState>({ status: "empty" });
   const [memoryProfile, setMemoryProfile] = useState<MemoryProfile>("auto");
-  const [systemPrompt, setSystemPrompt] = useState(DEFAULT_QWEN35_SYSTEM_PROMPT);
+  const [systemPrompt, setSystemPrompt] = useState(DEFAULT_GEMMA4_SYSTEM_PROMPT);
   const [prompt, setPrompt] = useState("");
   const [messages, setMessages] = useState<UiMessage[]>([]);
   const [isGenerating, setIsGenerating] = useState(false);
@@ -361,7 +361,7 @@ function App() {
         <div className="message-panel" aria-live="polite">
           {messages.length === 0 ? (
             <div className="empty-state">
-              <h2>Load a Qwen GGUF model</h2>
+              <h2>Load a Gemma GGUF model</h2>
               <p>Choose a local model file, then start a private on-device chat.</p>
             </div>
           ) : (
@@ -412,7 +412,7 @@ function App() {
 function MessageBubble(
   { isGenerating, message }: { isGenerating: boolean; message: UiMessage },
 ) {
-  const visibleContent = stripQwen35Thinking(message.content);
+  const visibleContent = stripGemma4Thinking(message.content);
   const placeholder = message.role === "assistant" && isGenerating ? "Generating..." : "";
   return (
     <article className={`message message--${message.role}`}>

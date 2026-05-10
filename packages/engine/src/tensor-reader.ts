@@ -278,6 +278,7 @@ export function tensorByteLength(tensor: GgufTensorInfo): number {
 export const ggmlTypeStorage: Record<string, { blockSize: number; typeSize: number }> = {
   F32: { blockSize: 1, typeSize: 4 },
   F16: { blockSize: 1, typeSize: 2 },
+  BF16: { blockSize: 1, typeSize: 2 },
   Q8_0: { blockSize: 32, typeSize: 34 },
   Q4_K: { blockSize: 256, typeSize: 144 },
   Q5_K: { blockSize: 256, typeSize: 176 },

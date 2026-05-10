@@ -1,4 +1,4 @@
-import type { Qwen35ModelManifest } from "../../model";
+import type { Gemma4ModelManifest } from "../../model";
 import type { GgufTensorReader } from "../../tensor-reader";
 import { GPU_COPY_DST, GPU_STORAGE } from "./gpu-constants";
 import { webGpuAdapterLimits } from "./gpu-device";
@@ -49,7 +49,7 @@ export type GpuLayer = RecurrentGpuLayer | FullAttentionGpuLayer;
 export async function loadGpuLayer(
   arena: GpuMemoryArena,
   tensorReader: GgufTensorReader,
-  manifest: Qwen35ModelManifest,
+  manifest: Gemma4ModelManifest,
   layer: number,
 ): Promise<GpuLayer> {
   const ffn = {
@@ -129,7 +129,7 @@ export async function loadQuantizedHandle(
 export async function loadOutputStripes(
   arena: GpuMemoryArena,
   tensorReader: GgufTensorReader,
-  manifest: Qwen35ModelManifest,
+  manifest: Gemma4ModelManifest,
 ): Promise<OutputStripe[]> {
   const tensor = tensorReader.getTensor("output.weight");
   const type = webGpuMatMulType(tensor.type, "output.weight");

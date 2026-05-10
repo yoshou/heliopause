@@ -11,6 +11,8 @@ export function dequantizeRow(type: GgmlTypeName, bytes: Uint8Array, elements: n
       return new Float32Array(bytes.buffer, bytes.byteOffset, elements).slice();
     case "F16":
       return dequantizeF16(bytes, elements);
+    case "BF16":
+      return dequantizeBF16(bytes, elements);
     case "Q8_0":
       return dequantizeQ8_0(bytes, elements);
     case "Q4_K":
@@ -31,6 +33,18 @@ export function dequantizeF16(bytes: Uint8Array, elements: number): Float32Array
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   for (let index = 0; index < elements; index += 1) {
     output[index] = float16ToFloat32(view.getUint16(index * 2, true));
+  }
+  return output;
+}
+
+export function dequantizeBF16(bytes: Uint8Array, elements: number): Float32Array {
+  const output = new Float32Array(elements);
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const scratch = new ArrayBuffer(4);
+  const scratchView = new DataView(scratch);
+  for (let index = 0; index < elements; index += 1) {
+    scratchView.setUint32(0, view.getUint16(index * 2, true) << 16, false);
+    output[index] = scratchView.getFloat32(0, false);
   }
   return output;
 }
@@ -95,8 +109,9 @@ export function dequantizeQ5_K(bytes: Uint8Array, elements: number): Float32Arra
     const qh = bytes.subarray(offset + 16, offset + 48);
     const qs = bytes.subarray(offset + 48, offset + 176);
     let qOffset = 0;
-    let hOffset = 0;
     let scaleIndex = 0;
+    let lowHighMask = 1;
+    let highHighMask = 2;
     for (let j = 0; j < QK_K; j += 64) {
       const [sc1, min1] = getScaleMinK4(scaleIndex, scales);
       const [sc2, min2] = getScaleMinK4(scaleIndex + 1, scales);
@@ -105,16 +120,17 @@ export function dequantizeQ5_K(bytes: Uint8Array, elements: number): Float32Arra
       const m1 = dmin * min1;
       const m2 = dmin * min2;
       for (let l = 0; l < 32; l += 1) {
-        const high = (qh[hOffset + l] ?? 0) & 1 ? 16 : 0;
+        const high = (qh[l] ?? 0) & lowHighMask ? 16 : 0;
         output[out++] = d1 * (((qs[qOffset + l] ?? 0) & 0x0f) + high) - m1;
       }
       for (let l = 0; l < 32; l += 1) {
-        const high = (qh[hOffset + l] ?? 0) & 2 ? 16 : 0;
+        const high = (qh[l] ?? 0) & highHighMask ? 16 : 0;
         output[out++] = d2 * (((qs[qOffset + l] ?? 0) >> 4) + high) - m2;
       }
       qOffset += 32;
-      hOffset += 32;
       scaleIndex += 2;
+      lowHighMask <<= 2;
+      highHighMask <<= 2;
     }
     offset += 176;
   }

@@ -2,25 +2,28 @@ import {
   createForwardTrace,
   modelSession,
   timedAsync,
-  type Qwen35InferenceState,
-  type Qwen35ModelInput,
-  type Qwen35ModelSession,
+  type Gemma4InferenceState,
+  type Gemma4ModelInput,
+  type Gemma4ModelSession,
   type TimingSink,
 } from "./runtime";
-import { planQwen35RunnerPlacement } from "./runner/webgpu/planning";
+import { planGemma4RunnerPlacement } from "./runner/webgpu/planning";
 import {
-  qwen35CpuOutput,
-  qwen35CpuSegmentRunner,
+  gemma4CpuOutput,
+  gemma4CpuSegmentRunner,
 } from "./runner/cpu/execution-provider";
 import {
-  qwen35WebGpuSegmentRunner,
+  prepareGemma4Input,
+} from "./runner/cpu/layers";
+import {
+  gemma4WebGpuSegmentRunner,
   webGpuExecutionProviderEnabled,
   webGpuExecutionProviderOptions,
 } from "./runner/webgpu/execution-provider";
 
 export type PrefillOptions = {
   positions?: Int32Array | number[];
-  state?: Qwen35InferenceState;
+  state?: Gemma4InferenceState;
   computeLogits?: boolean;
   logitsTopK?: number;
   onTiming?: TimingSink;
@@ -28,35 +31,35 @@ export type PrefillOptions = {
 
 export type PrefillResult = {
   hidden: Float32Array;
-  state: Qwen35InferenceState;
+  state: Gemma4InferenceState;
   logits?: Float32Array;
   topTokens?: Array<{ id: number; value: number }>;
 };
 
 export type DecodeOptions = {
   position?: number;
-  state?: Qwen35InferenceState;
+  state?: Gemma4InferenceState;
   logitsTopK?: number;
   onTiming?: TimingSink;
 };
 
 export type DecodeResult = {
   hidden: Float32Array;
-  state: Qwen35InferenceState;
+  state: Gemma4InferenceState;
   logits?: Float32Array;
   topTokens: Array<{ id: number; value: number }>;
 };
 
 export type { OutputResult } from "./runtime";
 
-export async function prefillQwen35(
-  model: Qwen35ModelInput,
+export async function prefillGemma4(
+  model: Gemma4ModelInput,
   tokenIds: readonly number[],
   options: PrefillOptions = {},
 ): Promise<PrefillResult> {
   const session = modelSession(model);
   if (webGpuExecutionProviderEnabled(session)) {
-    return prefillQwen35HybridWebGpu(session, tokenIds, options);
+    return prefillGemma4HybridWebGpu(session, tokenIds, options);
   }
   const state = options.state ?? session.createInferenceState();
   const positions = normalizePositions(options.positions, tokenIds.length);
@@ -66,20 +69,23 @@ export async function prefillQwen35(
     return { hidden: new Float32Array(), state };
   }
 
-  const embedding = await timedAsync(trace, "embedding read", () => session.readEmbeddingRows(tokenIds));
-  const runner = qwen35CpuSegmentRunner({
+  const prepared = await prepareGemma4Input(session, tokenIds, trace);
+  const runner = gemma4CpuSegmentRunner({
     session,
     manifest: session.manifest,
     epsilon: session.epsilon,
     segmentStartLayer: 0,
     segmentEndLayerExclusive: session.manifest.blockCount,
   });
-  const hidden = (await runner.runTokensHidden(embedding, positions, state, { trace })).hidden;
+  const hidden = (await runner.runTokensHidden(prepared.hidden, positions, state, {
+    trace,
+    perLayerInputs: prepared.perLayerInputs,
+  })).hidden;
   updateNextPosition(state, positions, tokenIds.length);
 
   const result: PrefillResult = { hidden, state };
   if (options.computeLogits) {
-    const output = await qwen35CpuOutput(session, hidden, {
+    const output = await gemma4CpuOutput(session, hidden, {
       topK: options.logitsTopK ?? 10,
       trace,
     });
@@ -89,30 +95,33 @@ export async function prefillQwen35(
   return result;
 }
 
-export async function decodeQwen35(
-  model: Qwen35ModelInput,
+export async function decodeGemma4(
+  model: Gemma4ModelInput,
   tokenId: number,
   options: DecodeOptions = {},
 ): Promise<DecodeResult> {
   const session = modelSession(model);
   if (webGpuExecutionProviderEnabled(session)) {
-    return decodeQwen35HybridWebGpu(session, tokenId, options);
+    return decodeGemma4HybridWebGpu(session, tokenId, options);
   }
   const state = options.state ?? session.createInferenceState();
   const position = options.position ?? state.nextPosition;
   const positions = new Int32Array([position]);
   const trace = createForwardTrace("decode", options.onTiming);
-  const embedding = await timedAsync(trace, "embedding read", () => session.readEmbeddingRows([tokenId]));
-  const runner = qwen35CpuSegmentRunner({
+  const prepared = await prepareGemma4Input(session, [tokenId], trace);
+  const runner = gemma4CpuSegmentRunner({
     session,
     manifest: session.manifest,
     epsilon: session.epsilon,
     segmentStartLayer: 0,
     segmentEndLayerExclusive: session.manifest.blockCount,
   });
-  const hidden = (await runner.runTokenHidden(embedding, positions, state, { trace })).hidden;
+  const hidden = (await runner.runTokenHidden(prepared.hidden, positions, state, {
+    trace,
+    perLayerInputs: prepared.perLayerInputs,
+  })).hidden;
   state.nextPosition = Math.max(state.nextPosition, position + 1);
-  const output = await qwen35CpuOutput(session, hidden, {
+  const output = await gemma4CpuOutput(session, hidden, {
     topK: options.logitsTopK ?? 10,
     trace,
   });
@@ -124,8 +133,8 @@ export async function decodeQwen35(
   };
 }
 
-async function prefillQwen35HybridWebGpu(
-  session: Qwen35ModelSession,
+async function prefillGemma4HybridWebGpu(
+  session: Gemma4ModelSession,
   tokenIds: readonly number[],
   options: PrefillOptions = {},
 ): Promise<PrefillResult> {
@@ -137,15 +146,18 @@ async function prefillQwen35HybridWebGpu(
     return { hidden: new Float32Array(), state };
   }
 
-  const embedding = await timedAsync(trace, "embedding read", () => session.readEmbeddingRows(tokenIds));
-  const cpuPrefix = qwen35CpuSegmentRunner({
+  const prepared = await prepareGemma4Input(session, tokenIds, trace);
+  const cpuPrefix = gemma4CpuSegmentRunner({
     session,
     manifest: session.manifest,
     epsilon: session.epsilon,
     segmentStartLayer: 0,
     segmentEndLayerExclusive: runner.segmentStartLayer,
   });
-  const segmentInputHidden = (await cpuPrefix.runTokensHidden(embedding, positions, state, { trace })).hidden;
+  const segmentInputHidden = (await cpuPrefix.runTokensHidden(prepared.hidden, positions, state, {
+    trace,
+    perLayerInputs: prepared.perLayerInputs,
+  })).hidden;
   const gpu = await timedAsync(
     trace,
     "WebGPU segment",
@@ -166,8 +178,8 @@ async function prefillQwen35HybridWebGpu(
   return result;
 }
 
-async function decodeQwen35HybridWebGpu(
-  session: Qwen35ModelSession,
+async function decodeGemma4HybridWebGpu(
+  session: Gemma4ModelSession,
   tokenId: number,
   options: DecodeOptions = {},
 ): Promise<DecodeResult> {
@@ -177,15 +189,18 @@ async function decodeQwen35HybridWebGpu(
   const trace = createForwardTrace("decode", options.onTiming);
   const runner = await webGpuSegmentRunnerForForward(session, state);
 
-  const embedding = await timedAsync(trace, "embedding read", () => session.readEmbeddingRows([tokenId]));
-  const cpuPrefix = qwen35CpuSegmentRunner({
+  const prepared = await prepareGemma4Input(session, [tokenId], trace);
+  const cpuPrefix = gemma4CpuSegmentRunner({
     session,
     manifest: session.manifest,
     epsilon: session.epsilon,
     segmentStartLayer: 0,
     segmentEndLayerExclusive: runner.segmentStartLayer,
   });
-  const segmentInputHidden = (await cpuPrefix.runTokenHidden(embedding, positions, state, { trace })).hidden;
+  const segmentInputHidden = (await cpuPrefix.runTokenHidden(prepared.hidden, positions, state, {
+    trace,
+    perLayerInputs: prepared.perLayerInputs,
+  })).hidden;
   const gpu = await timedAsync(
     trace,
     "WebGPU segment",
@@ -214,15 +229,15 @@ function normalizePositions(positions: PrefillOptions["positions"], tokenCount: 
 }
 
 async function webGpuSegmentRunnerForForward(
-  session: Qwen35ModelSession,
-  state: Qwen35InferenceState,
+  session: Gemma4ModelSession,
+  state: Gemma4InferenceState,
 ) {
   const providerOptions = webGpuExecutionProviderOptions(session);
   if (!providerOptions) {
-    throw new Error("WebGPU segment runner is not enabled for this Qwen35 session.");
+    throw new Error("WebGPU segment runner is not enabled for this Gemma4 session.");
   }
   const segmentStartLayer = providerOptions.segmentStartLayer ??
-    planQwen35RunnerPlacement(
+    planGemma4RunnerPlacement(
       session.tensorReader.metadata,
       session.manifest,
       {
@@ -231,11 +246,11 @@ async function webGpuSegmentRunnerForForward(
         memoryLimitBytes: providerOptions.memoryLimitBytes,
       },
     ).segmentStartLayer;
-  return qwen35WebGpuSegmentRunner(session, state, { segmentStartLayer });
+  return gemma4WebGpuSegmentRunner(session, state, { segmentStartLayer });
 }
 
 function updateNextPosition(
-  state: Qwen35InferenceState,
+  state: Gemma4InferenceState,
   positions: Int32Array,
   tokenCount: number,
 ): void {

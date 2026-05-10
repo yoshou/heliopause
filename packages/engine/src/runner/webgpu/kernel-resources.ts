@@ -17,7 +17,6 @@ import {
   Q8_0_QUANTIZE_WGSL,
   SSM_NORM_GATE_WGSL,
   QKV_CONV_SPLIT_WGSL,
-  GATED_DELTA_NET_WGSL,
   FULL_ATTENTION_SCORE_WGSL,
   FULL_ATTENTION_APPLY_WGSL,
   Q4_K_MATMUL_WGSL,
@@ -538,78 +537,6 @@ export function createQkvConvResources(
         bindBuffer(5, kBuffer),
         bindBuffer(6, vBuffer),
         bindBuffer(7, newStateBuffer),
-      ],
-    }),
-    destroy: () => paramsBuffer.destroy?.(),
-  };
-}
-
-export function createGatedDeltaNetResources(
-  device: WebGpuDeviceLike,
-  queryBuffer: WebGpuBufferLike,
-  keyBuffer: WebGpuBufferLike,
-  valueBuffer: WebGpuBufferLike,
-  gateBuffer: WebGpuBufferLike,
-  betaBuffer: WebGpuBufferLike,
-  stateBuffer: WebGpuBufferLike,
-  outputBuffer: WebGpuBufferLike,
-  newStateBuffer: WebGpuBufferLike,
-  options: {
-    stateSize: number;
-    keyHeadCount: number;
-    valueHeadCount: number;
-    tokenCount: number;
-  },
-): { pipeline: unknown; bindGroup: unknown; destroy: () => void } {
-  const params = new Uint32Array([
-    options.stateSize,
-    options.keyHeadCount,
-    options.valueHeadCount,
-    options.tokenCount,
-  ]);
-  const paramsBuffer = device.createBuffer({
-    size: params.byteLength,
-    usage: GPU_UNIFORM | GPU_COPY_DST,
-  });
-  device.queue.writeBuffer(paramsBuffer, 0, params);
-  const bindGroupLayout = device.createBindGroupLayout({
-    entries: [
-      storageEntry(0, "read-only-storage"),
-      storageEntry(1, "read-only-storage"),
-      storageEntry(2, "read-only-storage"),
-      storageEntry(3, "read-only-storage"),
-      storageEntry(4, "read-only-storage"),
-      storageEntry(5, "read-only-storage"),
-      {
-        binding: 6,
-        visibility: GPU_SHADER_STAGE_COMPUTE,
-        buffer: { type: "uniform" },
-      },
-      storageEntry(7, "storage"),
-      storageEntry(8, "storage"),
-    ],
-  });
-  const pipeline = device.createComputePipeline({
-    layout: device.createPipelineLayout({ bindGroupLayouts: [bindGroupLayout] }),
-    compute: {
-      module: device.createShaderModule({ code: GATED_DELTA_NET_WGSL }),
-      entryPoint: "main",
-    },
-  });
-  return {
-    pipeline,
-    bindGroup: device.createBindGroup({
-      layout: bindGroupLayout,
-      entries: [
-        bindBuffer(0, queryBuffer),
-        bindBuffer(1, keyBuffer),
-        bindBuffer(2, valueBuffer),
-        bindBuffer(3, gateBuffer),
-        bindBuffer(4, betaBuffer),
-        bindBuffer(5, stateBuffer),
-        bindBuffer(6, paramsBuffer),
-        bindBuffer(7, outputBuffer),
-        bindBuffer(8, newStateBuffer),
       ],
     }),
     destroy: () => paramsBuffer.destroy?.(),

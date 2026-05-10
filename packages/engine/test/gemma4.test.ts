@@ -2,15 +2,15 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
-  auditQwen35TensorCoverage,
-  buildQwen35Manifest,
-  cloneQwen35InferenceState,
-  createQwen35ModelSession,
-  createQwen35InferenceState,
-  decodeQwen35,
+  auditGemma4TensorCoverage,
+  buildGemma4Manifest,
+  cloneGemma4InferenceState,
+  createGemma4ModelSession,
+  createGemma4InferenceState,
+  decodeGemma4,
   estimateWeightCacheBytes,
   GgufTensorReader,
-  prefillQwen35,
+  prefillGemma4,
 } from "../src/index.ts";
 
 test("tensor coverage audit fails closed on unknown and unused tensors", async () => {
@@ -20,29 +20,24 @@ test("tensor coverage audit fails closed on unknown and unused tensors", async (
     metadataCount: 14,
     dataStart: 0n,
     metadata: {
-      "general.architecture": "qwen35",
-      "qwen35.block_count": 1,
-      "qwen35.embedding_length": 4,
-      "qwen35.feed_forward_length": 8,
-      "qwen35.attention.head_count": 1,
-      "qwen35.attention.head_count_kv": 1,
-      "qwen35.attention.key_length": 2,
-      "qwen35.attention.value_length": 2,
-      "qwen35.context_length": 16,
-      "qwen35.full_attention_interval": 4,
-      "qwen35.rope.dimension_count": 2,
-      "qwen35.rope.dimension_sections": {
+      "general.architecture": "gemma4",
+      "gemma4.block_count": 1,
+      "gemma4.embedding_length": 4,
+      "gemma4.feed_forward_length": 8,
+      "gemma4.attention.head_count": 1,
+      "gemma4.attention.head_count_kv": 1,
+      "gemma4.attention.key_length": 2,
+      "gemma4.attention.value_length": 2,
+      "gemma4.context_length": 16,
+      "gemma4.full_attention_interval": 4,
+      "gemma4.rope.dimension_count": 2,
+      "gemma4.rope.dimension_sections": {
         type: "int32",
         length: 4,
         sample: [1, 1, 0, 0],
         truncated: false,
       },
-      "qwen35.rope.freq_base": 10000,
-      "qwen35.ssm.conv_kernel": 4,
-      "qwen35.ssm.group_count": 1,
-      "qwen35.ssm.inner_size": 2,
-      "qwen35.ssm.state_size": 2,
-      "qwen35.ssm.time_step_rank": 1,
+      "gemma4.rope.freq_base": 10000,
     },
     tensors: [
       {
@@ -64,8 +59,8 @@ test("tensor coverage audit fails closed on unknown and unused tensors", async (
     ],
   };
 
-  const manifest = buildQwen35Manifest(gguf);
-  const audit = auditQwen35TensorCoverage(gguf, manifest, ["output_norm.weight"]);
+  const manifest = buildGemma4Manifest(gguf);
+  const audit = auditGemma4TensorCoverage(gguf, manifest, ["output_norm.weight"]);
 
   assert.equal(audit.ok, false);
   assert.ok(audit.unknown.includes("unexpected.weight"));
@@ -73,31 +68,32 @@ test("tensor coverage audit fails closed on unknown and unused tensors", async (
   assert.ok(audit.missing.length > 0);
 });
 
-test("Qwen35 inference state allocates recurrent and full-attention caches from manifest", () => {
-  const manifest = buildQwen35Manifest({
+test("Gemma4 inference state allocates attention caches from manifest", () => {
+  const manifest = buildGemma4Manifest({
     ...minimalGguf(),
     tensorCount: 0,
     tensors: [],
   });
 
-  const state = createQwen35InferenceState(manifest);
+  const state = createGemma4InferenceState(manifest);
 
-  assert.deepEqual(Array.from(state.recurrent.keys()), []);
   assert.deepEqual(Array.from(state.fullAttention.keys()), [0]);
   assert.equal(state.nextPosition, 0);
   assert.equal(state.fullAttention.get(0)?.key.length, 2);
   assert.equal(state.fullAttention.get(0)?.value.length, 2);
+  assert.equal(state.fullAttention.get(0)?.keyLength, 2);
+  assert.equal(state.fullAttention.get(0)?.valueLength, 2);
 });
 
-test("Qwen35 model session can cap inference cache context", () => {
+test("Gemma4 model session can cap inference cache context", () => {
   const reader = tensorReaderFromTensors([
     f32Tensor("token_embd.weight", [4, 8], sequence(32)),
   ], {
-    "qwen35.block_count": 1,
-    "qwen35.context_length": 16,
-    "qwen35.full_attention_interval": 1,
+    "gemma4.block_count": 1,
+    "gemma4.context_length": 16,
+    "gemma4.full_attention_interval": 1,
   });
-  const session = createQwen35ModelSession(reader, { maxContextLength: 4 });
+  const session = createGemma4ModelSession(reader, { maxContextLength: 4 });
   const state = session.createInferenceState();
 
   assert.equal(session.manifest.contextLength, 16);
@@ -106,79 +102,69 @@ test("Qwen35 model session can cap inference cache context", () => {
   assert.equal(state.fullAttention.get(0)?.value.length, 8);
 });
 
-test("Qwen35 inference state defaults capped context to manifest context", () => {
-  const manifest = buildQwen35Manifest({
+test("Gemma4 inference state defaults capped context to manifest context", () => {
+  const manifest = buildGemma4Manifest({
     ...minimalGguf(),
     tensorCount: 0,
     tensors: [],
   });
-  const state = createQwen35InferenceState(manifest, { contextLength: 1 });
+  const state = createGemma4InferenceState(manifest, { contextLength: 1 });
 
   assert.equal(state.contextLength, 1);
   assert.equal(state.fullAttention.get(0)?.key.length, 2);
 });
 
-test("Qwen35 inference state clone deep-copies cache arrays", () => {
-  const manifest = buildQwen35Manifest({
+test("Gemma4 inference state clone deep-copies cache arrays", () => {
+  const manifest = buildGemma4Manifest({
     ...minimalGguf(),
     metadata: {
       ...minimalGguf().metadata,
-      "qwen35.block_count": 2,
-      "qwen35.full_attention_interval": 2,
+      "gemma4.block_count": 2,
+      "gemma4.full_attention_interval": 2,
     },
     tensorCount: 0,
     tensors: [],
   });
-  const state = createQwen35InferenceState(manifest);
+  const state = createGemma4InferenceState(manifest);
   state.nextPosition = 3;
-  const recurrent = state.recurrent.get(0);
   const fullAttention = state.fullAttention.get(1);
-  assert.ok(recurrent);
   assert.ok(fullAttention);
-  recurrent.conv[0] = 3;
-  recurrent.state[0] = 4;
   fullAttention.key[0] = 1;
   fullAttention.value[0] = 2;
 
-  const clone = cloneQwen35InferenceState(state);
-  const cloneRecurrent = clone.recurrent.get(0);
+  const clone = cloneGemma4InferenceState(state);
   const cloneFullAttention = clone.fullAttention.get(1);
-  assert.ok(cloneRecurrent);
   assert.ok(cloneFullAttention);
   clone.nextPosition = 7;
-  cloneRecurrent.conv[0] = 30;
-  cloneRecurrent.state[0] = 40;
   cloneFullAttention.key[0] = 10;
   cloneFullAttention.value[0] = 20;
 
   assert.equal(state.nextPosition, 3);
-  assert.equal(recurrent.conv[0], 3);
-  assert.equal(recurrent.state[0], 4);
   assert.equal(fullAttention.key[0], 1);
   assert.equal(fullAttention.value[0], 2);
 });
 
-test("Qwen35 prefill advances nextPosition from default and explicit positions", async () => {
+test("Gemma4 prefill advances nextPosition from default and explicit positions", async () => {
   const reader = tensorReaderFromTensors([
     f32Tensor("token_embd.weight", [4, 8], sequence(32)),
   ]);
-  const session = createQwen35ModelSession(reader);
+  const session = createGemma4ModelSession(reader);
 
-  const defaultResult = await prefillQwen35(session, [1, 2, 3]);
+  const defaultResult = await prefillGemma4(session, [1, 2, 3]);
   assert.equal(defaultResult.state.nextPosition, 3);
 
-  const explicitResult = await prefillQwen35(session, [1, 2], {
+  const explicitResult = await prefillGemma4(session, [1, 2], {
     positions: new Int32Array([4, 7]),
   });
   assert.equal(explicitResult.state.nextPosition, 8);
 
-  const mropeResult = await prefillQwen35(session, [1, 2], {
+  const mropeResult = await prefillGemma4(session, [1, 2], {
     positions: new Int32Array([5, 6, 50, 60, 70, 80, 90, 100]),
   });
   assert.equal(mropeResult.state.nextPosition, 7);
 });
 
-test("Qwen35 decode uses state position, explicit position, and returns logits", async () => {
+test("Gemma4 decode uses state position, explicit position, and returns fixed logits", async () => {
   const reader = tensorReaderFromTensors([
     f32Tensor("token_embd.weight", [4, 8], sequence(32)),
     f32Tensor("output_norm.weight", [4], new Float32Array([1, 1, 1, 1])),
@@ -188,25 +174,45 @@ test("Qwen35 decode uses state position, explicit position, and returns logits",
       0.3, -0.2, 0.4, -0.3,
     ])),
   ]);
-  const session = createQwen35ModelSession(reader);
+  const session = createGemma4ModelSession(reader);
   const state = session.createInferenceState();
   state.nextPosition = 4;
 
-  const first = await decodeQwen35(session, 2, { state, logitsTopK: 2 });
+  const first = await decodeGemma4(session, 2, { state, logitsTopK: 2 });
   assert.equal(first.state.nextPosition, 5);
-  assert.equal(first.logits.length, 3);
-  assert.equal(first.topTokens.length, 2);
+  assertFloatArrayClose(first.logits, new Float32Array([
+    -0.16329793632030487,
+    0.5715428590774536,
+    -0.5715428590774536,
+  ]), 2e-5);
+  assert.deepEqual(first.topTokens.map((token) => token.id), [1, 0]);
+  assertFloatArrayClose(
+    Float32Array.from(first.topTokens.map((token) => token.value)),
+    new Float32Array([0.5715428590774536, -0.16329793632030487]),
+    2e-5,
+  );
 
-  const second = await decodeQwen35(session, 3, { state, position: 9 });
+  const second = await decodeGemma4(session, 3, { state, position: 9, logitsTopK: 2 });
   assert.equal(second.state.nextPosition, 10);
+  assertFloatArrayClose(second.logits, new Float32Array([
+    0.1568925976753235,
+    -0.7452399134635925,
+    -0.23533886671066284,
+  ]), 2e-5);
+  assert.deepEqual(second.topTokens.map((token) => token.id), [0, 2]);
+  assertFloatArrayClose(
+    Float32Array.from(second.topTokens.map((token) => token.value)),
+    new Float32Array([0.1568925976753235, -0.23533886671066284]),
+    2e-5,
+  );
 });
 
-test("Qwen35 model session caches F32 tensors and embedding rows", async () => {
+test("Gemma4 model session caches F32 tensors and embedding rows", async () => {
   const reader = tensorReaderFromTensors([
     f32Tensor("token_embd.weight", [4, 8], sequence(32)),
     f32Tensor("output_norm.weight", [4], new Float32Array([1, 2, 3, 4])),
   ]);
-  const session = createQwen35ModelSession(reader);
+  const session = createGemma4ModelSession(reader);
 
   await session.readF32Tensor("output_norm.weight");
   await session.readF32Tensor("output_norm.weight");
@@ -228,13 +234,13 @@ test("Qwen35 model session caches F32 tensors and embedding rows", async () => {
   });
 });
 
-test("Qwen35 model session evicts large weight bytes without evicting small F32 tensors", async () => {
+test("Gemma4 model session evicts large weight bytes without evicting small F32 tensors", async () => {
   const reader = tensorReaderFromTensors([
     f32Tensor("output_norm.weight", [4], new Float32Array([1, 2, 3, 4])),
     bytesTensor("a.weight", [32, 1], "Q8_0", new Uint8Array(34).fill(1)),
     bytesTensor("b.weight", [32, 1], "Q8_0", new Uint8Array(34).fill(2)),
   ]);
-  const session = createQwen35ModelSession(reader, { maxWeightCacheBytes: 40 });
+  const session = createGemma4ModelSession(reader, { maxWeightCacheBytes: 40 });
 
   await session.readF32Tensor("output_norm.weight");
   await session.readWeightBytes("a.weight");
@@ -252,7 +258,7 @@ test("Qwen35 model session evicts large weight bytes without evicting small F32 
   assert.equal(session.cacheStats().weightCacheEvictions, 2);
 });
 
-test("Qwen35 weight cache estimate counts quantized matmul weights only", () => {
+test("Gemma4 weight cache estimate counts quantized matmul weights only", () => {
   const reader = tensorReaderFromTensors([
     f32Tensor("token_embd.weight", [4, 8], sequence(32)),
     bytesTensor("blk.0.attn_q.weight", [32, 2], "Q8_0", new Uint8Array(68).fill(1)),
@@ -263,21 +269,26 @@ test("Qwen35 weight cache estimate counts quantized matmul weights only", () => 
   assert.equal(estimateWeightCacheBytes(reader), 212);
 });
 
-test("Qwen35 full-attention decode rejects positions outside context", async () => {
+test("Gemma4 full-attention decode rejects positions outside context", async () => {
   const reader = tensorReaderFromTensors([
     f32Tensor("token_embd.weight", [4, 8], sequence(32)),
     f32Tensor("output_norm.weight", [4], new Float32Array([1, 1, 1, 1])),
     f32Tensor("output.weight", [4, 3], sequence(12)),
     ...fullAttentionLayerTensors(),
   ], {
-    "qwen35.block_count": 1,
-    "qwen35.context_length": 1,
-    "qwen35.full_attention_interval": 1,
+    "gemma4.block_count": 1,
+    "gemma4.context_length": 1,
+    "gemma4.attention.sliding_window_pattern": {
+      type: "bool",
+      length: 1,
+      sample: [false],
+      truncated: false,
+    },
   });
-  const session = createQwen35ModelSession(reader);
+  const session = createGemma4ModelSession(reader);
 
   await assert.rejects(
-    decodeQwen35(session, 1, { position: 1 }),
+    decodeGemma4(session, 1, { position: 1 }),
     /outside context length/,
   );
 });
@@ -289,29 +300,24 @@ function minimalGguf() {
     metadataCount: 14,
     dataStart: 0n,
     metadata: {
-      "general.architecture": "qwen35",
-      "qwen35.block_count": 1,
-      "qwen35.embedding_length": 4,
-      "qwen35.feed_forward_length": 8,
-      "qwen35.attention.head_count": 1,
-      "qwen35.attention.head_count_kv": 1,
-      "qwen35.attention.key_length": 2,
-      "qwen35.attention.value_length": 2,
-      "qwen35.context_length": 1,
-      "qwen35.full_attention_interval": 1,
-      "qwen35.rope.dimension_count": 2,
-      "qwen35.rope.dimension_sections": {
+      "general.architecture": "gemma4",
+      "gemma4.block_count": 1,
+      "gemma4.embedding_length": 4,
+      "gemma4.feed_forward_length": 8,
+      "gemma4.attention.head_count": 1,
+      "gemma4.attention.head_count_kv": 1,
+      "gemma4.attention.key_length": 2,
+      "gemma4.attention.value_length": 2,
+      "gemma4.context_length": 1,
+      "gemma4.full_attention_interval": 1,
+      "gemma4.rope.dimension_count": 2,
+      "gemma4.rope.dimension_sections": {
         type: "int32",
         length: 4,
         sample: [1, 1, 0, 0],
         truncated: false,
       },
-      "qwen35.rope.freq_base": 10000,
-      "qwen35.ssm.conv_kernel": 4,
-      "qwen35.ssm.group_count": 1,
-      "qwen35.ssm.inner_size": 2,
-      "qwen35.ssm.state_size": 2,
-      "qwen35.ssm.time_step_rank": 1,
+      "gemma4.rope.freq_base": 10000,
     },
     tensors: [],
   };
@@ -366,10 +372,10 @@ function tensorReaderFromTensors(
     tensors: infos,
     metadata: {
       ...minimalGguf().metadata,
-      "qwen35.block_count": 0,
-      "qwen35.context_length": 16,
-      "qwen35.full_attention_interval": 1,
-      "qwen35.attention.layer_norm_rms_epsilon": 1e-6,
+      "gemma4.block_count": 0,
+      "gemma4.context_length": 16,
+      "gemma4.full_attention_interval": 1,
+      "gemma4.attention.layer_norm_rms_epsilon": 1e-6,
       ...metadataOverrides,
     },
   };
@@ -403,6 +409,16 @@ function f32Tensor(name: string, dimensions: number[], values: Float32Array) {
 
 function bytesTensor(name: string, dimensions: number[], type: "Q8_0" | "Q4_K", bytes: Uint8Array) {
   return { name, dimensions, type, bytes };
+}
+
+function assertFloatArrayClose(actual: Float32Array, expected: Float32Array, tolerance: number): void {
+  assert.equal(actual.length, expected.length);
+  for (let index = 0; index < actual.length; index += 1) {
+    assert.ok(
+      Math.abs((actual[index] ?? 0) - (expected[index] ?? 0)) <= tolerance,
+      `index ${index}: expected ${expected[index]}, got ${actual[index]}`,
+    );
+  }
 }
 
 function sequence(length: number): Float32Array {

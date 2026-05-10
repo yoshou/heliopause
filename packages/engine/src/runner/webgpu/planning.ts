@@ -1,15 +1,15 @@
 import type { GgufMetadata, GgufTensorInfo } from "../../gguf";
-import type { Qwen35LayerKind, Qwen35ModelManifest } from "../../model";
+import type { Gemma4LayerKind, Gemma4ModelManifest } from "../../model";
 import { tensorByteLength } from "../../tensor-reader";
 import {
-  planQwen35ProviderPlacement,
-  type Qwen35RunnerPlacementPlan,
-  type Qwen35RunnerPlanningOptions,
+  planGemma4ProviderPlacement,
+  type Gemma4RunnerPlacementPlan,
+  type Gemma4RunnerPlanningOptions,
 } from "../planning";
 import {
   DEFAULT_GPU_FIXED_BYTES,
   DEFAULT_GPU_SCRATCH_BYTES,
-  QWEN35_WEBGPU_MEMORY_LIMIT_BYTES,
+  GEMMA4_WEBGPU_MEMORY_LIMIT_BYTES,
 } from "./gpu-constants";
 
 type WebGpuPlanningSupport =
@@ -18,7 +18,7 @@ type WebGpuPlanningSupport =
 
 type WebGpuLayerPlacementParams = {
   tensorsByName: ReadonlyMap<string, GgufTensorInfo>;
-  manifest: Qwen35ModelManifest;
+  manifest: Gemma4ModelManifest;
   layer: number;
   contextLength: number;
 };
@@ -31,29 +31,27 @@ type WebGpuCopyAuditExpectations = {
   expectedTokenReadbacks: number;
 };
 
-export const qwen35WebGpuPlanningProvider = {
+export const gemma4WebGpuPlanningProvider = {
   name: "webgpu",
-  defaultMemoryLimitBytes: QWEN35_WEBGPU_MEMORY_LIMIT_BYTES,
+  defaultMemoryLimitBytes: GEMMA4_WEBGPU_MEMORY_LIMIT_BYTES,
   fixedBytes: DEFAULT_GPU_FIXED_BYTES,
   scratchBytes: DEFAULT_GPU_SCRATCH_BYTES,
-  outputTensorNames: ["output.weight", "output_norm.weight"],
+  outputTensorNames: ["token_embd.weight", "output_norm.weight"],
   offReason: "WebGPU execution is off; this is a placement plan only.",
   blockedByMemoryReason: "`output.weight` plus fixed GPU buffers exceed the configured WebGPU memory cap.",
   unavailableReason: (support: WebGpuPlanningSupport) => `WebGPU unavailable: ${support.available ? "unknown" : support.reason}`,
   plannedReason: "WebGPU segment placement is planned, but execution still requires verified kernels.",
   layerPlacement: ({ tensorsByName, manifest, layer, contextLength }: WebGpuLayerPlacementParams) => {
-    const layerKind: Qwen35LayerKind = manifest.fullAttentionLayers.includes(layer)
-      ? "full-attention"
-      : "recurrent";
+    const layerKind: Gemma4LayerKind = manifest.layerKinds[layer] ?? "sliding-attention";
     const weightBytes = manifest.expectedTensors.reduce((sum, expected) => {
       if (expected.layer !== layer) {
         return sum;
       }
       return sum + tensorBytes(tensorsByName, expected.name);
     }, 0);
-    const cacheBytes = layerKind === "full-attention"
-      ? fullAttentionCacheBytes(manifest, contextLength)
-      : recurrentCacheBytes(manifest);
+    const cacheBytes = manifest.layerHasKv[layer]
+      ? attentionCacheBytes(manifest, layer, contextLength)
+      : 0;
     return {
       layer,
       layerKind,
@@ -71,13 +69,13 @@ export const qwen35WebGpuPlanningProvider = {
   }),
 };
 
-export function planQwen35RunnerPlacement(
+export function planGemma4RunnerPlacement(
   gguf: GgufMetadata,
-  manifest: Qwen35ModelManifest,
-  options: Qwen35RunnerPlanningOptions = {},
-): Qwen35RunnerPlacementPlan {
-  return planQwen35ProviderPlacement(
-    qwen35WebGpuPlanningProvider,
+  manifest: Gemma4ModelManifest,
+  options: Gemma4RunnerPlanningOptions = {},
+): Gemma4RunnerPlacementPlan {
+  return planGemma4ProviderPlacement(
+    gemma4WebGpuPlanningProvider,
     gguf,
     manifest,
     options,
@@ -89,20 +87,12 @@ function tensorBytes(tensorsByName: ReadonlyMap<string, GgufTensorInfo>, name: s
   return tensor ? tensorByteLength(tensor) : 0;
 }
 
-function recurrentCacheBytes(manifest: Qwen35ModelManifest): number {
-  const convDim =
-    manifest.ssm.stateSize * manifest.ssm.groupCount * 2 +
-    manifest.ssm.stateSize * manifest.ssm.timeStepRank;
-  const recurrentStateSize =
-    manifest.ssm.stateSize * manifest.ssm.stateSize * manifest.ssm.timeStepRank;
-  return (manifest.ssm.convKernel - 1) * convDim * Float32Array.BYTES_PER_ELEMENT +
-    recurrentStateSize * Float32Array.BYTES_PER_ELEMENT;
-}
-
-function fullAttentionCacheBytes(
-  manifest: Qwen35ModelManifest,
+function attentionCacheBytes(
+  manifest: Gemma4ModelManifest,
+  layer: number,
   contextLength: number,
 ): number {
-  const perCache = contextLength * manifest.headCountKv * manifest.keyLength;
-  return perCache * 2 * Float32Array.BYTES_PER_ELEMENT;
+  const keyLength = manifest.layerKeyLengths[layer] ?? manifest.keyLength;
+  const valueLength = manifest.layerValueLengths[layer] ?? manifest.valueLength;
+  return contextLength * manifest.headCountKv * (keyLength + valueLength) * Float32Array.BYTES_PER_ELEMENT;
 }

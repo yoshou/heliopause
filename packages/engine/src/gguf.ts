@@ -36,6 +36,7 @@ export type GgufMetadata = {
 
 export type ParseGgufOptions = {
   maxArraySample?: number;
+  completeArrayKeys?: readonly string[];
 };
 
 type GgufMetadataTypeName =
@@ -151,6 +152,7 @@ export async function parseGguf(
   options: ParseGgufOptions = {},
 ): Promise<GgufMetadata> {
   const cursor = new GgufCursor(reader);
+  const completeArrayKeys = new Set(options.completeArrayKeys ?? []);
   const magic = await cursor.readAscii(4);
 
   if (magic !== GGUF_MAGIC) {
@@ -165,7 +167,11 @@ export async function parseGguf(
   for (let index = 0; index < metadataCount; index += 1) {
     const key = await cursor.readString();
     const typeId = await cursor.readUint32();
-    metadata[key] = await readMetadataValue(cursor, typeId, options.maxArraySample ?? 16);
+    metadata[key] = await readMetadataValue(
+      cursor,
+      typeId,
+      completeArrayKeys.has(key) ? Number.MAX_SAFE_INTEGER : options.maxArraySample ?? 16,
+    );
   }
 
   const tensors: GgufTensorInfo[] = [];

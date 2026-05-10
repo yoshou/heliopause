@@ -7,7 +7,6 @@ import {
   createFullAttentionScoreResources,
   createFullKvUpdateResources,
   createFullQueryResources,
-  createGatedDeltaNetResources,
   createKMatMulBindResources,
   createQkvConvResources,
   createQ8_0MatMulBindResources,
@@ -293,32 +292,6 @@ export function dispatchDeltaGate(
   pass.setPipeline(resource.pipeline);
   pass.setBindGroup(0, resource.bindGroup);
   pass.dispatchWorkgroups(valueHeadCount, tokenCount);
-}
-
-export function dispatchGatedDeltaNet(
-  device: WebGpuDeviceLike,
-  pass: WebGpuComputePassLike,
-  resources: Array<{ destroy: () => void }>,
-  query: WebGpuBufferLike,
-  key: WebGpuBufferLike,
-  value: WebGpuBufferLike,
-  gate: WebGpuBufferLike,
-  beta: WebGpuBufferLike,
-  state: WebGpuBufferLike,
-  output: WebGpuBufferLike,
-  nextState: WebGpuBufferLike,
-  options: {
-    stateSize: number;
-    keyHeadCount: number;
-    valueHeadCount: number;
-    tokenCount: number;
-  },
-): void {
-  const resource = createGatedDeltaNetResources(device, query, key, value, gate, beta, state, output, nextState, options);
-  resources.push(resource);
-  pass.setPipeline(resource.pipeline);
-  pass.setBindGroup(0, resource.bindGroup);
-  pass.dispatchWorkgroups(options.valueHeadCount);
 }
 
 export function dispatchSsmNormGate(

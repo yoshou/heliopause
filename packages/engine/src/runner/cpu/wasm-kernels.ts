@@ -1,46 +1,10 @@
-import type {
-  GatedDeltaNetOptions,
-  GqaAttentionOptions,
-} from "../../ops";
+import type { GqaAttentionOptions } from "../../ops";
 import { PREFILL_WASM_SIMD_BASE64 } from "./wasm-kernels.generated";
 
 type KernelExports = WebAssembly.Exports & {
   memory: WebAssembly.Memory;
   hp_alloc(byteLength: number): number;
   hp_dealloc(ptr: number, byteLength: number): void;
-  hp_ssm_conv1d_f32(
-    convInputPtr: number,
-    convInputLen: number,
-    kernelPtr: number,
-    kernelLen: number,
-    channelCount: number,
-    tokenCount: number,
-    kernelSize: number,
-    outputPtr: number,
-    outputLen: number,
-  ): number;
-  hp_gated_delta_net_f32(
-    queryPtr: number,
-    queryLen: number,
-    keyPtr: number,
-    keyLen: number,
-    valuePtr: number,
-    valueLen: number,
-    gatePtr: number,
-    gateLen: number,
-    betaPtr: number,
-    betaLen: number,
-    statePtr: number,
-    stateLen: number,
-    stateSize: number,
-    keyHeadCount: number,
-    valueHeadCount: number,
-    tokenCount: number,
-    outputPtr: number,
-    outputLen: number,
-    newStatePtr: number,
-    newStateLen: number,
-  ): number;
   hp_matmul_quantized_f32(
     typeId: number,
     weightPtr: number,
@@ -228,136 +192,6 @@ export function setPrefillWasmTrace(trace: PrefillWasmTrace | undefined): void {
   wasmTrace = trace;
 }
 
-export async function ssmConv1dWasm(
-  convInput: Float32Array,
-  kernel: Float32Array,
-  channelCount: number,
-  tokenCount: number,
-  kernelSize: number,
-): Promise<Float32Array | undefined> {
-  const exports = await prefillWasmExports();
-  if (!exports) {
-    return undefined;
-  }
-
-  const expectedInputWindow = kernelSize - 1 + tokenCount;
-  if (convInput.length !== expectedInputWindow * channelCount) {
-    throw new Error(`SSM conv input shape mismatch: ${convInput.length}`);
-  }
-  if (kernel.length !== kernelSize * channelCount) {
-    throw new Error(`SSM conv kernel shape mismatch: ${kernel.length}`);
-  }
-
-  const allocations: Allocation[] = [];
-  try {
-    const outputLength = channelCount * tokenCount;
-    const { convInputAlloc, kernelAlloc, outputAlloc } = timedWasmSection("ssmConv1d", "allocation + input copy", () => ({
-      convInputAlloc: copyF32ToWasm(exports, convInput, allocations),
-      kernelAlloc: copyF32ToWasm(exports, kernel, allocations),
-      outputAlloc: allocateBytes(exports, outputLength * Float32Array.BYTES_PER_ELEMENT, allocations),
-    }), convInput.byteLength + kernel.byteLength + outputLength * Float32Array.BYTES_PER_ELEMENT);
-
-    const code = timedWasmSection("ssmConv1d", "kernel call", () => exports.hp_ssm_conv1d_f32(
-      convInputAlloc.ptr,
-      convInput.length,
-      kernelAlloc.ptr,
-      kernel.length,
-      channelCount,
-      tokenCount,
-      kernelSize,
-      outputAlloc.ptr,
-      outputLength,
-    ));
-    assertWasmOk(code, "ssmConv1d");
-    return timedWasmSection("ssmConv1d", "output copy + free", () => {
-      const output = readF32FromWasm(exports, outputAlloc.ptr, outputLength);
-      releaseAllocations(exports, allocations);
-      allocations.length = 0;
-      return output;
-    }, outputLength * Float32Array.BYTES_PER_ELEMENT);
-  } finally {
-    releaseAllocations(exports, allocations);
-  }
-}
-
-export async function gatedDeltaNetWasm(
-  query: Float32Array,
-  key: Float32Array,
-  value: Float32Array,
-  gate: Float32Array,
-  beta: Float32Array,
-  state: Float32Array,
-  {
-    stateSize,
-    keyHeadCount,
-    valueHeadCount,
-    tokenCount,
-  }: GatedDeltaNetOptions,
-): Promise<{ output: Float32Array; newState: Float32Array } | undefined> {
-  const exports = await prefillWasmExports();
-  if (!exports) {
-    return undefined;
-  }
-
-  validateGatedDeltaShapes(query, key, value, gate, beta, state, {
-    stateSize,
-    keyHeadCount,
-    valueHeadCount,
-    tokenCount,
-  });
-
-  const allocations: Allocation[] = [];
-  try {
-    const outputLength = tokenCount * valueHeadCount * stateSize;
-    const { queryAlloc, keyAlloc, valueAlloc, gateAlloc, betaAlloc, stateAlloc, outputAlloc, newStateAlloc } =
-      timedWasmSection("gatedDeltaNet", "allocation + input copy", () => ({
-        queryAlloc: copyF32ToWasm(exports, query, allocations),
-        keyAlloc: copyF32ToWasm(exports, key, allocations),
-        valueAlloc: copyF32ToWasm(exports, value, allocations),
-        gateAlloc: copyF32ToWasm(exports, gate, allocations),
-        betaAlloc: copyF32ToWasm(exports, beta, allocations),
-        stateAlloc: copyF32ToWasm(exports, state, allocations),
-        outputAlloc: allocateBytes(exports, outputLength * Float32Array.BYTES_PER_ELEMENT, allocations),
-        newStateAlloc: allocateBytes(exports, state.length * Float32Array.BYTES_PER_ELEMENT, allocations),
-      }), query.byteLength + key.byteLength + value.byteLength + gate.byteLength + beta.byteLength +
-        state.byteLength + outputLength * Float32Array.BYTES_PER_ELEMENT + state.byteLength);
-
-    const code = timedWasmSection("gatedDeltaNet", "kernel call", () => exports.hp_gated_delta_net_f32(
-      queryAlloc.ptr,
-      query.length,
-      keyAlloc.ptr,
-      key.length,
-      valueAlloc.ptr,
-      value.length,
-      gateAlloc.ptr,
-      gate.length,
-      betaAlloc.ptr,
-      beta.length,
-      stateAlloc.ptr,
-      state.length,
-      stateSize,
-      keyHeadCount,
-      valueHeadCount,
-      tokenCount,
-      outputAlloc.ptr,
-      outputLength,
-      newStateAlloc.ptr,
-      state.length,
-    ));
-    assertWasmOk(code, "gatedDeltaNet");
-    return timedWasmSection("gatedDeltaNet", "output copy + free", () => {
-      const output = {
-        output: readF32FromWasm(exports, outputAlloc.ptr, outputLength),
-        newState: readF32FromWasm(exports, newStateAlloc.ptr, state.length),
-      };
-      releaseAllocations(exports, allocations);
-      allocations.length = 0;
-      return output;
-    }, outputLength * Float32Array.BYTES_PER_ELEMENT + state.byteLength);
-  } finally {
-    releaseAllocations(exports, allocations);
-  }
-}
 
 export async function matMulQuantizedWasm(
   type: "Q4_K" | "Q5_K" | "Q6_K" | "IQ4_XS" | "Q8_0",
@@ -1102,42 +936,5 @@ function validateGqaShapes(
   }
   if (queryHeadCount % keyValueHeadCount !== 0) {
     throw new Error(`GQA head count mismatch: q=${queryHeadCount} kv=${keyValueHeadCount}`);
-  }
-}
-
-function validateGatedDeltaShapes(
-  query: Float32Array,
-  key: Float32Array,
-  value: Float32Array,
-  gate: Float32Array,
-  beta: Float32Array,
-  state: Float32Array,
-  {
-    stateSize,
-    keyHeadCount,
-    valueHeadCount,
-    tokenCount,
-  }: GatedDeltaNetOptions,
-): void {
-  if (query.length !== tokenCount * keyHeadCount * stateSize) {
-    throw new Error(`GDN query shape mismatch: ${query.length}`);
-  }
-  if (key.length !== tokenCount * keyHeadCount * stateSize) {
-    throw new Error(`GDN key shape mismatch: ${key.length}`);
-  }
-  if (value.length !== tokenCount * valueHeadCount * stateSize) {
-    throw new Error(`GDN value shape mismatch: ${value.length}`);
-  }
-  if (gate.length !== tokenCount * valueHeadCount) {
-    throw new Error(`GDN gate shape mismatch: ${gate.length}`);
-  }
-  if (beta.length !== tokenCount * valueHeadCount) {
-    throw new Error(`GDN beta shape mismatch: ${beta.length}`);
-  }
-  if (state.length !== valueHeadCount * stateSize * stateSize) {
-    throw new Error(`GDN state shape mismatch: ${state.length}`);
-  }
-  if (valueHeadCount % keyHeadCount !== 0) {
-    throw new Error(`GDN head count mismatch: k=${keyHeadCount} v=${valueHeadCount}`);
   }
 }

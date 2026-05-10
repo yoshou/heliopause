@@ -2,27 +2,27 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
-  auditQwen35RunnerPlacementCopies,
-  buildQwen35Manifest,
-  planQwen35RunnerPlacement,
+  auditGemma4RunnerPlacementCopies,
+  buildGemma4Manifest,
+  planGemma4RunnerPlacement,
 } from "../src/index.ts";
 
 test("runner placement planning handles off, blocked, and planned WebGPU placement", () => {
   const gguf = minimalGguf();
-  const manifest = buildQwen35Manifest(gguf);
+  const manifest = buildGemma4Manifest(gguf);
 
-  const off = planQwen35RunnerPlacement(gguf, manifest);
+  const off = planGemma4RunnerPlacement(gguf, manifest);
   assert.equal(off.status, "off");
   assert.equal(off.selectedLayerCount, 0);
 
-  const blocked = planQwen35RunnerPlacement(gguf, manifest, {
+  const blocked = planGemma4RunnerPlacement(gguf, manifest, {
     mode: "enabled",
     memoryLimitBytes: 1,
   });
   assert.equal(blocked.status, "blocked");
   assert.equal(blocked.selectedLayerCount, 0);
 
-  const planned = planQwen35RunnerPlacement(gguf, manifest, {
+  const planned = planGemma4RunnerPlacement(gguf, manifest, {
     mode: "enabled",
     memoryLimitBytes: 2 * 1024 * 1024 * 1024,
   });
@@ -33,13 +33,13 @@ test("runner placement planning handles off, blocked, and planned WebGPU placeme
 
 test("runner placement copy audit reports unexpected copies", () => {
   const gguf = minimalGguf();
-  const manifest = buildQwen35Manifest(gguf);
-  const plan = planQwen35RunnerPlacement(gguf, manifest, {
+  const manifest = buildGemma4Manifest(gguf);
+  const plan = planGemma4RunnerPlacement(gguf, manifest, {
     mode: "enabled",
     memoryLimitBytes: 2 * 1024 * 1024 * 1024,
   });
 
-  const audit = auditQwen35RunnerPlacementCopies(plan, {
+  const audit = auditGemma4RunnerPlacementCopies(plan, {
     decodeTensorReads: 0,
     segmentIntermediateReadbacks: 1,
     logitsReadbacks: 0,
@@ -58,30 +58,25 @@ function minimalGguf() {
     metadataCount: 14,
     dataStart: 0n,
     metadata: {
-      "general.architecture": "qwen35",
-      "qwen35.block_count": 2,
-      "qwen35.embedding_length": 4,
-      "qwen35.feed_forward_length": 8,
-      "qwen35.attention.head_count": 1,
-      "qwen35.attention.head_count_kv": 1,
-      "qwen35.attention.key_length": 2,
-      "qwen35.attention.value_length": 2,
-      "qwen35.context_length": 16,
-      "qwen35.full_attention_interval": 2,
-      "qwen35.attention.layer_norm_rms_epsilon": 1e-6,
-      "qwen35.rope.dimension_count": 2,
-      "qwen35.rope.dimension_sections": {
+      "general.architecture": "gemma4",
+      "gemma4.block_count": 2,
+      "gemma4.embedding_length": 4,
+      "gemma4.feed_forward_length": 8,
+      "gemma4.attention.head_count": 1,
+      "gemma4.attention.head_count_kv": 1,
+      "gemma4.attention.key_length": 2,
+      "gemma4.attention.value_length": 2,
+      "gemma4.context_length": 16,
+      "gemma4.full_attention_interval": 2,
+      "gemma4.attention.layer_norm_rms_epsilon": 1e-6,
+      "gemma4.rope.dimension_count": 2,
+      "gemma4.rope.dimension_sections": {
         type: "int32",
         length: 4,
         sample: [1, 1, 0, 0],
         truncated: false,
       },
-      "qwen35.rope.freq_base": 10000,
-      "qwen35.ssm.conv_kernel": 4,
-      "qwen35.ssm.group_count": 1,
-      "qwen35.ssm.inner_size": 2,
-      "qwen35.ssm.state_size": 2,
-      "qwen35.ssm.time_step_rank": 1,
+      "gemma4.rope.freq_base": 10000,
     },
     tensors: [],
   };
