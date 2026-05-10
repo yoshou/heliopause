@@ -1,4 +1,4 @@
-import type { Gemma4ModelManifest } from "../../model";
+import type { Gemma4LayerKind, Gemma4ModelManifest } from "../../model";
 import type { GgufTensorReader } from "../../tensor-reader";
 import { GPU_COPY_DST, GPU_STORAGE } from "./gpu-constants";
 import { webGpuAdapterLimits } from "./gpu-device";
@@ -9,83 +9,70 @@ export type OutputStripe = QuantizedHandle & {
   readonly rowOffset: number;
 };
 
-export type RecurrentGpuLayer = {
-  kind: "recurrent";
+export type Gemma4GpuLayer = {
+  kind: Gemma4LayerKind;
   layer: number;
-  attnNorm: F32Handle;
-  qkv: QuantizedHandle;
-  alpha: F32Handle;
-  beta: F32Handle;
-  z: QuantizedHandle;
-  convKernel: F32Handle;
-  dtBias: F32Handle;
-  ssmA: F32Handle;
-  ssmNorm: F32Handle;
-  out: QuantizedHandle;
-  postNorm: F32Handle;
-  ffnGate: QuantizedHandle;
-  ffnUp: QuantizedHandle;
-  ffnDown: QuantizedHandle;
-};
-
-export type FullAttentionGpuLayer = {
-  kind: "full-attention";
-  layer: number;
+  hasKv: boolean;
+  kvSourceLayer: number;
+  headSize: number;
+  valueSize: number;
   attnNorm: F32Handle;
   q: QuantizedHandle;
-  k: QuantizedHandle;
-  v: QuantizedHandle;
-  out: QuantizedHandle;
+  k?: QuantizedHandle;
+  v?: QuantizedHandle;
   qNorm: F32Handle;
-  kNorm: F32Handle;
-  postNorm: F32Handle;
+  kNorm?: F32Handle;
+  attnOut: QuantizedHandle;
+  postAttentionNorm: F32Handle;
+  ffnNorm: F32Handle;
   ffnGate: QuantizedHandle;
   ffnUp: QuantizedHandle;
   ffnDown: QuantizedHandle;
+  postFfwNorm: F32Handle;
+  perLayerInputGate?: F32Handle;
+  perLayerProjection?: F32Handle;
+  postNorm?: F32Handle;
+  layerOutputScale: F32Handle;
 };
-
-export type GpuLayer = RecurrentGpuLayer | FullAttentionGpuLayer;
 
 export async function loadGpuLayer(
   arena: GpuMemoryArena,
   tensorReader: GgufTensorReader,
   manifest: Gemma4ModelManifest,
   layer: number,
-): Promise<GpuLayer> {
-  const ffn = {
-    postNorm: await loadF32Handle(arena, tensorReader, `blk.${layer}.post_attention_norm.weight`),
+): Promise<Gemma4GpuLayer> {
+  const hasPerLayerInput = manifest.perLayerEmbeddingLength > 0;
+  const hasKv = manifest.layerHasKv[layer] === true;
+  return {
+    kind: manifest.layerKinds[layer] ?? "sliding-attention",
+    layer,
+    hasKv,
+    kvSourceLayer: manifest.kvSourceLayers[layer] ?? layer,
+    headSize: manifest.layerKeyLengths[layer] ?? manifest.keyLength,
+    valueSize: manifest.layerValueLengths[layer] ?? manifest.valueLength,
+    attnNorm: await loadF32Handle(arena, tensorReader, `blk.${layer}.attn_norm.weight`),
+    q: await loadQuantizedHandle(arena, tensorReader, `blk.${layer}.attn_q.weight`),
+    k: hasKv ? await loadQuantizedHandle(arena, tensorReader, `blk.${layer}.attn_k.weight`) : undefined,
+    v: hasKv ? await loadQuantizedHandle(arena, tensorReader, `blk.${layer}.attn_v.weight`) : undefined,
+    qNorm: await loadF32Handle(arena, tensorReader, `blk.${layer}.attn_q_norm.weight`),
+    kNorm: hasKv ? await loadF32Handle(arena, tensorReader, `blk.${layer}.attn_k_norm.weight`) : undefined,
+    attnOut: await loadQuantizedHandle(arena, tensorReader, `blk.${layer}.attn_output.weight`),
+    postAttentionNorm: await loadF32Handle(arena, tensorReader, `blk.${layer}.post_attention_norm.weight`),
+    ffnNorm: await loadF32Handle(arena, tensorReader, `blk.${layer}.ffn_norm.weight`),
     ffnGate: await loadQuantizedHandle(arena, tensorReader, `blk.${layer}.ffn_gate.weight`),
     ffnUp: await loadQuantizedHandle(arena, tensorReader, `blk.${layer}.ffn_up.weight`),
     ffnDown: await loadQuantizedHandle(arena, tensorReader, `blk.${layer}.ffn_down.weight`),
-  };
-  if (manifest.fullAttentionLayers.includes(layer)) {
-    return {
-      kind: "full-attention",
-      layer,
-      attnNorm: await loadF32Handle(arena, tensorReader, `blk.${layer}.attn_norm.weight`),
-      q: await loadQuantizedHandle(arena, tensorReader, `blk.${layer}.attn_q.weight`),
-      k: await loadQuantizedHandle(arena, tensorReader, `blk.${layer}.attn_k.weight`),
-      v: await loadQuantizedHandle(arena, tensorReader, `blk.${layer}.attn_v.weight`),
-      out: await loadQuantizedHandle(arena, tensorReader, `blk.${layer}.attn_output.weight`),
-      qNorm: await loadF32Handle(arena, tensorReader, `blk.${layer}.attn_q_norm.weight`),
-      kNorm: await loadF32Handle(arena, tensorReader, `blk.${layer}.attn_k_norm.weight`),
-      ...ffn,
-    };
-  }
-  return {
-    kind: "recurrent",
-    layer,
-    attnNorm: await loadF32Handle(arena, tensorReader, `blk.${layer}.attn_norm.weight`),
-    qkv: await loadQuantizedHandle(arena, tensorReader, `blk.${layer}.attn_qkv.weight`),
-    alpha: await loadF32Handle(arena, tensorReader, `blk.${layer}.ssm_alpha.weight`),
-    beta: await loadF32Handle(arena, tensorReader, `blk.${layer}.ssm_beta.weight`),
-    z: await loadQuantizedHandle(arena, tensorReader, `blk.${layer}.attn_gate.weight`),
-    convKernel: await loadF32Handle(arena, tensorReader, `blk.${layer}.ssm_conv1d.weight`),
-    dtBias: await loadF32Handle(arena, tensorReader, `blk.${layer}.ssm_dt.bias`),
-    ssmA: await loadF32Handle(arena, tensorReader, `blk.${layer}.ssm_a`),
-    ssmNorm: await loadF32Handle(arena, tensorReader, `blk.${layer}.ssm_norm.weight`),
-    out: await loadQuantizedHandle(arena, tensorReader, `blk.${layer}.ssm_out.weight`),
-    ...ffn,
+    postFfwNorm: await loadF32Handle(arena, tensorReader, `blk.${layer}.post_ffw_norm.weight`),
+    perLayerInputGate: hasPerLayerInput
+      ? await loadF32Handle(arena, tensorReader, `blk.${layer}.inp_gate.weight`)
+      : undefined,
+    perLayerProjection: hasPerLayerInput
+      ? await loadF32Handle(arena, tensorReader, `blk.${layer}.proj.weight`)
+      : undefined,
+    postNorm: hasPerLayerInput
+      ? await loadF32Handle(arena, tensorReader, `blk.${layer}.post_norm.weight`)
+      : undefined,
+    layerOutputScale: await loadF32Handle(arena, tensorReader, `blk.${layer}.layer_output_scale.weight`),
   };
 }
 
@@ -131,12 +118,15 @@ export async function loadOutputStripes(
   tensorReader: GgufTensorReader,
   manifest: Gemma4ModelManifest,
 ): Promise<OutputStripe[]> {
-  const tensor = tensorReader.getTensor("output.weight");
-  const type = webGpuMatMulType(tensor.type, "output.weight");
+  const tensorName = tensorReader.metadata.tensors.some((tensor) => tensor.name === "output.weight")
+    ? "output.weight"
+    : "token_embd.weight";
+  const tensor = tensorReader.getTensor(tensorName);
+  const type = webGpuMatMulType(tensor.type, tensorName);
   const inputSize = tensor.dimensions[0] ?? 0;
   const rowCount = tensor.dimensions[1] ?? 0;
   if (inputSize !== manifest.embeddingLength) {
-    throw new Error(`output.weight input mismatch: ${inputSize}`);
+    throw new Error(`${tensorName} input mismatch: ${inputSize}`);
   }
   const layout = webGpuQuantizedWeightLayout(type, inputSize);
   const limits = await webGpuAdapterLimits();
@@ -154,7 +144,7 @@ export async function loadOutputStripes(
     stripes.push({
       ...createQuantizedHandleFromBytes(
         arena,
-        `output.weight.${rowOffset}`,
+        `${tensorName}.${rowOffset}`,
         type,
         inputSize,
         stripeRows,

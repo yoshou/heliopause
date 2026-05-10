@@ -164,6 +164,7 @@ async function prefillGemma4HybridWebGpu(
     () => runner.runTokens(segmentInputHidden, positions, state, {
       computeTopK: options.computeLogits === true,
       topK: options.logitsTopK ?? 10,
+      perLayerInputs: prepared.perLayerInputs,
     }),
   );
   updateNextPosition(state, positions, tokenIds.length);
@@ -207,6 +208,7 @@ async function decodeGemma4HybridWebGpu(
     () => runner.runToken(segmentInputHidden, positions, state, {
       computeTopK: true,
       topK: options.logitsTopK ?? 10,
+      perLayerInputs: prepared.perLayerInputs,
     }),
   );
   state.nextPosition = Math.max(state.nextPosition, position + 1);

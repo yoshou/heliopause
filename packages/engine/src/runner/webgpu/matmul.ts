@@ -1026,15 +1026,24 @@ export async function fullAttentionDecodeOutWebGpuResident(
       queryBuffer,
       keyBuffer,
       probabilitiesBuffer,
-      options,
+      {
+        ...options,
+        tokenPosition: options.keyValueTokenCount - 1,
+      },
     );
     const applyResources = createFullAttentionApplyResources(
       out.device,
       valueBuffer,
-      gateBuffer,
       probabilitiesBuffer,
       gatedBuffer,
-      options,
+      {
+        valueSize: options.headSize,
+        queryHeadCount: options.queryHeadCount,
+        keyValueHeadCount: options.keyValueHeadCount,
+        keyValueTokenCount: options.keyValueTokenCount,
+        contextLength: options.contextLength,
+        scale: options.scale,
+      },
     );
     const quantizeResources = createQ8KQuantizeResources(
       out.device,

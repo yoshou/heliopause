@@ -10,6 +10,11 @@ import {
   TOPK_WGSL,
   Q8_0_MATMUL_WGSL,
   SWIGLU_WGSL,
+  GEGLU_WGSL,
+  GELU_WGSL,
+  ELEMENTWISE_MUL_WGSL,
+  SCALE_WGSL,
+  F16_CAST_WGSL,
   F32_MATMUL_WGSL,
   DELTA_GATE_WGSL,
   TOP1_WGSL,
@@ -156,6 +161,147 @@ export function createSwiGluResources(
         bindBuffer(1, upOutputBuffer),
         bindBuffer(2, paramsBuffer),
         bindBuffer(3, swigluBuffer),
+      ],
+    }),
+    destroy: () => paramsBuffer.destroy?.(),
+  };
+}
+
+export function createGegluResources(
+  device: WebGpuDeviceLike,
+  gateOutputBuffer: WebGpuBufferLike,
+  upOutputBuffer: WebGpuBufferLike,
+  outputBuffer: WebGpuBufferLike,
+  length: number,
+): { pipeline: unknown; bindGroup: unknown; destroy: () => void } {
+  return createBinaryElementwiseResources(device, gateOutputBuffer, upOutputBuffer, outputBuffer, length, GEGLU_WGSL);
+}
+
+export function createElementwiseMulResources(
+  device: WebGpuDeviceLike,
+  leftBuffer: WebGpuBufferLike,
+  rightBuffer: WebGpuBufferLike,
+  outputBuffer: WebGpuBufferLike,
+  length: number,
+): { pipeline: unknown; bindGroup: unknown; destroy: () => void } {
+  return createBinaryElementwiseResources(device, leftBuffer, rightBuffer, outputBuffer, length, ELEMENTWISE_MUL_WGSL);
+}
+
+export function createGeluResources(
+  device: WebGpuDeviceLike,
+  inputBuffer: WebGpuBufferLike,
+  outputBuffer: WebGpuBufferLike,
+  length: number,
+): { pipeline: unknown; bindGroup: unknown; destroy: () => void } {
+  return createUnaryElementwiseResources(device, inputBuffer, outputBuffer, length, GELU_WGSL);
+}
+
+export function createF16CastResources(
+  device: WebGpuDeviceLike,
+  inputBuffer: WebGpuBufferLike,
+  outputBuffer: WebGpuBufferLike,
+  length: number,
+): { pipeline: unknown; bindGroup: unknown; destroy: () => void } {
+  return createUnaryElementwiseResources(device, inputBuffer, outputBuffer, length, F16_CAST_WGSL);
+}
+
+export function createScaleResources(
+  device: WebGpuDeviceLike,
+  inputBuffer: WebGpuBufferLike,
+  scaleBuffer: WebGpuBufferLike,
+  outputBuffer: WebGpuBufferLike,
+  length: number,
+): { pipeline: unknown; bindGroup: unknown; destroy: () => void } {
+  return createBinaryElementwiseResources(device, inputBuffer, scaleBuffer, outputBuffer, length, SCALE_WGSL);
+}
+
+function createBinaryElementwiseResources(
+  device: WebGpuDeviceLike,
+  leftBuffer: WebGpuBufferLike,
+  rightBuffer: WebGpuBufferLike,
+  outputBuffer: WebGpuBufferLike,
+  length: number,
+  shaderCode: string,
+): { pipeline: unknown; bindGroup: unknown; destroy: () => void } {
+  const params = new Uint32Array([length, 0, 0, 0]);
+  const paramsBuffer = device.createBuffer({
+    size: params.byteLength,
+    usage: GPU_UNIFORM | GPU_COPY_DST,
+  });
+  device.queue.writeBuffer(paramsBuffer, 0, params);
+  const bindGroupLayout = device.createBindGroupLayout({
+    entries: [
+      storageEntry(0, "read-only-storage"),
+      storageEntry(1, "read-only-storage"),
+      {
+        binding: 2,
+        visibility: GPU_SHADER_STAGE_COMPUTE,
+        buffer: { type: "uniform" },
+      },
+      storageEntry(3, "storage"),
+    ],
+  });
+  const pipeline = device.createComputePipeline({
+    layout: device.createPipelineLayout({ bindGroupLayouts: [bindGroupLayout] }),
+    compute: {
+      module: device.createShaderModule({ code: shaderCode }),
+      entryPoint: "main",
+    },
+  });
+  return {
+    pipeline,
+    bindGroup: device.createBindGroup({
+      layout: bindGroupLayout,
+      entries: [
+        bindBuffer(0, leftBuffer),
+        bindBuffer(1, rightBuffer),
+        bindBuffer(2, paramsBuffer),
+        bindBuffer(3, outputBuffer),
+      ],
+    }),
+    destroy: () => paramsBuffer.destroy?.(),
+  };
+}
+
+function createUnaryElementwiseResources(
+  device: WebGpuDeviceLike,
+  inputBuffer: WebGpuBufferLike,
+  outputBuffer: WebGpuBufferLike,
+  length: number,
+  shaderCode: string,
+): { pipeline: unknown; bindGroup: unknown; destroy: () => void } {
+  const params = new Uint32Array([length, 0, 0, 0]);
+  const paramsBuffer = device.createBuffer({
+    size: params.byteLength,
+    usage: GPU_UNIFORM | GPU_COPY_DST,
+  });
+  device.queue.writeBuffer(paramsBuffer, 0, params);
+  const bindGroupLayout = device.createBindGroupLayout({
+    entries: [
+      storageEntry(0, "read-only-storage"),
+      {
+        binding: 1,
+        visibility: GPU_SHADER_STAGE_COMPUTE,
+        buffer: { type: "uniform" },
+      },
+      storageEntry(2, "storage"),
+    ],
+  });
+  const pipeline = device.createComputePipeline({
+    layout: device.createPipelineLayout({ bindGroupLayouts: [bindGroupLayout] }),
+    compute: {
+      module: device.createShaderModule({ code: shaderCode }),
+      entryPoint: "main",
+    },
+  });
+  return {
+    pipeline,
+    bindGroup: device.createBindGroup({
+      layout: bindGroupLayout,
+      entries: [
+        bindBuffer(0, inputBuffer),
+        bindBuffer(1, paramsBuffer),
+        bindBuffer(2, outputBuffer),
       ],
     }),
     destroy: () => paramsBuffer.destroy?.(),
@@ -555,6 +701,8 @@ export function createFullAttentionScoreResources(
     keyValueTokenCount: number;
     contextLength: number;
     scale: number;
+    tokenPosition: number;
+    slidingWindow?: number;
   },
 ): { pipeline: unknown; bindGroup: unknown; destroy: () => void } {
   const paramsF32 = new Float32Array([options.scale, 0, 0, 0, 0, 0, 0, 0]);
@@ -564,6 +712,8 @@ export function createFullAttentionScoreResources(
   paramsU32[3] = options.keyValueHeadCount;
   paramsU32[4] = options.keyValueTokenCount;
   paramsU32[5] = options.contextLength;
+  paramsU32[6] = options.tokenPosition;
+  paramsU32[7] = options.slidingWindow ?? 0;
   const paramsBuffer = device.createBuffer({
     size: paramsU32.byteLength,
     usage: GPU_UNIFORM | GPU_COPY_DST,
@@ -606,11 +756,10 @@ export function createFullAttentionScoreResources(
 export function createFullAttentionApplyResources(
   device: WebGpuDeviceLike,
   valueBuffer: WebGpuBufferLike,
-  gateBuffer: WebGpuBufferLike,
   probabilitiesBuffer: WebGpuBufferLike,
   outputBuffer: WebGpuBufferLike,
   options: {
-    headSize: number;
+    valueSize: number;
     queryHeadCount: number;
     keyValueHeadCount: number;
     keyValueTokenCount: number;
@@ -620,7 +769,7 @@ export function createFullAttentionApplyResources(
 ): { pipeline: unknown; bindGroup: unknown; destroy: () => void } {
   const paramsF32 = new Float32Array([options.scale, 0, 0, 0, 0, 0, 0, 0]);
   const paramsU32 = new Uint32Array(paramsF32.buffer);
-  paramsU32[1] = options.headSize;
+  paramsU32[1] = options.valueSize;
   paramsU32[2] = options.queryHeadCount;
   paramsU32[3] = options.keyValueHeadCount;
   paramsU32[4] = options.keyValueTokenCount;
@@ -634,13 +783,12 @@ export function createFullAttentionApplyResources(
     entries: [
       storageEntry(0, "read-only-storage"),
       storageEntry(1, "read-only-storage"),
-      storageEntry(2, "read-only-storage"),
       {
-        binding: 3,
+        binding: 2,
         visibility: GPU_SHADER_STAGE_COMPUTE,
         buffer: { type: "uniform" },
       },
-      storageEntry(4, "storage"),
+      storageEntry(3, "storage"),
     ],
   });
   const pipeline = device.createComputePipeline({
@@ -656,10 +804,9 @@ export function createFullAttentionApplyResources(
       layout: bindGroupLayout,
       entries: [
         bindBuffer(0, valueBuffer),
-        bindBuffer(1, gateBuffer),
-        bindBuffer(2, probabilitiesBuffer),
-        bindBuffer(3, paramsBuffer),
-        bindBuffer(4, outputBuffer),
+        bindBuffer(1, probabilitiesBuffer),
+        bindBuffer(2, paramsBuffer),
+        bindBuffer(3, outputBuffer),
       ],
     }),
     destroy: () => paramsBuffer.destroy?.(),
@@ -793,10 +940,10 @@ export function createResidualAddResources(
 
 export function createFullQueryResources(
   device: WebGpuDeviceLike,
-  qFull: WebGpuBufferLike,
+  qProjection: WebGpuBufferLike,
   qNorm: WebGpuBufferLike,
+  freqFactors: WebGpuBufferLike,
   query: WebGpuBufferLike,
-  gate: WebGpuBufferLike,
   options: {
     headCount: number;
     headSize: number;
@@ -804,23 +951,25 @@ export function createFullQueryResources(
     epsilon: number;
     freqBase: number;
     position: number;
+    hasFreqFactors: boolean;
   },
 ): { pipeline: unknown; bindGroup: unknown; destroy: () => void } {
   const paramsF32 = new Float32Array([options.epsilon, options.freqBase, options.position, 0]);
   const paramsU32 = new Uint32Array(paramsF32.buffer);
-  paramsU32[3] = options.headCount;
-  const more = new Uint32Array([options.headSize, options.ropeDims, 0, 0]);
+  paramsU32[3] = options.hasFreqFactors ? 1 : 0;
   const params = new Uint32Array(8);
   params.set(paramsU32, 0);
-  params.set(more, 4);
+  params[4] = options.headCount;
+  params[5] = options.headSize;
+  params[6] = options.ropeDims;
   const paramsBuffer = device.createBuffer({ size: params.byteLength, usage: GPU_UNIFORM | GPU_COPY_DST });
   device.queue.writeBuffer(paramsBuffer, 0, params);
   const bindGroupLayout = device.createBindGroupLayout({
     entries: [
       storageEntry(0, "read-only-storage"),
       storageEntry(1, "read-only-storage"),
-      { binding: 2, visibility: GPU_SHADER_STAGE_COMPUTE, buffer: { type: "uniform" } },
-      storageEntry(3, "storage"),
+      storageEntry(2, "read-only-storage"),
+      { binding: 3, visibility: GPU_SHADER_STAGE_COMPUTE, buffer: { type: "uniform" } },
       storageEntry(4, "storage"),
     ],
   });
@@ -832,7 +981,13 @@ export function createFullQueryResources(
     pipeline,
     bindGroup: device.createBindGroup({
       layout: bindGroupLayout,
-      entries: [bindBuffer(0, qFull), bindBuffer(1, qNorm), bindBuffer(2, paramsBuffer), bindBuffer(3, query), bindBuffer(4, gate)],
+      entries: [
+        bindBuffer(0, qProjection),
+        bindBuffer(1, qNorm),
+        bindBuffer(2, freqFactors),
+        bindBuffer(3, paramsBuffer),
+        bindBuffer(4, query),
+      ],
     }),
     destroy: () => paramsBuffer.destroy?.(),
   };
@@ -843,26 +998,33 @@ export function createFullKvUpdateResources(
   kProjection: WebGpuBufferLike,
   vProjection: WebGpuBufferLike,
   kNorm: WebGpuBufferLike,
+  freqFactors: WebGpuBufferLike,
   keyCache: WebGpuBufferLike,
   valueCache: WebGpuBufferLike,
   options: {
     headCount: number;
     headSize: number;
+    valueSize: number;
     ropeDims: number;
     epsilon: number;
     freqBase: number;
     position: number;
     tokenPosition: number;
     contextLength: number;
+    hasFreqFactors: boolean;
   },
 ): { pipeline: unknown; bindGroup: unknown; destroy: () => void } {
   const paramsF32 = new Float32Array([options.epsilon, options.freqBase, options.position, 0]);
   const paramsU32 = new Uint32Array(paramsF32.buffer);
-  paramsU32[3] = options.headCount;
-  const more = new Uint32Array([options.headSize, options.ropeDims, options.tokenPosition, options.contextLength]);
-  const params = new Uint32Array(8);
+  paramsU32[3] = options.hasFreqFactors ? 1 : 0;
+  const params = new Uint32Array(12);
   params.set(paramsU32, 0);
-  params.set(more, 4);
+  params[4] = options.headCount;
+  params[5] = options.headSize;
+  params[6] = options.valueSize;
+  params[7] = options.ropeDims;
+  params[8] = options.tokenPosition;
+  params[9] = options.contextLength;
   const paramsBuffer = device.createBuffer({ size: params.byteLength, usage: GPU_UNIFORM | GPU_COPY_DST });
   device.queue.writeBuffer(paramsBuffer, 0, params);
   const bindGroupLayout = device.createBindGroupLayout({
@@ -870,9 +1032,10 @@ export function createFullKvUpdateResources(
       storageEntry(0, "read-only-storage"),
       storageEntry(1, "read-only-storage"),
       storageEntry(2, "read-only-storage"),
-      { binding: 3, visibility: GPU_SHADER_STAGE_COMPUTE, buffer: { type: "uniform" } },
-      storageEntry(4, "storage"),
+      storageEntry(3, "read-only-storage"),
+      { binding: 4, visibility: GPU_SHADER_STAGE_COMPUTE, buffer: { type: "uniform" } },
       storageEntry(5, "storage"),
+      storageEntry(6, "storage"),
     ],
   });
   const pipeline = device.createComputePipeline({
@@ -887,9 +1050,10 @@ export function createFullKvUpdateResources(
         bindBuffer(0, kProjection),
         bindBuffer(1, vProjection),
         bindBuffer(2, kNorm),
-        bindBuffer(3, paramsBuffer),
-        bindBuffer(4, keyCache),
-        bindBuffer(5, valueCache),
+        bindBuffer(3, freqFactors),
+        bindBuffer(4, paramsBuffer),
+        bindBuffer(5, keyCache),
+        bindBuffer(6, valueCache),
       ],
     }),
     destroy: () => paramsBuffer.destroy?.(),

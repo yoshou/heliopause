@@ -469,11 +469,32 @@ function ModelStatus({ model }: { model: ModelState }) {
         </dd>
       </div>
       <div>
+        <dt>Execution</dt>
+        <dd>{executionLabel(model.memoryProfile)}</dd>
+      </div>
+      <div>
         <dt>Estimated weights</dt>
         <dd>{formatBytes(model.memoryProfile.estimatedWeightCacheBytes)}</dd>
       </div>
     </dl>
   );
+}
+
+function executionLabel(memoryProfile: WorkerModelInfo["memoryProfile"]): string {
+  if (memoryProfile.webGpuStatus === "suffix-enabled") {
+    const start = memoryProfile.webGpuSegmentStartLayer;
+    const count = memoryProfile.webGpuSegmentLayerCount;
+    return start === undefined || count === undefined
+      ? "CPU/WASM + WebGPU suffix"
+      : `CPU/WASM + WebGPU suffix (${start}-${start + count - 1})`;
+  }
+  if (memoryProfile.webGpuStatus === "blocked") {
+    return "CPU/WASM (WebGPU suffix blocked)";
+  }
+  if (memoryProfile.webGpuStatus === "memory-profile-disabled") {
+    return "CPU/WASM";
+  }
+  return "CPU/WASM";
 }
 
 async function readSystemMemoryInfo(): Promise<SystemMemoryInfo | undefined> {

@@ -88,6 +88,10 @@ export type Gemma4RunnerPlanningProvider = {
   blockedByMemoryReason: string;
   unavailableReason: (support: Gemma4RunnerProviderSupport) => string;
   plannedReason: string;
+  requiredSegmentStart?: (params: {
+    manifest: Gemma4ModelManifest;
+    selectedLayers: readonly Gemma4RunnerLayerPlacement[];
+  }) => number | undefined;
   layerPlacement: (params: {
     tensorsByName: ReadonlyMap<string, GgufTensorInfo>;
     manifest: Gemma4ModelManifest;
@@ -163,6 +167,29 @@ export function planGemma4ProviderPlacement(
     }
     selectedLayers.unshift(candidate);
     selectedBytes += candidate.totalBytes;
+  }
+
+  const requiredStart = provider.requiredSegmentStart?.({ manifest, selectedLayers });
+  if (requiredStart !== undefined && selectedLayers.length > 0) {
+    const currentStart = selectedLayers[0]?.layer ?? manifest.blockCount;
+    for (let layer = currentStart - 1; layer >= requiredStart; layer -= 1) {
+      const candidate = layerPlans.get(layer);
+      if (!candidate) {
+        continue;
+      }
+      if (selectedBytes + candidate.totalBytes > memoryLimitBytes) {
+        return emptyPlan(provider, {
+          status: "blocked",
+          mode,
+          memoryLimitBytes,
+          reason: provider.blockedByMemoryReason,
+          outputBytes,
+          blockCount: manifest.blockCount,
+        });
+      }
+      selectedLayers.unshift(candidate);
+      selectedBytes += candidate.totalBytes;
+    }
   }
 
   const segmentStartLayer = selectedLayers[0]?.layer;

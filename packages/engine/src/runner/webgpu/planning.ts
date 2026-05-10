@@ -38,9 +38,9 @@ export const gemma4WebGpuPlanningProvider = {
   scratchBytes: DEFAULT_GPU_SCRATCH_BYTES,
   outputTensorNames: ["token_embd.weight", "output_norm.weight"],
   offReason: "WebGPU execution is off; this is a placement plan only.",
-  blockedByMemoryReason: "`output.weight` plus fixed GPU buffers exceed the configured WebGPU memory cap.",
+  blockedByMemoryReason: "WebGPU Gemma4 layer suffix plus required KV source layers exceed the configured WebGPU memory cap.",
   unavailableReason: (support: WebGpuPlanningSupport) => `WebGPU unavailable: ${support.available ? "unknown" : support.reason}`,
-  plannedReason: "WebGPU segment placement is planned, but execution still requires verified kernels.",
+  plannedReason: "WebGPU Gemma4 layer suffix placement is planned.",
   layerPlacement: ({ tensorsByName, manifest, layer, contextLength }: WebGpuLayerPlacementParams) => {
     const layerKind: Gemma4LayerKind = manifest.layerKinds[layer] ?? "sliding-attention";
     const weightBytes = manifest.expectedTensors.reduce((sum, expected) => {
@@ -67,6 +67,25 @@ export const gemma4WebGpuPlanningProvider = {
     expectedBoundaryUploads: selectedLayerCount > 0 ? 1 : 0,
     expectedTokenReadbacks: 1,
   }),
+  requiredSegmentStart: ({
+    manifest,
+    selectedLayers,
+  }: {
+    manifest: Gemma4ModelManifest;
+    selectedLayers: readonly { layer: number }[];
+  }): number | undefined => {
+    if (selectedLayers.length === 0) {
+      return undefined;
+    }
+    let requiredStart = selectedLayers[0]?.layer;
+    for (const layer of selectedLayers) {
+      const source = manifest.kvSourceLayers[layer.layer] ?? layer.layer;
+      if (manifest.layerHasKv[layer.layer] !== true && requiredStart !== undefined) {
+        requiredStart = Math.min(requiredStart, source);
+      }
+    }
+    return requiredStart;
+  },
 };
 
 export function planGemma4RunnerPlacement(

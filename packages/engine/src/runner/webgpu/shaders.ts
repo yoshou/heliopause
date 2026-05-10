@@ -75,22 +75,29 @@ struct Params {
   epsilon: f32,
   freqBase: f32,
   position: f32,
+  hasFreqFactors: u32,
   headCount: u32,
   headSize: u32,
   ropeDims: u32,
   _pad0: u32,
-  _pad1: u32,
 };
 
-@group(0) @binding(0) var<storage, read> qFullValues: array<f32>;
+@group(0) @binding(0) var<storage, read> qValues: array<f32>;
 @group(0) @binding(1) var<storage, read> normWeights: array<f32>;
-@group(0) @binding(2) var<uniform> params: Params;
-@group(0) @binding(3) var<storage, read_write> queryValues: array<f32>;
-@group(0) @binding(4) var<storage, read_write> gateValues: array<f32>;
+@group(0) @binding(2) var<storage, read> freqFactors: array<f32>;
+@group(0) @binding(3) var<uniform> params: Params;
+@group(0) @binding(4) var<storage, read_write> queryValues: array<f32>;
 
 fn normed(head: u32, dim: u32, scale: f32) -> f32 {
-  let qFullBase = head * params.headSize * 2u;
-  return qFullValues[qFullBase + dim] * scale * normWeights[dim];
+  let base = head * params.headSize;
+  return qValues[base + dim] * scale * normWeights[dim];
+}
+
+fn ropeFactor(index: u32) -> f32 {
+  if (params.hasFreqFactors == 0u) {
+    return 1.0;
+  }
+  return freqFactors[index];
 }
 
 @compute @workgroup_size(1, 1, 1)
@@ -99,13 +106,12 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   if (head >= params.headCount) {
     return;
   }
-  let qFullBase = head * params.headSize * 2u;
+  let qBase = head * params.headSize;
   let outBase = head * params.headSize;
   var meanSquare = 0.0;
   for (var dim = 0u; dim < params.headSize; dim = dim + 1u) {
-    let value = qFullValues[qFullBase + dim];
+    let value = qValues[qBase + dim];
     meanSquare = meanSquare + value * value;
-    gateValues[outBase + dim] = qFullValues[qFullBase + params.headSize + dim];
   }
   let scale = inverseSqrt(meanSquare / f32(params.headSize) + params.epsilon);
   for (var dim = 0u; dim < params.headSize; dim = dim + 1u) {
@@ -117,8 +123,9 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     let ic = i0 / 2u;
     let x0 = normed(head, ic, scale);
     let x1 = normed(head, params.ropeDims / 2u + ic, scale);
-    let cosTheta = cos(theta);
-    let sinTheta = sin(theta);
+    let thetaWithFactor = theta / ropeFactor(ic);
+    let cosTheta = cos(thetaWithFactor);
+    let sinTheta = sin(thetaWithFactor);
     queryValues[outBase + ic] = x0 * cosTheta - x1 * sinTheta;
     queryValues[outBase + params.ropeDims / 2u + ic] = x0 * sinTheta + x1 * cosTheta;
     theta = theta * thetaScale;
@@ -131,8 +138,10 @@ struct Params {
   epsilon: f32,
   freqBase: f32,
   position: f32,
+  hasFreqFactors: u32,
   headCount: u32,
   headSize: u32,
+  valueSize: u32,
   ropeDims: u32,
   tokenPosition: u32,
   contextLength: u32,
@@ -141,13 +150,21 @@ struct Params {
 @group(0) @binding(0) var<storage, read> kProjectionValues: array<f32>;
 @group(0) @binding(1) var<storage, read> vProjectionValues: array<f32>;
 @group(0) @binding(2) var<storage, read> normWeights: array<f32>;
-@group(0) @binding(3) var<uniform> params: Params;
-@group(0) @binding(4) var<storage, read_write> keyCache: array<f32>;
-@group(0) @binding(5) var<storage, read_write> valueCache: array<f32>;
+@group(0) @binding(3) var<storage, read> freqFactors: array<f32>;
+@group(0) @binding(4) var<uniform> params: Params;
+@group(0) @binding(5) var<storage, read_write> keyCache: array<f32>;
+@group(0) @binding(6) var<storage, read_write> valueCache: array<f32>;
 
 fn normed(head: u32, dim: u32, scale: f32) -> f32 {
   let base = head * params.headSize;
   return kProjectionValues[base + dim] * scale * normWeights[dim];
+}
+
+fn ropeFactor(index: u32) -> f32 {
+  if (params.hasFreqFactors == 0u) {
+    return 1.0;
+  }
+  return freqFactors[index];
 }
 
 @compute @workgroup_size(1, 1, 1)
@@ -166,8 +183,17 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   let keyBase = (params.tokenPosition * params.headCount + head) * params.headSize;
   for (var dim = 0u; dim < params.headSize; dim = dim + 1u) {
     keyCache[keyBase + dim] = normed(head, dim, scale);
+  }
+  var valueMeanSquare = 0.0;
+  let valueBase = head * params.valueSize;
+  for (var dim = 0u; dim < params.valueSize; dim = dim + 1u) {
+    let value = vProjectionValues[valueBase + dim];
+    valueMeanSquare = valueMeanSquare + value * value;
+  }
+  let valueScale = inverseSqrt(valueMeanSquare / f32(params.valueSize) + params.epsilon);
+  for (var dim = 0u; dim < params.valueSize; dim = dim + 1u) {
     valueCache[(dim * params.headCount + head) * params.contextLength + params.tokenPosition] =
-      vProjectionValues[base + dim];
+      vProjectionValues[valueBase + dim] * valueScale;
   }
   let thetaScale = pow(params.freqBase, -2.0 / f32(params.ropeDims));
   var theta = params.position;
@@ -175,8 +201,9 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     let ic = i0 / 2u;
     let x0 = normed(head, ic, scale);
     let x1 = normed(head, params.ropeDims / 2u + ic, scale);
-    let cosTheta = cos(theta);
-    let sinTheta = sin(theta);
+    let thetaWithFactor = theta / ropeFactor(ic);
+    let cosTheta = cos(thetaWithFactor);
+    let sinTheta = sin(thetaWithFactor);
     keyCache[keyBase + ic] = x0 * cosTheta - x1 * sinTheta;
     keyCache[keyBase + params.ropeDims / 2u + ic] = x0 * sinTheta + x1 * cosTheta;
     theta = theta * thetaScale;
@@ -312,6 +339,280 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   }
   let gate = gateValues[index];
   outputValues[index] = (gate / (1.0 + exp(-gate))) * upValues[index];
+}
+`;
+
+export const GEGLU_WGSL = `
+struct Params {
+  length: u32,
+  _pad0: u32,
+  _pad1: u32,
+  _pad2: u32,
+};
+
+@group(0) @binding(0) var<storage, read> gateValues: array<f32>;
+@group(0) @binding(1) var<storage, read> upValues: array<f32>;
+@group(0) @binding(2) var<uniform> params: Params;
+@group(0) @binding(3) var<storage, read_write> outputValues: array<f32>;
+
+fn f16BitsToF32(bits: u32) -> f32 {
+  let sign = select(1.0, -1.0, (bits & 0x8000u) != 0u);
+  let exponent = (bits >> 10u) & 31u;
+  let fraction = bits & 1023u;
+  if (exponent == 0u) {
+    return sign * exp2(-14.0) * (f32(fraction) / 1024.0);
+  }
+  if (exponent == 31u) {
+    return sign * 65504.0;
+  }
+  return sign * exp2(f32(exponent) - 15.0) * (1.0 + f32(fraction) / 1024.0);
+}
+
+fn f32ToF16Bits(value: f32) -> u32 {
+  let bits = bitcast<u32>(value);
+  let sign = (bits >> 16u) & 0x8000u;
+  let absBits = bits & 0x7fffffffu;
+  if (absBits == 0u) {
+    return sign;
+  }
+  if (absBits >= 0x7f800000u) {
+    return sign | 0x7c00u;
+  }
+  var exponent = i32((absBits >> 23u) & 255u) - 127 + 15;
+  let mantissa = absBits & 0x7fffffu;
+  if (exponent <= 0) {
+    if (exponent < -10) {
+      return sign;
+    }
+    let shifted = (mantissa | 0x800000u) >> u32(1 - exponent);
+    return sign | ((shifted + 0x1000u) >> 13u);
+  }
+  var halfMantissa = (mantissa + 0x1000u) >> 13u;
+  if (halfMantissa == 0x400u) {
+    halfMantissa = 0u;
+    exponent = exponent + 1;
+  }
+  if (exponent >= 31) {
+    return sign | 0x7c00u;
+  }
+  return sign | (u32(exponent) << 10u) | halfMantissa;
+}
+
+fn castF16(value: f32) -> f32 {
+  return f16BitsToF32(f32ToF16Bits(value));
+}
+
+fn gelu(value: f32) -> f32 {
+  if (value <= -10.0) {
+    return 0.0;
+  }
+  if (value >= 10.0) {
+    return value;
+  }
+  let x = castF16(value);
+  let inner = sqrt(2.0 / 3.141592653589793) * x * (1.0 + 0.044715 * x * x);
+  return castF16(0.5 * x * (1.0 + tanh(inner)));
+}
+
+@compute @workgroup_size(256, 1, 1)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let index = id.x;
+  if (index >= params.length) {
+    return;
+  }
+  outputValues[index] = gelu(gateValues[index]) * upValues[index];
+}
+`;
+
+export const GELU_WGSL = `
+struct Params {
+  length: u32,
+  _pad0: u32,
+  _pad1: u32,
+  _pad2: u32,
+};
+
+@group(0) @binding(0) var<storage, read> inputValues: array<f32>;
+@group(0) @binding(1) var<uniform> params: Params;
+@group(0) @binding(2) var<storage, read_write> outputValues: array<f32>;
+
+fn f16BitsToF32(bits: u32) -> f32 {
+  let sign = select(1.0, -1.0, (bits & 0x8000u) != 0u);
+  let exponent = (bits >> 10u) & 31u;
+  let fraction = bits & 1023u;
+  if (exponent == 0u) {
+    return sign * exp2(-14.0) * (f32(fraction) / 1024.0);
+  }
+  if (exponent == 31u) {
+    return sign * 65504.0;
+  }
+  return sign * exp2(f32(exponent) - 15.0) * (1.0 + f32(fraction) / 1024.0);
+}
+
+fn f32ToF16Bits(value: f32) -> u32 {
+  let bits = bitcast<u32>(value);
+  let sign = (bits >> 16u) & 0x8000u;
+  let absBits = bits & 0x7fffffffu;
+  if (absBits == 0u) {
+    return sign;
+  }
+  if (absBits >= 0x7f800000u) {
+    return sign | 0x7c00u;
+  }
+  var exponent = i32((absBits >> 23u) & 255u) - 127 + 15;
+  let mantissa = absBits & 0x7fffffu;
+  if (exponent <= 0) {
+    if (exponent < -10) {
+      return sign;
+    }
+    let shifted = (mantissa | 0x800000u) >> u32(1 - exponent);
+    return sign | ((shifted + 0x1000u) >> 13u);
+  }
+  var halfMantissa = (mantissa + 0x1000u) >> 13u;
+  if (halfMantissa == 0x400u) {
+    halfMantissa = 0u;
+    exponent = exponent + 1;
+  }
+  if (exponent >= 31) {
+    return sign | 0x7c00u;
+  }
+  return sign | (u32(exponent) << 10u) | halfMantissa;
+}
+
+fn castF16(value: f32) -> f32 {
+  return f16BitsToF32(f32ToF16Bits(value));
+}
+
+fn gelu(value: f32) -> f32 {
+  if (value <= -10.0) {
+    return 0.0;
+  }
+  if (value >= 10.0) {
+    return value;
+  }
+  let x = castF16(value);
+  let inner = sqrt(2.0 / 3.141592653589793) * x * (1.0 + 0.044715 * x * x);
+  return castF16(0.5 * x * (1.0 + tanh(inner)));
+}
+
+@compute @workgroup_size(256, 1, 1)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let index = id.x;
+  if (index >= params.length) {
+    return;
+  }
+  outputValues[index] = gelu(inputValues[index]);
+}
+`;
+
+export const ELEMENTWISE_MUL_WGSL = `
+struct Params {
+  length: u32,
+  _pad0: u32,
+  _pad1: u32,
+  _pad2: u32,
+};
+
+@group(0) @binding(0) var<storage, read> leftValues: array<f32>;
+@group(0) @binding(1) var<storage, read> rightValues: array<f32>;
+@group(0) @binding(2) var<uniform> params: Params;
+@group(0) @binding(3) var<storage, read_write> outputValues: array<f32>;
+
+@compute @workgroup_size(256, 1, 1)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let index = id.x;
+  if (index >= params.length) {
+    return;
+  }
+  outputValues[index] = leftValues[index] * rightValues[index];
+}
+`;
+
+export const SCALE_WGSL = `
+struct Params {
+  length: u32,
+  _pad0: u32,
+  _pad1: u32,
+  _pad2: u32,
+};
+
+@group(0) @binding(0) var<storage, read> inputValues: array<f32>;
+@group(0) @binding(1) var<storage, read> scaleValue: array<f32>;
+@group(0) @binding(2) var<uniform> params: Params;
+@group(0) @binding(3) var<storage, read_write> outputValues: array<f32>;
+
+@compute @workgroup_size(256, 1, 1)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let index = id.x;
+  if (index >= params.length) {
+    return;
+  }
+  outputValues[index] = inputValues[index] * scaleValue[0];
+}
+`;
+
+export const F16_CAST_WGSL = `
+struct Params {
+  length: u32,
+  _pad0: u32,
+  _pad1: u32,
+  _pad2: u32,
+};
+
+@group(0) @binding(0) var<storage, read> inputValues: array<f32>;
+@group(0) @binding(1) var<uniform> params: Params;
+@group(0) @binding(2) var<storage, read_write> outputValues: array<f32>;
+
+fn f16BitsToF32(bits: u32) -> f32 {
+  let sign = select(1.0, -1.0, (bits & 0x8000u) != 0u);
+  let exponent = (bits >> 10u) & 31u;
+  let fraction = bits & 1023u;
+  if (exponent == 0u) {
+    return sign * exp2(-14.0) * (f32(fraction) / 1024.0);
+  }
+  if (exponent == 31u) {
+    return sign * 65504.0;
+  }
+  return sign * exp2(f32(exponent) - 15.0) * (1.0 + f32(fraction) / 1024.0);
+}
+
+fn f32ToF16Bits(value: f32) -> u32 {
+  let bits = bitcast<u32>(value);
+  let sign = (bits >> 16u) & 0x8000u;
+  let absBits = bits & 0x7fffffffu;
+  if (absBits == 0u) {
+    return sign;
+  }
+  if (absBits >= 0x7f800000u) {
+    return sign | 0x7c00u;
+  }
+  var exponent = i32((absBits >> 23u) & 255u) - 127 + 15;
+  let mantissa = absBits & 0x7fffffu;
+  if (exponent <= 0) {
+    if (exponent < -10) {
+      return sign;
+    }
+    let shifted = (mantissa | 0x800000u) >> u32(1 - exponent);
+    return sign | ((shifted + 0x1000u) >> 13u);
+  }
+  var halfMantissa = (mantissa + 0x1000u) >> 13u;
+  if (halfMantissa == 0x400u) {
+    halfMantissa = 0u;
+    exponent = exponent + 1;
+  }
+  if (exponent >= 31) {
+    return sign | 0x7c00u;
+  }
+  return sign | (u32(exponent) << 10u) | halfMantissa;
+}
+
+@compute @workgroup_size(256, 1, 1)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let index = id.x;
+  if (index >= params.length) {
+    return;
+  }
+  outputValues[index] = f16BitsToF32(f32ToF16Bits(inputValues[index]));
 }
 `;
 
@@ -688,8 +989,8 @@ struct Params {
   keyValueHeadCount: u32,
   keyValueTokenCount: u32,
   contextLength: u32,
-  _pad0: u32,
-  _pad1: u32,
+  tokenPosition: u32,
+  slidingWindow: u32,
 };
 
 @group(0) @binding(0) var<storage, read> queryValues: array<f32>;
@@ -745,6 +1046,14 @@ fn queryValue(index: u32) -> f32 {
 }
 
 fn attentionScore(qHead: u32, kvHead: u32, keyToken: u32) -> f32 {
+  let minPosition = select(
+    0u,
+    params.tokenPosition + 1u - params.slidingWindow,
+    params.slidingWindow != 0u && params.tokenPosition + 1u > params.slidingWindow,
+  );
+  if (keyToken > params.tokenPosition || keyToken < minPosition) {
+    return -3.4028234663852886e38;
+  }
   let queryOffset = qHead * params.headSize;
   let keyOffset = (keyToken * params.keyValueHeadCount + kvHead) * params.headSize;
   var dot = 0.0;
@@ -782,7 +1091,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 export const FULL_ATTENTION_APPLY_WGSL = `
 struct Params {
   scale: f32,
-  headSize: u32,
+  valueSize: u32,
   queryHeadCount: u32,
   keyValueHeadCount: u32,
   keyValueTokenCount: u32,
@@ -792,16 +1101,15 @@ struct Params {
 };
 
 @group(0) @binding(0) var<storage, read> valueValues: array<f32>;
-@group(0) @binding(1) var<storage, read> gateValues: array<f32>;
-@group(0) @binding(2) var<storage, read> probabilityValues: array<f32>;
-@group(0) @binding(3) var<uniform> params: Params;
-@group(0) @binding(4) var<storage, read_write> outputValues: array<f32>;
+@group(0) @binding(1) var<storage, read> probabilityValues: array<f32>;
+@group(0) @binding(2) var<uniform> params: Params;
+@group(0) @binding(3) var<storage, read_write> outputValues: array<f32>;
 
 @compute @workgroup_size(1, 1, 1)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   let qHead = id.x;
   let dim = id.y;
-  if (qHead >= params.queryHeadCount || dim >= params.headSize) {
+  if (qHead >= params.queryHeadCount || dim >= params.valueSize) {
     return;
   }
   let groupSize = params.queryHeadCount / params.keyValueHeadCount;
@@ -813,9 +1121,8 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     let valueIndex = (dim * params.keyValueHeadCount + kvHead) * params.contextLength + keyToken;
     weighted = weighted + probability * valueValues[valueIndex];
   }
-  let outputIndex = qHead * params.headSize + dim;
-  let gate = gateValues[outputIndex];
-  outputValues[outputIndex] = weighted * (1.0 / (1.0 + exp(-gate)));
+  let outputIndex = qHead * params.valueSize + dim;
+  outputValues[outputIndex] = weighted;
 }
 `;
 

@@ -2,11 +2,15 @@ import type { WebGpuBufferLike, WebGpuComputePassLike, WebGpuDeviceLike } from "
 import type { Q8_0Buffers, Q8KBuffers, QuantizedHandle } from "./arena";
 import {
   createDeltaGateResources,
+  createElementwiseMulResources,
+  createF16CastResources,
   createF32MatMulResources,
   createFullAttentionApplyResources,
   createFullAttentionScoreResources,
   createFullKvUpdateResources,
   createFullQueryResources,
+  createGegluResources,
+  createGeluResources,
   createKMatMulBindResources,
   createQkvConvResources,
   createQ8_0MatMulBindResources,
@@ -14,6 +18,7 @@ import {
   createQ8KQuantizeResources,
   createResidualAddResources,
   createRmsNormResources,
+  createScaleResources,
   createSsmNormGateResources,
   createSwiGluResources,
   createTokenSliceResources,
@@ -144,10 +149,10 @@ export function dispatchFullQuery(
   device: WebGpuDeviceLike,
   pass: WebGpuComputePassLike,
   resources: Array<{ destroy: () => void }>,
-  qFull: WebGpuBufferLike,
+  qProjection: WebGpuBufferLike,
   qNorm: WebGpuBufferLike,
+  freqFactors: WebGpuBufferLike,
   query: WebGpuBufferLike,
-  gate: WebGpuBufferLike,
   options: {
     headCount: number;
     headSize: number;
@@ -155,9 +160,10 @@ export function dispatchFullQuery(
     epsilon: number;
     freqBase: number;
     position: number;
+    hasFreqFactors: boolean;
   },
 ): void {
-  const resource = createFullQueryResources(device, qFull, qNorm, query, gate, options);
+  const resource = createFullQueryResources(device, qProjection, qNorm, freqFactors, query, options);
   resources.push(resource);
   pass.setPipeline(resource.pipeline);
   pass.setBindGroup(0, resource.bindGroup);
@@ -171,20 +177,23 @@ export function dispatchFullKvUpdate(
   kProjection: WebGpuBufferLike,
   vProjection: WebGpuBufferLike,
   kNorm: WebGpuBufferLike,
+  freqFactors: WebGpuBufferLike,
   keyCache: WebGpuBufferLike,
   valueCache: WebGpuBufferLike,
   options: {
     headCount: number;
     headSize: number;
+    valueSize: number;
     ropeDims: number;
     epsilon: number;
     freqBase: number;
     position: number;
     tokenPosition: number;
     contextLength: number;
+    hasFreqFactors: boolean;
   },
 ): void {
-  const resource = createFullKvUpdateResources(device, kProjection, vProjection, kNorm, keyCache, valueCache, options);
+  const resource = createFullKvUpdateResources(device, kProjection, vProjection, kNorm, freqFactors, keyCache, valueCache, options);
   resources.push(resource);
   pass.setPipeline(resource.pipeline);
   pass.setBindGroup(0, resource.bindGroup);
@@ -241,6 +250,84 @@ export function dispatchSwiGlu(
   length: number,
 ): void {
   const resource = createSwiGluResources(device, gate, up, output, length);
+  resources.push(resource);
+  pass.setPipeline(resource.pipeline);
+  pass.setBindGroup(0, resource.bindGroup);
+  pass.dispatchWorkgroups(Math.ceil(length / 256));
+}
+
+export function dispatchGeglu(
+  device: WebGpuDeviceLike,
+  pass: WebGpuComputePassLike,
+  resources: Array<{ destroy: () => void }>,
+  gate: WebGpuBufferLike,
+  up: WebGpuBufferLike,
+  output: WebGpuBufferLike,
+  length: number,
+): void {
+  const resource = createGegluResources(device, gate, up, output, length);
+  resources.push(resource);
+  pass.setPipeline(resource.pipeline);
+  pass.setBindGroup(0, resource.bindGroup);
+  pass.dispatchWorkgroups(Math.ceil(length / 256));
+}
+
+export function dispatchGelu(
+  device: WebGpuDeviceLike,
+  pass: WebGpuComputePassLike,
+  resources: Array<{ destroy: () => void }>,
+  input: WebGpuBufferLike,
+  output: WebGpuBufferLike,
+  length: number,
+): void {
+  const resource = createGeluResources(device, input, output, length);
+  resources.push(resource);
+  pass.setPipeline(resource.pipeline);
+  pass.setBindGroup(0, resource.bindGroup);
+  pass.dispatchWorkgroups(Math.ceil(length / 256));
+}
+
+export function dispatchElementwiseMul(
+  device: WebGpuDeviceLike,
+  pass: WebGpuComputePassLike,
+  resources: Array<{ destroy: () => void }>,
+  left: WebGpuBufferLike,
+  right: WebGpuBufferLike,
+  output: WebGpuBufferLike,
+  length: number,
+): void {
+  const resource = createElementwiseMulResources(device, left, right, output, length);
+  resources.push(resource);
+  pass.setPipeline(resource.pipeline);
+  pass.setBindGroup(0, resource.bindGroup);
+  pass.dispatchWorkgroups(Math.ceil(length / 256));
+}
+
+export function dispatchScale(
+  device: WebGpuDeviceLike,
+  pass: WebGpuComputePassLike,
+  resources: Array<{ destroy: () => void }>,
+  input: WebGpuBufferLike,
+  scale: WebGpuBufferLike,
+  output: WebGpuBufferLike,
+  length: number,
+): void {
+  const resource = createScaleResources(device, input, scale, output, length);
+  resources.push(resource);
+  pass.setPipeline(resource.pipeline);
+  pass.setBindGroup(0, resource.bindGroup);
+  pass.dispatchWorkgroups(Math.ceil(length / 256));
+}
+
+export function dispatchF16Cast(
+  device: WebGpuDeviceLike,
+  pass: WebGpuComputePassLike,
+  resources: Array<{ destroy: () => void }>,
+  input: WebGpuBufferLike,
+  output: WebGpuBufferLike,
+  length: number,
+): void {
+  const resource = createF16CastResources(device, input, output, length);
   resources.push(resource);
   pass.setPipeline(resource.pipeline);
   pass.setBindGroup(0, resource.bindGroup);
@@ -327,6 +414,8 @@ export function dispatchFullAttentionScore(
     keyValueTokenCount: number;
     contextLength: number;
     scale: number;
+    tokenPosition: number;
+    slidingWindow?: number;
   },
 ): void {
   const resource = createFullAttentionScoreResources(device, query, key, probabilities, options);
@@ -341,11 +430,10 @@ export function dispatchFullAttentionApply(
   pass: WebGpuComputePassLike,
   resources: Array<{ destroy: () => void }>,
   value: WebGpuBufferLike,
-  gate: WebGpuBufferLike,
   probabilities: WebGpuBufferLike,
   output: WebGpuBufferLike,
   options: {
-    headSize: number;
+    valueSize: number;
     queryHeadCount: number;
     keyValueHeadCount: number;
     keyValueTokenCount: number;
@@ -353,9 +441,9 @@ export function dispatchFullAttentionApply(
     scale: number;
   },
 ): void {
-  const resource = createFullAttentionApplyResources(device, value, gate, probabilities, output, options);
+  const resource = createFullAttentionApplyResources(device, value, probabilities, output, options);
   resources.push(resource);
   pass.setPipeline(resource.pipeline);
   pass.setBindGroup(0, resource.bindGroup);
-  pass.dispatchWorkgroups(options.queryHeadCount, options.headSize);
+  pass.dispatchWorkgroups(options.queryHeadCount, options.valueSize);
 }

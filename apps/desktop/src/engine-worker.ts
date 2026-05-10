@@ -1,4 +1,5 @@
 import {
+  buildGemma4Manifest,
   buildGemma4Tokenizer,
   cloneGemma4InferenceState,
   createFileGgufTensorReader,
@@ -6,7 +7,9 @@ import {
   estimateWeightCacheBytes,
   generateGemma4ChatTurn,
   getGgufModelName,
+  planGemma4RunnerPlacement,
   prefillGemma4ChatMessages,
+  type ExecutionProviderConfig,
   type Gemma4InferenceState,
   type Gemma4ModelSession,
   type Gemma4Tokenizer,
@@ -72,28 +75,52 @@ async function handleLoadModel(
   currentSystemPrompt = undefined;
 
   const tensorReader = await createFileGgufTensorReader(request.file);
+  const manifest = buildGemma4Manifest(tensorReader.metadata);
   const estimatedWeightCacheBytes = estimateWeightCacheBytes(tensorReader);
   const resolvedMemoryProfile = resolveMemoryProfile(
     request.memoryProfile,
     estimatedWeightCacheBytes,
     request.memoryInfo,
   );
+  const executionProviders: ExecutionProviderConfig[] = [{
+    name: "cpu",
+    options: {
+      projectionBatching: true,
+      residentWeightCache: resolvedMemoryProfile.wasmResidentWeightCache,
+      parallelResidentMatmul: resolvedMemoryProfile.wasmResidentWeightCache,
+      parallelMatmulMinRows: 512,
+      threadPoolSize: resolvedMemoryProfile.wasmResidentWeightCache ? "auto" : 1,
+      ioPrefetch: resolvedMemoryProfile.wasmResidentWeightCache,
+      ioPrefetchConcurrency: "auto",
+      ioWorkerBlobRead: false,
+    },
+  }];
+
+  if (resolvedMemoryProfile.resolved === "full") {
+    const webGpuPlan = planGemma4RunnerPlacement(tensorReader.metadata, manifest, {
+      mode: "enabled",
+      contextLength: CHAT_CONTEXT_LENGTH,
+    });
+    if (webGpuPlan.status === "planned" && webGpuPlan.segmentStartLayer !== undefined) {
+      resolvedMemoryProfile.webGpuStatus = "suffix-enabled";
+      resolvedMemoryProfile.webGpuSegmentStartLayer = webGpuPlan.segmentStartLayer;
+      resolvedMemoryProfile.webGpuSegmentLayerCount = webGpuPlan.gpuSegmentLayerCount;
+      executionProviders.push({
+        name: "webgpu",
+        options: {
+          segmentStartLayer: webGpuPlan.segmentStartLayer,
+          memoryLimitBytes: webGpuPlan.memoryLimitBytes,
+        },
+      });
+    } else {
+      resolvedMemoryProfile.webGpuStatus = "blocked";
+    }
+  }
+
   const nextSession = createGemma4ChatSession(tensorReader, {
     maxContextLength: CHAT_CONTEXT_LENGTH,
     maxWeightCacheBytes: resolvedMemoryProfile.maxWeightCacheBytes,
-    executionProviders: [{
-      name: "cpu",
-      options: {
-        projectionBatching: true,
-        residentWeightCache: resolvedMemoryProfile.wasmResidentWeightCache,
-        parallelResidentMatmul: resolvedMemoryProfile.wasmResidentWeightCache,
-        parallelMatmulMinRows: 512,
-        threadPoolSize: resolvedMemoryProfile.wasmResidentWeightCache ? "auto" : 1,
-        ioPrefetch: resolvedMemoryProfile.wasmResidentWeightCache,
-        ioPrefetchConcurrency: "auto",
-        ioWorkerBlobRead: false,
-      },
-    }],
+    executionProviders,
   });
   const nextTokenizer = buildGemma4Tokenizer(tensorReader.metadata);
 
@@ -242,6 +269,7 @@ function resolveMemoryProfile(
     maxWeightCacheBytes: resolved === "full" ? fullBytes : LOW_WEIGHT_CACHE_BYTES,
     estimatedWeightCacheBytes,
     wasmResidentWeightCache: resolved === "full",
+    webGpuStatus: resolved === "full" ? "blocked" : "memory-profile-disabled",
     availableMemoryBytes,
   };
 }
