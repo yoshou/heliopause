@@ -12,6 +12,7 @@ import {
   RMS_NORM_WGSL,
   RESIDUAL_ADD_WGSL,
   RESIDUAL_ADD_SCALE_WGSL,
+  RMS_NORM_RESIDUAL_ADD_WGSL,
   FULL_QUERY_NORM_ROPE_WGSL,
   FULL_KV_UPDATE_WGSL,
   TOPK_WGSL,
@@ -29,13 +30,13 @@ import {
   TOP1_CHUNK_WGSL,
   SELECT_TOP1_CANDIDATE_WGSL,
   Q8_K_QUANTIZE_WGSL,
-  F16_Q8_K_QUANTIZE_WGSL,
   RMS_NORM_Q8_K_QUANTIZE_WGSL,
   Q8_0_QUANTIZE_WGSL,
   SSM_NORM_GATE_WGSL,
   QKV_CONV_SPLIT_WGSL,
   FULL_ATTENTION_SCORE_WGSL,
   FULL_ATTENTION_APPLY_WGSL,
+  Q4_K_DUAL_MATMUL_WGSL,
   Q4_K_MATMUL_WGSL,
   Q5_K_MATMUL_WGSL,
   Q6_K_MATMUL_WGSL,
@@ -127,6 +128,73 @@ export function createKMatMulBindResources(
     bindGroup: handle.device.createBindGroup({
       layout: bindGroupLayout,
       entries,
+    }),
+    destroy: () => paramsBuffer.destroy?.(),
+  };
+}
+
+export function createDualQ4KMatMulBindResources(
+  leftHandle: WebGpuQuantizedWeightHandleInternal,
+  rightHandle: WebGpuQuantizedWeightHandleInternal,
+  inputScaleBuffer: WebGpuBufferLike,
+  inputQsBuffer: WebGpuBufferLike,
+  inputBsumsBuffer: WebGpuBufferLike,
+  leftOutputBuffer: WebGpuBufferLike,
+  rightOutputBuffer: WebGpuBufferLike,
+  columnCount: number,
+): { pipeline: unknown; bindGroup: unknown; destroy: () => void } {
+  const params = new Uint32Array([
+    leftHandle.inputSize,
+    leftHandle.rowCount,
+    columnCount,
+    leftHandle.blockCount,
+    leftHandle.rowByteLength,
+    0,
+    0,
+    0,
+  ]);
+  const paramsBuffer = leftHandle.device.createBuffer({
+    size: params.byteLength,
+    usage: GPU_UNIFORM | GPU_COPY_DST,
+  });
+  leftHandle.device.queue.writeBuffer(paramsBuffer, 0, params);
+  const bindGroupLayout = leftHandle.device.createBindGroupLayout({
+    entries: [
+      storageEntry(0, "read-only-storage"),
+      storageEntry(1, "read-only-storage"),
+      storageEntry(2, "read-only-storage"),
+      storageEntry(3, "read-only-storage"),
+      storageEntry(4, "read-only-storage"),
+      {
+        binding: 5,
+        visibility: GPU_SHADER_STAGE_COMPUTE,
+        buffer: { type: "uniform" },
+      },
+      storageEntry(6, "storage"),
+      storageEntry(7, "storage"),
+    ],
+  });
+  const pipeline = leftHandle.device.createComputePipeline({
+    layout: leftHandle.device.createPipelineLayout({ bindGroupLayouts: [bindGroupLayout] }),
+    compute: {
+      module: leftHandle.device.createShaderModule({ code: Q4_K_DUAL_MATMUL_WGSL }),
+      entryPoint: "main",
+    },
+  });
+  return {
+    pipeline,
+    bindGroup: leftHandle.device.createBindGroup({
+      layout: bindGroupLayout,
+      entries: [
+        bindBuffer(0, leftHandle.weightBuffer),
+        bindBuffer(1, rightHandle.weightBuffer),
+        bindBuffer(2, inputScaleBuffer),
+        bindBuffer(3, inputQsBuffer),
+        bindBuffer(4, inputBsumsBuffer),
+        bindBuffer(5, paramsBuffer),
+        bindBuffer(6, leftOutputBuffer),
+        bindBuffer(7, rightOutputBuffer),
+      ],
     }),
     destroy: () => paramsBuffer.destroy?.(),
   };
@@ -412,58 +480,6 @@ export function createQ8KQuantizeResources(
     layout: device.createPipelineLayout({ bindGroupLayouts: [bindGroupLayout] }),
     compute: {
       module: device.createShaderModule({ code: Q8_K_QUANTIZE_WGSL }),
-      entryPoint: "main",
-    },
-  });
-  return {
-    pipeline,
-    bindGroup: device.createBindGroup({
-      layout: bindGroupLayout,
-      entries: [
-        bindBuffer(0, inputBuffer),
-        bindBuffer(1, scaleBuffer),
-        bindBuffer(2, qsBuffer),
-        bindBuffer(3, bsumsBuffer),
-        bindBuffer(4, paramsBuffer),
-      ],
-    }),
-    destroy: () => paramsBuffer.destroy?.(),
-  };
-}
-
-export function createF16Q8KQuantizeResources(
-  device: WebGpuDeviceLike,
-  inputBuffer: WebGpuBufferLike,
-  scaleBuffer: WebGpuBufferLike,
-  qsBuffer: WebGpuBufferLike,
-  bsumsBuffer: WebGpuBufferLike,
-  inputSize: number,
-  columnCount: number,
-  blockCount: number,
-): { pipeline: unknown; bindGroup: unknown; destroy: () => void } {
-  const params = new Uint32Array([inputSize, columnCount, blockCount, 0]);
-  const paramsBuffer = device.createBuffer({
-    size: params.byteLength,
-    usage: GPU_UNIFORM | GPU_COPY_DST,
-  });
-  device.queue.writeBuffer(paramsBuffer, 0, params);
-  const bindGroupLayout = device.createBindGroupLayout({
-    entries: [
-      storageEntry(0, "read-only-storage"),
-      storageEntry(1, "storage"),
-      storageEntry(2, "storage"),
-      storageEntry(3, "storage"),
-      {
-        binding: 4,
-        visibility: GPU_SHADER_STAGE_COMPUTE,
-        buffer: { type: "uniform" },
-      },
-    ],
-  });
-  const pipeline = device.createComputePipeline({
-    layout: device.createPipelineLayout({ bindGroupLayouts: [bindGroupLayout] }),
-    compute: {
-      module: device.createShaderModule({ code: F16_Q8_K_QUANTIZE_WGSL }),
       entryPoint: "main",
     },
   });
@@ -1152,6 +1168,49 @@ export function createResidualAddScaleResources(
         bindBuffer(0, left),
         bindBuffer(1, right),
         bindBuffer(2, scale),
+        bindBuffer(3, paramsBuffer),
+        bindBuffer(4, output),
+      ],
+    }),
+    destroy: () => paramsBuffer.destroy?.(),
+  };
+}
+
+export function createRmsNormResidualAddResources(
+  device: WebGpuDeviceLike,
+  input: WebGpuBufferLike,
+  weight: WebGpuBufferLike,
+  residual: WebGpuBufferLike,
+  output: WebGpuBufferLike,
+  length: number,
+  epsilon: number,
+): { pipeline: unknown; bindGroup: unknown; destroy: () => void } {
+  const paramsF32 = new Float32Array([epsilon, 0, 0, 0]);
+  const paramsU32 = new Uint32Array(paramsF32.buffer);
+  paramsU32[1] = length;
+  const paramsBuffer = device.createBuffer({ size: paramsU32.byteLength, usage: GPU_UNIFORM | GPU_COPY_DST });
+  device.queue.writeBuffer(paramsBuffer, 0, paramsU32);
+  const bindGroupLayout = device.createBindGroupLayout({
+    entries: [
+      storageEntry(0, "read-only-storage"),
+      storageEntry(1, "read-only-storage"),
+      storageEntry(2, "read-only-storage"),
+      { binding: 3, visibility: GPU_SHADER_STAGE_COMPUTE, buffer: { type: "uniform" } },
+      storageEntry(4, "storage"),
+    ],
+  });
+  const pipeline = device.createComputePipeline({
+    layout: device.createPipelineLayout({ bindGroupLayouts: [bindGroupLayout] }),
+    compute: { module: device.createShaderModule({ code: RMS_NORM_RESIDUAL_ADD_WGSL }), entryPoint: "main" },
+  });
+  return {
+    pipeline,
+    bindGroup: device.createBindGroup({
+      layout: bindGroupLayout,
+      entries: [
+        bindBuffer(0, input),
+        bindBuffer(1, weight),
+        bindBuffer(2, residual),
         bindBuffer(3, paramsBuffer),
         bindBuffer(4, output),
       ],

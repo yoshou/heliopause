@@ -14,8 +14,7 @@ import {
 } from "./arena";
 import {
   dispatchElementwiseMul,
-  dispatchF16Cast,
-  dispatchF16Q8KQuantize,
+  dispatchDualQ4KMatMul,
   dispatchF32GatherRowsScale,
   dispatchF32MatMul,
   dispatchFullAttentionApply,
@@ -34,6 +33,7 @@ import {
   dispatchResidualAddScale,
   dispatchRmsNorm,
   dispatchRmsNormQ8KQuantize,
+  dispatchRmsNormResidualAdd,
   dispatchScale,
   dispatchSelectTop1Candidate,
   dispatchTokenSlice,
@@ -1423,10 +1423,6 @@ export class Gemma4WebGpuSegmentRunner {
         hasFreqFactors: this.hasRopeFreqFactors && layer.kind === "full-attention",
       },
     );
-    restartLayerSection("attn.q_f16");
-    const queryForAttention = scratchF32(this.arena, queryDim, cleanup, `blk.${layer.layer}.q_rope.f16`);
-    dispatchF16Cast(this.arena.device, pass, resources, query, queryForAttention, queryDim);
-
     if (layer.hasKv) {
       const layerState = gpuState.fullAttention.get(layer.layer);
       if (!layerState || !layer.k || !layer.v || !layer.kNorm) {
@@ -1488,7 +1484,7 @@ export class Gemma4WebGpuSegmentRunner {
       slidingWindow: layer.kind === "sliding-attention" ? this.manifest.slidingWindow : undefined,
     };
     const keyValueStart = attentionKeyValueStart(tokenPosition, attentionOptions.slidingWindow);
-    dispatchFullAttentionScore(this.arena.device, pass, resources, queryForAttention, state.key, probabilities, attentionOptions);
+    dispatchFullAttentionScore(this.arena.device, pass, resources, query, state.key, probabilities, attentionOptions);
     restartLayerSection("attn.apply");
     dispatchFullAttentionApply(this.arena.device, pass, resources, state.value, probabilities, attention, {
       ...attentionOptions,
@@ -1496,11 +1492,9 @@ export class Gemma4WebGpuSegmentRunner {
     });
 
     restartLayerSection("attn.out");
-    const attentionOut = this.dispatchF16QuantizedMatMul(pass, resources, layer.attnOut, attention, tokenCount, cleanup, `blk.${layer.layer}.attention_out`);
-    const attentionPostNorm = scratchF32(this.arena, hiddenSize, cleanup, `blk.${layer.layer}.attention_post_norm`);
-    dispatchRmsNorm(this.arena.device, pass, resources, attentionOut, layer.postAttentionNorm.buffer, attentionPostNorm, hiddenSize, this.epsilon);
+    const attentionOut = this.dispatchQuantizedMatMul(pass, resources, layer.attnOut, attention, tokenCount, cleanup, `blk.${layer.layer}.attention_out`);
     const attentionResidual = scratchF32(this.arena, hiddenSize, cleanup, `blk.${layer.layer}.attention_residual`);
-    dispatchResidualAdd(this.arena.device, pass, resources, input, attentionPostNorm, attentionResidual, hiddenSize);
+    dispatchRmsNormResidualAdd(this.arena.device, pass, resources, attentionOut, layer.postAttentionNorm.buffer, input, attentionResidual, hiddenSize, this.epsilon);
 
     restartLayerSection("ffn.norm_quant");
     const ffn = this.dispatchFfn(pass, layer, attentionResidual, cleanup, resources, profileDetails
@@ -1530,18 +1524,19 @@ export class Gemma4WebGpuSegmentRunner {
     const up = scratchF32(this.arena, this.manifest.feedForwardLength, cleanup, `blk.${layer.layer}.ffn_up`);
     const geglu = scratchF32(this.arena, this.manifest.feedForwardLength, cleanup, `blk.${layer.layer}.ffn_geglu`);
     activePass = restartSection?.("gate") ?? activePass;
-    dispatchKMatMul(activePass, resources, layer.ffnGate, ffnQ8, gate, 1);
-    activePass = restartSection?.("up") ?? activePass;
-    dispatchKMatMul(activePass, resources, layer.ffnUp, ffnQ8, up, 1);
+    const dispatchedDual = dispatchDualQ4KMatMul(activePass, resources, layer.ffnGate, layer.ffnUp, ffnQ8, gate, up, 1);
+    if (!dispatchedDual) {
+      dispatchKMatMul(activePass, resources, layer.ffnGate, ffnQ8, gate, 1);
+      activePass = restartSection?.("up") ?? activePass;
+      dispatchKMatMul(activePass, resources, layer.ffnUp, ffnQ8, up, 1);
+    }
     activePass = restartSection?.("geglu") ?? activePass;
     dispatchGeglu(this.arena.device, activePass, resources, gate, up, geglu, this.manifest.feedForwardLength);
     activePass = restartSection?.("down") ?? activePass;
     const ffnOut = this.dispatchQuantizedMatMul(activePass, resources, layer.ffnDown, geglu, 1, cleanup, `blk.${layer.layer}.ffn_out`);
-    const postNorm = scratchF32(this.arena, hiddenSize, cleanup, `blk.${layer.layer}.ffn_post_norm`);
     activePass = restartSection?.("post") ?? activePass;
-    dispatchRmsNorm(this.arena.device, activePass, resources, ffnOut, layer.postFfwNorm.buffer, postNorm, hiddenSize, this.epsilon);
     const output = scratchF32(this.arena, hiddenSize, cleanup, `blk.${layer.layer}.ffn_residual`);
-    dispatchResidualAdd(this.arena.device, activePass, resources, residual, postNorm, output, hiddenSize);
+    dispatchRmsNormResidualAdd(this.arena.device, activePass, resources, ffnOut, layer.postFfwNorm.buffer, residual, output, hiddenSize, this.epsilon);
     return output;
   }
 
@@ -1626,30 +1621,6 @@ export class Gemma4WebGpuSegmentRunner {
     }
     const q8 = scratchQ8K(this.arena, handle.inputSize, columnCount, cleanup, `${label}.q8k`);
     dispatchQ8KQuantize(this.arena.device, pass, resources, input, q8, handle.inputSize, columnCount);
-    dispatchKMatMul(pass, resources, handle, q8, output, columnCount);
-    return output;
-  }
-
-  private dispatchF16QuantizedMatMul(
-    pass: WebGpuComputePassLike,
-    resources: Array<{ destroy: () => void }>,
-    handle: QuantizedHandle,
-    input: WebGpuBufferLike,
-    columnCount: number,
-    cleanup: GpuResource[],
-    label: string,
-  ): WebGpuBufferLike {
-    const output = scratchF32(this.arena, handle.rowCount * columnCount, cleanup, label);
-    if (handle.type === "Q8_0") {
-      const inputF16 = scratchF32(this.arena, handle.inputSize * columnCount, cleanup, `${label}.f16`);
-      dispatchF16Cast(this.arena.device, pass, resources, input, inputF16, handle.inputSize * columnCount);
-      const q8 = scratchQ8_0(this.arena, handle.inputSize, columnCount, handle.blockCount, cleanup, `${label}.q8_0`);
-      dispatchQ8_0Quantize(this.arena.device, pass, resources, inputF16, q8, handle.inputSize, columnCount, handle.blockCount);
-      dispatchQ8_0MatMul(pass, resources, handle, q8, output, columnCount);
-      return output;
-    }
-    const q8 = scratchQ8K(this.arena, handle.inputSize, columnCount, cleanup, `${label}.q8k`);
-    dispatchF16Q8KQuantize(this.arena.device, pass, resources, input, q8, handle.inputSize, columnCount);
     dispatchKMatMul(pass, resources, handle, q8, output, columnCount);
     return output;
   }

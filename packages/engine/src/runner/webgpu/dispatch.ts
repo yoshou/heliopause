@@ -2,9 +2,9 @@ import type { WebGpuBufferLike, WebGpuComputePassLike, WebGpuDeviceLike } from "
 import type { Q8_0Buffers, Q8KBuffers, QuantizedHandle } from "./arena";
 import {
   createDeltaGateResources,
+  createDualQ4KMatMulBindResources,
   createElementwiseMulResources,
   createF16CastResources,
-  createF16Q8KQuantizeResources,
   createF32GatherRowsScaleResources,
   createF32MatMulResources,
   createFullAttentionApplyResources,
@@ -24,6 +24,7 @@ import {
   createResidualAddScaleResources,
   createRmsNormResources,
   createRmsNormQ8KQuantizeResources,
+  createRmsNormResidualAddResources,
   createScaleResources,
   createSelectTop1CandidateResources,
   createSigmoidMulResources,
@@ -50,6 +51,44 @@ export function dispatchKMatMul(
   pass.setPipeline(resource.pipeline);
   pass.setBindGroup(0, resource.bindGroup);
   pass.dispatchWorkgroups(Math.ceil(handle.rowCount / 8), columnCount);
+}
+
+export function dispatchDualQ4KMatMul(
+  pass: WebGpuComputePassLike,
+  resources: Array<{ destroy: () => void }>,
+  leftHandle: QuantizedHandle,
+  rightHandle: QuantizedHandle,
+  q8: Q8KBuffers,
+  leftOutput: WebGpuBufferLike,
+  rightOutput: WebGpuBufferLike,
+  columnCount: number,
+): boolean {
+  if (
+    leftHandle.type !== "Q4_K" ||
+    rightHandle.type !== "Q4_K" ||
+    leftHandle.device !== rightHandle.device ||
+    leftHandle.inputSize !== rightHandle.inputSize ||
+    leftHandle.rowCount !== rightHandle.rowCount ||
+    leftHandle.blockCount !== rightHandle.blockCount ||
+    leftHandle.rowByteLength !== rightHandle.rowByteLength
+  ) {
+    return false;
+  }
+  const resource = createDualQ4KMatMulBindResources(
+    leftHandle,
+    rightHandle,
+    q8.scale,
+    q8.qs,
+    q8.bsums,
+    leftOutput,
+    rightOutput,
+    columnCount,
+  );
+  resources.push(resource);
+  pass.setPipeline(resource.pipeline);
+  pass.setBindGroup(0, resource.bindGroup);
+  pass.dispatchWorkgroups(Math.ceil(leftHandle.rowCount / 8), columnCount, 2);
+  return true;
 }
 
 export function dispatchQ8_0MatMul(
@@ -98,22 +137,6 @@ export function dispatchQ8KQuantize(
   columnCount: number,
 ): void {
   const resource = createQ8KQuantizeResources(device, input, q8.scale, q8.qs, q8.bsums, inputSize, columnCount, inputSize / 256);
-  resources.push(resource);
-  pass.setPipeline(resource.pipeline);
-  pass.setBindGroup(0, resource.bindGroup);
-  pass.dispatchWorkgroups(columnCount, inputSize / 256);
-}
-
-export function dispatchF16Q8KQuantize(
-  device: WebGpuDeviceLike,
-  pass: WebGpuComputePassLike,
-  resources: Array<{ destroy: () => void }>,
-  input: WebGpuBufferLike,
-  q8: Q8KBuffers,
-  inputSize: number,
-  columnCount: number,
-): void {
-  const resource = createF16Q8KQuantizeResources(device, input, q8.scale, q8.qs, q8.bsums, inputSize, columnCount, inputSize / 256);
   resources.push(resource);
   pass.setPipeline(resource.pipeline);
   pass.setBindGroup(0, resource.bindGroup);
@@ -202,6 +225,24 @@ export function dispatchResidualAddScale(
   pass.setPipeline(resource.pipeline);
   pass.setBindGroup(0, resource.bindGroup);
   pass.dispatchWorkgroups(Math.ceil(length / 256));
+}
+
+export function dispatchRmsNormResidualAdd(
+  device: WebGpuDeviceLike,
+  pass: WebGpuComputePassLike,
+  resources: Array<{ destroy: () => void }>,
+  input: WebGpuBufferLike,
+  weight: WebGpuBufferLike,
+  residual: WebGpuBufferLike,
+  output: WebGpuBufferLike,
+  length: number,
+  epsilon: number,
+): void {
+  const resource = createRmsNormResidualAddResources(device, input, weight, residual, output, length, epsilon);
+  resources.push(resource);
+  pass.setPipeline(resource.pipeline);
+  pass.setBindGroup(0, resource.bindGroup);
+  pass.dispatchWorkgroups(1);
 }
 
 export function dispatchFullQuery(
