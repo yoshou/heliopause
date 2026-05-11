@@ -120,6 +120,58 @@ export async function prepareGemma4Input(
   return { hidden, perLayerInputs };
 }
 
+export async function prepareGemma4PreparedHiddenInput(
+  model: Gemma4ModelInput,
+  hidden: Float32Array,
+  trace?: ForwardTrace,
+): Promise<Gemma4PreparedInput> {
+  const session = modelSession(model);
+  const manifest = session.manifest;
+  const tokenCount = hidden.length / manifest.embeddingLength;
+  if (!Number.isInteger(tokenCount)) {
+    throw new Error(`Prepared hidden shape mismatch: ${hidden.length}`);
+  }
+  if (manifest.perLayerEmbeddingLength <= 0 || tokenCount === 0) {
+    return { hidden };
+  }
+
+  const perLayerInputs = await timedAsync(trace, "per-layer prepared input projection", async () => {
+    const perLayerLength = manifest.perLayerEmbeddingLength;
+    const totalPerLayerLength = perLayerLength * manifest.blockCount;
+    const paddingRow = await readTensorRows(session, "per_layer_token_embd.weight", [0]);
+    const tokenScale = Math.sqrt(perLayerLength);
+    for (let index = 0; index < paddingRow.length; index += 1) {
+      paddingRow[index] = Math.fround((paddingRow[index] ?? 0) * tokenScale);
+    }
+
+    const projected = await matMulGemma4Weight(session, "per_layer_model_proj.weight", hidden, trace);
+    const projectionScale = 1 / Math.sqrt(manifest.embeddingLength);
+    const normWeight = await readF32ModelTensor(session, "per_layer_proj_norm.weight");
+    const output = new Float32Array(manifest.blockCount * tokenCount * perLayerLength);
+    for (let token = 0; token < tokenCount; token += 1) {
+      for (let layer = 0; layer < manifest.blockCount; layer += 1) {
+        const sourceOffset = token * totalPerLayerLength + layer * perLayerLength;
+        const projectedSlice = new Float32Array(perLayerLength);
+        for (let index = 0; index < perLayerLength; index += 1) {
+          projectedSlice[index] = Math.fround((projected[sourceOffset + index] ?? 0) * projectionScale);
+        }
+        const projectedNorm = rmsNorm(projectedSlice, normWeight, session.epsilon);
+        const targetOffset = (layer * tokenCount + token) * perLayerLength;
+        const paddingOffset = layer * perLayerLength;
+        for (let index = 0; index < perLayerLength; index += 1) {
+          output[targetOffset + index] = Math.fround(
+            Math.fround((paddingRow[paddingOffset + index] ?? 0) + (projectedNorm[index] ?? 0)) *
+              Math.SQRT1_2,
+          );
+        }
+      }
+    }
+    return output;
+  });
+
+  return { hidden, perLayerInputs };
+}
+
 export async function forwardGemma4AttentionLayer(
   model: Gemma4ModelInput,
   manifest: Gemma4ModelManifest,
@@ -130,6 +182,7 @@ export async function forwardGemma4AttentionLayer(
   perLayerInputs?: Float32Array,
   epsilon = modelSession(model).epsilon,
   trace?: ForwardTrace,
+  attentionCausal = true,
 ): Promise<Float32Array> {
   const session = modelSession(model);
   const kind = manifest.layerKinds[layer] ?? "sliding-attention";
@@ -234,12 +287,14 @@ export async function forwardGemma4AttentionLayer(
   }
 
   const keyValueTokenCount = Math.min(state.contextLength, Math.max(...Array.from(tokenPositions)) + 1);
-  const mask = timedSync(
-    trace,
-    "attention mask",
-    () => causalMask(tokenPositions, keyValueTokenCount, kind === "sliding-attention" ? manifest.slidingWindow : undefined),
-    { layer, layerKind: kind },
-  );
+  const mask = attentionCausal
+    ? timedSync(
+        trace,
+        "attention mask",
+        () => causalMask(tokenPositions, keyValueTokenCount, kind === "sliding-attention" ? manifest.slidingWindow : undefined),
+        { layer, layerKind: kind },
+      )
+    : undefined;
   const compactValue = timedSync(
     trace,
     "value compact",
@@ -260,6 +315,7 @@ export async function forwardGemma4AttentionLayer(
         tokenCount,
         keyValueTokenCount,
         scale: 1,
+        causal: attentionCausal,
         mask,
         valueLayout: "dim-head-token",
         quantizeQueryForScore: "f16",
@@ -275,6 +331,7 @@ export async function forwardGemma4AttentionLayer(
         tokenCount,
         keyValueTokenCount,
         scale: 1,
+        causal: attentionCausal,
         mask,
         valueLayout: "dim-head-token",
         quantizeQueryForScore: "f16",

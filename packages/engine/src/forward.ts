@@ -14,6 +14,7 @@ import {
 } from "./runner/cpu/execution-provider";
 import {
   prepareGemma4Input,
+  prepareGemma4PreparedHiddenInput,
 } from "./runner/cpu/layers";
 import {
   gemma4WebGpuSegmentRunner,
@@ -27,6 +28,10 @@ export type PrefillOptions = {
   computeLogits?: boolean;
   logitsTopK?: number;
   onTiming?: TimingSink;
+};
+
+export type PreparedHiddenPrefillOptions = PrefillOptions & {
+  attentionCausal?: boolean;
 };
 
 export type PrefillResult = {
@@ -53,6 +58,55 @@ export type DecodeResult = {
 };
 
 export type { OutputResult } from "./runtime";
+
+export async function prefillGemma4PreparedHidden(
+  model: Gemma4ModelInput,
+  hiddenInput: Float32Array,
+  options: PreparedHiddenPrefillOptions = {},
+): Promise<PrefillResult> {
+  const session = modelSession(model);
+  if (webGpuExecutionProviderEnabled(session)) {
+    throw new Error("Prepared hidden image input is only supported on the CPU/WASM runner.");
+  }
+  const tokenCount = hiddenInput.length / session.manifest.embeddingLength;
+  if (!Number.isInteger(tokenCount)) {
+    throw new Error(`Prepared hidden shape mismatch: ${hiddenInput.length}`);
+  }
+  const state = options.state ?? session.createInferenceState();
+  const positions = normalizePositions(options.positions, tokenCount);
+  const trace = createForwardTrace("prefill", options.onTiming);
+
+  if (tokenCount === 0) {
+    return { hidden: new Float32Array(), state };
+  }
+
+  const prepared = await prepareGemma4PreparedHiddenInput(session, hiddenInput, trace);
+  const runner = gemma4CpuSegmentRunner({
+    session,
+    manifest: session.manifest,
+    epsilon: session.epsilon,
+    segmentStartLayer: 0,
+    segmentEndLayerExclusive: session.manifest.blockCount,
+  });
+  const hidden = (await runner.runTokensHidden(prepared.hidden, positions, state, {
+    trace,
+    perLayerInputs: prepared.perLayerInputs,
+    attentionCausal: options.attentionCausal ?? true,
+  })).hidden;
+  updateNextPosition(state, positions, tokenCount);
+
+  const result: PrefillResult = { hidden, state };
+  if (options.computeLogits) {
+    const output = await gemma4CpuOutput(session, hidden, {
+      topK: options.logitsTopK ?? 10,
+      trace,
+    });
+    result.logits = output.logits;
+    result.selectedTokenId = output.topTokens[0]?.id;
+    result.topTokens = output.topTokens;
+  }
+  return result;
+}
 
 export async function prefillGemma4(
   model: Gemma4ModelInput,

@@ -4,15 +4,21 @@ import {
   cloneGemma4InferenceState,
   createFileGgufTensorReader,
   createGemma4ChatSession,
+  createGemma4VisionSession,
   estimateWeightCacheBytes,
+  generateGemma4PreparedImageChatTurn,
   generateGemma4ChatTurn,
   getGgufModelName,
+  isGemma4VisionGguf,
   planGemma4RunnerPlacement,
+  preprocessGemma4VisionImageFile,
   prefillGemma4ChatMessages,
+  runGemma4VisionEncoder,
   type ExecutionProviderConfig,
   type Gemma4InferenceState,
   type Gemma4ModelSession,
   type Gemma4Tokenizer,
+  type Gemma4VisionSession,
 } from "@heliopause/engine";
 import type {
   EngineWorkerRequest,
@@ -28,6 +34,7 @@ const FULL_WEIGHT_CACHE_LIMIT_BYTES = 32 * 1024 * 1024 * 1024;
 const FULL_WEIGHT_CACHE_HEADROOM = 1.25;
 
 let session: Gemma4ModelSession | undefined;
+let visionSession: Gemma4VisionSession | undefined;
 let tokenizer: Gemma4Tokenizer | undefined;
 let currentState: Gemma4InferenceState | undefined;
 let currentSystemPrompt: string | undefined;
@@ -70,12 +77,21 @@ async function handleLoadModel(
   activeGeneration?.abortController.abort();
   activeGeneration = undefined;
   session = undefined;
+  visionSession = undefined;
   tokenizer = undefined;
   currentState = undefined;
   currentSystemPrompt = undefined;
 
   const tensorReader = await createFileGgufTensorReader(request.file);
   const manifest = buildGemma4Manifest(tensorReader.metadata);
+  let nextVisionSession: Gemma4VisionSession | undefined;
+  if (request.visionFile) {
+    const visionReader = await createFileGgufTensorReader(request.visionFile);
+    if (!isGemma4VisionGguf(visionReader.metadata)) {
+      throw new Error("Vision encoder GGUF is not a Gemma4V projector.");
+    }
+    nextVisionSession = createGemma4VisionSession(visionReader);
+  }
   const estimatedWeightCacheBytes = estimateWeightCacheBytes(tensorReader);
   const resolvedMemoryProfile = resolveMemoryProfile(
     request.memoryProfile,
@@ -96,7 +112,7 @@ async function handleLoadModel(
     },
   }];
 
-  if (resolvedMemoryProfile.resolved === "full") {
+  if (resolvedMemoryProfile.resolved === "full" && !nextVisionSession) {
     const webGpuPlan = planGemma4RunnerPlacement(tensorReader.metadata, manifest, {
       mode: "enabled",
       contextLength: CHAT_CONTEXT_LENGTH,
@@ -115,6 +131,8 @@ async function handleLoadModel(
     } else {
       resolvedMemoryProfile.webGpuStatus = "blocked";
     }
+  } else if (nextVisionSession) {
+    resolvedMemoryProfile.webGpuStatus = "blocked";
   }
 
   const nextSession = createGemma4ChatSession(tensorReader, {
@@ -125,6 +143,7 @@ async function handleLoadModel(
   const nextTokenizer = buildGemma4Tokenizer(tensorReader.metadata);
 
   session = nextSession;
+  visionSession = nextVisionSession;
   tokenizer = nextTokenizer;
 
   workerScope.postMessage({
@@ -136,6 +155,14 @@ async function handleLoadModel(
       contextLength: Math.min(nextSession.manifest.contextLength, CHAT_CONTEXT_LENGTH),
       originalContextLength: nextSession.manifest.contextLength,
       memoryProfile: resolvedMemoryProfile,
+      visionFileName: request.visionFileName,
+      supportsImages: Boolean(nextVisionSession),
+      visionImageTokens: nextVisionSession
+        ? {
+            min: nextVisionSession.manifest.imageMinTokens,
+            max: nextVisionSession.manifest.imageMaxTokens,
+          }
+        : undefined,
     },
   });
 }
@@ -165,23 +192,43 @@ async function handleGenerateTurn(
       : cloneGemma4InferenceState(currentState);
     activeGeneration.workingState = workingState;
 
-    await generateGemma4ChatTurn(
-      session,
-      tokenizer,
-      workingState,
-      request.userContent,
-      {
-        maxNewTokens: request.maxNewTokens,
-        signal: abortController.signal,
-        onToken(chunk) {
-          workerScope.postMessage({
-            type: "generationChunk",
-            requestId: request.requestId,
-            content: chunk.content,
-          });
-        },
+    const turnOptions = {
+      maxNewTokens: request.maxNewTokens,
+      signal: abortController.signal,
+      onToken(chunk: { content: string }) {
+        workerScope.postMessage({
+          type: "generationChunk",
+          requestId: request.requestId,
+          content: chunk.content,
+        });
       },
-    );
+    };
+    if (request.image) {
+      if (!visionSession) {
+        throw new Error("No vision encoder loaded.");
+      }
+      const pixels = await preprocessGemma4VisionImageFile(request.image.file, visionSession.manifest);
+      const encoded = await runGemma4VisionEncoder(visionSession, pixels);
+      await generateGemma4PreparedImageChatTurn(
+        session,
+        tokenizer,
+        workingState,
+        request.userContent,
+        {
+          hidden: encoded.hidden,
+          tokenCount: encoded.tokenCount,
+        },
+        turnOptions,
+      );
+    } else {
+      await generateGemma4ChatTurn(
+        session,
+        tokenizer,
+        workingState,
+        request.userContent,
+        turnOptions,
+      );
+    }
 
     if (!abortController.signal.aborted) {
       currentState = workingState;

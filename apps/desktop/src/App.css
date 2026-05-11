@@ -230,6 +230,15 @@ textarea:disabled {
   white-space: pre-wrap;
 }
 
+.message-image {
+  display: block;
+  width: min(100%, 360px);
+  max-height: 360px;
+  margin: 4px 0 14px;
+  border-radius: 8px;
+  object-fit: contain;
+}
+
 .message-meta {
   margin-top: 10px;
   color: #647064;
@@ -264,6 +273,66 @@ textarea:disabled {
   color: #a23a2a;
   font-size: 0.86rem;
   line-height: 1.45;
+}
+
+.attachment-preview {
+  display: grid;
+  grid-template-columns: 76px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  padding: 8px;
+  border: 1px solid #d8ded8;
+  border-radius: 8px;
+  background: #f8faf7;
+}
+
+.attachment-preview img {
+  width: 76px;
+  height: 56px;
+  border-radius: 6px;
+  object-fit: cover;
+}
+
+.attachment-preview span {
+  min-width: 0;
+  overflow: hidden;
+  color: #29343b;
+  font-size: 0.84rem;
+  font-weight: 750;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.attachment-preview button,
+.image-button {
+  min-height: 36px;
+  padding: 0 12px;
+  border: 1px solid #c9d2cb;
+  border-radius: 8px;
+  color: #172026;
+  background: #ffffff;
+  font-size: 0.84rem;
+  font-weight: 800;
+  cursor: pointer;
+}
+
+.attachment-preview button:disabled,
+.image-button:has(input:disabled) {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.image-button {
+  display: inline-grid;
+  place-items: center;
+}
+
+.image-button input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+  pointer-events: none;
 }
 
 .form-actions button {

@@ -1,4 +1,4 @@
-import { ChangeEvent, FormEvent, useEffect, useMemo, useRef, useState } from "react";
+import { ChangeEvent, ClipboardEvent, FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import {
   DEFAULT_GEMMA4_SYSTEM_PROMPT,
   stripGemma4Thinking,
@@ -15,7 +15,14 @@ type UiMessage = {
   id: string;
   role: "user" | "assistant";
   content: string;
+  image?: UiImageAttachment;
   inferenceDurationMs?: number;
+};
+
+type UiImageAttachment = {
+  file: File;
+  fileName: string;
+  url: string;
 };
 
 type ModelState =
@@ -37,6 +44,7 @@ type PendingRequest =
       userId: string;
       assistantId: string;
       userContent: string;
+      image?: UiImageAttachment;
       resolve: () => void;
       reject: (error: Error) => void;
     };
@@ -46,6 +54,9 @@ function App() {
   const [memoryProfile, setMemoryProfile] = useState<MemoryProfile>("auto");
   const [systemPrompt, setSystemPrompt] = useState(DEFAULT_GEMMA4_SYSTEM_PROMPT);
   const [prompt, setPrompt] = useState("");
+  const [modelFile, setModelFile] = useState<File | undefined>();
+  const [visionFile, setVisionFile] = useState<File | undefined>();
+  const [imageAttachment, setImageAttachment] = useState<UiImageAttachment | undefined>();
   const [messages, setMessages] = useState<UiMessage[]>([]);
   const [isGenerating, setIsGenerating] = useState(false);
   const [generationError, setGenerationError] = useState<string | undefined>();
@@ -55,8 +66,12 @@ function App() {
   const generationRequestRef = useRef<{ requestId: number; worker: Worker } | null>(null);
 
   const canSubmit = useMemo(
-    () => model.status === "ready" && prompt.trim().length > 0 && !isGenerating,
-    [isGenerating, model.status, prompt],
+    () =>
+      model.status === "ready" &&
+      prompt.trim().length > 0 &&
+      !isGenerating &&
+      (!imageAttachment || model.supportsImages),
+    [imageAttachment, isGenerating, model, prompt],
   );
 
   useEffect(() => () => {
@@ -65,6 +80,9 @@ function App() {
       rejectWorkerRequests(worker, new Error("Application closed."));
       worker.terminate();
     }
+    if (imageAttachment) {
+      URL.revokeObjectURL(imageAttachment.url);
+    }
   }, []);
 
   async function handleModelChange(event: ChangeEvent<HTMLInputElement>) {
@@ -72,7 +90,24 @@ function App() {
     if (!file) {
       return;
     }
+    setModelFile(file);
+    await loadSelectedModel(file, visionFile);
+    event.target.value = "";
+  }
 
+  async function handleVisionModelChange(event: ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0];
+    if (!file) {
+      return;
+    }
+    setVisionFile(file);
+    if (modelFile) {
+      await loadSelectedModel(modelFile, file);
+    }
+    event.target.value = "";
+  }
+
+  async function loadSelectedModel(file: File, nextVisionFile: File | undefined) {
     const worker = createEngineWorker();
     const previousWorker = workerRef.current;
     if (previousWorker) {
@@ -88,6 +123,8 @@ function App() {
         worker,
         file,
         file.name,
+        nextVisionFile,
+        nextVisionFile?.name,
         memoryProfile,
         await readSystemMemoryInfo(),
       );
@@ -106,8 +143,6 @@ function App() {
         fileName: file.name,
         message: error instanceof Error ? error.message : String(error),
       });
-    } finally {
-      event.target.value = "";
     }
   }
 
@@ -126,6 +161,7 @@ function App() {
       id: createId("user"),
       role: "user",
       content: trimmedPrompt,
+      image: imageAttachment,
     };
     const assistantId = createId("assistant");
     const nextMessages = [
@@ -136,6 +172,7 @@ function App() {
 
     setMessages(nextMessages);
     setPrompt("");
+    setImageAttachment(undefined);
     setIsGenerating(true);
     setGenerationError(undefined);
 
@@ -144,7 +181,7 @@ function App() {
       if (!worker) {
         throw new Error("The model worker is not running. Reload the model.");
       }
-      await generateTurnInWorker(worker, userMessage.id, assistantId, trimmedPrompt, 256);
+      await generateTurnInWorker(worker, userMessage.id, assistantId, trimmedPrompt, imageAttachment, 256);
     } catch (error) {
       setGenerationError(error instanceof Error ? error.message : String(error));
       setMessages((currentMessages) =>
@@ -153,6 +190,7 @@ function App() {
         ),
       );
       setPrompt((currentPrompt) => currentPrompt.length === 0 ? trimmedPrompt : currentPrompt);
+      setImageAttachment(imageAttachment);
     } finally {
       generationRequestRef.current = null;
       setIsGenerating(false);
@@ -168,6 +206,40 @@ function App() {
       type: "cancelGeneration",
       requestId: activeGeneration.requestId,
     } satisfies EngineWorkerRequest);
+  }
+
+  function handleImageFileChange(event: ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0];
+    if (file) {
+      setNextImageAttachment(file);
+    }
+    event.target.value = "";
+  }
+
+  function handlePromptPaste(event: ClipboardEvent<HTMLTextAreaElement>) {
+    const file = Array.from(event.clipboardData.files).find((item) => item.type.startsWith("image/"));
+    if (file) {
+      setNextImageAttachment(file);
+    }
+  }
+
+  function clearImageAttachment() {
+    if (imageAttachment) {
+      URL.revokeObjectURL(imageAttachment.url);
+    }
+    setImageAttachment(undefined);
+  }
+
+  function setNextImageAttachment(file: File) {
+    if (imageAttachment) {
+      URL.revokeObjectURL(imageAttachment.url);
+    }
+    setImageAttachment({
+      file,
+      fileName: file.name || "pasted-image",
+      url: URL.createObjectURL(file),
+    });
+    setGenerationError(undefined);
   }
 
   function createEngineWorker(): Worker {
@@ -190,6 +262,8 @@ function App() {
     worker: Worker,
     file: File,
     fileName: string,
+    visionModelFile: File | undefined,
+    visionFileName: string | undefined,
     requestedMemoryProfile: MemoryProfile,
     memoryInfo: SystemMemoryInfo | undefined,
   ): Promise<WorkerModelInfo> {
@@ -208,6 +282,8 @@ function App() {
         requestId,
         file,
         fileName,
+        visionFile: visionModelFile,
+        visionFileName,
         memoryProfile: requestedMemoryProfile,
         memoryInfo,
       } satisfies EngineWorkerRequest);
@@ -219,6 +295,7 @@ function App() {
     userId: string,
     assistantId: string,
     userContent: string,
+    image: UiImageAttachment | undefined,
     maxNewTokens: number,
   ): Promise<void> {
     const requestId = nextRequestIdRef.current;
@@ -232,6 +309,7 @@ function App() {
         userId,
         assistantId,
         userContent,
+        image,
         resolve,
         reject,
       });
@@ -240,6 +318,12 @@ function App() {
         requestId,
         systemPrompt,
         userContent,
+        image: image
+          ? {
+              file: image.file,
+              fileName: image.fileName,
+            }
+          : undefined,
         maxNewTokens,
       } satisfies EngineWorkerRequest);
     });
@@ -290,6 +374,7 @@ function App() {
       setPrompt((currentPrompt) =>
         currentPrompt.length === 0 ? pending.userContent : currentPrompt
       );
+      setImageAttachment(pending.image);
     }
 
     if (message.type === "generationDone") {
@@ -339,6 +424,10 @@ function App() {
             <span>Load GGUF model</span>
             <input type="file" accept=".gguf" onChange={handleModelChange} />
           </label>
+          <label className="file-picker">
+            <span>Vision encoder GGUF</span>
+            <input type="file" accept=".gguf" onChange={handleVisionModelChange} />
+          </label>
           <ModelStatus model={model} />
         </section>
 
@@ -384,14 +473,33 @@ function App() {
               setPrompt(event.target.value);
               setGenerationError(undefined);
             }}
+            onPaste={handlePromptPaste}
             placeholder={model.status === "ready" ? "Ask the local model" : "Load a GGUF model first"}
             rows={4}
             disabled={model.status !== "ready" || isGenerating}
           />
+          {imageAttachment ? (
+            <div className="attachment-preview">
+              <img src={imageAttachment.url} alt="" />
+              <span>{imageAttachment.fileName}</span>
+              <button type="button" onClick={clearImageAttachment} disabled={isGenerating}>
+                Remove
+              </button>
+            </div>
+          ) : null}
           {generationError ? (
             <p className="generation-error">{generationError}</p>
           ) : null}
           <div className="form-actions">
+            <label className="image-button">
+              Image
+              <input
+                type="file"
+                accept="image/*"
+                onChange={handleImageFileChange}
+                disabled={model.status !== "ready" || isGenerating || (model.status === "ready" && !model.supportsImages)}
+              />
+            </label>
             <p>{model.status === "ready" ? `${prompt.trim().length} characters` : "No model loaded"}</p>
             {isGenerating ? (
               <button type="button" className="secondary-button" onClick={handleStop}>
@@ -417,6 +525,9 @@ function MessageBubble(
   return (
     <article className={`message message--${message.role}`}>
       <span>{message.role === "user" ? "You" : "Assistant"}</span>
+      {message.image ? (
+        <img className="message-image" src={message.image.url} alt="" />
+      ) : null}
       <p>{visibleContent || placeholder}</p>
       {message.role === "assistant" && message.inferenceDurationMs !== undefined ? (
         <footer className="message-meta">
@@ -471,6 +582,14 @@ function ModelStatus({ model }: { model: ModelState }) {
       <div>
         <dt>Execution</dt>
         <dd>{executionLabel(model.memoryProfile)}</dd>
+      </div>
+      <div>
+        <dt>Vision</dt>
+        <dd>
+          {model.supportsImages
+            ? `${model.visionFileName ?? "Loaded"} (${model.visionImageTokens?.min ?? 0}-${model.visionImageTokens?.max ?? 0} image tokens)`
+            : "Not loaded"}
+        </dd>
       </div>
       <div>
         <dt>Estimated weights</dt>

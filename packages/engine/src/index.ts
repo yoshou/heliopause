@@ -22,20 +22,36 @@ export {
 export {
   auditGemma4TensorCoverage,
   buildGemma4Manifest,
+  buildGemma4VisionManifest,
+  isGemma4VisionGguf,
   type ExpectedTensor,
   type Gemma4LayerKind,
   type Gemma4ModelManifest,
+  type Gemma4VisionManifest,
   type TensorCoverageAudit,
 } from "./model";
 
 export {
   decodeGemma4,
   prefillGemma4,
+  prefillGemma4PreparedHidden,
   type DecodeOptions,
   type DecodeResult,
+  type PreparedHiddenPrefillOptions,
   type PrefillOptions,
   type PrefillResult,
 } from "./forward";
+
+export {
+  calculateGemma4VisionResize,
+  createGemma4VisionSession,
+  preprocessGemma4VisionImageFile,
+  runGemma4VisionEncoder,
+  Gemma4VisionSession,
+  type Gemma4VisionEncodeResult,
+  type Gemma4VisionPixelValues,
+  type Gemma4VisionResize,
+} from "./vision";
 
 export {
   createGemma4InferenceState,
@@ -107,6 +123,7 @@ export {
   createFileGgufTensorReader,
   createGemma4ChatSession,
   DEFAULT_GEMMA4_SYSTEM_PROMPT,
+  generateGemma4PreparedImageChatTurn,
   generateGemma4ChatTurn,
   generateGemma4ChatCompletion,
   getGgufModelName,
@@ -120,6 +137,7 @@ export {
   type Gemma4ChatTemplateOptions,
   type Gemma4ChatTurnOptions,
   type Gemma4ChatTurnResult,
+  type Gemma4PreparedImageInput,
 } from "./chat";
 
 export {

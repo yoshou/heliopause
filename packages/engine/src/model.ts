@@ -70,7 +70,78 @@ export type TensorCoverageAudit = {
   wrongLayerUse: string[];
 };
 
+export type Gemma4VisionManifest = {
+  architecture: "clip";
+  projectorType: "gemma4";
+  tensorCount: number;
+  imageSize: number;
+  patchSize: number;
+  embeddingLength: number;
+  feedForwardLength: number;
+  blockCount: number;
+  headCount: number;
+  layerNormEpsilon: number;
+  projectionDim: number;
+  spatialMergeSize: number;
+  imageMinTokens: number;
+  imageMaxTokens: number;
+  imageMean: [number, number, number];
+  imageStd: [number, number, number];
+  tensorTypes: Record<string, number>;
+};
+
 const REQUIRED_ARCHITECTURE = "gemma4";
+const GEMMA4V_DEFAULT_IMAGE_MIN_TOKENS = 252;
+const GEMMA4V_DEFAULT_IMAGE_MAX_TOKENS = 280;
+
+export function isGemma4VisionGguf(gguf: GgufMetadata): boolean {
+  return gguf.metadata["general.architecture"] === "clip" &&
+    gguf.metadata["clip.has_vision_encoder"] === true &&
+    normalizeVisionProjector(getMetadataString(gguf.metadata, "clip.vision.projector_type")) === "gemma4";
+}
+
+export function buildGemma4VisionManifest(gguf: GgufMetadata): Gemma4VisionManifest {
+  const metadata = gguf.metadata;
+  const architecture = requiredString(metadata, "general.architecture");
+  if (architecture !== "clip") {
+    throw new Error(`Expected architecture clip, got ${architecture}`);
+  }
+
+  const rawProjector = requiredString(metadata, "clip.vision.projector_type");
+  const projectorType = normalizeVisionProjector(rawProjector);
+  if (projectorType !== "gemma4") {
+    throw new Error(`Unsupported vision projector type: ${rawProjector}`);
+  }
+
+  const tensorTypes: Record<string, number> = {};
+  for (const tensor of gguf.tensors) {
+    tensorTypes[tensor.type] = (tensorTypes[tensor.type] ?? 0) + 1;
+  }
+
+  return {
+    architecture: "clip",
+    projectorType,
+    tensorCount: gguf.tensorCount,
+    imageSize: requiredNumber(metadata, "clip.vision.image_size"),
+    patchSize: requiredNumber(metadata, "clip.vision.patch_size"),
+    embeddingLength: requiredNumber(metadata, "clip.vision.embedding_length"),
+    feedForwardLength: requiredNumber(metadata, "clip.vision.feed_forward_length"),
+    blockCount: requiredNumber(metadata, "clip.vision.block_count"),
+    headCount: requiredNumber(metadata, "clip.vision.attention.head_count"),
+    layerNormEpsilon: requiredNumber(metadata, "clip.vision.attention.layer_norm_epsilon"),
+    projectionDim: requiredNumber(metadata, "clip.vision.projection_dim"),
+    spatialMergeSize: getMetadataNumber(metadata, "clip.vision.projector.scale_factor") ?? 3,
+    imageMinTokens: GEMMA4V_DEFAULT_IMAGE_MIN_TOKENS,
+    imageMaxTokens: GEMMA4V_DEFAULT_IMAGE_MAX_TOKENS,
+    imageMean: requiredNumberTuple3(metadata, "clip.vision.image_mean"),
+    imageStd: requiredNumberTuple3(metadata, "clip.vision.image_std"),
+    tensorTypes,
+  };
+}
+
+function normalizeVisionProjector(value: string | undefined): "gemma4" | string | undefined {
+  return value === "gemma4v" ? "gemma4" : value;
+}
 
 export function buildGemma4Manifest(gguf: GgufMetadata): Gemma4ModelManifest {
   const metadata = gguf.metadata;
@@ -463,6 +534,14 @@ function requiredString(metadata: GgufMetadata["metadata"], key: string): string
 function requiredNumberArray(metadata: GgufMetadata["metadata"], key: string): number[] | undefined {
   const value = getMetadataNumberArray(metadata, key);
   return value;
+}
+
+function requiredNumberTuple3(metadata: GgufMetadata["metadata"], key: string): [number, number, number] {
+  const value = requiredNumberArray(metadata, key);
+  if (!value || value.length !== 3) {
+    throw new Error(`Missing numeric[3] GGUF metadata: ${key}`);
+  }
+  return [value[0] ?? 0, value[1] ?? 0, value[2] ?? 0];
 }
 
 function firstNumber(metadata: GgufMetadata["metadata"], keys: string[], fallback: number): number {

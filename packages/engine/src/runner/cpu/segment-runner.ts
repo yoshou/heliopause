@@ -55,7 +55,7 @@ export class Gemma4CpuSegmentRunner {
     inputHidden: Float32Array,
     positions: Int32Array,
     state: Gemma4InferenceState,
-    options: { trace?: ForwardTrace; perLayerInputs?: Float32Array } = {},
+    options: { trace?: ForwardTrace; perLayerInputs?: Float32Array; attentionCausal?: boolean } = {},
   ): Promise<Gemma4CpuHiddenResult> {
     let hidden = inputHidden;
     for (let layer = this.segmentStartLayer; layer < this.segmentEndLayerExclusive; layer += 1) {
@@ -75,6 +75,7 @@ export class Gemma4CpuSegmentRunner {
         options.perLayerInputs,
         this.epsilon,
         options.trace,
+        options.attentionCausal ?? true,
       );
     }
     return { hidden };
@@ -84,7 +85,7 @@ export class Gemma4CpuSegmentRunner {
     inputHidden: Float32Array,
     positions: Int32Array,
     state: Gemma4InferenceState,
-    options: { trace?: ForwardTrace; perLayerInputs?: Float32Array } = {},
+    options: { trace?: ForwardTrace; perLayerInputs?: Float32Array; attentionCausal?: boolean } = {},
   ): Promise<Gemma4CpuHiddenResult> {
     return this.runTokensHidden(inputHidden, positions, state, options);
   }

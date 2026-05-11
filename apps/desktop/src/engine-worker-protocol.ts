@@ -23,6 +23,17 @@ export type WorkerModelInfo = {
   contextLength: number;
   originalContextLength: number;
   memoryProfile: ResolvedMemoryProfile;
+  visionFileName?: string;
+  supportsImages: boolean;
+  visionImageTokens?: {
+    min: number;
+    max: number;
+  };
+};
+
+export type WorkerImageInput = {
+  file: File;
+  fileName: string;
 };
 
 export type EngineWorkerRequest =
@@ -31,6 +42,8 @@ export type EngineWorkerRequest =
       requestId: number;
       file: File;
       fileName: string;
+      visionFile?: File;
+      visionFileName?: string;
       memoryProfile: MemoryProfile;
       memoryInfo?: SystemMemoryInfo;
     }
@@ -39,6 +52,7 @@ export type EngineWorkerRequest =
       requestId: number;
       systemPrompt: string;
       userContent: string;
+      image?: WorkerImageInput;
       maxNewTokens: number;
     }
   | {
