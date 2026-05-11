@@ -51,6 +51,7 @@ export {
   type Gemma4VisionEncodeResult,
   type Gemma4VisionPixelValues,
   type Gemma4VisionResize,
+  type Gemma4VisionSessionOptions,
 } from "./vision";
 
 export {

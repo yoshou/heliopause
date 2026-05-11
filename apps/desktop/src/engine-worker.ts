@@ -76,6 +76,7 @@ async function handleLoadModel(
 ): Promise<void> {
   activeGeneration?.abortController.abort();
   activeGeneration = undefined;
+  visionSession?.dispose();
   session = undefined;
   visionSession = undefined;
   tokenizer = undefined;
@@ -85,19 +86,29 @@ async function handleLoadModel(
   const tensorReader = await createFileGgufTensorReader(request.file);
   const manifest = buildGemma4Manifest(tensorReader.metadata);
   let nextVisionSession: Gemma4VisionSession | undefined;
-  if (request.visionFile) {
-    const visionReader = await createFileGgufTensorReader(request.visionFile);
-    if (!isGemma4VisionGguf(visionReader.metadata)) {
-      throw new Error("Vision encoder GGUF is not a Gemma4V projector.");
-    }
-    nextVisionSession = createGemma4VisionSession(visionReader);
-  }
   const estimatedWeightCacheBytes = estimateWeightCacheBytes(tensorReader);
   const resolvedMemoryProfile = resolveMemoryProfile(
     request.memoryProfile,
     estimatedWeightCacheBytes,
     request.memoryInfo,
   );
+  if (request.visionFile) {
+    const visionReader = await createFileGgufTensorReader(request.visionFile);
+    if (!isGemma4VisionGguf(visionReader.metadata)) {
+      throw new Error("Vision encoder GGUF is not a Gemma4V projector.");
+    }
+    nextVisionSession = createGemma4VisionSession(visionReader, {
+      maxWeightCacheBytes: resolvedMemoryProfile.maxWeightCacheBytes,
+      executionProviders: [{
+        name: "cpu",
+        options: {
+          projectionBatching: true,
+          residentWeightCache: resolvedMemoryProfile.wasmResidentWeightCache,
+          wasmKernels: true,
+        },
+      }],
+    });
+  }
   const executionProviders: ExecutionProviderConfig[] = [{
     name: "cpu",
     options: {

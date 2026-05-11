@@ -577,6 +577,347 @@ pub unsafe extern "C" fn hp_gqa_attention_f32(
     OK
 }
 
+#[no_mangle]
+pub unsafe extern "C" fn hp_vision_patch_embed_f32(
+    pixels_ptr: *const f32,
+    pixels_len: usize,
+    weights_ptr: *const f32,
+    weights_len: usize,
+    image_width: usize,
+    patch_size: usize,
+    patch_grid_x: usize,
+    patch_grid_y: usize,
+    embedding_length: usize,
+    output_ptr: *mut f32,
+    output_len: usize,
+) -> i32 {
+    let image_height = patch_grid_y.saturating_mul(patch_size);
+    if image_width != patch_grid_x.saturating_mul(patch_size)
+        || pixels_len != image_width.saturating_mul(image_height).saturating_mul(3)
+        || weights_len != patch_size.saturating_mul(patch_size).saturating_mul(3).saturating_mul(embedding_length)
+        || output_len != patch_grid_x.saturating_mul(patch_grid_y).saturating_mul(embedding_length)
+    {
+        return ERR_SHAPE;
+    }
+
+    let pixels = slice::from_raw_parts(pixels_ptr, pixels_len);
+    let weights = slice::from_raw_parts(weights_ptr, weights_len);
+    let output = slice::from_raw_parts_mut(output_ptr, output_len);
+
+    for patch_y in 0..patch_grid_y {
+        for patch_x in 0..patch_grid_x {
+            let patch = patch_y * patch_grid_x + patch_x;
+            let output_offset = patch * embedding_length;
+            for emb in 0..embedding_length {
+                let mut sum = 0.0_f32;
+                for ky in 0..patch_size {
+                    let y = patch_y * patch_size + ky;
+                    for kx in 0..patch_size {
+                        let x = patch_x * patch_size + kx;
+                        let pixel_offset = (y * image_width + x) * 3;
+                        for channel in 0..3 {
+                            let weight_offset = kx + patch_size * (ky + patch_size * (channel + 3 * emb));
+                            let scaled_pixel = (pixels[pixel_offset + channel] * 2.0 - 1.0).round_to_f32();
+                            sum = (sum + (weights[weight_offset] * scaled_pixel).round_to_f32()).round_to_f32();
+                        }
+                    }
+                }
+                output[output_offset + emb] = sum;
+            }
+        }
+    }
+
+    OK
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn hp_vision_add_position_f32(
+    hidden_ptr: *const f32,
+    hidden_len: usize,
+    positions_ptr: *const f32,
+    positions_len: usize,
+    patch_grid_x: usize,
+    token_count: usize,
+    embedding_length: usize,
+    table_size: usize,
+    output_ptr: *mut f32,
+    output_len: usize,
+) -> i32 {
+    if hidden_len != token_count.saturating_mul(embedding_length)
+        || output_len != hidden_len
+        || positions_len < table_size.saturating_mul(2).saturating_mul(embedding_length)
+    {
+        return ERR_SHAPE;
+    }
+    let hidden = slice::from_raw_parts(hidden_ptr, hidden_len);
+    let positions = slice::from_raw_parts(positions_ptr, positions_len);
+    let output = slice::from_raw_parts_mut(output_ptr, output_len);
+
+    for patch in 0..token_count {
+        let x = patch % patch_grid_x;
+        let y = patch / patch_grid_x;
+        if x >= table_size || y >= table_size {
+            return ERR_SHAPE;
+        }
+        let output_offset = patch * embedding_length;
+        let x_offset = x * embedding_length;
+        let y_offset = (table_size + y) * embedding_length;
+        for index in 0..embedding_length {
+            output[output_offset + index] = ((hidden[output_offset + index] + positions[x_offset + index]).round_to_f32()
+                + positions[y_offset + index]).round_to_f32();
+        }
+    }
+
+    OK
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn hp_vision_rms_norm_f32(
+    input_ptr: *const f32,
+    input_len: usize,
+    weight_ptr: *const f32,
+    weight_len: usize,
+    row_size: usize,
+    epsilon: f32,
+    output_ptr: *mut f32,
+    output_len: usize,
+) -> i32 {
+    if row_size == 0
+        || input_len % row_size != 0
+        || output_len != input_len
+        || (weight_len != 0 && weight_len != row_size)
+    {
+        return ERR_SHAPE;
+    }
+    let input = slice::from_raw_parts(input_ptr, input_len);
+    let weight = if weight_len == 0 { &[][..] } else { slice::from_raw_parts(weight_ptr, weight_len) };
+    let output = slice::from_raw_parts_mut(output_ptr, output_len);
+
+    for row in 0..input_len / row_size {
+        let offset = row * row_size;
+        let mut sum_squares = 0.0_f32;
+        for index in 0..row_size {
+            let value = input[offset + index];
+            sum_squares += value * value;
+        }
+        let scale = 1.0 / (sum_squares / row_size as f32 + epsilon).sqrt();
+        for index in 0..row_size {
+            let weighted = if weight_len == 0 { 1.0 } else { weight[index] };
+            output[offset + index] = (input[offset + index] * scale * weighted).round_to_f32();
+        }
+    }
+
+    OK
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn hp_vision_rope2d_neox_f32(
+    input_ptr: *const f32,
+    input_len: usize,
+    patch_grid_x: usize,
+    head_size: usize,
+    head_count: usize,
+    token_count: usize,
+    freq_base: f32,
+    output_ptr: *mut f32,
+    output_len: usize,
+) -> i32 {
+    if head_size == 0
+        || head_count == 0
+        || input_len != token_count.saturating_mul(head_count).saturating_mul(head_size)
+        || output_len != input_len
+        || head_size % 4 != 0
+    {
+        return ERR_SHAPE;
+    }
+    let input = slice::from_raw_parts(input_ptr, input_len);
+    let output = slice::from_raw_parts_mut(output_ptr, output_len);
+    output.copy_from_slice(input);
+    vision_apply_rope_slice(output, input, patch_grid_x, head_size, head_count, token_count, 0, head_size / 2, freq_base, 0);
+    vision_apply_rope_slice(output, input, patch_grid_x, head_size, head_count, token_count, head_size / 2, head_size / 2, freq_base, 1);
+    OK
+}
+
+#[allow(clippy::too_many_arguments)]
+fn vision_apply_rope_slice(
+    output: &mut [f32],
+    input: &[f32],
+    patch_grid_x: usize,
+    head_size: usize,
+    head_count: usize,
+    token_count: usize,
+    slice_offset: usize,
+    slice_length: usize,
+    freq_base: f32,
+    axis: i32,
+) {
+    let theta_scale = freq_base.powf(-2.0 / slice_length as f32);
+    for token in 0..token_count {
+        let position = if axis == 0 { token % patch_grid_x } else { token / patch_grid_x };
+        for head in 0..head_count {
+            let row_offset = (token * head_count + head) * head_size + slice_offset;
+            let mut theta = position as f32;
+            for i0 in (0..slice_length).step_by(2) {
+                let index = i0 / 2;
+                let x0 = input[row_offset + index];
+                let x1 = input[row_offset + slice_length / 2 + index];
+                let cos_theta = theta.cos();
+                let sin_theta = theta.sin();
+                output[row_offset + index] = ((x0 * cos_theta).round_to_f32() - (x1 * sin_theta).round_to_f32()).round_to_f32();
+                output[row_offset + slice_length / 2 + index] = ((x0 * sin_theta).round_to_f32() + (x1 * cos_theta).round_to_f32()).round_to_f32();
+                theta = (theta * theta_scale).round_to_f32();
+            }
+        }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn hp_vision_clamp_f32(
+    input_ptr: *const f32,
+    input_len: usize,
+    min: f32,
+    max: f32,
+    output_ptr: *mut f32,
+    output_len: usize,
+) -> i32 {
+    if output_len != input_len {
+        return ERR_SHAPE;
+    }
+    let input = slice::from_raw_parts(input_ptr, input_len);
+    let output = slice::from_raw_parts_mut(output_ptr, output_len);
+    for index in 0..input_len {
+        output[index] = input[index].max(min).min(max);
+    }
+    OK
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn hp_vision_gelu_mul_f32(
+    gate_ptr: *const f32,
+    gate_len: usize,
+    up_ptr: *const f32,
+    up_len: usize,
+    output_ptr: *mut f32,
+    output_len: usize,
+) -> i32 {
+    if up_len != gate_len || output_len != gate_len {
+        return ERR_SHAPE;
+    }
+    let gate = slice::from_raw_parts(gate_ptr, gate_len);
+    let up = slice::from_raw_parts(up_ptr, up_len);
+    let output = slice::from_raw_parts_mut(output_ptr, output_len);
+    for index in 0..gate_len {
+        output[index] = (vision_gelu(gate[index]) * up[index]).round_to_f32();
+    }
+    OK
+}
+
+fn vision_gelu(value: f32) -> f32 {
+    if value <= -10.0 {
+        return 0.0;
+    }
+    if value >= 10.0 {
+        return value;
+    }
+    let inner = ((2.0 / core::f32::consts::PI).sqrt() * value).round_to_f32()
+        * (1.0 + (0.044715 * value * value).round_to_f32()).round_to_f32();
+    ((0.5 * value).round_to_f32() * (1.0 + inner.tanh()).round_to_f32()).round_to_f32()
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn hp_vision_residual_add_f32(
+    left_ptr: *const f32,
+    left_len: usize,
+    right_ptr: *const f32,
+    right_len: usize,
+    output_ptr: *mut f32,
+    output_len: usize,
+) -> i32 {
+    if left_len != right_len || output_len != left_len {
+        return ERR_SHAPE;
+    }
+    let left = slice::from_raw_parts(left_ptr, left_len);
+    let right = slice::from_raw_parts(right_ptr, right_len);
+    let output = slice::from_raw_parts_mut(output_ptr, output_len);
+    for index in 0..left_len {
+        output[index] = (left[index] + right[index]).round_to_f32();
+    }
+    OK
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn hp_vision_average_pool_scale_f32(
+    input_ptr: *const f32,
+    input_len: usize,
+    patch_grid_x: usize,
+    patch_grid_y: usize,
+    embedding_length: usize,
+    kernel_size: usize,
+    output_scale: f32,
+    output_ptr: *mut f32,
+    output_len: usize,
+) -> i32 {
+    if kernel_size == 0
+        || patch_grid_x % kernel_size != 0
+        || patch_grid_y % kernel_size != 0
+        || input_len != patch_grid_x.saturating_mul(patch_grid_y).saturating_mul(embedding_length)
+    {
+        return ERR_SHAPE;
+    }
+    let out_x = patch_grid_x / kernel_size;
+    let out_y = patch_grid_y / kernel_size;
+    if output_len != out_x.saturating_mul(out_y).saturating_mul(embedding_length) {
+        return ERR_SHAPE;
+    }
+    let input = slice::from_raw_parts(input_ptr, input_len);
+    let output = slice::from_raw_parts_mut(output_ptr, output_len);
+    output.fill(0.0);
+    let scale = output_scale / (kernel_size * kernel_size) as f32;
+    for oy in 0..out_y {
+        for ox in 0..out_x {
+            let out_token = oy * out_x + ox;
+            for ky in 0..kernel_size {
+                for kx in 0..kernel_size {
+                    let in_token = (oy * kernel_size + ky) * patch_grid_x + ox * kernel_size + kx;
+                    for emb in 0..embedding_length {
+                        let out_index = out_token * embedding_length + emb;
+                        output[out_index] = (output[out_index] + (input[in_token * embedding_length + emb] * scale).round_to_f32()).round_to_f32();
+                    }
+                }
+            }
+        }
+    }
+    OK
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn hp_vision_std_normalize_f32(
+    input_ptr: *const f32,
+    input_len: usize,
+    bias_ptr: *const f32,
+    bias_len: usize,
+    scale_ptr: *const f32,
+    scale_len: usize,
+    row_size: usize,
+    output_ptr: *mut f32,
+    output_len: usize,
+) -> i32 {
+    if row_size == 0 || input_len % row_size != 0 || output_len != input_len || bias_len != row_size || scale_len != row_size {
+        return ERR_SHAPE;
+    }
+    let input = slice::from_raw_parts(input_ptr, input_len);
+    let bias = slice::from_raw_parts(bias_ptr, bias_len);
+    let scale = slice::from_raw_parts(scale_ptr, scale_len);
+    let output = slice::from_raw_parts_mut(output_ptr, output_len);
+    for row in 0..input_len / row_size {
+        let offset = row * row_size;
+        for index in 0..row_size {
+            output[offset + index] = ((input[offset + index] - bias[index]).round_to_f32() * scale[index]).round_to_f32();
+        }
+    }
+    OK
+}
+
 struct QuantizedQ8K {
     d: Vec<f32>,
     qs: Vec<i8>,
