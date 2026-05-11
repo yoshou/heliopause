@@ -10,10 +10,16 @@ import {
   Q6_K_GATHER_ROWS_SCALE_WGSL,
   PREPARE_PER_LAYER_INPUTS_WGSL,
   RMS_NORM_WGSL,
+  RMS_NORM_Q8_K_QUANTIZE_WGSL,
   RESIDUAL_ADD_WGSL,
   RESIDUAL_ADD_SCALE_WGSL,
   RMS_NORM_RESIDUAL_ADD_WGSL,
   RMS_NORM_RESIDUAL_ADD_SCALE_WGSL,
+  HEAD_RMS_NORM_WGSL,
+  HEAD_RMS_NORM_NO_WEIGHT_WGSL,
+  ROPE_WGSL,
+  KEY_CACHE_ROPE_WGSL,
+  VALUE_CACHE_WRITE_WGSL,
   FULL_QUERY_NORM_ROPE_WGSL,
   FULL_KV_UPDATE_WGSL,
   TOPK_WGSL,
@@ -31,7 +37,6 @@ import {
   TOP1_CHUNK_WGSL,
   SELECT_TOP1_CANDIDATE_WGSL,
   Q8_K_QUANTIZE_WGSL,
-  RMS_NORM_Q8_K_QUANTIZE_WGSL,
   Q8_0_QUANTIZE_WGSL,
   FULL_ATTENTION_SCORE_WGSL,
   FULL_ATTENTION_APPLY_WGSL,
@@ -1119,6 +1124,230 @@ export function createRmsNormResidualAddScaleResources(
         bindBuffer(3, scale),
         bindBuffer(4, paramsBuffer),
         bindBuffer(5, output),
+      ],
+    }),
+    destroy: () => paramsBuffer.destroy?.(),
+  };
+}
+
+export function createHeadRmsNormResources(
+  device: WebGpuDeviceLike,
+  input: WebGpuBufferLike,
+  weight: WebGpuBufferLike,
+  output: WebGpuBufferLike,
+  options: {
+    headCount: number;
+    headSize: number;
+    epsilon: number;
+  },
+): { pipeline: unknown; bindGroup: unknown; destroy: () => void } {
+  const paramsF32 = new Float32Array([options.epsilon, 0, 0, 0]);
+  const paramsU32 = new Uint32Array(paramsF32.buffer);
+  paramsU32[1] = options.headCount;
+  paramsU32[2] = options.headSize;
+  const paramsBuffer = device.createBuffer({ size: paramsU32.byteLength, usage: GPU_UNIFORM | GPU_COPY_DST });
+  device.queue.writeBuffer(paramsBuffer, 0, paramsU32);
+  const bindGroupLayout = device.createBindGroupLayout({
+    entries: [
+      storageEntry(0, "read-only-storage"),
+      storageEntry(1, "read-only-storage"),
+      { binding: 2, visibility: GPU_SHADER_STAGE_COMPUTE, buffer: { type: "uniform" } },
+      storageEntry(3, "storage"),
+    ],
+  });
+  const pipeline = device.createComputePipeline({
+    layout: device.createPipelineLayout({ bindGroupLayouts: [bindGroupLayout] }),
+    compute: { module: device.createShaderModule({ code: HEAD_RMS_NORM_WGSL }), entryPoint: "main" },
+  });
+  return {
+    pipeline,
+    bindGroup: device.createBindGroup({
+      layout: bindGroupLayout,
+      entries: [
+        bindBuffer(0, input),
+        bindBuffer(1, weight),
+        bindBuffer(2, paramsBuffer),
+        bindBuffer(3, output),
+      ],
+    }),
+    destroy: () => paramsBuffer.destroy?.(),
+  };
+}
+
+export function createHeadRmsNormNoWeightResources(
+  device: WebGpuDeviceLike,
+  input: WebGpuBufferLike,
+  output: WebGpuBufferLike,
+  options: {
+    headCount: number;
+    headSize: number;
+    epsilon: number;
+  },
+): { pipeline: unknown; bindGroup: unknown; destroy: () => void } {
+  const paramsF32 = new Float32Array([options.epsilon, 0, 0, 0]);
+  const paramsU32 = new Uint32Array(paramsF32.buffer);
+  paramsU32[1] = options.headCount;
+  paramsU32[2] = options.headSize;
+  const paramsBuffer = device.createBuffer({ size: paramsU32.byteLength, usage: GPU_UNIFORM | GPU_COPY_DST });
+  device.queue.writeBuffer(paramsBuffer, 0, paramsU32);
+  const bindGroupLayout = device.createBindGroupLayout({
+    entries: [
+      storageEntry(0, "read-only-storage"),
+      { binding: 1, visibility: GPU_SHADER_STAGE_COMPUTE, buffer: { type: "uniform" } },
+      storageEntry(2, "storage"),
+    ],
+  });
+  const pipeline = device.createComputePipeline({
+    layout: device.createPipelineLayout({ bindGroupLayouts: [bindGroupLayout] }),
+    compute: { module: device.createShaderModule({ code: HEAD_RMS_NORM_NO_WEIGHT_WGSL }), entryPoint: "main" },
+  });
+  return {
+    pipeline,
+    bindGroup: device.createBindGroup({
+      layout: bindGroupLayout,
+      entries: [
+        bindBuffer(0, input),
+        bindBuffer(1, paramsBuffer),
+        bindBuffer(2, output),
+      ],
+    }),
+    destroy: () => paramsBuffer.destroy?.(),
+  };
+}
+
+export function createRopeResources(
+  device: WebGpuDeviceLike,
+  input: WebGpuBufferLike,
+  freqFactors: WebGpuBufferLike,
+  output: WebGpuBufferLike,
+  options: {
+    headCount: number;
+    headSize: number;
+    ropeDims: number;
+    freqBase: number;
+    position: number;
+    hasFreqFactors: boolean;
+  },
+): { pipeline: unknown; bindGroup: unknown; destroy: () => void } {
+  const paramsF32 = new Float32Array([options.freqBase, options.position, 0, 0, 0, 0, 0, 0]);
+  const params = new Uint32Array(paramsF32.buffer);
+  params[2] = options.hasFreqFactors ? 1 : 0;
+  params[3] = options.headCount;
+  params[4] = options.headSize;
+  params[5] = options.ropeDims;
+  const paramsBuffer = device.createBuffer({ size: params.byteLength, usage: GPU_UNIFORM | GPU_COPY_DST });
+  device.queue.writeBuffer(paramsBuffer, 0, params);
+  const bindGroupLayout = device.createBindGroupLayout({
+    entries: [
+      storageEntry(0, "read-only-storage"),
+      storageEntry(1, "read-only-storage"),
+      { binding: 2, visibility: GPU_SHADER_STAGE_COMPUTE, buffer: { type: "uniform" } },
+      storageEntry(3, "storage"),
+    ],
+  });
+  const pipeline = device.createComputePipeline({
+    layout: device.createPipelineLayout({ bindGroupLayouts: [bindGroupLayout] }),
+    compute: { module: device.createShaderModule({ code: ROPE_WGSL }), entryPoint: "main" },
+  });
+  return {
+    pipeline,
+    bindGroup: device.createBindGroup({
+      layout: bindGroupLayout,
+      entries: [
+        bindBuffer(0, input),
+        bindBuffer(1, freqFactors),
+        bindBuffer(2, paramsBuffer),
+        bindBuffer(3, output),
+      ],
+    }),
+    destroy: () => paramsBuffer.destroy?.(),
+  };
+}
+
+export function createKeyCacheRopeResources(
+  device: WebGpuDeviceLike,
+  input: WebGpuBufferLike,
+  freqFactors: WebGpuBufferLike,
+  keyCache: WebGpuBufferLike,
+  options: {
+    headCount: number;
+    headSize: number;
+    ropeDims: number;
+    freqBase: number;
+    position: number;
+    tokenPosition: number;
+    hasFreqFactors: boolean;
+  },
+): { pipeline: unknown; bindGroup: unknown; destroy: () => void } {
+  const paramsF32 = new Float32Array([options.freqBase, options.position, 0, 0, 0, 0, 0, 0]);
+  const params = new Uint32Array(paramsF32.buffer);
+  params[2] = options.hasFreqFactors ? 1 : 0;
+  params[3] = options.headCount;
+  params[4] = options.headSize;
+  params[5] = options.ropeDims;
+  params[6] = options.tokenPosition;
+  const paramsBuffer = device.createBuffer({ size: params.byteLength, usage: GPU_UNIFORM | GPU_COPY_DST });
+  device.queue.writeBuffer(paramsBuffer, 0, params);
+  const bindGroupLayout = device.createBindGroupLayout({
+    entries: [
+      storageEntry(0, "read-only-storage"),
+      storageEntry(1, "read-only-storage"),
+      { binding: 2, visibility: GPU_SHADER_STAGE_COMPUTE, buffer: { type: "uniform" } },
+      storageEntry(3, "storage"),
+    ],
+  });
+  const pipeline = device.createComputePipeline({
+    layout: device.createPipelineLayout({ bindGroupLayouts: [bindGroupLayout] }),
+    compute: { module: device.createShaderModule({ code: KEY_CACHE_ROPE_WGSL }), entryPoint: "main" },
+  });
+  return {
+    pipeline,
+    bindGroup: device.createBindGroup({
+      layout: bindGroupLayout,
+      entries: [
+        bindBuffer(0, input),
+        bindBuffer(1, freqFactors),
+        bindBuffer(2, paramsBuffer),
+        bindBuffer(3, keyCache),
+      ],
+    }),
+    destroy: () => paramsBuffer.destroy?.(),
+  };
+}
+
+export function createValueCacheWriteResources(
+  device: WebGpuDeviceLike,
+  input: WebGpuBufferLike,
+  valueCache: WebGpuBufferLike,
+  options: {
+    headCount: number;
+    valueSize: number;
+    tokenPosition: number;
+    contextLength: number;
+  },
+): { pipeline: unknown; bindGroup: unknown; destroy: () => void } {
+  const params = new Uint32Array([options.headCount, options.valueSize, options.tokenPosition, options.contextLength]);
+  const paramsBuffer = device.createBuffer({ size: params.byteLength, usage: GPU_UNIFORM | GPU_COPY_DST });
+  device.queue.writeBuffer(paramsBuffer, 0, params);
+  const bindGroupLayout = device.createBindGroupLayout({
+    entries: [
+      storageEntry(0, "read-only-storage"),
+      { binding: 1, visibility: GPU_SHADER_STAGE_COMPUTE, buffer: { type: "uniform" } },
+      storageEntry(2, "storage"),
+    ],
+  });
+  const pipeline = device.createComputePipeline({
+    layout: device.createPipelineLayout({ bindGroupLayouts: [bindGroupLayout] }),
+    compute: { module: device.createShaderModule({ code: VALUE_CACHE_WRITE_WGSL }), entryPoint: "main" },
+  });
+  return {
+    pipeline,
+    bindGroup: device.createBindGroup({
+      layout: bindGroupLayout,
+      entries: [
+        bindBuffer(0, input),
+        bindBuffer(1, paramsBuffer),
+        bindBuffer(2, valueCache),
       ],
     }),
     destroy: () => paramsBuffer.destroy?.(),

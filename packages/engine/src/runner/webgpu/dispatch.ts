@@ -13,6 +13,9 @@ import {
   createGegluResources,
   createGegluSliceResources,
   createGeluResources,
+  createHeadRmsNormNoWeightResources,
+  createHeadRmsNormResources,
+  createKeyCacheRopeResources,
   createKMatMulBindResources,
   createQ8_0MatMulBindResources,
   createQuantizedGatherRowsScaleResources,
@@ -21,6 +24,7 @@ import {
   createPreparePerLayerInputsResources,
   createResidualAddResources,
   createResidualAddScaleResources,
+  createRopeResources,
   createRmsNormResources,
   createRmsNormQ8KQuantizeResources,
   createRmsNormResidualAddResources,
@@ -32,6 +36,7 @@ import {
   createTokenSliceResources,
   createTopKResources,
   createTop1ChunkResources,
+  createValueCacheWriteResources,
 } from "./kernel-resources";
 
 export function dispatchKMatMul(
@@ -261,6 +266,112 @@ export function dispatchRmsNormResidualAddScale(
   pass.setPipeline(resource.pipeline);
   pass.setBindGroup(0, resource.bindGroup);
   pass.dispatchWorkgroups(1);
+}
+
+export function dispatchHeadRmsNorm(
+  device: WebGpuDeviceLike,
+  pass: WebGpuComputePassLike,
+  resources: Array<{ destroy: () => void }>,
+  input: WebGpuBufferLike,
+  weight: WebGpuBufferLike,
+  output: WebGpuBufferLike,
+  options: {
+    headCount: number;
+    headSize: number;
+    epsilon: number;
+  },
+): void {
+  const resource = createHeadRmsNormResources(device, input, weight, output, options);
+  resources.push(resource);
+  pass.setPipeline(resource.pipeline);
+  pass.setBindGroup(0, resource.bindGroup);
+  pass.dispatchWorkgroups(options.headCount);
+}
+
+export function dispatchHeadRmsNormNoWeight(
+  device: WebGpuDeviceLike,
+  pass: WebGpuComputePassLike,
+  resources: Array<{ destroy: () => void }>,
+  input: WebGpuBufferLike,
+  output: WebGpuBufferLike,
+  options: {
+    headCount: number;
+    headSize: number;
+    epsilon: number;
+  },
+): void {
+  const resource = createHeadRmsNormNoWeightResources(device, input, output, options);
+  resources.push(resource);
+  pass.setPipeline(resource.pipeline);
+  pass.setBindGroup(0, resource.bindGroup);
+  pass.dispatchWorkgroups(options.headCount);
+}
+
+export function dispatchRope(
+  device: WebGpuDeviceLike,
+  pass: WebGpuComputePassLike,
+  resources: Array<{ destroy: () => void }>,
+  input: WebGpuBufferLike,
+  freqFactors: WebGpuBufferLike,
+  output: WebGpuBufferLike,
+  options: {
+    headCount: number;
+    headSize: number;
+    ropeDims: number;
+    freqBase: number;
+    position: number;
+    hasFreqFactors: boolean;
+  },
+): void {
+  const resource = createRopeResources(device, input, freqFactors, output, options);
+  resources.push(resource);
+  pass.setPipeline(resource.pipeline);
+  pass.setBindGroup(0, resource.bindGroup);
+  pass.dispatchWorkgroups(options.headCount);
+}
+
+export function dispatchKeyCacheRope(
+  device: WebGpuDeviceLike,
+  pass: WebGpuComputePassLike,
+  resources: Array<{ destroy: () => void }>,
+  input: WebGpuBufferLike,
+  freqFactors: WebGpuBufferLike,
+  keyCache: WebGpuBufferLike,
+  options: {
+    headCount: number;
+    headSize: number;
+    ropeDims: number;
+    freqBase: number;
+    position: number;
+    tokenPosition: number;
+    hasFreqFactors: boolean;
+  },
+): void {
+  const resource = createKeyCacheRopeResources(device, input, freqFactors, keyCache, options);
+  resources.push(resource);
+  pass.setPipeline(resource.pipeline);
+  pass.setBindGroup(0, resource.bindGroup);
+  pass.dispatchWorkgroups(options.headCount);
+}
+
+export function dispatchValueCacheWrite(
+  device: WebGpuDeviceLike,
+  pass: WebGpuComputePassLike,
+  resources: Array<{ destroy: () => void }>,
+  input: WebGpuBufferLike,
+  valueCache: WebGpuBufferLike,
+  options: {
+    headCount: number;
+    valueSize: number;
+    tokenPosition: number;
+    contextLength: number;
+  },
+): void {
+  const resource = createValueCacheWriteResources(device, input, valueCache, options);
+  resources.push(resource);
+  pass.setPipeline(resource.pipeline);
+  pass.setBindGroup(0, resource.bindGroup);
+  pass.dispatchWorkgroups(options.headCount);
 }
 
 export function dispatchFullQuery(

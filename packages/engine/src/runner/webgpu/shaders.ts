@@ -553,6 +553,234 @@ fn main(@builtin(local_invocation_id) localId: vec3<u32>) {
 }
 `;
 
+export const HEAD_RMS_NORM_WGSL = `
+struct Params {
+  epsilon: f32,
+  headCount: u32,
+  headSize: u32,
+  _pad0: u32,
+};
+
+@group(0) @binding(0) var<storage, read> inputValues: array<f32>;
+@group(0) @binding(1) var<storage, read> normWeights: array<f32>;
+@group(0) @binding(2) var<uniform> params: Params;
+@group(0) @binding(3) var<storage, read_write> outputValues: array<f32>;
+
+var<workgroup> headRmsReduceValues: array<f32, 256>;
+
+@compute @workgroup_size(256, 1, 1)
+fn main(@builtin(workgroup_id) workgroupId: vec3<u32>, @builtin(local_invocation_id) localId: vec3<u32>) {
+  let head = workgroupId.x;
+  let lane = localId.x;
+  if (head >= params.headCount) {
+    return;
+  }
+  let base = head * params.headSize;
+  var meanSquare = 0.0;
+  for (var dim = lane; dim < params.headSize; dim = dim + 256u) {
+    let value = inputValues[base + dim];
+    meanSquare = meanSquare + value * value;
+  }
+  headRmsReduceValues[lane] = meanSquare;
+  workgroupBarrier();
+  for (var stride = 128u; stride > 0u; stride = stride / 2u) {
+    if (lane < stride) {
+      headRmsReduceValues[lane] = headRmsReduceValues[lane] + headRmsReduceValues[lane + stride];
+    }
+    workgroupBarrier();
+  }
+  let scale = inverseSqrt(headRmsReduceValues[0] / f32(params.headSize) + params.epsilon);
+  for (var dim = lane; dim < params.headSize; dim = dim + 256u) {
+    outputValues[base + dim] = inputValues[base + dim] * scale * normWeights[dim];
+  }
+}
+`;
+
+export const HEAD_RMS_NORM_NO_WEIGHT_WGSL = `
+struct Params {
+  epsilon: f32,
+  headCount: u32,
+  headSize: u32,
+  _pad0: u32,
+};
+
+@group(0) @binding(0) var<storage, read> inputValues: array<f32>;
+@group(0) @binding(1) var<uniform> params: Params;
+@group(0) @binding(2) var<storage, read_write> outputValues: array<f32>;
+
+var<workgroup> headRmsNoWeightReduceValues: array<f32, 256>;
+
+@compute @workgroup_size(256, 1, 1)
+fn main(@builtin(workgroup_id) workgroupId: vec3<u32>, @builtin(local_invocation_id) localId: vec3<u32>) {
+  let head = workgroupId.x;
+  let lane = localId.x;
+  if (head >= params.headCount) {
+    return;
+  }
+  let base = head * params.headSize;
+  var meanSquare = 0.0;
+  for (var dim = lane; dim < params.headSize; dim = dim + 256u) {
+    let value = inputValues[base + dim];
+    meanSquare = meanSquare + value * value;
+  }
+  headRmsNoWeightReduceValues[lane] = meanSquare;
+  workgroupBarrier();
+  for (var stride = 128u; stride > 0u; stride = stride / 2u) {
+    if (lane < stride) {
+      headRmsNoWeightReduceValues[lane] = headRmsNoWeightReduceValues[lane] + headRmsNoWeightReduceValues[lane + stride];
+    }
+    workgroupBarrier();
+  }
+  let scale = inverseSqrt(headRmsNoWeightReduceValues[0] / f32(params.headSize) + params.epsilon);
+  for (var dim = lane; dim < params.headSize; dim = dim + 256u) {
+    outputValues[base + dim] = inputValues[base + dim] * scale;
+  }
+}
+`;
+
+export const ROPE_WGSL = `
+struct Params {
+  freqBase: f32,
+  position: f32,
+  hasFreqFactors: u32,
+  headCount: u32,
+  headSize: u32,
+  ropeDims: u32,
+  _pad0: u32,
+  _pad1: u32,
+};
+
+@group(0) @binding(0) var<storage, read> inputValues: array<f32>;
+@group(0) @binding(1) var<storage, read> freqFactors: array<f32>;
+@group(0) @binding(2) var<uniform> params: Params;
+@group(0) @binding(3) var<storage, read_write> outputValues: array<f32>;
+
+fn ropeFactor(index: u32) -> f32 {
+  if (params.hasFreqFactors == 0u) {
+    return 1.0;
+  }
+  return freqFactors[index];
+}
+
+fn ropeTheta(pairIndex: u32) -> f32 {
+  let thetaScale = pow(params.freqBase, -2.0 / f32(params.ropeDims));
+  var theta = params.position;
+  for (var index = 0u; index < pairIndex; index = index + 1u) {
+    theta = theta * thetaScale;
+  }
+  return theta;
+}
+
+@compute @workgroup_size(256, 1, 1)
+fn main(@builtin(workgroup_id) workgroupId: vec3<u32>, @builtin(local_invocation_id) localId: vec3<u32>) {
+  let head = workgroupId.x;
+  let lane = localId.x;
+  let base = head * params.headSize;
+  if (head >= params.headCount) {
+    return;
+  }
+  for (var dim = lane + params.ropeDims; dim < params.headSize; dim = dim + 256u) {
+    outputValues[base + dim] = inputValues[base + dim];
+  }
+  let ropePairCount = params.ropeDims / 2u;
+  for (var ic = lane; ic < ropePairCount; ic = ic + 256u) {
+    let x0 = inputValues[base + ic];
+    let x1 = inputValues[base + ropePairCount + ic];
+    let theta = ropeTheta(ic);
+    let thetaWithFactor = theta / ropeFactor(ic);
+    let cosTheta = cos(thetaWithFactor);
+    let sinTheta = sin(thetaWithFactor);
+    outputValues[base + ic] = x0 * cosTheta - x1 * sinTheta;
+    outputValues[base + ropePairCount + ic] = x0 * sinTheta + x1 * cosTheta;
+  }
+}
+`;
+
+export const KEY_CACHE_ROPE_WGSL = `
+struct Params {
+  freqBase: f32,
+  position: f32,
+  hasFreqFactors: u32,
+  headCount: u32,
+  headSize: u32,
+  ropeDims: u32,
+  tokenPosition: u32,
+  _pad0: u32,
+};
+
+@group(0) @binding(0) var<storage, read> inputValues: array<f32>;
+@group(0) @binding(1) var<storage, read> freqFactors: array<f32>;
+@group(0) @binding(2) var<uniform> params: Params;
+@group(0) @binding(3) var<storage, read_write> keyCache: array<f32>;
+
+fn ropeFactor(index: u32) -> f32 {
+  if (params.hasFreqFactors == 0u) {
+    return 1.0;
+  }
+  return freqFactors[index];
+}
+
+fn ropeTheta(pairIndex: u32) -> f32 {
+  let thetaScale = pow(params.freqBase, -2.0 / f32(params.ropeDims));
+  var theta = params.position;
+  for (var index = 0u; index < pairIndex; index = index + 1u) {
+    theta = theta * thetaScale;
+  }
+  return theta;
+}
+
+@compute @workgroup_size(256, 1, 1)
+fn main(@builtin(workgroup_id) workgroupId: vec3<u32>, @builtin(local_invocation_id) localId: vec3<u32>) {
+  let head = workgroupId.x;
+  let lane = localId.x;
+  let base = head * params.headSize;
+  let keyBase = (params.tokenPosition * params.headCount + head) * params.headSize;
+  if (head >= params.headCount) {
+    return;
+  }
+  for (var dim = lane + params.ropeDims; dim < params.headSize; dim = dim + 256u) {
+    keyCache[keyBase + dim] = inputValues[base + dim];
+  }
+  let ropePairCount = params.ropeDims / 2u;
+  for (var ic = lane; ic < ropePairCount; ic = ic + 256u) {
+    let x0 = inputValues[base + ic];
+    let x1 = inputValues[base + ropePairCount + ic];
+    let theta = ropeTheta(ic);
+    let thetaWithFactor = theta / ropeFactor(ic);
+    let cosTheta = cos(thetaWithFactor);
+    let sinTheta = sin(thetaWithFactor);
+    keyCache[keyBase + ic] = x0 * cosTheta - x1 * sinTheta;
+    keyCache[keyBase + ropePairCount + ic] = x0 * sinTheta + x1 * cosTheta;
+  }
+}
+`;
+
+export const VALUE_CACHE_WRITE_WGSL = `
+struct Params {
+  headCount: u32,
+  valueSize: u32,
+  tokenPosition: u32,
+  contextLength: u32,
+};
+
+@group(0) @binding(0) var<storage, read> inputValues: array<f32>;
+@group(0) @binding(1) var<uniform> params: Params;
+@group(0) @binding(2) var<storage, read_write> valueCache: array<f32>;
+
+@compute @workgroup_size(256, 1, 1)
+fn main(@builtin(workgroup_id) workgroupId: vec3<u32>, @builtin(local_invocation_id) localId: vec3<u32>) {
+  let head = workgroupId.x;
+  let lane = localId.x;
+  let base = head * params.valueSize;
+  if (head >= params.headCount) {
+    return;
+  }
+  for (var dim = lane; dim < params.valueSize; dim = dim + 256u) {
+    valueCache[(dim * params.headCount + head) * params.contextLength + params.tokenPosition] = inputValues[base + dim];
+  }
+}
+`;
+
 export const FULL_QUERY_NORM_ROPE_WGSL = `
 struct Params {
   epsilon: f32,

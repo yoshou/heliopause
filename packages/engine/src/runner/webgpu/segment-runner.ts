@@ -22,6 +22,9 @@ import {
   dispatchFullQuery,
   dispatchGeglu,
   dispatchGegluSlice,
+  dispatchHeadRmsNorm,
+  dispatchHeadRmsNormNoWeight,
+  dispatchKeyCacheRope,
   dispatchKMatMul,
   dispatchQ8_0MatMul,
   dispatchQ8_0Quantize,
@@ -29,6 +32,8 @@ import {
   dispatchPreparePerLayerInputs,
   dispatchQuantizedGatherRowsScale,
   dispatchResidualAdd,
+  dispatchRope,
+  dispatchRmsNorm,
   dispatchRmsNormQ8KQuantize,
   dispatchRmsNormResidualAdd,
   dispatchRmsNormResidualAddScale,
@@ -37,6 +42,7 @@ import {
   dispatchTokenSlice,
   dispatchTop1Chunks,
   dispatchTopK,
+  dispatchValueCacheWrite,
   TOP1_CHUNK_SIZE,
 } from "./dispatch";
 import {
@@ -525,6 +531,68 @@ export class Gemma4WebGpuSegmentRunner {
       },
       end: () => pass.end(),
     };
+  }
+
+  private dispatchRmsNormToQ8K(
+    pass: WebGpuComputePassLike,
+    resources: Array<{ destroy: () => void }>,
+    input: WebGpuBufferLike,
+    weight: WebGpuBufferLike,
+    q8: ReturnType<typeof scratchQ8K>,
+    length: number,
+    cleanup: GpuResource[],
+    label: string,
+  ): void {
+    if (webGpuFusionEnabled()) {
+      dispatchRmsNormQ8KQuantize(this.arena.device, pass, resources, input, weight, q8, length, this.epsilon);
+      return;
+    }
+    const normalized = scratchF32(this.arena, length, cleanup, label);
+    dispatchRmsNorm(this.arena.device, pass, resources, input, weight, normalized, length, this.epsilon);
+    dispatchQ8KQuantize(this.arena.device, pass, resources, normalized, q8, length, 1);
+  }
+
+  private dispatchRmsNormThenResidualAdd(
+    pass: WebGpuComputePassLike,
+    resources: Array<{ destroy: () => void }>,
+    input: WebGpuBufferLike,
+    weight: WebGpuBufferLike,
+    residual: WebGpuBufferLike,
+    output: WebGpuBufferLike,
+    length: number,
+    cleanup: GpuResource[],
+    label: string,
+  ): void {
+    if (webGpuFusionEnabled()) {
+      dispatchRmsNormResidualAdd(this.arena.device, pass, resources, input, weight, residual, output, length, this.epsilon);
+      return;
+    }
+    const normalized = scratchF32(this.arena, length, cleanup, label);
+    dispatchRmsNorm(this.arena.device, pass, resources, input, weight, normalized, length, this.epsilon);
+    dispatchResidualAdd(this.arena.device, pass, resources, normalized, residual, output, length);
+  }
+
+  private dispatchRmsNormThenResidualAddScale(
+    pass: WebGpuComputePassLike,
+    resources: Array<{ destroy: () => void }>,
+    input: WebGpuBufferLike,
+    weight: WebGpuBufferLike,
+    residual: WebGpuBufferLike,
+    scale: WebGpuBufferLike,
+    output: WebGpuBufferLike,
+    length: number,
+    cleanup: GpuResource[],
+    label: string,
+  ): void {
+    if (webGpuFusionEnabled()) {
+      dispatchRmsNormResidualAddScale(this.arena.device, pass, resources, input, weight, residual, scale, output, length, this.epsilon);
+      return;
+    }
+    const normalized = scratchF32(this.arena, length, cleanup, label);
+    const residualAdded = scratchF32(this.arena, length, cleanup, `${label}.residual`);
+    dispatchRmsNorm(this.arena.device, pass, resources, input, weight, normalized, length, this.epsilon);
+    dispatchResidualAdd(this.arena.device, pass, resources, normalized, residual, residualAdded, length);
+    dispatchScale(this.arena.device, pass, resources, residualAdded, scale, output, length);
   }
 
   private beginComputePass(
@@ -1398,31 +1466,64 @@ export class Gemma4WebGpuSegmentRunner {
     const kvValueDim = this.manifest.headCountKv * layer.valueSize;
 
     const attnQ8 = scratchQ8K(this.arena, hiddenSize, tokenCount, cleanup, `blk.${layer.layer}.attn_norm.q8k`);
-    dispatchRmsNormQ8KQuantize(this.arena.device, pass, resources, input, layer.attnNorm.buffer, attnQ8, hiddenSize, this.epsilon);
+    this.dispatchRmsNormToQ8K(pass, resources, input, layer.attnNorm.buffer, attnQ8, hiddenSize, cleanup, `blk.${layer.layer}.attn_norm`);
 
     restartLayerSection("attn.q_proj");
     const qProjection = scratchF32(this.arena, queryDim, cleanup, `blk.${layer.layer}.q`);
     dispatchKMatMul(pass, resources, layer.q, attnQ8, qProjection, tokenCount);
     restartLayerSection("attn.q_rope");
     const query = scratchF32(this.arena, queryDim, cleanup, `blk.${layer.layer}.q_rope`);
-    dispatchFullQuery(
-      this.arena.device,
-      pass,
-      resources,
-      qProjection,
-      layer.qNorm.buffer,
-      this.ropeFreqFactors.buffer,
-      query,
-      {
-        headCount: this.manifest.headCount,
-        headSize: layer.headSize,
-        ropeDims: ropeDimensionCount(this.manifest, layer.kind),
-        epsilon: this.epsilon,
-        freqBase: ropeFreqBase(this.manifest, layer.kind),
-        position: mropeTextPosition(positions, tokenPosition),
-        hasFreqFactors: this.hasRopeFreqFactors && layer.kind === "full-attention",
-      },
-    );
+    if (webGpuFusionEnabled()) {
+      dispatchFullQuery(
+        this.arena.device,
+        pass,
+        resources,
+        qProjection,
+        layer.qNorm.buffer,
+        this.ropeFreqFactors.buffer,
+        query,
+        {
+          headCount: this.manifest.headCount,
+          headSize: layer.headSize,
+          ropeDims: ropeDimensionCount(this.manifest, layer.kind),
+          epsilon: this.epsilon,
+          freqBase: ropeFreqBase(this.manifest, layer.kind),
+          position: mropeTextPosition(positions, tokenPosition),
+          hasFreqFactors: this.hasRopeFreqFactors && layer.kind === "full-attention",
+        },
+      );
+    } else {
+      const qNormed = scratchF32(this.arena, queryDim, cleanup, `blk.${layer.layer}.q_norm`);
+      dispatchHeadRmsNorm(
+        this.arena.device,
+        pass,
+        resources,
+        qProjection,
+        layer.qNorm.buffer,
+        qNormed,
+        {
+          headCount: this.manifest.headCount,
+          headSize: layer.headSize,
+          epsilon: this.epsilon,
+        },
+      );
+      dispatchRope(
+        this.arena.device,
+        pass,
+        resources,
+        qNormed,
+        this.ropeFreqFactors.buffer,
+        query,
+        {
+          headCount: this.manifest.headCount,
+          headSize: layer.headSize,
+          ropeDims: ropeDimensionCount(this.manifest, layer.kind),
+          freqBase: ropeFreqBase(this.manifest, layer.kind),
+          position: mropeTextPosition(positions, tokenPosition),
+          hasFreqFactors: this.hasRopeFreqFactors && layer.kind === "full-attention",
+        },
+      );
+    }
     if (layer.hasKv) {
       const layerState = gpuState.fullAttention.get(layer.layer);
       if (!layerState || !layer.k || !layer.v || !layer.kNorm) {
@@ -1431,7 +1532,7 @@ export class Gemma4WebGpuSegmentRunner {
       const kProjection = scratchF32(this.arena, kvDim, cleanup, `blk.${layer.layer}.k`);
       const vProjection = scratchF32(this.arena, kvValueDim, cleanup, `blk.${layer.layer}.v`);
       restartLayerSection("attn.kv_proj");
-      const dispatchedDualKv = dispatchDualQ4KMatMul(
+      const dispatchedDualKv = webGpuFusionEnabled() && dispatchDualQ4KMatMul(
         pass,
         resources,
         layer.k,
@@ -1446,29 +1547,89 @@ export class Gemma4WebGpuSegmentRunner {
         dispatchKMatMul(pass, resources, layer.v, attnQ8, vProjection, tokenCount);
       }
       restartLayerSection("attn.kv_update");
-      dispatchFullKvUpdate(
-        this.arena.device,
-        pass,
-        resources,
-        kProjection,
-        vProjection,
-        layer.kNorm.buffer,
-        this.ropeFreqFactors.buffer,
-        layerState.key,
-        layerState.value,
-        {
-          headCount: this.manifest.headCountKv,
-          headSize: layer.headSize,
-          valueSize: layer.valueSize,
-          ropeDims: ropeDimensionCount(this.manifest, layer.kind),
-          epsilon: this.epsilon,
-          freqBase: ropeFreqBase(this.manifest, layer.kind),
-          position: mropeTextPosition(positions, tokenPosition),
-          tokenPosition,
-          contextLength,
-          hasFreqFactors: this.hasRopeFreqFactors && layer.kind === "full-attention",
-        },
-      );
+      if (webGpuFusionEnabled()) {
+        dispatchFullKvUpdate(
+          this.arena.device,
+          pass,
+          resources,
+          kProjection,
+          vProjection,
+          layer.kNorm.buffer,
+          this.ropeFreqFactors.buffer,
+          layerState.key,
+          layerState.value,
+          {
+            headCount: this.manifest.headCountKv,
+            headSize: layer.headSize,
+            valueSize: layer.valueSize,
+            ropeDims: ropeDimensionCount(this.manifest, layer.kind),
+            epsilon: this.epsilon,
+            freqBase: ropeFreqBase(this.manifest, layer.kind),
+            position: mropeTextPosition(positions, tokenPosition),
+            tokenPosition,
+            contextLength,
+            hasFreqFactors: this.hasRopeFreqFactors && layer.kind === "full-attention",
+          },
+        );
+      } else {
+        const kNormed = scratchF32(this.arena, kvDim, cleanup, `blk.${layer.layer}.k_norm`);
+        dispatchHeadRmsNorm(
+          this.arena.device,
+          pass,
+          resources,
+          kProjection,
+          layer.kNorm.buffer,
+          kNormed,
+          {
+            headCount: this.manifest.headCountKv,
+            headSize: layer.headSize,
+            epsilon: this.epsilon,
+          },
+        );
+        dispatchKeyCacheRope(
+          this.arena.device,
+          pass,
+          resources,
+          kNormed,
+          this.ropeFreqFactors.buffer,
+          layerState.key,
+          {
+            headCount: this.manifest.headCountKv,
+            headSize: layer.headSize,
+            ropeDims: ropeDimensionCount(this.manifest, layer.kind),
+            freqBase: ropeFreqBase(this.manifest, layer.kind),
+            position: mropeTextPosition(positions, tokenPosition),
+            tokenPosition,
+            hasFreqFactors: this.hasRopeFreqFactors && layer.kind === "full-attention",
+          },
+        );
+        const vNormed = scratchF32(this.arena, kvValueDim, cleanup, `blk.${layer.layer}.v_norm`);
+        dispatchHeadRmsNormNoWeight(
+          this.arena.device,
+          pass,
+          resources,
+          vProjection,
+          vNormed,
+          {
+            headCount: this.manifest.headCountKv,
+            headSize: layer.valueSize,
+            epsilon: this.epsilon,
+          },
+        );
+        dispatchValueCacheWrite(
+          this.arena.device,
+          pass,
+          resources,
+          vNormed,
+          layerState.value,
+          {
+            headCount: this.manifest.headCountKv,
+            valueSize: layer.valueSize,
+            tokenPosition,
+            contextLength,
+          },
+        );
+      }
     }
 
     restartLayerSection("attn.score");
@@ -1507,7 +1668,7 @@ export class Gemma4WebGpuSegmentRunner {
     restartLayerSection("attn.out");
     const attentionOut = this.dispatchQuantizedMatMul(pass, resources, layer.attnOut, attention, tokenCount, cleanup, `blk.${layer.layer}.attention_out`);
     const attentionResidual = scratchF32(this.arena, hiddenSize, cleanup, `blk.${layer.layer}.attention_residual`);
-    dispatchRmsNormResidualAdd(this.arena.device, pass, resources, attentionOut, layer.postAttentionNorm.buffer, input, attentionResidual, hiddenSize, this.epsilon);
+    this.dispatchRmsNormThenResidualAdd(pass, resources, attentionOut, layer.postAttentionNorm.buffer, input, attentionResidual, hiddenSize, cleanup, `blk.${layer.layer}.attention_out_norm`);
 
     restartLayerSection("ffn.norm_quant");
     const ffn = this.dispatchFfn(pass, layer, attentionResidual, cleanup, resources, profileDetails
@@ -1532,24 +1693,21 @@ export class Gemma4WebGpuSegmentRunner {
     let activePass = pass;
     const hiddenSize = this.manifest.embeddingLength;
     const ffnQ8 = scratchQ8K(this.arena, hiddenSize, 1, cleanup, `blk.${layer.layer}.ffn_norm.q8k`);
-    dispatchRmsNormQ8KQuantize(this.arena.device, activePass, resources, residual, layer.ffnNorm.buffer, ffnQ8, hiddenSize, this.epsilon);
+    this.dispatchRmsNormToQ8K(activePass, resources, residual, layer.ffnNorm.buffer, ffnQ8, hiddenSize, cleanup, `blk.${layer.layer}.ffn_norm`);
     const gate = scratchF32(this.arena, this.manifest.feedForwardLength, cleanup, `blk.${layer.layer}.ffn_gate`);
     const up = scratchF32(this.arena, this.manifest.feedForwardLength, cleanup, `blk.${layer.layer}.ffn_up`);
     const geglu = scratchF32(this.arena, this.manifest.feedForwardLength, cleanup, `blk.${layer.layer}.ffn_geglu`);
     activePass = restartSection?.("gate") ?? activePass;
-    const dispatchedDual = dispatchDualQ4KMatMul(activePass, resources, layer.ffnGate, layer.ffnUp, ffnQ8, gate, up, 1);
-    if (!dispatchedDual) {
-      dispatchKMatMul(activePass, resources, layer.ffnGate, ffnQ8, gate, 1);
-      activePass = restartSection?.("up") ?? activePass;
-      dispatchKMatMul(activePass, resources, layer.ffnUp, ffnQ8, up, 1);
-    }
+    dispatchKMatMul(activePass, resources, layer.ffnGate, ffnQ8, gate, 1);
+    activePass = restartSection?.("up") ?? activePass;
+    dispatchKMatMul(activePass, resources, layer.ffnUp, ffnQ8, up, 1);
     activePass = restartSection?.("geglu") ?? activePass;
     dispatchGeglu(this.arena.device, activePass, resources, gate, up, geglu, this.manifest.feedForwardLength);
     activePass = restartSection?.("down") ?? activePass;
     const ffnOut = this.dispatchQuantizedMatMul(activePass, resources, layer.ffnDown, geglu, 1, cleanup, `blk.${layer.layer}.ffn_out`);
     activePass = restartSection?.("post") ?? activePass;
     const output = scratchF32(this.arena, hiddenSize, cleanup, `blk.${layer.layer}.ffn_residual`);
-    dispatchRmsNormResidualAdd(this.arena.device, activePass, resources, ffnOut, layer.postFfwNorm.buffer, residual, output, hiddenSize, this.epsilon);
+    this.dispatchRmsNormThenResidualAdd(activePass, resources, ffnOut, layer.postFfwNorm.buffer, residual, output, hiddenSize, cleanup, `blk.${layer.layer}.ffn_out_norm`);
     return output;
   }
 
@@ -1598,8 +1756,7 @@ export class Gemma4WebGpuSegmentRunner {
     const projected = scratchF32(this.arena, this.manifest.embeddingLength, cleanup, `blk.${layer.layer}.inp_projected`);
     dispatchF32MatMul(this.arena.device, pass, resources, layer.perLayerProjection.buffer, mixed, projected, perLayerLength, this.manifest.embeddingLength, 1);
     const output = scratchF32(this.arena, this.manifest.embeddingLength, cleanup, `blk.${layer.layer}.scaled`);
-    dispatchRmsNormResidualAddScale(
-      this.arena.device,
+    this.dispatchRmsNormThenResidualAddScale(
       pass,
       resources,
       projected,
@@ -1608,7 +1765,8 @@ export class Gemma4WebGpuSegmentRunner {
       layer.layerOutputScale.buffer,
       output,
       this.manifest.embeddingLength,
-      this.epsilon,
+      cleanup,
+      `blk.${layer.layer}.inp_projected_norm`,
     );
     return output;
   }
@@ -1646,7 +1804,7 @@ export class Gemma4WebGpuSegmentRunner {
     const outputStripes = this.requireOutputStripes();
     const hiddenSize = this.manifest.embeddingLength;
     const q8 = scratchQ8K(this.arena, hiddenSize, 1, cleanup, "output_norm.q8k");
-    dispatchRmsNormQ8KQuantize(this.arena.device, pass, resources, hidden, outputNorm.buffer, q8, hiddenSize, this.epsilon);
+    this.dispatchRmsNormToQ8K(pass, resources, hidden, outputNorm.buffer, q8, hiddenSize, cleanup, "output_norm");
 
     const candidates = this.arena.createScratchBuffer(
       "output.topk.candidates",
@@ -1681,7 +1839,7 @@ export class Gemma4WebGpuSegmentRunner {
     const outputStripes = this.requireOutputStripes();
     const hiddenSize = this.manifest.embeddingLength;
     const q8 = scratchQ8K(this.arena, hiddenSize, 1, cleanup, "output_norm.selected.q8k");
-    dispatchRmsNormQ8KQuantize(this.arena.device, pass, resources, hidden, outputNorm.buffer, q8, hiddenSize, this.epsilon);
+    this.dispatchRmsNormToQ8K(pass, resources, hidden, outputNorm.buffer, q8, hiddenSize, cleanup, "output_norm.selected");
     const candidateCount = outputTop1CandidateCount(outputStripes);
 
     const candidates = this.arena.createScratchBuffer(
@@ -1739,7 +1897,7 @@ export class Gemma4WebGpuSegmentRunner {
     const outputStripes = this.requireOutputStripes();
     const hiddenSize = this.manifest.embeddingLength;
     const q8 = scratchQ8K(this.arena, hiddenSize, 1, cleanup, "output_norm.selected.q8k");
-    dispatchRmsNormQ8KQuantize(this.arena.device, pass, resources, hidden, outputNorm.buffer, q8, hiddenSize, this.epsilon);
+    this.dispatchRmsNormToQ8K(pass, resources, hidden, outputNorm.buffer, q8, hiddenSize, cleanup, "output_norm.selected");
     const candidateCount = outputTop1CandidateCount(outputStripes);
 
     const candidates = this.arena.createScratchBuffer(
@@ -1997,4 +2155,8 @@ function webGpuGpuTimingEnabled(): boolean {
 
 function webGpuGpuDetailedTimingEnabled(): boolean {
   return (globalThis as { __heliopauseEnableWebGpuDetailedTimings?: unknown }).__heliopauseEnableWebGpuDetailedTimings === true;
+}
+
+function webGpuFusionEnabled(): boolean {
+  return (globalThis as { __heliopauseDisableWebGpuFusion?: unknown }).__heliopauseDisableWebGpuFusion !== true;
 }

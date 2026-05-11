@@ -638,7 +638,7 @@ export async function matMulSwiGluDownWebGpuResident(
     throw new Error(`WebGPU FFN input shape mismatch: ${inputColumns.length}`);
   }
   if (gate.type === "Q8_0" || up.type === "Q8_0" || down.type === "Q8_0") {
-    throw new Error("WebGPU FFN fusion currently supports K-quant weights only");
+    throw new Error("WebGPU FFN resident path currently supports K-quant weights only");
   }
 
   const inputQ8 = quantizeQ8_KColumns(inputColumns, gate.inputSize, columnCount);
