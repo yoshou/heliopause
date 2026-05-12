@@ -1,4 +1,4 @@
-import { GPU_STORAGE } from "./gpu-constants";
+import { GPU_COPY_SRC, GPU_STORAGE } from "./gpu-constants";
 import type { WebGpuBufferLike, WebGpuDeviceLike, WebGpuF32TensorHandleInternal, WebGpuQuantizedWeightHandleInternal } from "./gpu-types";
 
 export type GpuResource = {
@@ -127,7 +127,7 @@ export function scratchF32(
   cleanup: GpuResource[],
   label: string,
 ): WebGpuBufferLike {
-  const buffer = arena.createScratchBuffer(label, length * Float32Array.BYTES_PER_ELEMENT, GPU_STORAGE);
+  const buffer = arena.createScratchBuffer(label, length * Float32Array.BYTES_PER_ELEMENT, GPU_STORAGE | GPU_COPY_SRC);
   cleanup.push(buffer);
   return buffer;
 }

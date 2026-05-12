@@ -66,7 +66,7 @@ export async function prefillGemma4PreparedHidden(
 ): Promise<PrefillResult> {
   const session = modelSession(model);
   if (webGpuExecutionProviderEnabled(session)) {
-    throw new Error("Prepared hidden image input is only supported on the CPU/WASM runner.");
+    return prefillGemma4PreparedHiddenHybridWebGpu(session, hiddenInput, options);
   }
   const tokenCount = hiddenInput.length / session.manifest.embeddingLength;
   if (!Number.isInteger(tokenCount)) {
@@ -104,6 +104,61 @@ export async function prefillGemma4PreparedHidden(
     result.logits = output.logits;
     result.selectedTokenId = output.topTokens[0]?.id;
     result.topTokens = output.topTokens;
+  }
+  return result;
+}
+
+async function prefillGemma4PreparedHiddenHybridWebGpu(
+  session: Gemma4ModelSession,
+  hiddenInput: Float32Array,
+  options: PreparedHiddenPrefillOptions = {},
+): Promise<PrefillResult> {
+  const tokenCount = hiddenInput.length / session.manifest.embeddingLength;
+  if (!Number.isInteger(tokenCount)) {
+    throw new Error(`Prepared hidden shape mismatch: ${hiddenInput.length}`);
+  }
+  const state = options.state ?? session.createInferenceState();
+  const positions = normalizePositions(options.positions, tokenCount);
+  const trace = createForwardTrace("prefill", options.onTiming);
+  const runner = await webGpuSegmentRunnerForForward(session, state);
+
+  if (tokenCount === 0) {
+    return { hidden: new Float32Array(), state };
+  }
+
+  const prepared = await prepareGemma4PreparedHiddenInput(session, hiddenInput, trace);
+  const cpuPrefix = gemma4CpuSegmentRunner({
+    session,
+    manifest: session.manifest,
+    epsilon: session.epsilon,
+    segmentStartLayer: 0,
+    segmentEndLayerExclusive: runner.segmentStartLayer,
+  });
+  const segmentInputHidden = runner.segmentStartLayer > 0
+    ? (await cpuPrefix.runTokensHidden(prepared.hidden, positions, state, {
+      trace,
+      perLayerInputs: prepared.perLayerInputs,
+      attentionCausal: options.attentionCausal ?? true,
+    })).hidden
+    : prepared.hidden;
+
+  const gpu = await timedAsync(
+    trace,
+    "WebGPU prepared hidden segment",
+    () => runner.runTokensHidden(segmentInputHidden, positions, state, {
+      computeSelectedToken: options.computeLogits === true,
+      topK: options.logitsTopK ?? 10,
+      perLayerInputs: prepared.perLayerInputs,
+      attentionCausal: options.attentionCausal ?? true,
+    }),
+  );
+  updateNextPosition(state, positions, tokenCount);
+  logWebGpuRunnerTiming(session, "prefill");
+
+  const result: PrefillResult = { hidden: gpu.hidden, state };
+  if (options.computeLogits) {
+    result.selectedTokenId = gpu.selectedTokenId;
+    result.topTokens = gpu.topTokens ?? [];
   }
   return result;
 }

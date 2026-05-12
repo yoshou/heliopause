@@ -93,6 +93,9 @@ test("Gemma4V falls back through WebGPU and unavailable WASM paths", async () =>
     assert.equal(result.hidden.length, 2);
     assert.equal(result.width, 1);
     assert.equal(result.height, 1);
+    assert.equal(session.cacheStats().executionProviderStats.webgpuVisionAttempts, 1);
+    assert.equal(session.cacheStats().executionProviderStats.webgpuVisionFallbacks, 1);
+    assert.equal(session.cacheStats().executionProviderStats.webgpuVisionLastFallbackReason, "webgpu-unavailable");
   } finally {
     resetPrefillWasmForTesting();
   }

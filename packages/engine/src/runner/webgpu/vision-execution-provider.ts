@@ -1,12 +1,532 @@
-import type {
-  Gemma4VisionEncodeResult,
-  Gemma4VisionPixelValues,
-  Gemma4VisionSession,
+import type { GgmlTypeName } from "../../gguf";
+import { dequantizeRow } from "../../quant";
+import {
+  type Gemma4VisionEncodeResult,
+  type Gemma4VisionPixelValues,
+  type Gemma4VisionSession,
 } from "../../vision";
+import { GpuMemoryArena, type F32Handle, type GpuResource } from "./arena";
+import { GPU_COPY_DST, GPU_COPY_SRC, GPU_MAP_READ, GPU_STORAGE, GEMMA4_WEBGPU_MEMORY_LIMIT_BYTES } from "./gpu-constants";
+import { webGpuDevice } from "./gpu-device";
+import {
+  dispatchF32MatMul,
+  dispatchResidualAdd,
+} from "./dispatch";
+import type { WebGpuBufferLike, WebGpuComputePassLike } from "./gpu-types";
+import {
+  createVisionAddPositionResources,
+  createVisionAttentionApplyResources,
+  createVisionAttentionScoreResources,
+  createVisionAveragePoolResources,
+  createVisionClampResources,
+  createVisionGeluMulResources,
+  createVisionPatchEmbedResources,
+  createVisionRmsNormResources,
+  createVisionRope2dResources,
+  createVisionStdNormalizeResources,
+} from "./vision-kernel-resources";
+
+type VisionStats = {
+  attempts: number;
+  runs: number;
+  fallbacks: number;
+  lastFallbackReason: string;
+};
+
+type VisionRunBuffers = {
+  resources: Array<{ destroy: () => void }>;
+  cleanup: GpuResource[];
+};
+
+const runners = new WeakMap<Gemma4VisionSession, Promise<Gemma4WebGpuVisionRunner | undefined>>();
+const statsBySession = new WeakMap<Gemma4VisionSession, VisionStats>();
 
 export async function runGemma4WebGpuVisionEncoder(
-  _session: Gemma4VisionSession,
-  _pixels: Gemma4VisionPixelValues,
+  session: Gemma4VisionSession,
+  pixels: Gemma4VisionPixelValues,
 ): Promise<Gemma4VisionEncodeResult | undefined> {
-  return undefined;
+  if (!session.executionProvider("webgpu")) {
+    return undefined;
+  }
+  const stats = visionStats(session);
+  stats.attempts += 1;
+  const runner = await visionRunner(session);
+  if (!runner) {
+    stats.fallbacks += 1;
+    stats.lastFallbackReason = "webgpu-unavailable";
+    return undefined;
+  }
+  try {
+    const result = await runner.run(pixels);
+    stats.runs += 1;
+    stats.lastFallbackReason = "";
+    return result;
+  } catch (error) {
+    if (!isFallbackError(error)) {
+      throw error;
+    }
+    stats.fallbacks += 1;
+    stats.lastFallbackReason = error instanceof Error ? error.message : String(error);
+    return undefined;
+  }
 }
+
+function visionStats(session: Gemma4VisionSession): VisionStats {
+  let stats = statsBySession.get(session);
+  if (!stats) {
+    stats = {
+      attempts: 0,
+      runs: 0,
+      fallbacks: 0,
+      lastFallbackReason: "",
+    };
+    statsBySession.set(session, stats);
+    const captured = stats;
+    session.setExecutionProviderStatsProvider(() => ({
+      webgpuVisionAttempts: captured.attempts,
+      webgpuVisionRuns: captured.runs,
+      webgpuVisionFallbacks: captured.fallbacks,
+      webgpuVisionLastFallbackReason: captured.lastFallbackReason,
+    }), "webgpu-vision");
+  }
+  return stats;
+}
+
+async function visionRunner(session: Gemma4VisionSession): Promise<Gemma4WebGpuVisionRunner | undefined> {
+  let runner = runners.get(session);
+  if (!runner) {
+    runner = createVisionRunner(session);
+    runners.set(session, runner);
+  }
+  return runner;
+}
+
+async function createVisionRunner(session: Gemma4VisionSession): Promise<Gemma4WebGpuVisionRunner | undefined> {
+  const device = await webGpuDevice();
+  if (!device) {
+    return undefined;
+  }
+  const options = session.executionProvider("webgpu")?.options;
+  const arena = new GpuMemoryArena(
+    device,
+    numberOption(options, "memoryLimitBytes") ?? GEMMA4_WEBGPU_MEMORY_LIMIT_BYTES,
+  );
+  const runner = new Gemma4WebGpuVisionRunner(session, arena);
+  session.addDisposeCallback(() => runner.dispose());
+  return runner;
+}
+
+class Gemma4WebGpuVisionRunner {
+  private readonly session: Gemma4VisionSession;
+  private readonly arena: GpuMemoryArena;
+  private readonly f32Handles = new Map<string, F32Handle>();
+
+  constructor(session: Gemma4VisionSession, arena: GpuMemoryArena) {
+    this.session = session;
+    this.arena = arena;
+  }
+
+  dispose(): void {
+    for (const handle of this.f32Handles.values()) {
+      handle.destroy();
+    }
+    this.f32Handles.clear();
+  }
+
+  async run(pixels: Gemma4VisionPixelValues): Promise<Gemma4VisionEncodeResult> {
+    const manifest = this.session.manifest;
+    const patchGridX = pixels.width / manifest.patchSize;
+    const patchGridY = pixels.height / manifest.patchSize;
+    if (!Number.isInteger(patchGridX) || !Number.isInteger(patchGridY)) {
+      throw new Error(`Vision image size must be patch-aligned, got ${pixels.width}x${pixels.height}`);
+    }
+    if (patchGridX % manifest.spatialMergeSize !== 0 || patchGridY % manifest.spatialMergeSize !== 0) {
+      throw new Error(`Vision image size must be merge-aligned, got ${pixels.width}x${pixels.height}`);
+    }
+
+    const run: VisionRunBuffers = { resources: [], cleanup: [] };
+    const outputTokenCount = (patchGridX / manifest.spatialMergeSize) * (patchGridY / manifest.spatialMergeSize);
+    const outputLength = outputTokenCount * manifest.projectionDim;
+    let readback: WebGpuBufferLike | undefined;
+    try {
+      const pixelsBuffer = this.bufferFromF32("vision.pixels", pixels.values, run.cleanup);
+      const encoder = this.arena.device.createCommandEncoder();
+      const pass = encoder.beginComputePass();
+      let hidden = await this.dispatchPatchEmbed(pass, run, pixelsBuffer, pixels.width, patchGridX, patchGridY);
+      hidden = await this.dispatchAddPosition(pass, run, hidden, patchGridX, patchGridX * patchGridY);
+      for (let layer = 0; layer < manifest.blockCount; layer += 1) {
+        hidden = await this.dispatchLayer(pass, run, hidden, layer, patchGridX, patchGridX * patchGridY);
+      }
+      hidden = this.dispatchAveragePool(pass, run, hidden, patchGridX, patchGridY);
+      if (this.session.hasTensor("v.std_bias") && this.session.hasTensor("v.std_scale")) {
+        hidden = await this.dispatchStdNormalize(pass, run, hidden, outputTokenCount);
+      }
+      hidden = await this.dispatchMatMulVisionWeight(pass, run, "mm.input_projection.weight", hidden, outputTokenCount);
+      hidden = this.dispatchRowRmsNorm(pass, run, hidden, "vision.output_norm", outputTokenCount, manifest.projectionDim, undefined, manifest.layerNormEpsilon);
+
+      pass.end();
+      readback = this.arena.device.createBuffer({
+        size: outputLength * Float32Array.BYTES_PER_ELEMENT,
+        usage: GPU_MAP_READ | GPU_COPY_DST,
+      });
+      encoder.copyBufferToBuffer(hidden, 0, readback, 0, outputLength * Float32Array.BYTES_PER_ELEMENT);
+      this.arena.device.queue.submit([encoder.finish()]);
+      await readback.mapAsync(GPU_MAP_READ);
+      const result = new Float32Array(readback.getMappedRange()).slice();
+      readback.unmap();
+      readback.destroy?.();
+      readback = undefined;
+      return {
+        hidden: result,
+        tokenCount: outputTokenCount,
+        width: pixels.width,
+        height: pixels.height,
+      };
+    } finally {
+      readback?.destroy?.();
+      for (const resource of run.resources) {
+        resource.destroy();
+      }
+      for (const item of run.cleanup.reverse()) {
+        item.destroy?.();
+      }
+    }
+  }
+
+  private async dispatchPatchEmbed(
+    pass: WebGpuComputePassLike,
+    run: VisionRunBuffers,
+    pixels: WebGpuBufferLike,
+    imageWidth: number,
+    patchGridX: number,
+    patchGridY: number,
+  ): Promise<WebGpuBufferLike> {
+    const manifest = this.session.manifest;
+    const weight = await this.f32Handle("v.patch_embd.weight");
+    const output = this.scratchF32("vision.patch_embed", patchGridX * patchGridY * manifest.embeddingLength, run.cleanup);
+    const resource = createVisionPatchEmbedResources(this.arena.device, pixels, weight.buffer, output, {
+      imageWidth,
+      patchSize: manifest.patchSize,
+      patchGridX,
+      patchGridY,
+      embeddingLength: manifest.embeddingLength,
+    });
+    run.resources.push(resource);
+    pass.setPipeline(resource.pipeline);
+    pass.setBindGroup(0, resource.bindGroup);
+    pass.dispatchWorkgroups(Math.ceil((patchGridX * patchGridY * manifest.embeddingLength) / 256));
+    return output;
+  }
+
+  private async dispatchAddPosition(
+    pass: WebGpuComputePassLike,
+    run: VisionRunBuffers,
+    input: WebGpuBufferLike,
+    patchGridX: number,
+    tokenCount: number,
+  ): Promise<WebGpuBufferLike> {
+    const manifest = this.session.manifest;
+    const position = await this.f32Handle("v.position_embd.weight");
+    const tensor = this.session.getTensor("v.position_embd.weight");
+    const tableSize = tensor.dimensions[1] ?? 0;
+    const output = this.scratchF32("vision.position", tokenCount * manifest.embeddingLength, run.cleanup);
+    const resource = createVisionAddPositionResources(this.arena.device, input, position.buffer, output, {
+      patchGridX,
+      tokenCount,
+      embeddingLength: manifest.embeddingLength,
+      tableSize,
+    });
+    run.resources.push(resource);
+    pass.setPipeline(resource.pipeline);
+    pass.setBindGroup(0, resource.bindGroup);
+    pass.dispatchWorkgroups(Math.ceil((tokenCount * manifest.embeddingLength) / 256));
+    return output;
+  }
+
+  private async dispatchLayer(
+    pass: WebGpuComputePassLike,
+    run: VisionRunBuffers,
+    input: WebGpuBufferLike,
+    layer: number,
+    patchGridX: number,
+    tokenCount: number,
+  ): Promise<WebGpuBufferLike> {
+    const manifest = this.session.manifest;
+    const headSize = manifest.embeddingLength / manifest.headCount;
+    const norm = this.dispatchRowRmsNorm(pass, run, input, `v.blk.${layer}.ln1`, tokenCount, manifest.embeddingLength, await this.f32Handle(`v.blk.${layer}.ln1.weight`), this.session.epsilon);
+    const qProjection = await this.dispatchMatMulVisionWeight(pass, run, `v.blk.${layer}.attn_q.weight`, norm, tokenCount);
+    const kProjection = await this.dispatchMatMulVisionWeight(pass, run, `v.blk.${layer}.attn_k.weight`, norm, tokenCount);
+    const vProjection = await this.dispatchMatMulVisionWeight(pass, run, `v.blk.${layer}.attn_v.weight`, norm, tokenCount);
+    const qNorm = this.dispatchRowRmsNorm(pass, run, qProjection, `v.blk.${layer}.attn_q_norm`, tokenCount * manifest.headCount, headSize, await this.f32Handle(`v.blk.${layer}.attn_q_norm.weight`), this.session.epsilon);
+    const kNorm = this.dispatchRowRmsNorm(pass, run, kProjection, `v.blk.${layer}.attn_k_norm`, tokenCount * manifest.headCount, headSize, await this.f32Handle(`v.blk.${layer}.attn_k_norm.weight`), this.session.epsilon);
+    const vNorm = this.dispatchRowRmsNorm(pass, run, vProjection, `v.blk.${layer}.attn_v_norm`, tokenCount * manifest.headCount, headSize, undefined, this.session.epsilon);
+    const q = this.dispatchRope2d(pass, run, qNorm, `v.blk.${layer}.q_rope`, patchGridX, tokenCount, headSize);
+    const k = this.dispatchRope2d(pass, run, kNorm, `v.blk.${layer}.k_rope`, patchGridX, tokenCount, headSize);
+    const attention = this.dispatchAttention(pass, run, q, k, vNorm, `v.blk.${layer}.attention`, tokenCount, manifest.headCount, headSize);
+    const attentionOutput = await this.dispatchMatMulVisionWeight(pass, run, `v.blk.${layer}.attn_out.weight`, attention, tokenCount);
+    const attentionNorm = this.dispatchRowRmsNorm(pass, run, attentionOutput, `v.blk.${layer}.attn_post_norm`, tokenCount, manifest.embeddingLength, await this.f32Handle(`v.blk.${layer}.attn_post_norm.weight`), this.session.epsilon);
+    const attentionResidual = this.scratchF32(`v.blk.${layer}.attention_residual`, tokenCount * manifest.embeddingLength, run.cleanup);
+    dispatchResidualAdd(this.arena.device, pass, run.resources, input, attentionNorm, attentionResidual, tokenCount * manifest.embeddingLength);
+    const ffnInput = this.dispatchRowRmsNorm(pass, run, attentionResidual, `v.blk.${layer}.ln2`, tokenCount, manifest.embeddingLength, await this.f32Handle(`v.blk.${layer}.ln2.weight`), this.session.epsilon);
+    const gate = await this.dispatchMatMulVisionWeight(pass, run, `v.blk.${layer}.ffn_gate.weight`, ffnInput, tokenCount);
+    const up = await this.dispatchMatMulVisionWeight(pass, run, `v.blk.${layer}.ffn_up.weight`, ffnInput, tokenCount);
+    const activated = this.scratchF32(`v.blk.${layer}.ffn_geglu`, tokenCount * manifest.feedForwardLength, run.cleanup);
+    this.dispatchGeluMul(pass, run, gate, up, activated, tokenCount * manifest.feedForwardLength);
+    const ffnOutput = await this.dispatchMatMulVisionWeight(pass, run, `v.blk.${layer}.ffn_down.weight`, activated, tokenCount);
+    const ffnNorm = this.dispatchRowRmsNorm(pass, run, ffnOutput, `v.blk.${layer}.ffn_post_norm`, tokenCount, manifest.embeddingLength, await this.f32Handle(`v.blk.${layer}.ffn_post_norm.weight`), this.session.epsilon);
+    const output = this.scratchF32(`v.blk.${layer}.output`, tokenCount * manifest.embeddingLength, run.cleanup);
+    dispatchResidualAdd(this.arena.device, pass, run.resources, attentionResidual, ffnNorm, output, tokenCount * manifest.embeddingLength);
+    return output;
+  }
+
+  private dispatchRowRmsNorm(
+    pass: WebGpuComputePassLike,
+    run: VisionRunBuffers,
+    input: WebGpuBufferLike,
+    label: string,
+    rowCount: number,
+    rowSize: number,
+    weight: F32Handle | undefined,
+    epsilon: number,
+  ): WebGpuBufferLike {
+    const output = this.scratchF32(`${label}.rms_norm`, rowCount * rowSize, run.cleanup);
+    const resource = createVisionRmsNormResources(this.arena.device, input, weight?.buffer, output, {
+      rowCount,
+      rowSize,
+      epsilon,
+    });
+    run.resources.push(resource);
+    pass.setPipeline(resource.pipeline);
+    pass.setBindGroup(0, resource.bindGroup);
+    pass.dispatchWorkgroups(rowCount);
+    return output;
+  }
+
+  private dispatchRope2d(
+    pass: WebGpuComputePassLike,
+    run: VisionRunBuffers,
+    input: WebGpuBufferLike,
+    label: string,
+    patchGridX: number,
+    tokenCount: number,
+    headSize: number,
+  ): WebGpuBufferLike {
+    const output = this.scratchF32(label, tokenCount * this.session.manifest.embeddingLength, run.cleanup);
+    const resource = createVisionRope2dResources(this.arena.device, input, output, {
+      patchGridX,
+      tokenCount,
+      headCount: this.session.manifest.headCount,
+      headSize,
+      freqBase: 100,
+    });
+    run.resources.push(resource);
+    pass.setPipeline(resource.pipeline);
+    pass.setBindGroup(0, resource.bindGroup);
+    pass.dispatchWorkgroups(Math.ceil((tokenCount * this.session.manifest.embeddingLength) / 256));
+    return output;
+  }
+
+  private dispatchAttention(
+    pass: WebGpuComputePassLike,
+    run: VisionRunBuffers,
+    q: WebGpuBufferLike,
+    k: WebGpuBufferLike,
+    v: WebGpuBufferLike,
+    label: string,
+    tokenCount: number,
+    headCount: number,
+    headSize: number,
+  ): WebGpuBufferLike {
+    const probabilities = this.scratchF32(`${label}.probabilities`, tokenCount * headCount * tokenCount, run.cleanup);
+    const score = createVisionAttentionScoreResources(this.arena.device, q, k, probabilities, {
+      tokenCount,
+      headCount,
+      headSize,
+      scale: 1,
+    });
+    run.resources.push(score);
+    pass.setPipeline(score.pipeline);
+    pass.setBindGroup(0, score.bindGroup);
+    pass.dispatchWorkgroups(tokenCount, headCount);
+
+    const output = this.scratchF32(label, tokenCount * headCount * headSize, run.cleanup);
+    const apply = createVisionAttentionApplyResources(this.arena.device, v, probabilities, output, {
+      tokenCount,
+      headCount,
+      headSize,
+    });
+    run.resources.push(apply);
+    pass.setPipeline(apply.pipeline);
+    pass.setBindGroup(0, apply.bindGroup);
+    pass.dispatchWorkgroups(tokenCount, headCount, headSize);
+    return output;
+  }
+
+  private dispatchAveragePool(
+    pass: WebGpuComputePassLike,
+    run: VisionRunBuffers,
+    input: WebGpuBufferLike,
+    patchGridX: number,
+    patchGridY: number,
+  ): WebGpuBufferLike {
+    const manifest = this.session.manifest;
+    const outputTokenCount = (patchGridX / manifest.spatialMergeSize) * (patchGridY / manifest.spatialMergeSize);
+    const output = this.scratchF32("vision.pool", outputTokenCount * manifest.embeddingLength, run.cleanup);
+    const resource = createVisionAveragePoolResources(this.arena.device, input, output, {
+      patchGridX,
+      patchGridY,
+      embeddingLength: manifest.embeddingLength,
+      kernelSize: manifest.spatialMergeSize,
+      outputScale: Math.sqrt(manifest.embeddingLength),
+    });
+    run.resources.push(resource);
+    pass.setPipeline(resource.pipeline);
+    pass.setBindGroup(0, resource.bindGroup);
+    pass.dispatchWorkgroups(Math.ceil((outputTokenCount * manifest.embeddingLength) / 256));
+    return output;
+  }
+
+  private async dispatchStdNormalize(
+    pass: WebGpuComputePassLike,
+    run: VisionRunBuffers,
+    input: WebGpuBufferLike,
+    tokenCount: number,
+  ): Promise<WebGpuBufferLike> {
+    const manifest = this.session.manifest;
+    const bias = await this.f32Handle("v.std_bias");
+    const scale = await this.f32Handle("v.std_scale");
+    const output = this.scratchF32("vision.std_norm", tokenCount * manifest.embeddingLength, run.cleanup);
+    const resource = createVisionStdNormalizeResources(this.arena.device, input, bias.buffer, scale.buffer, output, {
+      length: tokenCount * manifest.embeddingLength,
+      rowSize: manifest.embeddingLength,
+    });
+    run.resources.push(resource);
+    pass.setPipeline(resource.pipeline);
+    pass.setBindGroup(0, resource.bindGroup);
+    pass.dispatchWorkgroups(Math.ceil((tokenCount * manifest.embeddingLength) / 256));
+    return output;
+  }
+
+  private async dispatchMatMulVisionWeight(
+    pass: WebGpuComputePassLike,
+    run: VisionRunBuffers,
+    weightName: string,
+    input: WebGpuBufferLike,
+    columnCount: number,
+  ): Promise<WebGpuBufferLike> {
+    const tensor = this.session.getTensor(weightName);
+    const inputSize = tensor.dimensions[0] ?? 0;
+    const rowCount = tensor.dimensions[1] ?? 0;
+    let current = await this.dispatchClamp(pass, run, input, weightName.replace(/\.weight$/, ".input_min"), weightName.replace(/\.weight$/, ".input_max"), inputSize * columnCount);
+    const output = this.scratchF32(`${weightName}.output`, rowCount * columnCount, run.cleanup);
+    if (isF32LoadableType(tensor.type)) {
+      const handle = await this.f32Handle(weightName);
+      dispatchF32MatMul(this.arena.device, pass, run.resources, handle.buffer, current, output, inputSize, rowCount, columnCount);
+    } else {
+      return unsupported(`${weightName} has unsupported WebGPU vision matmul type ${tensor.type}`);
+    }
+    current = await this.dispatchClamp(pass, run, output, weightName.replace(/\.weight$/, ".output_min"), weightName.replace(/\.weight$/, ".output_max"), rowCount * columnCount);
+    return current;
+  }
+
+  private async dispatchClamp(
+    pass: WebGpuComputePassLike,
+    run: VisionRunBuffers,
+    input: WebGpuBufferLike,
+    minName: string,
+    maxName: string,
+    length: number,
+  ): Promise<WebGpuBufferLike> {
+    if (!this.session.hasTensor(minName) || !this.session.hasTensor(maxName)) {
+      return input;
+    }
+    const min = (await this.session.readF32Tensor(minName))[0] ?? -Infinity;
+    const max = (await this.session.readF32Tensor(maxName))[0] ?? Infinity;
+    const output = this.scratchF32(`${minName}.clamp`, length, run.cleanup);
+    const resource = createVisionClampResources(this.arena.device, input, output, { length, min, max });
+    run.resources.push(resource);
+    pass.setPipeline(resource.pipeline);
+    pass.setBindGroup(0, resource.bindGroup);
+    pass.dispatchWorkgroups(Math.ceil(length / 256));
+    return output;
+  }
+
+  private dispatchGeluMul(
+    pass: WebGpuComputePassLike,
+    run: VisionRunBuffers,
+    gate: WebGpuBufferLike,
+    up: WebGpuBufferLike,
+    output: WebGpuBufferLike,
+    length: number,
+  ): void {
+    const resource = createVisionGeluMulResources(this.arena.device, gate, up, output, { length });
+    run.resources.push(resource);
+    pass.setPipeline(resource.pipeline);
+    pass.setBindGroup(0, resource.bindGroup);
+    pass.dispatchWorkgroups(Math.ceil(length / 256));
+  }
+
+  private async f32Handle(name: string): Promise<F32Handle> {
+    const cached = this.f32Handles.get(name);
+    if (cached) {
+      return cached;
+    }
+    const tensor = this.session.getTensor(name);
+    if (!isF32LoadableType(tensor.type)) {
+      return unsupported(`${name} must be F32-compatible for WebGPU vision, got ${tensor.type}`);
+    }
+    const elementCount = tensor.dimensions.reduce((product, dimension) => product * dimension, 1);
+    const bytes = await this.session.readWeightBytes(name);
+    const values = tensor.type === "F32"
+      ? new Float32Array(bytes.buffer, bytes.byteOffset, bytes.byteLength / Float32Array.BYTES_PER_ELEMENT).slice()
+      : dequantizeRow(tensor.type, bytes, elementCount);
+    const buffer = this.arena.createBuffer(name, values.byteLength, GPU_STORAGE | GPU_COPY_DST);
+    this.arena.device.queue.writeBuffer(buffer, 0, values);
+    const handle: F32Handle = {
+      length: values.length,
+      byteLength: values.byteLength,
+      device: this.arena.device,
+      buffer,
+      destroy: () => buffer.destroy?.(),
+    };
+    this.f32Handles.set(name, handle);
+    return handle;
+  }
+
+  private bufferFromF32(label: string, values: Float32Array, cleanup: GpuResource[]): WebGpuBufferLike {
+    const buffer = this.arena.createBuffer(label, values.byteLength, GPU_STORAGE | GPU_COPY_DST);
+    this.arena.device.queue.writeBuffer(buffer, 0, values);
+    cleanup.push(buffer);
+    return buffer;
+  }
+
+  private scratchF32(label: string, length: number, cleanup: GpuResource[]): WebGpuBufferLike {
+    const buffer = this.arena.createBuffer(label, length * Float32Array.BYTES_PER_ELEMENT, GPU_STORAGE | GPU_COPY_SRC);
+    cleanup.push(buffer);
+    return buffer;
+  }
+}
+
+function numberOption(options: Readonly<Record<string, unknown>> | undefined, name: string): number | undefined {
+  const value = options?.[name];
+  return typeof value === "number" ? value : undefined;
+}
+
+function isDenseType(type: GgmlTypeName): boolean {
+  return type === "F32" || type === "F16" || type === "BF16";
+}
+
+function isF32LoadableType(type: GgmlTypeName): boolean {
+  return isDenseType(type) || type === "Q8_0";
+}
+
+function unsupported(message: string): never {
+  throw new WebGpuVisionFallbackError(message);
+}
+
+function isFallbackError(error: unknown): boolean {
+  return error instanceof WebGpuVisionFallbackError ||
+    (error instanceof Error && error.message.includes("WebGPU memory cap exceeded"));
+}
+
+class WebGpuVisionFallbackError extends Error {}

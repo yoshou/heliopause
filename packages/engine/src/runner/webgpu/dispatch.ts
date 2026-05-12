@@ -34,6 +34,7 @@ import {
   createSigmoidMulResources,
   createSwiGluResources,
   createTokenSliceResources,
+  createTokenWriteResources,
   createTopKResources,
   createTop1ChunkResources,
   createValueCacheWriteResources,
@@ -501,6 +502,24 @@ export function dispatchTokenSlice(
   },
 ): void {
   const resource = createTokenSliceResources(device, input, output, options);
+  resources.push(resource);
+  pass.setPipeline(resource.pipeline);
+  pass.setBindGroup(0, resource.bindGroup);
+  pass.dispatchWorkgroups(Math.ceil(options.rowSize / 256));
+}
+
+export function dispatchTokenWrite(
+  device: WebGpuDeviceLike,
+  pass: WebGpuComputePassLike,
+  resources: Array<{ destroy: () => void }>,
+  input: WebGpuBufferLike,
+  output: WebGpuBufferLike,
+  options: {
+    rowSize: number;
+    rowIndex: number;
+  },
+): void {
+  const resource = createTokenWriteResources(device, input, output, options);
   resources.push(resource);
   pass.setPipeline(resource.pipeline);
   pass.setBindGroup(0, resource.bindGroup);

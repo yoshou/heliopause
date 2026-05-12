@@ -40,6 +40,7 @@ import {
   dispatchScale,
   dispatchSelectTop1Candidate,
   dispatchTokenSlice,
+  dispatchTokenWrite,
   dispatchTop1Chunks,
   dispatchTopK,
   dispatchValueCacheWrite,
@@ -94,6 +95,14 @@ export type Gemma4WebGpuRunOptions = {
   topK?: number;
   perLayerInputs?: Float32Array;
   perLayerInputsBuffer?: WebGpuBufferLike;
+  attentionCausal?: boolean;
+};
+
+type Gemma4WebGpuInternalRunOptions = Gemma4WebGpuRunOptions & {
+  sourceTokenCount: number;
+  sourceTokenIndex: number;
+  keyValueTokenCount?: number;
+  skipKvUpdate?: boolean;
 };
 
 export type Gemma4WebGpuRuntimeStats = {
@@ -989,6 +998,9 @@ export class Gemma4WebGpuSegmentRunner {
     const runtimeRun = this.beginRuntimeRun();
     try {
       const tokenCount = this.assertBatchedHidden(inputHidden, positions);
+      if (options.attentionCausal === false && tokenCount > 1) {
+        return await this.runTokensHiddenNonCausal(inputHidden, positions, state, options, tokenCount);
+      }
       const boundary = this.arena.createBuffer(
         "segment boundary hidden batch",
         inputHidden.byteLength,
@@ -1035,12 +1047,135 @@ export class Gemma4WebGpuSegmentRunner {
     }
   }
 
+  private async runTokensHiddenNonCausal(
+    inputHidden: Float32Array,
+    positions: Int32Array,
+    state: Gemma4WebGpuStateLike,
+    options: Gemma4WebGpuRunOptions,
+    tokenCount: number,
+  ): Promise<Gemma4WebGpuHiddenResult> {
+    const tokenPositions = tokenPositionsFromBatchedMrope(positions, tokenCount);
+    for (const position of tokenPositions) {
+      if (position < 0 || position >= state.contextLength) {
+        throw new Error(`Position ${position} is outside context length ${state.contextLength}`);
+      }
+    }
+    const keyValueTokenCount = Math.min(state.contextLength, maxInt32(tokenPositions) + 1);
+    const gpuState = this.ensureGpuState(state);
+    const cleanup: GpuResource[] = [];
+    const resources: Array<{ destroy: () => void }> = [];
+    const byteLength = tokenCount * this.manifest.embeddingLength * Float32Array.BYTES_PER_ELEMENT;
+    let readback: WebGpuBufferLike | undefined;
+    const boundary = this.arena.createBuffer(
+      "segment boundary hidden noncausal batch",
+      inputHidden.byteLength,
+      GPU_STORAGE | GPU_COPY_DST | GPU_COPY_SRC,
+    );
+    this.arena.device.queue.writeBuffer(boundary, 0, inputHidden);
+    this.boundaryUploads += 1;
+    cleanup.push(boundary);
+
+    const encodeStartMs = nowMs();
+    const encoder = this.arena.device.createCommandEncoder();
+    let compute = this.beginComputePass(encoder, false, "prefill.noncausal");
+    let currentBatch = boundary;
+
+    try {
+      for (const layer of this.layers) {
+        for (let tokenIndex = 0; tokenIndex < tokenCount; tokenIndex += 1) {
+          const current = scratchF32(this.arena, this.manifest.embeddingLength, cleanup, `blk.${layer.layer}.kv.token`);
+          dispatchTokenSlice(this.arena.device, compute.pass, resources, currentBatch, current, {
+            rowSize: this.manifest.embeddingLength,
+            rowIndex: tokenIndex,
+          });
+          this.dispatchLayerKvUpdate(
+            compute.pass,
+            layer,
+            gpuState,
+            current,
+            tokenPositionsFromBatch(positions, tokenIndex, tokenCount),
+            tokenPositions[tokenIndex] ?? 0,
+            state.contextLength,
+            cleanup,
+            resources,
+          );
+        }
+
+        const nextBatch = this.arena.createScratchBuffer(
+          `blk.${layer.layer}.noncausal.output_batch`,
+          byteLength,
+          GPU_STORAGE | GPU_COPY_SRC,
+        );
+        cleanup.push(nextBatch);
+        for (let tokenIndex = 0; tokenIndex < tokenCount; tokenIndex += 1) {
+          const current = scratchF32(this.arena, this.manifest.embeddingLength, cleanup, `blk.${layer.layer}.token`);
+          dispatchTokenSlice(this.arena.device, compute.pass, resources, currentBatch, current, {
+            rowSize: this.manifest.embeddingLength,
+            rowIndex: tokenIndex,
+          });
+          const result = this.dispatchLayer(
+            encoder,
+            compute,
+            layer,
+            gpuState,
+            current,
+            tokenPositionsFromBatch(positions, tokenIndex, tokenCount),
+            tokenPositions[tokenIndex] ?? 0,
+            state.contextLength,
+            {
+              ...options,
+              attentionCausal: false,
+              keyValueTokenCount,
+              skipKvUpdate: true,
+              sourceTokenCount: tokenCount,
+              sourceTokenIndex: tokenIndex,
+            },
+            cleanup,
+            resources,
+          );
+          compute = result.compute;
+          dispatchTokenWrite(this.arena.device, compute.pass, resources, result.output, nextBatch, {
+            rowSize: this.manifest.embeddingLength,
+            rowIndex: tokenIndex,
+          });
+        }
+        currentBatch = nextBatch;
+      }
+
+      readback = this.arena.device.createBuffer({
+        size: byteLength,
+        usage: GPU_MAP_READ | GPU_COPY_DST,
+      });
+      this.endComputePass(encoder, compute);
+      encoder.copyBufferToBuffer(currentBatch, 0, readback, 0, byteLength);
+      this.activeRunEncodeMs += nowMs() - encodeStartMs;
+      this.submitCommandBuffer(encoder.finish());
+      this.readbackCount += 1;
+      await this.mapReadback(readback);
+      const hidden = new Float32Array(readback.getMappedRange()).slice();
+      readback.unmap();
+      readback.destroy?.();
+      readback = undefined;
+      this.readbackBytes += byteLength;
+      this.activeRunReadbackBytes += byteLength;
+      return { hidden };
+    } finally {
+      readback?.destroy?.();
+      for (const resource of resources) {
+        resource.destroy();
+      }
+      for (const item of cleanup.reverse()) {
+        item.destroy?.();
+      }
+    }
+  }
+
   private async runTokenFromBoundary(
     boundary: WebGpuBufferLike,
     tokenIndex: number,
     positions: Int32Array,
     state: Gemma4WebGpuStateLike,
-    options: Gemma4WebGpuRunOptions & { sourceTokenCount: number; sourceTokenIndex: number },
+    options: Gemma4WebGpuInternalRunOptions,
   ): Promise<Gemma4WebGpuTokenResult> {
     const result = await this.runTokenFromBoundaryInternal(boundary, tokenIndex, positions, state, options, false);
     return { selectedTokenId: result.selectedTokenId, topTokens: result.topTokens };
@@ -1051,7 +1186,7 @@ export class Gemma4WebGpuSegmentRunner {
     tokenIndex: number,
     positions: Int32Array,
     state: Gemma4WebGpuStateLike,
-    options: Gemma4WebGpuRunOptions & { sourceTokenCount: number; sourceTokenIndex: number },
+    options: Gemma4WebGpuInternalRunOptions,
   ): Promise<Gemma4WebGpuHiddenResult> {
     return this.runTokenFromBoundaryInternal(boundary, tokenIndex, positions, state, options, true);
   }
@@ -1189,6 +1324,131 @@ export class Gemma4WebGpuSegmentRunner {
     };
   }
 
+  private dispatchLayerKvUpdate(
+    pass: WebGpuComputePassLike,
+    layer: Gemma4GpuLayer,
+    gpuState: GpuState,
+    input: WebGpuBufferLike,
+    positions: Int32Array,
+    tokenPosition: number,
+    contextLength: number,
+    cleanup: GpuResource[],
+    resources: Array<{ destroy: () => void }>,
+  ): void {
+    if (!layer.hasKv) {
+      return;
+    }
+    const layerState = gpuState.fullAttention.get(layer.layer);
+    if (!layerState || !layer.k || !layer.v || !layer.kNorm) {
+      throw new Error(`Missing WebGPU KV state or weights for layer ${layer.layer}`);
+    }
+    const hiddenSize = this.manifest.embeddingLength;
+    const tokenCount = 1;
+    const kvDim = this.manifest.headCountKv * layer.headSize;
+    const kvValueDim = this.manifest.headCountKv * layer.valueSize;
+    const attnQ8 = scratchQ8K(this.arena, hiddenSize, tokenCount, cleanup, `blk.${layer.layer}.prefill_kv.attn_norm.q8k`);
+    this.dispatchRmsNormToQ8K(pass, resources, input, layer.attnNorm.buffer, attnQ8, hiddenSize, cleanup, `blk.${layer.layer}.prefill_kv.attn_norm`);
+    const kProjection = scratchF32(this.arena, kvDim, cleanup, `blk.${layer.layer}.prefill_kv.k`);
+    const vProjection = scratchF32(this.arena, kvValueDim, cleanup, `blk.${layer.layer}.prefill_kv.v`);
+    const dispatchedDualKv = webGpuFusionEnabled() && dispatchDualQ4KMatMul(
+      pass,
+      resources,
+      layer.k,
+      layer.v,
+      attnQ8,
+      kProjection,
+      vProjection,
+      tokenCount,
+    );
+    if (!dispatchedDualKv) {
+      dispatchKMatMul(pass, resources, layer.k, attnQ8, kProjection, tokenCount);
+      dispatchKMatMul(pass, resources, layer.v, attnQ8, vProjection, tokenCount);
+    }
+    if (webGpuFusionEnabled()) {
+      dispatchFullKvUpdate(
+        this.arena.device,
+        pass,
+        resources,
+        kProjection,
+        vProjection,
+        layer.kNorm.buffer,
+        this.ropeFreqFactors.buffer,
+        layerState.key,
+        layerState.value,
+        {
+          headCount: this.manifest.headCountKv,
+          headSize: layer.headSize,
+          valueSize: layer.valueSize,
+          ropeDims: ropeDimensionCount(this.manifest, layer.kind),
+          epsilon: this.epsilon,
+          freqBase: ropeFreqBase(this.manifest, layer.kind),
+          position: mropeTextPosition(positions, tokenPosition),
+          tokenPosition,
+          contextLength,
+          hasFreqFactors: this.hasRopeFreqFactors && layer.kind === "full-attention",
+        },
+      );
+      return;
+    }
+    const kNormed = scratchF32(this.arena, kvDim, cleanup, `blk.${layer.layer}.prefill_kv.k_norm`);
+    dispatchHeadRmsNorm(
+      this.arena.device,
+      pass,
+      resources,
+      kProjection,
+      layer.kNorm.buffer,
+      kNormed,
+      {
+        headCount: this.manifest.headCountKv,
+        headSize: layer.headSize,
+        epsilon: this.epsilon,
+      },
+    );
+    dispatchKeyCacheRope(
+      this.arena.device,
+      pass,
+      resources,
+      kNormed,
+      this.ropeFreqFactors.buffer,
+      layerState.key,
+      {
+        headCount: this.manifest.headCountKv,
+        headSize: layer.headSize,
+        ropeDims: ropeDimensionCount(this.manifest, layer.kind),
+        freqBase: ropeFreqBase(this.manifest, layer.kind),
+        position: mropeTextPosition(positions, tokenPosition),
+        tokenPosition,
+        hasFreqFactors: this.hasRopeFreqFactors && layer.kind === "full-attention",
+      },
+    );
+    const vNormed = scratchF32(this.arena, kvValueDim, cleanup, `blk.${layer.layer}.prefill_kv.v_norm`);
+    dispatchHeadRmsNormNoWeight(
+      this.arena.device,
+      pass,
+      resources,
+      vProjection,
+      vNormed,
+      {
+        headCount: this.manifest.headCountKv,
+        headSize: layer.valueSize,
+        epsilon: this.epsilon,
+      },
+    );
+    dispatchValueCacheWrite(
+      this.arena.device,
+      pass,
+      resources,
+      vNormed,
+      layerState.value,
+      {
+        headCount: this.manifest.headCountKv,
+        valueSize: layer.valueSize,
+        tokenPosition,
+        contextLength,
+      },
+    );
+  }
+
   private async loadGpuInputResources(): Promise<GpuInputResources> {
     this.inputResourcesPromise ??= this.loadGpuInputResourcesUncached();
     return this.inputResourcesPromise;
@@ -1278,7 +1538,7 @@ export class Gemma4WebGpuSegmentRunner {
     tokenIndex: number,
     positions: Int32Array,
     state: Gemma4WebGpuStateLike,
-    options: Gemma4WebGpuRunOptions & { sourceTokenCount: number; sourceTokenIndex: number },
+    options: Gemma4WebGpuInternalRunOptions,
     readHidden: boolean,
   ): Promise<Gemma4WebGpuHiddenResult> {
     const tokenPosition = tokenPositionFromSingleMrope(positions);
@@ -1444,7 +1704,7 @@ export class Gemma4WebGpuSegmentRunner {
     positions: Int32Array,
     tokenPosition: number,
     contextLength: number,
-    options: Gemma4WebGpuRunOptions & { sourceTokenCount: number; sourceTokenIndex: number },
+    options: Gemma4WebGpuInternalRunOptions,
     cleanup: GpuResource[],
     resources: Array<{ destroy: () => void }>,
   ): { output: WebGpuBufferLike; compute: ActiveComputePass } {
@@ -1524,7 +1784,7 @@ export class Gemma4WebGpuSegmentRunner {
         },
       );
     }
-    if (layer.hasKv) {
+    if (layer.hasKv && options.skipKvUpdate !== true) {
       const layerState = gpuState.fullAttention.get(layer.layer);
       if (!layerState || !layer.k || !layer.v || !layer.kNorm) {
         throw new Error(`Missing WebGPU KV state or weights for layer ${layer.layer}`);
@@ -1637,7 +1897,9 @@ export class Gemma4WebGpuSegmentRunner {
     if (!state) {
       throw new Error(`Missing WebGPU KV state for layer ${layer.layer}`);
     }
-    const keyValueTokenCount = Math.min(contextLength, tokenPosition + 1);
+    const keyValueTokenCount = options.attentionCausal === false
+      ? Math.min(contextLength, options.keyValueTokenCount ?? tokenPosition + 1)
+      : Math.min(contextLength, tokenPosition + 1);
     const probabilityTokenCapacity = bucketAttentionProbabilityTokenCount(keyValueTokenCount);
     const probabilities = scratchF32(
       this.arena,
@@ -1655,7 +1917,9 @@ export class Gemma4WebGpuSegmentRunner {
       contextLength,
       scale: 1,
       tokenPosition,
-      slidingWindow: layer.kind === "sliding-attention" ? this.manifest.slidingWindow : undefined,
+      slidingWindow: options.attentionCausal === false
+        ? undefined
+        : layer.kind === "sliding-attention" ? this.manifest.slidingWindow : undefined,
     };
     const keyValueStart = attentionKeyValueStart(tokenPosition, attentionOptions.slidingWindow);
     dispatchFullAttentionScore(this.arena.device, pass, resources, query, state.key, probabilities, attentionOptions);
@@ -1715,7 +1979,7 @@ export class Gemma4WebGpuSegmentRunner {
     pass: WebGpuComputePassLike,
     layer: Gemma4GpuLayer,
     input: WebGpuBufferLike,
-    options: Gemma4WebGpuRunOptions & { sourceTokenCount: number; sourceTokenIndex: number },
+    options: Gemma4WebGpuInternalRunOptions,
     cleanup: GpuResource[],
     resources: Array<{ destroy: () => void }>,
   ): WebGpuBufferLike {
@@ -2065,6 +2329,24 @@ function tokenPositionsFromBatch(positions: Int32Array, tokenIndex: number, toke
     ]);
   }
   throw new Error(`WebGPU token batch expects ${tokenCount} or ${tokenCount * 4} positions, got ${positions.length}`);
+}
+
+function tokenPositionsFromBatchedMrope(positions: Int32Array, tokenCount: number): Int32Array {
+  if (positions.length === tokenCount) {
+    return positions;
+  }
+  if (positions.length === tokenCount * 4) {
+    return positions.slice(0, tokenCount);
+  }
+  throw new Error(`WebGPU token batch expects ${tokenCount} or ${tokenCount * 4} positions, got ${positions.length}`);
+}
+
+function maxInt32(values: Int32Array): number {
+  let max = -Infinity;
+  for (const value of values) {
+    max = Math.max(max, value);
+  }
+  return max;
 }
 
 function mropeTextPosition(positions: Int32Array, fallback: number): number {

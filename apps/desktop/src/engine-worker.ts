@@ -99,14 +99,19 @@ async function handleLoadModel(
     }
     nextVisionSession = createGemma4VisionSession(visionReader, {
       maxWeightCacheBytes: resolvedMemoryProfile.maxWeightCacheBytes,
-      executionProviders: [{
-        name: "cpu",
-        options: {
-          projectionBatching: true,
-          residentWeightCache: resolvedMemoryProfile.wasmResidentWeightCache,
-          wasmKernels: true,
+      executionProviders: [
+        {
+          name: "webgpu",
         },
-      }],
+        {
+          name: "cpu",
+          options: {
+            projectionBatching: true,
+            residentWeightCache: resolvedMemoryProfile.wasmResidentWeightCache,
+            wasmKernels: true,
+          },
+        },
+      ],
     });
   }
   const executionProviders: ExecutionProviderConfig[] = [{
@@ -123,7 +128,7 @@ async function handleLoadModel(
     },
   }];
 
-  if (resolvedMemoryProfile.resolved === "full" && !nextVisionSession) {
+  if (resolvedMemoryProfile.resolved === "full") {
     const webGpuPlan = planGemma4RunnerPlacement(tensorReader.metadata, manifest, {
       mode: "enabled",
       contextLength: CHAT_CONTEXT_LENGTH,
@@ -142,8 +147,6 @@ async function handleLoadModel(
     } else {
       resolvedMemoryProfile.webGpuStatus = "blocked";
     }
-  } else if (nextVisionSession) {
-    resolvedMemoryProfile.webGpuStatus = "blocked";
   }
 
   const nextSession = createGemma4ChatSession(tensorReader, {

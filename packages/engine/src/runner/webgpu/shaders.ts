@@ -20,6 +20,28 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 }
 `;
 
+export const TOKEN_WRITE_WGSL = `
+struct Params {
+  rowSize: u32,
+  rowIndex: u32,
+  _pad0: u32,
+  _pad1: u32,
+};
+
+@group(0) @binding(0) var<storage, read> inputValues: array<f32>;
+@group(0) @binding(1) var<uniform> params: Params;
+@group(0) @binding(2) var<storage, read_write> outputValues: array<f32>;
+
+@compute @workgroup_size(256, 1, 1)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let index = id.x;
+  if (index >= params.rowSize) {
+    return;
+  }
+  outputValues[params.rowIndex * params.rowSize + index] = inputValues[index];
+}
+`;
+
 export const F32_GATHER_ROWS_SCALE_WGSL = `
 struct Params {
   rowSize: u32,
@@ -2612,5 +2634,407 @@ fn main(@builtin(workgroup_id) workgroupId: vec3<u32>, @builtin(local_invocation
   if (rowLane == 0u && row < params.rowCount) {
     outputValues[column * params.rowCount + row] = q6MatmulReduceValues[lane];
   }
+}
+`;
+
+export const VISION_PATCH_EMBED_WGSL = `
+struct Params {
+  imageWidth: u32,
+  patchSize: u32,
+  patchGridX: u32,
+  patchGridY: u32,
+  embeddingLength: u32,
+  _pad0: u32,
+  _pad1: u32,
+  _pad2: u32,
+};
+
+@group(0) @binding(0) var<storage, read> pixels: array<f32>;
+@group(0) @binding(1) var<storage, read> weights: array<f32>;
+@group(0) @binding(2) var<uniform> params: Params;
+@group(0) @binding(3) var<storage, read_write> outputValues: array<f32>;
+
+@compute @workgroup_size(256, 1, 1)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let index = id.x;
+  let patchCount = params.patchGridX * params.patchGridY;
+  if (index >= patchCount * params.embeddingLength) {
+    return;
+  }
+  let emb = index % params.embeddingLength;
+  let patchIndex = index / params.embeddingLength;
+  let patchX = patchIndex % params.patchGridX;
+  let patchY = patchIndex / params.patchGridX;
+  var sum = 0.0;
+  for (var ky = 0u; ky < params.patchSize; ky = ky + 1u) {
+    let y = patchY * params.patchSize + ky;
+    for (var kx = 0u; kx < params.patchSize; kx = kx + 1u) {
+      let x = patchX * params.patchSize + kx;
+      let pixelOffset = (y * params.imageWidth + x) * 3u;
+      for (var channel = 0u; channel < 3u; channel = channel + 1u) {
+        let weightOffset = kx + params.patchSize * (ky + params.patchSize * (channel + 3u * emb));
+        let scaledPixel = pixels[pixelOffset + channel] * 2.0 - 1.0;
+        sum = sum + weights[weightOffset] * scaledPixel;
+      }
+    }
+  }
+  outputValues[index] = sum;
+}
+`;
+
+export const VISION_ADD_POSITION_WGSL = `
+struct Params {
+  patchGridX: u32,
+  tokenCount: u32,
+  embeddingLength: u32,
+  tableSize: u32,
+};
+
+@group(0) @binding(0) var<storage, read> inputValues: array<f32>;
+@group(0) @binding(1) var<storage, read> positionValues: array<f32>;
+@group(0) @binding(2) var<uniform> params: Params;
+@group(0) @binding(3) var<storage, read_write> outputValues: array<f32>;
+
+@compute @workgroup_size(256, 1, 1)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let index = id.x;
+  if (index >= params.tokenCount * params.embeddingLength) {
+    return;
+  }
+  let emb = index % params.embeddingLength;
+  let token = index / params.embeddingLength;
+  let x = token % params.patchGridX;
+  let y = token / params.patchGridX;
+  outputValues[index] = inputValues[index] +
+    positionValues[x * params.embeddingLength + emb] +
+    positionValues[(params.tableSize + y) * params.embeddingLength + emb];
+}
+`;
+
+export const VISION_RMS_NORM_WGSL = `
+struct Params {
+  epsilon: f32,
+  rowSize: u32,
+  rowCount: u32,
+  hasWeight: u32,
+};
+
+@group(0) @binding(0) var<storage, read> inputValues: array<f32>;
+@group(0) @binding(1) var<storage, read> weightValues: array<f32>;
+@group(0) @binding(2) var<uniform> params: Params;
+@group(0) @binding(3) var<storage, read_write> outputValues: array<f32>;
+
+var<workgroup> reduceValues: array<f32, 256>;
+
+@compute @workgroup_size(256, 1, 1)
+fn main(@builtin(workgroup_id) workgroupId: vec3<u32>, @builtin(local_invocation_id) localId: vec3<u32>) {
+  let row = workgroupId.x;
+  let lane = localId.x;
+  if (row >= params.rowCount) {
+    return;
+  }
+  let base = row * params.rowSize;
+  var sum = 0.0;
+  for (var dim = lane; dim < params.rowSize; dim = dim + 256u) {
+    let value = inputValues[base + dim];
+    sum = sum + value * value;
+  }
+  reduceValues[lane] = sum;
+  workgroupBarrier();
+  for (var stride = 128u; stride > 0u; stride = stride / 2u) {
+    if (lane < stride) {
+      reduceValues[lane] = reduceValues[lane] + reduceValues[lane + stride];
+    }
+    workgroupBarrier();
+  }
+  let normScale = inverseSqrt(reduceValues[0] / f32(params.rowSize) + params.epsilon);
+  for (var dim = lane; dim < params.rowSize; dim = dim + 256u) {
+    let weight = select(1.0, weightValues[dim], params.hasWeight == 1u);
+    outputValues[base + dim] = inputValues[base + dim] * normScale * weight;
+  }
+}
+`;
+
+export const VISION_ROPE2D_WGSL = `
+struct Params {
+  freqBase: f32,
+  patchGridX: u32,
+  tokenCount: u32,
+  headCount: u32,
+  headSize: u32,
+  _pad0: u32,
+  _pad1: u32,
+  _pad2: u32,
+};
+
+@group(0) @binding(0) var<storage, read> inputValues: array<f32>;
+@group(0) @binding(1) var<uniform> params: Params;
+@group(0) @binding(2) var<storage, read_write> outputValues: array<f32>;
+
+fn rotatedValue(token: u32, head: u32, dim: u32, sliceStart: u32, position: u32) -> f32 {
+  let sliceLength = params.headSize / 2u;
+  let half = sliceLength / 2u;
+  let local = dim - sliceStart;
+  let pair = local % half;
+  let base = (token * params.headCount + head) * params.headSize + sliceStart;
+  let x0 = inputValues[base + pair];
+  let x1 = inputValues[base + half + pair];
+  let thetaScale = pow(params.freqBase, -2.0 / f32(sliceLength));
+  let theta = f32(position) * pow(thetaScale, f32(pair));
+  let c = cos(theta);
+  let s = sin(theta);
+  if (local < half) {
+    return x0 * c - x1 * s;
+  }
+  return x0 * s + x1 * c;
+}
+
+@compute @workgroup_size(256, 1, 1)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let index = id.x;
+  let total = params.tokenCount * params.headCount * params.headSize;
+  if (index >= total) {
+    return;
+  }
+  let dim = index % params.headSize;
+  let headToken = index / params.headSize;
+  let head = headToken % params.headCount;
+  let token = headToken / params.headCount;
+  let sliceLength = params.headSize / 2u;
+  if (dim < sliceLength) {
+    outputValues[index] = rotatedValue(token, head, dim, 0u, token % params.patchGridX);
+    return;
+  }
+  outputValues[index] = rotatedValue(token, head, dim, sliceLength, token / params.patchGridX);
+}
+`;
+
+export const VISION_ATTENTION_SCORE_WGSL = `
+struct Params {
+  scale: f32,
+  tokenCount: u32,
+  headCount: u32,
+  headSize: u32,
+};
+
+@group(0) @binding(0) var<storage, read> queryValues: array<f32>;
+@group(0) @binding(1) var<storage, read> keyValues: array<f32>;
+@group(0) @binding(2) var<uniform> params: Params;
+@group(0) @binding(3) var<storage, read_write> probabilityValues: array<f32>;
+
+var<workgroup> reduceValues: array<f32, 256>;
+
+fn dotScore(queryToken: u32, head: u32, keyToken: u32) -> f32 {
+  let qBase = (queryToken * params.headCount + head) * params.headSize;
+  let kBase = (keyToken * params.headCount + head) * params.headSize;
+  var dot = 0.0;
+  for (var dim = 0u; dim < params.headSize; dim = dim + 1u) {
+    dot = dot + queryValues[qBase + dim] * keyValues[kBase + dim];
+  }
+  return dot * params.scale;
+}
+
+@compute @workgroup_size(256, 1, 1)
+fn main(@builtin(workgroup_id) workgroupId: vec3<u32>, @builtin(local_invocation_id) localId: vec3<u32>) {
+  let queryToken = workgroupId.x;
+  let head = workgroupId.y;
+  let lane = localId.x;
+  let probabilityBase = (queryToken * params.headCount + head) * params.tokenCount;
+  var localMax = -3.4028234663852886e38;
+  for (var keyToken = lane; keyToken < params.tokenCount; keyToken = keyToken + 256u) {
+    let score = dotScore(queryToken, head, keyToken);
+    probabilityValues[probabilityBase + keyToken] = score;
+    localMax = max(localMax, score);
+  }
+  reduceValues[lane] = localMax;
+  workgroupBarrier();
+  for (var stride = 128u; stride > 0u; stride = stride / 2u) {
+    if (lane < stride) {
+      reduceValues[lane] = max(reduceValues[lane], reduceValues[lane + stride]);
+    }
+    workgroupBarrier();
+  }
+  let maxScore = reduceValues[0];
+  var localSum = 0.0;
+  for (var keyToken = lane; keyToken < params.tokenCount; keyToken = keyToken + 256u) {
+    let probability = exp(probabilityValues[probabilityBase + keyToken] - maxScore);
+    probabilityValues[probabilityBase + keyToken] = probability;
+    localSum = localSum + probability;
+  }
+  reduceValues[lane] = localSum;
+  workgroupBarrier();
+  for (var stride = 128u; stride > 0u; stride = stride / 2u) {
+    if (lane < stride) {
+      reduceValues[lane] = reduceValues[lane] + reduceValues[lane + stride];
+    }
+    workgroupBarrier();
+  }
+  let total = reduceValues[0];
+  for (var keyToken = lane; keyToken < params.tokenCount; keyToken = keyToken + 256u) {
+    let index = probabilityBase + keyToken;
+    probabilityValues[index] = probabilityValues[index] / total;
+  }
+}
+`;
+
+export const VISION_ATTENTION_APPLY_WGSL = `
+struct Params {
+  tokenCount: u32,
+  headCount: u32,
+  headSize: u32,
+  _pad0: u32,
+};
+
+@group(0) @binding(0) var<storage, read> valueValues: array<f32>;
+@group(0) @binding(1) var<storage, read> probabilityValues: array<f32>;
+@group(0) @binding(2) var<uniform> params: Params;
+@group(0) @binding(3) var<storage, read_write> outputValues: array<f32>;
+
+var<workgroup> reduceValues: array<f32, 256>;
+
+@compute @workgroup_size(256, 1, 1)
+fn main(@builtin(workgroup_id) workgroupId: vec3<u32>, @builtin(local_invocation_id) localId: vec3<u32>) {
+  let queryToken = workgroupId.x;
+  let head = workgroupId.y;
+  let dim = workgroupId.z;
+  let lane = localId.x;
+  let probabilityBase = (queryToken * params.headCount + head) * params.tokenCount;
+  var local = 0.0;
+  for (var keyToken = lane; keyToken < params.tokenCount; keyToken = keyToken + 256u) {
+    let valueIndex = (keyToken * params.headCount + head) * params.headSize + dim;
+    local = local + probabilityValues[probabilityBase + keyToken] * valueValues[valueIndex];
+  }
+  reduceValues[lane] = local;
+  workgroupBarrier();
+  for (var stride = 128u; stride > 0u; stride = stride / 2u) {
+    if (lane < stride) {
+      reduceValues[lane] = reduceValues[lane] + reduceValues[lane + stride];
+    }
+    workgroupBarrier();
+  }
+  if (lane == 0u) {
+    outputValues[(queryToken * params.headCount + head) * params.headSize + dim] = reduceValues[0];
+  }
+}
+`;
+
+export const VISION_AVERAGE_POOL_WGSL = `
+struct Params {
+  outputScale: f32,
+  patchGridX: u32,
+  patchGridY: u32,
+  embeddingLength: u32,
+  kernelSize: u32,
+  _pad0: u32,
+  _pad1: u32,
+  _pad2: u32,
+};
+
+@group(0) @binding(0) var<storage, read> inputValues: array<f32>;
+@group(0) @binding(1) var<uniform> params: Params;
+@group(0) @binding(2) var<storage, read_write> outputValues: array<f32>;
+
+@compute @workgroup_size(256, 1, 1)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let outX = params.patchGridX / params.kernelSize;
+  let outY = params.patchGridY / params.kernelSize;
+  let index = id.x;
+  if (index >= outX * outY * params.embeddingLength) {
+    return;
+  }
+  let emb = index % params.embeddingLength;
+  let outToken = index / params.embeddingLength;
+  let ox = outToken % outX;
+  let oy = outToken / outX;
+  let scale = params.outputScale / f32(params.kernelSize * params.kernelSize);
+  var sum = 0.0;
+  for (var ky = 0u; ky < params.kernelSize; ky = ky + 1u) {
+    for (var kx = 0u; kx < params.kernelSize; kx = kx + 1u) {
+      let inToken = (oy * params.kernelSize + ky) * params.patchGridX + ox * params.kernelSize + kx;
+      sum = sum + inputValues[inToken * params.embeddingLength + emb] * scale;
+    }
+  }
+  outputValues[index] = sum;
+}
+`;
+
+export const VISION_STD_NORMALIZE_WGSL = `
+struct Params {
+  length: u32,
+  rowSize: u32,
+  _pad0: u32,
+  _pad1: u32,
+};
+
+@group(0) @binding(0) var<storage, read> inputValues: array<f32>;
+@group(0) @binding(1) var<storage, read> biasValues: array<f32>;
+@group(0) @binding(2) var<storage, read> scaleValues: array<f32>;
+@group(0) @binding(3) var<uniform> params: Params;
+@group(0) @binding(4) var<storage, read_write> outputValues: array<f32>;
+
+@compute @workgroup_size(256, 1, 1)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let index = id.x;
+  if (index >= params.length) {
+    return;
+  }
+  let dim = index % params.rowSize;
+  outputValues[index] = (inputValues[index] - biasValues[dim]) * scaleValues[dim];
+}
+`;
+
+export const VISION_CLAMP_WGSL = `
+struct Params {
+  minValue: f32,
+  maxValue: f32,
+  length: u32,
+  _pad0: u32,
+};
+
+@group(0) @binding(0) var<storage, read> inputValues: array<f32>;
+@group(0) @binding(1) var<uniform> params: Params;
+@group(0) @binding(2) var<storage, read_write> outputValues: array<f32>;
+
+@compute @workgroup_size(256, 1, 1)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let index = id.x;
+  if (index >= params.length) {
+    return;
+  }
+  outputValues[index] = min(params.maxValue, max(params.minValue, inputValues[index]));
+}
+`;
+
+export const VISION_GELU_MUL_WGSL = `
+struct Params {
+  length: u32,
+  _pad0: u32,
+  _pad1: u32,
+  _pad2: u32,
+};
+
+@group(0) @binding(0) var<storage, read> gateValues: array<f32>;
+@group(0) @binding(1) var<storage, read> upValues: array<f32>;
+@group(0) @binding(2) var<uniform> params: Params;
+@group(0) @binding(3) var<storage, read_write> outputValues: array<f32>;
+
+fn gelu(value: f32) -> f32 {
+  if (value <= -10.0) {
+    return 0.0;
+  }
+  if (value >= 10.0) {
+    return value;
+  }
+  let inner = sqrt(2.0 / 3.141592653589793) * value * (1.0 + 0.044715 * value * value);
+  return 0.5 * value * (1.0 + tanh(inner));
+}
+
+@compute @workgroup_size(256, 1, 1)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let index = id.x;
+  if (index >= params.length) {
+    return;
+  }
+  outputValues[index] = gelu(gateValues[index]) * upValues[index];
 }
 `;
