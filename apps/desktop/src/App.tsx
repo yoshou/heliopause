@@ -1,4 +1,4 @@
-import { ChangeEvent, ClipboardEvent, FormEvent, useEffect, useMemo, useRef, useState } from "react";
+import { ChangeEvent, ClipboardEvent, FormEvent, KeyboardEvent, PointerEvent, useEffect, useMemo, useRef, useState } from "react";
 import {
   DEFAULT_GEMMA4_SYSTEM_PROMPT,
   stripGemma4Thinking,
@@ -16,6 +16,7 @@ type UiMessage = {
   role: "user" | "assistant";
   content: string;
   image?: UiImageAttachment;
+  audio?: UiAudioAttachment;
   inferenceDurationMs?: number;
 };
 
@@ -24,6 +25,18 @@ type UiImageAttachment = {
   fileName: string;
   url: string;
 };
+
+type UiAudioAttachment = {
+  blob: Blob;
+  url: string;
+  fileName: string;
+  wavBlob?: Blob;
+  wavUrl?: string;
+  wavFileName?: string;
+  durationMs: number;
+};
+
+type RecordingState = "idle" | "requesting" | "recording" | "processing";
 
 type ModelState =
   | { status: "empty" }
@@ -49,6 +62,10 @@ type PendingRequest =
       reject: (error: Error) => void;
     };
 
+const MIN_RECORDING_MS = 300;
+const MAX_RECORDING_MS = 30_000;
+const AUDIO_SAMPLE_RATE = 16_000;
+
 function App() {
   const [model, setModel] = useState<ModelState>({ status: "empty" });
   const [memoryProfile, setMemoryProfile] = useState<MemoryProfile>("auto");
@@ -57,6 +74,7 @@ function App() {
   const [modelFile, setModelFile] = useState<File | undefined>();
   const [visionFile, setVisionFile] = useState<File | undefined>();
   const [imageAttachment, setImageAttachment] = useState<UiImageAttachment | undefined>();
+  const [recordingState, setRecordingState] = useState<RecordingState>("idle");
   const [messages, setMessages] = useState<UiMessage[]>([]);
   const [isGenerating, setIsGenerating] = useState(false);
   const [generationError, setGenerationError] = useState<string | undefined>();
@@ -64,6 +82,14 @@ function App() {
   const nextRequestIdRef = useRef(1);
   const pendingRequestsRef = useRef(new Map<number, PendingRequest>());
   const generationRequestRef = useRef<{ requestId: number; worker: Worker } | null>(null);
+  const imageAttachmentRef = useRef<UiImageAttachment | undefined>(undefined);
+  const messagesRef = useRef<UiMessage[]>([]);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const mediaStreamRef = useRef<MediaStream | null>(null);
+  const recordingChunksRef = useRef<Blob[]>([]);
+  const recordingStartedAtRef = useRef(0);
+  const recordingStopTimerRef = useRef<number | undefined>(undefined);
+  const recordingStopRequestedRef = useRef(false);
 
   const canSubmit = useMemo(
     () =>
@@ -73,6 +99,29 @@ function App() {
       (!imageAttachment || model.supportsImages),
     [imageAttachment, isGenerating, model, prompt],
   );
+  const canRecordAudio = useMemo(
+    () =>
+      !isGenerating &&
+      recordingState !== "processing" &&
+      Boolean(navigator.mediaDevices?.getUserMedia) &&
+      typeof MediaRecorder !== "undefined",
+    [isGenerating, recordingState],
+  );
+  const recordingLabel = recordingState === "recording"
+    ? "Recording..."
+    : recordingState === "requesting"
+      ? "Requesting mic..."
+      : recordingState === "processing"
+        ? "Preparing audio..."
+        : "Hold to record";
+
+  useEffect(() => {
+    imageAttachmentRef.current = imageAttachment;
+  }, [imageAttachment]);
+
+  useEffect(() => {
+    messagesRef.current = messages;
+  }, [messages]);
 
   useEffect(() => () => {
     const worker = workerRef.current;
@@ -80,9 +129,22 @@ function App() {
       rejectWorkerRequests(worker, new Error("Application closed."));
       worker.terminate();
     }
-    if (imageAttachment) {
-      URL.revokeObjectURL(imageAttachment.url);
+    const image = imageAttachmentRef.current;
+    if (image) {
+      URL.revokeObjectURL(image.url);
     }
+    stopActiveRecording();
+    revokeMessageAudioAttachments(messagesRef.current);
+  }, []);
+
+  useEffect(() => {
+    function handleWindowBlur() {
+      void stopRecording();
+    }
+    window.addEventListener("blur", handleWindowBlur);
+    return () => {
+      window.removeEventListener("blur", handleWindowBlur);
+    };
   }, []);
 
   async function handleModelChange(event: ChangeEvent<HTMLInputElement>) {
@@ -116,6 +178,7 @@ function App() {
     }
     workerRef.current = worker;
     generationRequestRef.current = null;
+    clearMessages();
 
     setModel({ status: "loading", fileName: file.name });
     try {
@@ -128,7 +191,7 @@ function App() {
         memoryProfile,
         await readSystemMemoryInfo(),
       );
-      setMessages([]);
+      clearMessages();
       setModel({
         status: "ready",
         ...modelInfo,
@@ -240,6 +303,167 @@ function App() {
       url: URL.createObjectURL(file),
     });
     setGenerationError(undefined);
+  }
+
+  async function startRecording() {
+    if (!canRecordAudio || recordingState !== "idle") {
+      return;
+    }
+    setGenerationError(undefined);
+    setRecordingState("requesting");
+    recordingStopRequestedRef.current = false;
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      if (recordingStopRequestedRef.current) {
+        stopMediaStream(stream);
+        setRecordingState("idle");
+        return;
+      }
+      const mimeType = selectAudioMimeType();
+      const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
+      recordingChunksRef.current = [];
+      recordingStartedAtRef.current = performance.now();
+      mediaStreamRef.current = stream;
+      mediaRecorderRef.current = recorder;
+      recorder.ondataavailable = (event) => {
+        if (event.data.size > 0) {
+          recordingChunksRef.current.push(event.data);
+        }
+      };
+      recorder.onstop = () => {
+        void finalizeRecording(recorder.mimeType || mimeType || "audio/webm");
+      };
+      recorder.start();
+      setRecordingState("recording");
+      recordingStopTimerRef.current = window.setTimeout(() => {
+        void stopRecording();
+      }, MAX_RECORDING_MS);
+      if (recordingStopRequestedRef.current) {
+        void stopRecording();
+      }
+    } catch (error) {
+      setRecordingState("idle");
+      setGenerationError(error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  async function stopRecording() {
+    recordingStopRequestedRef.current = true;
+    if (recordingStopTimerRef.current !== undefined) {
+      window.clearTimeout(recordingStopTimerRef.current);
+      recordingStopTimerRef.current = undefined;
+    }
+    const recorder = mediaRecorderRef.current;
+    if (!recorder) {
+      if (recordingState === "requesting") {
+        return;
+      }
+      setRecordingState("idle");
+      return;
+    }
+    if (recorder.state !== "inactive") {
+      recorder.stop();
+    }
+  }
+
+  function handleRecordPointerDown(event: PointerEvent<HTMLButtonElement>) {
+    event.preventDefault();
+    event.currentTarget.setPointerCapture(event.pointerId);
+    void startRecording();
+  }
+
+  function handleRecordPointerUp(event: PointerEvent<HTMLButtonElement>) {
+    event.preventDefault();
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+    void stopRecording();
+  }
+
+  function handleRecordPointerCancel() {
+    void stopRecording();
+  }
+
+  function handleRecordKeyDown(event: KeyboardEvent<HTMLButtonElement>) {
+    if (event.key !== " " && event.key !== "Enter") {
+      return;
+    }
+    event.preventDefault();
+    if (event.repeat) {
+      return;
+    }
+    void startRecording();
+  }
+
+  function handleRecordKeyUp(event: KeyboardEvent<HTMLButtonElement>) {
+    if (event.key !== " " && event.key !== "Enter") {
+      return;
+    }
+    event.preventDefault();
+    void stopRecording();
+  }
+
+  async function finalizeRecording(mimeType: string) {
+    const chunks = recordingChunksRef.current;
+    const durationMs = performance.now() - recordingStartedAtRef.current;
+    stopActiveRecording();
+    if (durationMs < MIN_RECORDING_MS || chunks.length === 0) {
+      recordingChunksRef.current = [];
+      setRecordingState("idle");
+      return;
+    }
+
+    setRecordingState("processing");
+    const timestamp = formatAudioFileTimestamp(new Date());
+    const webmBlob = new Blob(chunks, { type: mimeType });
+    const fileName = `heliopause-audio-${timestamp}.webm`;
+    try {
+      const wavBlob = await create16KhzMonoWavBlob(webmBlob);
+      const nextAudio: UiAudioAttachment = {
+        blob: webmBlob,
+        url: URL.createObjectURL(webmBlob),
+        fileName,
+        wavBlob,
+        wavUrl: URL.createObjectURL(wavBlob),
+        wavFileName: `heliopause-audio-${timestamp}-16khz.wav`,
+        durationMs,
+      };
+      setMessages((currentMessages) => [
+        ...currentMessages,
+        {
+          id: createId("user"),
+          role: "user",
+          content: "",
+          audio: nextAudio,
+        },
+      ]);
+      setGenerationError(undefined);
+    } catch (error) {
+      setGenerationError(error instanceof Error ? error.message : String(error));
+    } finally {
+      recordingChunksRef.current = [];
+      setRecordingState("idle");
+    }
+  }
+
+  function clearMessages() {
+    setMessages((currentMessages) => {
+      revokeMessageAudioAttachments(currentMessages);
+      return [];
+    });
+  }
+
+  function stopActiveRecording() {
+    if (recordingStopTimerRef.current !== undefined) {
+      window.clearTimeout(recordingStopTimerRef.current);
+      recordingStopTimerRef.current = undefined;
+    }
+    mediaRecorderRef.current = null;
+    const stream = mediaStreamRef.current;
+    mediaStreamRef.current = null;
+    if (stream) {
+      stopMediaStream(stream);
+    }
   }
 
   function createEngineWorker(): Worker {
@@ -438,7 +662,7 @@ function App() {
             value={systemPrompt}
             onChange={(event) => {
               setSystemPrompt(event.target.value);
-              setMessages([]);
+              clearMessages();
             }}
             rows={8}
             disabled={isGenerating}
@@ -491,15 +715,31 @@ function App() {
             <p className="generation-error">{generationError}</p>
           ) : null}
           <div className="form-actions">
-            <label className="image-button">
-              Image
-              <input
-                type="file"
-                accept="image/*"
-                onChange={handleImageFileChange}
-                disabled={model.status !== "ready" || isGenerating || (model.status === "ready" && !model.supportsImages)}
-              />
-            </label>
+            <div className="input-actions">
+              <label className="image-button">
+                Image
+                <input
+                  type="file"
+                  accept="image/*"
+                  onChange={handleImageFileChange}
+                  disabled={model.status !== "ready" || isGenerating || (model.status === "ready" && !model.supportsImages)}
+                />
+              </label>
+              <button
+                type="button"
+                className={`record-button${recordingState === "recording" ? " record-button--active" : ""}`}
+                onPointerDown={handleRecordPointerDown}
+                onPointerUp={handleRecordPointerUp}
+                onPointerCancel={handleRecordPointerCancel}
+                onPointerLeave={handleRecordPointerCancel}
+                onKeyDown={handleRecordKeyDown}
+                onKeyUp={handleRecordKeyUp}
+                disabled={!canRecordAudio}
+                aria-pressed={recordingState === "recording"}
+              >
+                {recordingLabel}
+              </button>
+            </div>
             <p>{model.status === "ready" ? `${prompt.trim().length} characters` : "No model loaded"}</p>
             {isGenerating ? (
               <button type="button" className="secondary-button" onClick={handleStop}>
@@ -528,13 +768,28 @@ function MessageBubble(
       {message.image ? (
         <img className="message-image" src={message.image.url} alt="" />
       ) : null}
-      <p>{visibleContent || placeholder}</p>
+      {message.audio ? (
+        <AudioMessage audio={message.audio} />
+      ) : null}
+      {visibleContent || placeholder ? <p>{visibleContent || placeholder}</p> : null}
       {message.role === "assistant" && message.inferenceDurationMs !== undefined ? (
         <footer className="message-meta">
           {formatDuration(message.inferenceDurationMs)}
         </footer>
       ) : null}
     </article>
+  );
+}
+
+function AudioMessage({ audio }: { audio: UiAudioAttachment }) {
+  return (
+    <div className="message-audio">
+      <audio controls src={audio.url} />
+      <a href={audio.url} download={audio.fileName}>WebM</a>
+      {audio.wavUrl && audio.wavFileName ? (
+        <a href={audio.wavUrl} download={audio.wavFileName}>WAV</a>
+      ) : null}
+    </div>
   );
 }
 
@@ -614,6 +869,123 @@ function executionLabel(memoryProfile: WorkerModelInfo["memoryProfile"]): string
     return "CPU/WASM";
   }
   return "CPU/WASM";
+}
+
+function selectAudioMimeType(): string {
+  const supportedType = [
+    "audio/webm;codecs=opus",
+    "audio/webm",
+  ].find((mimeType) => MediaRecorder.isTypeSupported(mimeType));
+  return supportedType ?? "";
+}
+
+function stopMediaStream(stream: MediaStream) {
+  for (const track of stream.getTracks()) {
+    track.stop();
+  }
+}
+
+function revokeAudioAttachment(audio: UiAudioAttachment | undefined) {
+  if (!audio) {
+    return;
+  }
+  URL.revokeObjectURL(audio.url);
+  if (audio.wavUrl) {
+    URL.revokeObjectURL(audio.wavUrl);
+  }
+}
+
+function revokeMessageAudioAttachments(messages: UiMessage[]) {
+  for (const message of messages) {
+    revokeAudioAttachment(message.audio);
+  }
+}
+
+function formatAudioFileTimestamp(date: Date): string {
+  const pad = (value: number) => value.toString().padStart(2, "0");
+  return [
+    date.getFullYear(),
+    pad(date.getMonth() + 1),
+    pad(date.getDate()),
+    "-",
+    pad(date.getHours()),
+    pad(date.getMinutes()),
+    pad(date.getSeconds()),
+  ].join("");
+}
+
+async function create16KhzMonoWavBlob(audioBlob: Blob): Promise<Blob> {
+  const audioContext = new AudioContext();
+  try {
+    const decoded = await audioContext.decodeAudioData(await audioBlob.arrayBuffer());
+    const mono = mixAudioBufferToMono(decoded);
+    const resampled = resampleLinear(mono, decoded.sampleRate, AUDIO_SAMPLE_RATE);
+    return encodeFloat32PcmWav(resampled, AUDIO_SAMPLE_RATE);
+  } finally {
+    await audioContext.close();
+  }
+}
+
+function mixAudioBufferToMono(audioBuffer: AudioBuffer): Float32Array {
+  const mono = new Float32Array(audioBuffer.length);
+  for (let channel = 0; channel < audioBuffer.numberOfChannels; channel += 1) {
+    const channelData = audioBuffer.getChannelData(channel);
+    for (let index = 0; index < channelData.length; index += 1) {
+      mono[index] += channelData[index] / audioBuffer.numberOfChannels;
+    }
+  }
+  return mono;
+}
+
+function resampleLinear(input: Float32Array, sourceRate: number, targetRate: number): Float32Array {
+  if (sourceRate === targetRate) {
+    return input;
+  }
+  const outputLength = Math.max(1, Math.round(input.length * targetRate / sourceRate));
+  const output = new Float32Array(outputLength);
+  const ratio = sourceRate / targetRate;
+  for (let index = 0; index < outputLength; index += 1) {
+    const position = index * ratio;
+    const leftIndex = Math.floor(position);
+    const rightIndex = Math.min(leftIndex + 1, input.length - 1);
+    const fraction = position - leftIndex;
+    output[index] = input[leftIndex] * (1 - fraction) + input[rightIndex] * fraction;
+  }
+  return output;
+}
+
+function encodeFloat32PcmWav(samples: Float32Array, sampleRate: number): Blob {
+  const bytesPerSample = 2;
+  const dataSize = samples.length * bytesPerSample;
+  const buffer = new ArrayBuffer(44 + dataSize);
+  const view = new DataView(buffer);
+  writeAscii(view, 0, "RIFF");
+  view.setUint32(4, 36 + dataSize, true);
+  writeAscii(view, 8, "WAVE");
+  writeAscii(view, 12, "fmt ");
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, 1, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * bytesPerSample, true);
+  view.setUint16(32, bytesPerSample, true);
+  view.setUint16(34, bytesPerSample * 8, true);
+  writeAscii(view, 36, "data");
+  view.setUint32(40, dataSize, true);
+
+  let offset = 44;
+  for (const sample of samples) {
+    const clipped = Math.max(-1, Math.min(1, sample));
+    view.setInt16(offset, clipped < 0 ? clipped * 0x8000 : clipped * 0x7fff, true);
+    offset += bytesPerSample;
+  }
+  return new Blob([buffer], { type: "audio/wav" });
+}
+
+function writeAscii(view: DataView, offset: number, text: string) {
+  for (let index = 0; index < text.length; index += 1) {
+    view.setUint8(offset + index, text.charCodeAt(index));
+  }
 }
 
 async function readSystemMemoryInfo(): Promise<SystemMemoryInfo | undefined> {

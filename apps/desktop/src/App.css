@@ -268,6 +268,13 @@ textarea:disabled {
   font-size: 0.82rem;
 }
 
+.input-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
 .generation-error {
   margin: 0;
   color: #a23a2a;
@@ -304,7 +311,8 @@ textarea:disabled {
 }
 
 .attachment-preview button,
-.image-button {
+.image-button,
+.message-audio a {
   min-height: 36px;
   padding: 0 12px;
   border: 1px solid #c9d2cb;
@@ -322,9 +330,11 @@ textarea:disabled {
   opacity: 0.5;
 }
 
-.image-button {
+.image-button,
+.message-audio a {
   display: inline-grid;
   place-items: center;
+  text-decoration: none;
 }
 
 .image-button input {
@@ -364,6 +374,37 @@ textarea:disabled {
   background: #d6ded7;
 }
 
+.form-actions .record-button {
+  min-width: 132px;
+  border: 1px solid #c9d2cb;
+  color: #172026;
+  background: #ffffff;
+}
+
+.form-actions .record-button:hover:not(:disabled) {
+  background: #eef4f1;
+}
+
+.form-actions .record-button--active,
+.form-actions .record-button--active:hover:not(:disabled) {
+  border-color: #9f4636;
+  color: #ffffff;
+  background: #9f4636;
+}
+
+.message-audio audio {
+  width: 100%;
+  min-width: 0;
+}
+
+.message-audio {
+  display: grid;
+  grid-template-columns: minmax(180px, 1fr) auto auto;
+  align-items: center;
+  gap: 8px;
+  margin: 4px 0 14px;
+}
+
 @media (max-width: 800px) {
   .app-shell {
     grid-template-columns: 1fr;
@@ -392,5 +433,19 @@ textarea:disabled {
   .form-actions {
     align-items: stretch;
     flex-direction: column;
+  }
+
+  .input-actions {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .form-actions .record-button,
+  .image-button {
+    width: 100%;
+  }
+
+  .message-audio {
+    grid-template-columns: 1fr;
   }
 }
