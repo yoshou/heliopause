@@ -90,6 +90,38 @@ export type Gemma4VisionManifest = {
   tensorTypes: Record<string, number>;
 };
 
+export type Gemma4AudioManifest = {
+  architecture: "clip";
+  projectorType: "gemma4";
+  tensorCount: number;
+  embeddingLength: number;
+  feedForwardLength: number;
+  blockCount: number;
+  headCount: number;
+  headSize: number;
+  layerNormEpsilon: number;
+  numMelBins: number;
+  projectionDim: number;
+  outputProjectionDim: number;
+  convKernelSize: number;
+  residualWeight: number;
+  attentionChunkSize: number;
+  attentionContextLeft: number;
+  attentionContextRight: number;
+  attentionLogitCap: number;
+  attentionInvalidLogitsValue: number;
+  audioSeqLength: number;
+  audioMsPerToken: number;
+  sampleRate: number;
+  featureSize: number;
+  fftLength: number;
+  frameLength: number;
+  hopLength: number;
+  melFloor: number;
+  maxSeconds: number;
+  tensorTypes: Record<string, number>;
+};
+
 const REQUIRED_ARCHITECTURE = "gemma4";
 const GEMMA4V_DEFAULT_IMAGE_MIN_TOKENS = 252;
 const GEMMA4V_DEFAULT_IMAGE_MAX_TOKENS = 280;
@@ -98,6 +130,12 @@ export function isGemma4VisionGguf(gguf: GgufMetadata): boolean {
   return gguf.metadata["general.architecture"] === "clip" &&
     gguf.metadata["clip.has_vision_encoder"] === true &&
     normalizeVisionProjector(getMetadataString(gguf.metadata, "clip.vision.projector_type")) === "gemma4";
+}
+
+export function isGemma4AudioGguf(gguf: GgufMetadata): boolean {
+  return gguf.metadata["general.architecture"] === "clip" &&
+    gguf.metadata["clip.has_audio_encoder"] === true &&
+    normalizeAudioProjector(getMetadataString(gguf.metadata, "clip.audio.projector_type")) === "gemma4";
 }
 
 export function buildGemma4VisionManifest(gguf: GgufMetadata): Gemma4VisionManifest {
@@ -139,8 +177,65 @@ export function buildGemma4VisionManifest(gguf: GgufMetadata): Gemma4VisionManif
   };
 }
 
+export function buildGemma4AudioManifest(gguf: GgufMetadata): Gemma4AudioManifest {
+  const metadata = gguf.metadata;
+  const architecture = requiredString(metadata, "general.architecture");
+  if (architecture !== "clip") {
+    throw new Error(`Expected architecture clip, got ${architecture}`);
+  }
+
+  const rawProjector = requiredString(metadata, "clip.audio.projector_type");
+  const projectorType = normalizeAudioProjector(rawProjector);
+  if (projectorType !== "gemma4") {
+    throw new Error(`Unsupported audio projector type: ${rawProjector}`);
+  }
+
+  const tensorTypes: Record<string, number> = {};
+  for (const tensor of gguf.tensors) {
+    tensorTypes[tensor.type] = (tensorTypes[tensor.type] ?? 0) + 1;
+  }
+
+  const embeddingLength = requiredNumber(metadata, "clip.audio.embedding_length");
+  const headCount = requiredNumber(metadata, "clip.audio.attention.head_count");
+  return {
+    architecture: "clip",
+    projectorType,
+    tensorCount: gguf.tensorCount,
+    embeddingLength,
+    feedForwardLength: requiredNumber(metadata, "clip.audio.feed_forward_length"),
+    blockCount: requiredNumber(metadata, "clip.audio.block_count"),
+    headCount,
+    headSize: embeddingLength / headCount,
+    layerNormEpsilon: 1e-6,
+    numMelBins: requiredNumber(metadata, "clip.audio.num_mel_bins"),
+    projectionDim: requiredNumber(metadata, "clip.audio.projection_dim"),
+    outputProjectionDim: gguf.tensors.find((tensor) => tensor.name === "a.pre_encode.out.weight")?.dimensions[1] ?? 1536,
+    convKernelSize: 5,
+    residualWeight: 0.5,
+    attentionChunkSize: 12,
+    attentionContextLeft: 13,
+    attentionContextRight: 0,
+    attentionLogitCap: 50,
+    attentionInvalidLogitsValue: -1e9,
+    audioSeqLength: 750,
+    audioMsPerToken: 40,
+    sampleRate: 16000,
+    featureSize: 128,
+    fftLength: 512,
+    frameLength: 320,
+    hopLength: 160,
+    melFloor: 0.001,
+    maxSeconds: 30,
+    tensorTypes,
+  };
+}
+
 function normalizeVisionProjector(value: string | undefined): "gemma4" | string | undefined {
   return value === "gemma4v" ? "gemma4" : value;
+}
+
+function normalizeAudioProjector(value: string | undefined): "gemma4" | string | undefined {
+  return value === "gemma4a" ? "gemma4" : value;
 }
 
 export function buildGemma4Manifest(gguf: GgufMetadata): Gemma4ModelManifest {

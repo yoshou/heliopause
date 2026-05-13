@@ -2,19 +2,25 @@ import {
   buildGemma4Manifest,
   buildGemma4Tokenizer,
   cloneGemma4InferenceState,
+  createGemma4AudioSession,
   createFileGgufTensorReader,
   createGemma4ChatSession,
   createGemma4VisionSession,
   estimateWeightCacheBytes,
+  generateGemma4PreparedAudioChatTurn,
   generateGemma4PreparedImageChatTurn,
   generateGemma4ChatTurn,
   getGgufModelName,
+  isGemma4AudioGguf,
   isGemma4VisionGguf,
+  preprocessGemma4AudioPcm,
   planGemma4RunnerPlacement,
+  runGemma4AudioEncoder,
   preprocessGemma4VisionImageFile,
   prefillGemma4ChatMessages,
   runGemma4VisionEncoder,
   type ExecutionProviderConfig,
+  type Gemma4AudioSession,
   type Gemma4InferenceState,
   type Gemma4ModelSession,
   type Gemma4Tokenizer,
@@ -35,6 +41,7 @@ const FULL_WEIGHT_CACHE_HEADROOM = 1.25;
 
 let session: Gemma4ModelSession | undefined;
 let visionSession: Gemma4VisionSession | undefined;
+let audioSession: Gemma4AudioSession | undefined;
 let tokenizer: Gemma4Tokenizer | undefined;
 let currentState: Gemma4InferenceState | undefined;
 let currentSystemPrompt: string | undefined;
@@ -77,8 +84,10 @@ async function handleLoadModel(
   activeGeneration?.abortController.abort();
   activeGeneration = undefined;
   visionSession?.dispose();
+  audioSession?.dispose();
   session = undefined;
   visionSession = undefined;
+  audioSession = undefined;
   tokenizer = undefined;
   currentState = undefined;
   currentSystemPrompt = undefined;
@@ -86,6 +95,7 @@ async function handleLoadModel(
   const tensorReader = await createFileGgufTensorReader(request.file);
   const manifest = buildGemma4Manifest(tensorReader.metadata);
   let nextVisionSession: Gemma4VisionSession | undefined;
+  let nextAudioSession: Gemma4AudioSession | undefined;
   const estimatedWeightCacheBytes = estimateWeightCacheBytes(tensorReader);
   const resolvedMemoryProfile = resolveMemoryProfile(
     request.memoryProfile,
@@ -94,25 +104,42 @@ async function handleLoadModel(
   );
   if (request.visionFile) {
     const visionReader = await createFileGgufTensorReader(request.visionFile);
-    if (!isGemma4VisionGguf(visionReader.metadata)) {
-      throw new Error("Vision encoder GGUF is not a Gemma4V projector.");
+    if (!isGemma4VisionGguf(visionReader.metadata) && !isGemma4AudioGguf(visionReader.metadata)) {
+      throw new Error("Projector GGUF is not a Gemma4 multimodal projector.");
     }
-    nextVisionSession = createGemma4VisionSession(visionReader, {
-      maxWeightCacheBytes: resolvedMemoryProfile.maxWeightCacheBytes,
-      executionProviders: [
-        {
-          name: "webgpu",
-        },
-        {
-          name: "cpu",
-          options: {
-            projectionBatching: true,
-            residentWeightCache: resolvedMemoryProfile.wasmResidentWeightCache,
-            wasmKernels: true,
+    if (isGemma4VisionGguf(visionReader.metadata)) {
+      nextVisionSession = createGemma4VisionSession(visionReader, {
+        maxWeightCacheBytes: resolvedMemoryProfile.maxWeightCacheBytes,
+        executionProviders: [
+          {
+            name: "webgpu",
           },
-        },
-      ],
-    });
+          {
+            name: "cpu",
+            options: {
+              projectionBatching: true,
+              residentWeightCache: resolvedMemoryProfile.wasmResidentWeightCache,
+              wasmKernels: true,
+            },
+          },
+        ],
+      });
+    }
+    if (isGemma4AudioGguf(visionReader.metadata)) {
+      nextAudioSession = createGemma4AudioSession(visionReader, {
+        maxWeightCacheBytes: resolvedMemoryProfile.maxWeightCacheBytes,
+        executionProviders: [
+          {
+            name: "cpu",
+            options: {
+              projectionBatching: true,
+              residentWeightCache: resolvedMemoryProfile.wasmResidentWeightCache,
+              wasmKernels: false,
+            },
+          },
+        ],
+      });
+    }
   }
   const executionProviders: ExecutionProviderConfig[] = [{
     name: "cpu",
@@ -158,6 +185,7 @@ async function handleLoadModel(
 
   session = nextSession;
   visionSession = nextVisionSession;
+  audioSession = nextAudioSession;
   tokenizer = nextTokenizer;
 
   workerScope.postMessage({
@@ -177,6 +205,9 @@ async function handleLoadModel(
             max: nextVisionSession.manifest.imageMaxTokens,
           }
         : undefined,
+      supportsAudio: Boolean(nextAudioSession),
+      audioFileName: nextAudioSession ? request.visionFileName : undefined,
+      audioMaxSeconds: nextAudioSession?.manifest.maxSeconds,
     },
   });
 }
@@ -217,7 +248,29 @@ async function handleGenerateTurn(
         });
       },
     };
-    if (request.image) {
+    if (request.audio) {
+      if (!audioSession) {
+        throw new Error("No audio encoder loaded.");
+      }
+      const features = preprocessGemma4AudioPcm(request.audio, audioSession.manifest);
+      if (abortController.signal.aborted) {
+        throw new DOMException("Generation was aborted.", "AbortError");
+      }
+      const encoded = await runGemma4AudioEncoder(audioSession, features, {
+        signal: abortController.signal,
+      });
+      await generateGemma4PreparedAudioChatTurn(
+        session,
+        tokenizer,
+        workingState,
+        request.userContent,
+        {
+          hidden: encoded.hidden,
+          tokenCount: encoded.tokenCount,
+        },
+        turnOptions,
+      );
+    } else if (request.image) {
       if (!visionSession) {
         throw new Error("No vision encoder loaded.");
       }

@@ -21,10 +21,13 @@ export {
 
 export {
   auditGemma4TensorCoverage,
+  buildGemma4AudioManifest,
   buildGemma4Manifest,
   buildGemma4VisionManifest,
+  isGemma4AudioGguf,
   isGemma4VisionGguf,
   type ExpectedTensor,
+  type Gemma4AudioManifest,
   type Gemma4LayerKind,
   type Gemma4ModelManifest,
   type Gemma4VisionManifest,
@@ -53,6 +56,17 @@ export {
   type Gemma4VisionResize,
   type Gemma4VisionSessionOptions,
 } from "./vision";
+
+export {
+  createGemma4AudioSession,
+  preprocessGemma4AudioPcm,
+  runGemma4AudioEncoder,
+  Gemma4AudioSession,
+  type Gemma4AudioEncodeResult,
+  type Gemma4AudioFeatures,
+  type Gemma4AudioPcmInput,
+  type Gemma4AudioSessionOptions,
+} from "./audio";
 
 export {
   createGemma4InferenceState,
@@ -124,6 +138,7 @@ export {
   createFileGgufTensorReader,
   createGemma4ChatSession,
   DEFAULT_GEMMA4_SYSTEM_PROMPT,
+  generateGemma4PreparedAudioChatTurn,
   generateGemma4PreparedImageChatTurn,
   generateGemma4ChatTurn,
   generateGemma4ChatCompletion,
@@ -138,6 +153,7 @@ export {
   type Gemma4ChatTemplateOptions,
   type Gemma4ChatTurnOptions,
   type Gemma4ChatTurnResult,
+  type Gemma4PreparedAudioInput,
   type Gemma4PreparedImageInput,
 } from "./chat";
 

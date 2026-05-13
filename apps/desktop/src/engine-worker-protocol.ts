@@ -29,11 +29,20 @@ export type WorkerModelInfo = {
     min: number;
     max: number;
   };
+  supportsAudio: boolean;
+  audioFileName?: string;
+  audioMaxSeconds?: number;
 };
 
 export type WorkerImageInput = {
   file: File;
   fileName: string;
+};
+
+export type WorkerAudioInput = {
+  pcm: Float32Array;
+  sampleRate: 16000;
+  durationMs: number;
 };
 
 export type EngineWorkerRequest =
@@ -53,6 +62,7 @@ export type EngineWorkerRequest =
       systemPrompt: string;
       userContent: string;
       image?: WorkerImageInput;
+      audio?: WorkerAudioInput;
       maxNewTokens: number;
     }
   | {

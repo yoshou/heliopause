@@ -33,6 +33,7 @@ type UiAudioAttachment = {
   wavBlob?: Blob;
   wavUrl?: string;
   wavFileName?: string;
+  pcm: Float32Array;
   durationMs: number;
 };
 
@@ -58,6 +59,7 @@ type PendingRequest =
       assistantId: string;
       userContent: string;
       image?: UiImageAttachment;
+      audio?: UiAudioAttachment;
       resolve: () => void;
       reject: (error: Error) => void;
     };
@@ -101,11 +103,13 @@ function App() {
   );
   const canRecordAudio = useMemo(
     () =>
+      model.status === "ready" &&
+      model.supportsAudio &&
       !isGenerating &&
       recordingState !== "processing" &&
       Boolean(navigator.mediaDevices?.getUserMedia) &&
       typeof MediaRecorder !== "undefined",
-    [isGenerating, recordingState],
+    [isGenerating, model, recordingState],
   );
   const recordingLabel = recordingState === "recording"
     ? "Recording..."
@@ -244,7 +248,7 @@ function App() {
       if (!worker) {
         throw new Error("The model worker is not running. Reload the model.");
       }
-      await generateTurnInWorker(worker, userMessage.id, assistantId, trimmedPrompt, imageAttachment, 256);
+      await generateTurnInWorker(worker, userMessage.id, assistantId, trimmedPrompt, imageAttachment, undefined, 256);
     } catch (error) {
       setGenerationError(error instanceof Error ? error.message : String(error));
       setMessages((currentMessages) =>
@@ -418,7 +422,7 @@ function App() {
     const webmBlob = new Blob(chunks, { type: mimeType });
     const fileName = `heliopause-audio-${timestamp}.webm`;
     try {
-      const wavBlob = await create16KhzMonoWavBlob(webmBlob);
+      const { wavBlob, pcm } = await create16KhzMonoWavBlob(webmBlob);
       const nextAudio: UiAudioAttachment = {
         blob: webmBlob,
         url: URL.createObjectURL(webmBlob),
@@ -426,17 +430,10 @@ function App() {
         wavBlob,
         wavUrl: URL.createObjectURL(wavBlob),
         wavFileName: `heliopause-audio-${timestamp}-16khz.wav`,
+        pcm,
         durationMs,
       };
-      setMessages((currentMessages) => [
-        ...currentMessages,
-        {
-          id: createId("user"),
-          role: "user",
-          content: "",
-          audio: nextAudio,
-        },
-      ]);
+      await submitAudioTurn(nextAudio);
       setGenerationError(undefined);
     } catch (error) {
       setGenerationError(error instanceof Error ? error.message : String(error));
@@ -451,6 +448,47 @@ function App() {
       revokeMessageAudioAttachments(currentMessages);
       return [];
     });
+  }
+
+  async function submitAudioTurn(audio: UiAudioAttachment) {
+    if (model.status !== "ready" || isGenerating || !model.supportsAudio) {
+      revokeAudioAttachment(audio);
+      return;
+    }
+
+    const userMessage: UiMessage = {
+      id: createId("user"),
+      role: "user",
+      content: "",
+      audio,
+    };
+    const assistantId = createId("assistant");
+    setMessages((currentMessages) => [
+      ...currentMessages,
+      userMessage,
+      { id: assistantId, role: "assistant" as const, content: "" },
+    ]);
+    setIsGenerating(true);
+    setGenerationError(undefined);
+
+    try {
+      const worker = workerRef.current;
+      if (!worker) {
+        throw new Error("The model worker is not running. Reload the model.");
+      }
+      await generateTurnInWorker(worker, userMessage.id, assistantId, "", undefined, audio, 256);
+    } catch (error) {
+      setGenerationError(error instanceof Error ? error.message : String(error));
+      setMessages((currentMessages) =>
+        currentMessages.filter((message) =>
+          message.id !== userMessage.id && message.id !== assistantId
+        ),
+      );
+      revokeAudioAttachment(audio);
+    } finally {
+      generationRequestRef.current = null;
+      setIsGenerating(false);
+    }
   }
 
   function stopActiveRecording() {
@@ -520,6 +558,7 @@ function App() {
     assistantId: string,
     userContent: string,
     image: UiImageAttachment | undefined,
+    audio: UiAudioAttachment | undefined,
     maxNewTokens: number,
   ): Promise<void> {
     const requestId = nextRequestIdRef.current;
@@ -534,6 +573,7 @@ function App() {
         assistantId,
         userContent,
         image,
+        audio,
         resolve,
         reject,
       });
@@ -546,6 +586,13 @@ function App() {
           ? {
               file: image.file,
               fileName: image.fileName,
+            }
+          : undefined,
+        audio: audio
+          ? {
+              pcm: audio.pcm,
+              sampleRate: 16000,
+              durationMs: audio.durationMs,
             }
           : undefined,
         maxNewTokens,
@@ -595,6 +642,7 @@ function App() {
           uiMessage.id !== pending.userId && uiMessage.id !== pending.assistantId
         ),
       );
+      revokeAudioAttachment(pending.audio);
       setPrompt((currentPrompt) =>
         currentPrompt.length === 0 ? pending.userContent : currentPrompt
       );
@@ -649,7 +697,7 @@ function App() {
             <input type="file" accept=".gguf" onChange={handleModelChange} />
           </label>
           <label className="file-picker">
-            <span>Vision encoder GGUF</span>
+            <span>Multimodal projector GGUF</span>
             <input type="file" accept=".gguf" onChange={handleVisionModelChange} />
           </label>
           <ModelStatus model={model} />
@@ -847,6 +895,14 @@ function ModelStatus({ model }: { model: ModelState }) {
         </dd>
       </div>
       <div>
+        <dt>Audio</dt>
+        <dd>
+          {model.supportsAudio
+            ? `${model.audioFileName ?? "Loaded"} (${model.audioMaxSeconds ?? 30}s max)`
+            : "Not loaded"}
+        </dd>
+      </div>
+      <div>
         <dt>Estimated weights</dt>
         <dd>{formatBytes(model.memoryProfile.estimatedWeightCacheBytes)}</dd>
       </div>
@@ -914,13 +970,16 @@ function formatAudioFileTimestamp(date: Date): string {
   ].join("");
 }
 
-async function create16KhzMonoWavBlob(audioBlob: Blob): Promise<Blob> {
+async function create16KhzMonoWavBlob(audioBlob: Blob): Promise<{ wavBlob: Blob; pcm: Float32Array }> {
   const audioContext = new AudioContext();
   try {
     const decoded = await audioContext.decodeAudioData(await audioBlob.arrayBuffer());
     const mono = mixAudioBufferToMono(decoded);
     const resampled = resampleLinear(mono, decoded.sampleRate, AUDIO_SAMPLE_RATE);
-    return encodeFloat32PcmWav(resampled, AUDIO_SAMPLE_RATE);
+    return {
+      wavBlob: encodeFloat32PcmWav(resampled, AUDIO_SAMPLE_RATE),
+      pcm: resampled,
+    };
   } finally {
     await audioContext.close();
   }
