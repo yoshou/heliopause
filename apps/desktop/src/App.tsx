@@ -1,4 +1,4 @@
-import { ChangeEvent, ClipboardEvent, FormEvent, KeyboardEvent, PointerEvent, useEffect, useMemo, useRef, useState } from "react";
+import { ChangeEvent, ClipboardEvent, DragEvent, FormEvent, KeyboardEvent, PointerEvent, useEffect, useMemo, useRef, useState } from "react";
 import {
   DEFAULT_GEMMA4_SYSTEM_PROMPT,
   stripGemma4Thinking,
@@ -15,9 +15,14 @@ type UiMessage = {
   id: string;
   role: "user" | "assistant";
   content: string;
+  files?: UiFileAttachment[];
   image?: UiImageAttachment;
   audio?: UiAudioAttachment;
   inferenceDurationMs?: number;
+};
+
+type UiFileAttachment = {
+  fileName: string;
 };
 
 type UiImageAttachment = {
@@ -45,6 +50,24 @@ type ModelState =
   | ({ status: "ready" } & WorkerModelInfo)
   | { status: "error"; fileName: string; message: string };
 
+type GgufConfirmation = {
+  message: string;
+  mainCandidates: File[];
+  projectorCandidates: File[];
+  selectedMainName: string;
+  selectedProjectorName: string;
+};
+
+type GgufValidation =
+  | { status: "valid"; mainFile: File; projectorFile?: File }
+  | { status: "invalid"; message: string }
+  | {
+      status: "needs-confirmation";
+      message: string;
+      mainCandidates: File[];
+      projectorCandidates: File[];
+    };
+
 type PendingRequest =
   | {
       type: "load";
@@ -67,20 +90,29 @@ type PendingRequest =
 const MIN_RECORDING_MS = 300;
 const MAX_RECORDING_MS = 30_000;
 const AUDIO_SAMPLE_RATE = 16_000;
+const INITIAL_ASSISTANT_CONTENT = [
+  "Drop your GGUF files in the message box.",
+  "Add the main model and optional projector together.",
+].join("\n");
 
 function App() {
   const [model, setModel] = useState<ModelState>({ status: "empty" });
-  const [memoryProfile, setMemoryProfile] = useState<MemoryProfile>("auto");
-  const [systemPrompt, setSystemPrompt] = useState(DEFAULT_GEMMA4_SYSTEM_PROMPT);
+  const memoryProfile: MemoryProfile = "auto";
+  const systemPrompt = DEFAULT_GEMMA4_SYSTEM_PROMPT;
   const [prompt, setPrompt] = useState("");
-  const [modelFile, setModelFile] = useState<File | undefined>();
-  const [visionFile, setVisionFile] = useState<File | undefined>();
+  const [ggufFiles, setGgufFiles] = useState<File[]>([]);
+  const [ggufError, setGgufError] = useState<string | undefined>();
+  const [ggufConfirmation, setGgufConfirmation] = useState<GgufConfirmation | undefined>();
+  const [isDraggingFiles, setIsDraggingFiles] = useState(false);
   const [imageAttachment, setImageAttachment] = useState<UiImageAttachment | undefined>();
   const [recordingState, setRecordingState] = useState<RecordingState>("idle");
-  const [messages, setMessages] = useState<UiMessage[]>([]);
+  const [messages, setMessages] = useState<UiMessage[]>(() => [
+    createAssistantMessage(INITIAL_ASSISTANT_CONTENT),
+  ]);
   const [isGenerating, setIsGenerating] = useState(false);
   const [generationError, setGenerationError] = useState<string | undefined>();
   const workerRef = useRef<Worker | null>(null);
+  const modelFilesInputRef = useRef<HTMLInputElement | null>(null);
   const nextRequestIdRef = useRef(1);
   const pendingRequestsRef = useRef(new Map<number, PendingRequest>());
   const generationRequestRef = useRef<{ requestId: number; worker: Worker } | null>(null);
@@ -93,14 +125,18 @@ function App() {
   const recordingStopTimerRef = useRef<number | undefined>(undefined);
   const recordingStopRequestedRef = useRef(false);
 
-  const canSubmit = useMemo(
-    () =>
+  const isGgufComposerActive = model.status !== "ready" || ggufFiles.length > 0 || Boolean(ggufConfirmation);
+  const canSubmit = useMemo(() => {
+    if (isGgufComposerActive) {
+      return model.status !== "loading" && ggufFiles.length > 0 && !isGenerating;
+    }
+    return (
       model.status === "ready" &&
       prompt.trim().length > 0 &&
       !isGenerating &&
-      (!imageAttachment || model.supportsImages),
-    [imageAttachment, isGenerating, model, prompt],
-  );
+      (!imageAttachment || model.supportsImages)
+    );
+  }, [ggufFiles.length, imageAttachment, isGenerating, isGgufComposerActive, model, prompt]);
   const canRecordAudio = useMemo(
     () =>
       model.status === "ready" &&
@@ -151,26 +187,49 @@ function App() {
     };
   }, []);
 
-  async function handleModelChange(event: ChangeEvent<HTMLInputElement>) {
-    const file = event.target.files?.[0];
-    if (!file) {
+  function handleModelFilesChange(event: ChangeEvent<HTMLInputElement>) {
+    const files = Array.from(event.target.files ?? []);
+    if (files.length === 0) {
       return;
     }
-    setModelFile(file);
-    await loadSelectedModel(file, visionFile);
+    addGgufFiles(files);
     event.target.value = "";
   }
 
-  async function handleVisionModelChange(event: ChangeEvent<HTMLInputElement>) {
-    const file = event.target.files?.[0];
-    if (!file) {
+  function addGgufFiles(files: File[]) {
+    const ggufs = files.filter(isGgufFile);
+    const rejectedImages = files.some((file) => file.type.startsWith("image/"));
+    if (ggufs.length === 0) {
+      const message = rejectedImages && model.status !== "ready"
+        ? "Load a GGUF model before attaching images."
+        : "Add GGUF files to load a model.";
+      setGgufError(message);
+      appendAssistantMessage(message);
       return;
     }
-    setVisionFile(file);
-    if (modelFile) {
-      await loadSelectedModel(modelFile, file);
+
+    if (imageAttachment) {
+      URL.revokeObjectURL(imageAttachment.url);
     }
-    event.target.value = "";
+    setImageAttachment(undefined);
+    setGgufFiles((currentFiles) => {
+      const nextFiles = [...currentFiles];
+      for (const file of ggufs) {
+        if (!nextFiles.some((existingFile) => existingFile.name === file.name && existingFile.size === file.size)) {
+          nextFiles.push(file);
+        }
+      }
+      return nextFiles;
+    });
+    setGgufConfirmation(undefined);
+    setGgufError(files.length === ggufs.length ? undefined : "Only GGUF files can be used to load a model.");
+    setGenerationError(undefined);
+  }
+
+  function removeGgufFile(file: File) {
+    setGgufFiles((currentFiles) => currentFiles.filter((currentFile) => currentFile !== file));
+    setGgufConfirmation(undefined);
+    setGgufError(undefined);
   }
 
   async function loadSelectedModel(file: File, nextVisionFile: File | undefined) {
@@ -182,7 +241,6 @@ function App() {
     }
     workerRef.current = worker;
     generationRequestRef.current = null;
-    clearMessages();
 
     setModel({ status: "loading", fileName: file.name });
     try {
@@ -195,11 +253,11 @@ function App() {
         memoryProfile,
         await readSystemMemoryInfo(),
       );
-      clearMessages();
       setModel({
         status: "ready",
         ...modelInfo,
       });
+      appendAssistantMessage(formatModelLoadedMessage(modelInfo));
     } catch (error) {
       if (workerRef.current === worker) {
         workerRef.current = null;
@@ -210,11 +268,19 @@ function App() {
         fileName: file.name,
         message: error instanceof Error ? error.message : String(error),
       });
+      appendAssistantMessage([
+        "I could not load those GGUF files.",
+        "Please choose a usable Gemma GGUF model file, and optionally its projector.",
+      ].join("\n"));
     }
   }
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    if (isGgufComposerActive) {
+      await submitGgufFiles();
+      return;
+    }
     if (model.status !== "ready" || isGenerating) {
       return;
     }
@@ -286,8 +352,93 @@ function App() {
   function handlePromptPaste(event: ClipboardEvent<HTMLTextAreaElement>) {
     const file = Array.from(event.clipboardData.files).find((item) => item.type.startsWith("image/"));
     if (file) {
+      if (model.status !== "ready") {
+        const message = "Load a GGUF model before attaching images.";
+        setGgufError(message);
+        appendAssistantMessage(message);
+        return;
+      }
       setNextImageAttachment(file);
     }
+  }
+
+  function handleComposerDragOver(event: DragEvent<HTMLFormElement>) {
+    if (event.dataTransfer.types.includes("Files")) {
+      event.preventDefault();
+      setIsDraggingFiles(true);
+    }
+  }
+
+  function handleComposerDragLeave(event: DragEvent<HTMLFormElement>) {
+    if (!event.currentTarget.contains(event.relatedTarget as Node | null)) {
+      setIsDraggingFiles(false);
+    }
+  }
+
+  function handleComposerDrop(event: DragEvent<HTMLFormElement>) {
+    const files = Array.from(event.dataTransfer.files);
+    if (files.length === 0) {
+      return;
+    }
+    event.preventDefault();
+    setIsDraggingFiles(false);
+
+    const ggufs = files.filter(isGgufFile);
+    if (ggufs.length > 0 || model.status !== "ready") {
+      addGgufFiles(files);
+      return;
+    }
+
+    const image = files.find((file) => file.type.startsWith("image/"));
+    if (image) {
+      setNextImageAttachment(image);
+      return;
+    }
+
+    setGenerationError("Attach an image, or add GGUF files to replace the model.");
+  }
+
+  async function submitGgufFiles() {
+    if (model.status === "loading" || ggufFiles.length === 0) {
+      return;
+    }
+
+    const validation = ggufConfirmation
+      ? resolveConfirmedGgufFiles(ggufFiles, ggufConfirmation)
+      : validateGgufFiles(ggufFiles);
+
+    if (validation.status === "invalid") {
+      setGgufError(validation.message);
+      appendAssistantMessage(validation.message);
+      return;
+    }
+
+    if (validation.status === "needs-confirmation") {
+      setGgufConfirmation({
+        ...validation,
+        selectedMainName: validation.mainCandidates[0]?.name ?? "",
+        selectedProjectorName: validation.projectorCandidates[0]?.name ?? "",
+      });
+      setGgufError(undefined);
+      appendAssistantMessage(validation.message);
+      return;
+    }
+
+    const filesForMessage = [validation.mainFile, validation.projectorFile].filter(Boolean) as File[];
+    setMessages((currentMessages) => [
+      ...currentMessages,
+      {
+        id: createId("user"),
+        role: "user",
+        content: filesForMessage.map((file) => file.name).join("\n"),
+        files: filesForMessage.map((file) => ({ fileName: file.name })),
+      },
+    ]);
+    setGgufFiles([]);
+    setGgufConfirmation(undefined);
+    setGgufError(undefined);
+    setPrompt("");
+    await loadSelectedModel(validation.mainFile, validation.projectorFile);
   }
 
   function clearImageAttachment() {
@@ -443,11 +594,11 @@ function App() {
     }
   }
 
-  function clearMessages() {
-    setMessages((currentMessages) => {
-      revokeMessageAudioAttachments(currentMessages);
-      return [];
-    });
+  function appendAssistantMessage(content: string) {
+    setMessages((currentMessages) => [
+      ...currentMessages,
+      createAssistantMessage(content),
+    ]);
   }
 
   async function submitAudioTurn(audio: UiAudioAttachment) {
@@ -675,127 +826,119 @@ function App() {
 
   return (
     <main className="app-shell">
-      <aside className="sidebar" aria-label="Model settings">
-        <header>
-          <h1>Heliopause</h1>
-        </header>
-
-        <section className="model-panel">
-          <label className="field-label" htmlFor="memory-profile">Weight cache</label>
-          <select
-            id="memory-profile"
-            value={memoryProfile}
-            onChange={(event) => setMemoryProfile(event.target.value as MemoryProfile)}
-            disabled={model.status === "loading" || isGenerating}
-          >
-            <option value="auto">Auto</option>
-            <option value="full">Full</option>
-            <option value="low">Low</option>
-          </select>
-          <label className="file-picker">
-            <span>Load GGUF model</span>
-            <input type="file" accept=".gguf" onChange={handleModelChange} />
-          </label>
-          <label className="file-picker">
-            <span>Multimodal projector GGUF</span>
-            <input type="file" accept=".gguf" onChange={handleVisionModelChange} />
-          </label>
-          <ModelStatus model={model} />
-        </section>
-
-        <section className="system-panel">
-          <label htmlFor="system-prompt">System prompt</label>
-          <textarea
-            id="system-prompt"
-            value={systemPrompt}
-            onChange={(event) => {
-              setSystemPrompt(event.target.value);
-              clearMessages();
-            }}
-            rows={8}
-            disabled={isGenerating}
-          />
-        </section>
-      </aside>
-
       <section className="chat-workspace" aria-label="Chat">
         <div className="message-panel" aria-live="polite">
-          {messages.length === 0 ? (
-            <div className="empty-state">
-              <h2>Load a Gemma GGUF model</h2>
-              <p>Choose a local model file, then start a private on-device chat.</p>
-            </div>
-          ) : (
-            messages.map((message) => (
-              <MessageBubble
-                isGenerating={isGenerating}
-                key={message.id}
-                message={message}
-              />
-            ))
-          )}
+          {messages.map((message) => (
+            <MessageBubble
+              isGenerating={isGenerating}
+              key={message.id}
+              message={message}
+            />
+          ))}
         </div>
 
-        <form className="prompt-form" onSubmit={handleSubmit}>
-          <label htmlFor="prompt">Message</label>
-          <textarea
-            id="prompt"
-            value={prompt}
-            onChange={(event) => {
-              setPrompt(event.target.value);
-              setGenerationError(undefined);
-            }}
-            onPaste={handlePromptPaste}
-            placeholder={model.status === "ready" ? "Ask the local model" : "Load a GGUF model first"}
-            rows={4}
-            disabled={model.status !== "ready" || isGenerating}
+        <form
+          className={`prompt-form${isDraggingFiles ? " prompt-form--dragging" : ""}`}
+          onDragLeave={handleComposerDragLeave}
+          onDragOver={handleComposerDragOver}
+          onDrop={handleComposerDrop}
+          onSubmit={handleSubmit}
+        >
+          <input
+            ref={modelFilesInputRef}
+            className="visually-hidden-input"
+            type="file"
+            accept=".gguf"
+            multiple
+            onChange={handleModelFilesChange}
+            disabled={model.status === "loading" || isGenerating}
           />
-          {imageAttachment ? (
-            <div className="attachment-preview">
-              <img src={imageAttachment.url} alt="" />
-              <span>{imageAttachment.fileName}</span>
-              <button type="button" onClick={clearImageAttachment} disabled={isGenerating}>
-                Remove
-              </button>
-            </div>
-          ) : null}
-          {generationError ? (
-            <p className="generation-error">{generationError}</p>
-          ) : null}
+          {isGgufComposerActive ? (
+            <GgufComposer
+              confirmation={ggufConfirmation}
+              disabled={model.status === "loading" || isGenerating}
+              error={ggufError}
+              files={ggufFiles}
+              isLoading={model.status === "loading"}
+              onBrowse={() => modelFilesInputRef.current?.click()}
+              onConfirmationChange={setGgufConfirmation}
+              onRemoveFile={removeGgufFile}
+            />
+          ) : (
+            <>
+              <label htmlFor="prompt">You</label>
+              <textarea
+                id="prompt"
+                value={prompt}
+                onChange={(event) => {
+                  setPrompt(event.target.value);
+                  setGenerationError(undefined);
+                }}
+                onPaste={handlePromptPaste}
+                placeholder="Ask the local model"
+                rows={4}
+                disabled={isGenerating}
+              />
+              {imageAttachment ? (
+                <div className="attachment-preview">
+                  <img src={imageAttachment.url} alt="" />
+                  <span>{imageAttachment.fileName}</span>
+                  <button type="button" onClick={clearImageAttachment} disabled={isGenerating}>
+                    Remove
+                  </button>
+                </div>
+              ) : null}
+              {generationError ? (
+                <p className="generation-error">{generationError}</p>
+              ) : null}
+            </>
+          )}
           <div className="form-actions">
             <div className="input-actions">
-              <label className="image-button">
-                Image
-                <input
-                  type="file"
-                  accept="image/*"
-                  onChange={handleImageFileChange}
-                  disabled={model.status !== "ready" || isGenerating || (model.status === "ready" && !model.supportsImages)}
-                />
-              </label>
               <button
                 type="button"
-                className={`record-button${recordingState === "recording" ? " record-button--active" : ""}`}
-                onPointerDown={handleRecordPointerDown}
-                onPointerUp={handleRecordPointerUp}
-                onPointerCancel={handleRecordPointerCancel}
-                onPointerLeave={handleRecordPointerCancel}
-                onKeyDown={handleRecordKeyDown}
-                onKeyUp={handleRecordKeyUp}
-                disabled={!canRecordAudio}
-                aria-pressed={recordingState === "recording"}
+                className="image-button"
+                onClick={() => modelFilesInputRef.current?.click()}
+                disabled={model.status === "loading" || isGenerating}
               >
-                {recordingLabel}
+                Models
               </button>
+              {!isGgufComposerActive ? (
+                <>
+                  <label className="image-button">
+                    Image
+                    <input
+                      type="file"
+                      accept="image/*"
+                      onChange={handleImageFileChange}
+                      disabled={isGenerating || (model.status === "ready" && !model.supportsImages)}
+                    />
+                  </label>
+                  <button
+                    type="button"
+                    className={`record-button${recordingState === "recording" ? " record-button--active" : ""}`}
+                    onPointerDown={handleRecordPointerDown}
+                    onPointerUp={handleRecordPointerUp}
+                    onPointerCancel={handleRecordPointerCancel}
+                    onPointerLeave={handleRecordPointerCancel}
+                    onKeyDown={handleRecordKeyDown}
+                    onKeyUp={handleRecordKeyUp}
+                    disabled={!canRecordAudio}
+                    aria-pressed={recordingState === "recording"}
+                  >
+                    {recordingLabel}
+                  </button>
+                </>
+              ) : null}
             </div>
-            <p>{model.status === "ready" ? `${prompt.trim().length} characters` : "No model loaded"}</p>
+            <p>{composerStatusLabel(model, prompt, ggufFiles.length)}</p>
             {isGenerating ? (
               <button type="button" className="secondary-button" onClick={handleStop}>
                 Stop
               </button>
             ) : (
               <button type="submit" disabled={!canSubmit}>
-                Send
+                {model.status === "loading" ? "Loading..." : ggufConfirmation ? "Load" : "Send"}
               </button>
             )}
           </div>
@@ -809,23 +952,133 @@ function MessageBubble(
   { isGenerating, message }: { isGenerating: boolean; message: UiMessage },
 ) {
   const visibleContent = stripGemma4Thinking(message.content);
+  const textContent = message.files && message.files.length > 0 ? "" : visibleContent;
   const placeholder = message.role === "assistant" && isGenerating ? "Generating..." : "";
   return (
     <article className={`message message--${message.role}`}>
       <span>{message.role === "user" ? "You" : "Assistant"}</span>
+      {message.files && message.files.length > 0 ? (
+        <div className="message-files" aria-label="Attached files">
+          {message.files.map((file) => (
+            <div className="file-chip" key={file.fileName}>
+              {file.fileName}
+            </div>
+          ))}
+        </div>
+      ) : null}
       {message.image ? (
         <img className="message-image" src={message.image.url} alt="" />
       ) : null}
       {message.audio ? (
         <AudioMessage audio={message.audio} />
       ) : null}
-      {visibleContent || placeholder ? <p>{visibleContent || placeholder}</p> : null}
+      {textContent || placeholder ? <p>{textContent || placeholder}</p> : null}
       {message.role === "assistant" && message.inferenceDurationMs !== undefined ? (
         <footer className="message-meta">
           {formatDuration(message.inferenceDurationMs)}
         </footer>
       ) : null}
     </article>
+  );
+}
+
+function GgufComposer(
+  {
+    confirmation,
+    disabled,
+    error,
+    files,
+    isLoading,
+    onBrowse,
+    onConfirmationChange,
+    onRemoveFile,
+  }: {
+    confirmation: GgufConfirmation | undefined;
+    disabled: boolean;
+    error: string | undefined;
+    files: File[];
+    isLoading: boolean;
+    onBrowse: () => void;
+    onConfirmationChange: (confirmation: GgufConfirmation) => void;
+    onRemoveFile: (file: File) => void;
+  },
+) {
+  return (
+    <>
+      <label>You</label>
+      <div className="gguf-drop-box">
+        {files.length > 0 ? (
+          <div className="file-chip-list" aria-label="Attached GGUF files">
+            {files.map((file) => (
+              <div className="file-chip file-chip--removable" key={`${file.name}-${file.size}`}>
+                <span>{file.name}</span>
+                <button
+                  type="button"
+                  aria-label={`Remove ${file.name}`}
+                  onClick={() => onRemoveFile(file)}
+                  disabled={disabled}
+                >
+                  Remove
+                </button>
+              </div>
+            ))}
+          </div>
+        ) : (
+          <button
+            type="button"
+            className="gguf-placeholder"
+            onClick={onBrowse}
+            disabled={disabled}
+          >
+            Drop GGUF here or choose files
+          </button>
+        )}
+        {isLoading ? <p className="composer-hint">Loading model...</p> : null}
+      </div>
+      {confirmation ? (
+        <div className="gguf-confirmation">
+          <p>{confirmation.message}</p>
+          <label>
+            Main model
+            <select
+              value={confirmation.selectedMainName}
+              onChange={(event) =>
+                onConfirmationChange({
+                  ...confirmation,
+                  selectedMainName: event.target.value,
+                })}
+              disabled={disabled}
+            >
+              {confirmation.mainCandidates.map((file) => (
+                <option key={`${file.name}-${file.size}-main`} value={file.name}>
+                  {file.name}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label>
+            Projector
+            <select
+              value={confirmation.selectedProjectorName}
+              onChange={(event) =>
+                onConfirmationChange({
+                  ...confirmation,
+                  selectedProjectorName: event.target.value,
+                })}
+              disabled={disabled}
+            >
+              <option value="">None</option>
+              {confirmation.projectorCandidates.map((file) => (
+                <option key={`${file.name}-${file.size}-projector`} value={file.name}>
+                  {file.name}
+                </option>
+              ))}
+            </select>
+          </label>
+        </div>
+      ) : null}
+      {error ? <p className="generation-error">{error}</p> : null}
+    </>
   );
 }
 
@@ -841,90 +1094,120 @@ function AudioMessage({ audio }: { audio: UiAudioAttachment }) {
   );
 }
 
-function ModelStatus({ model }: { model: ModelState }) {
-  if (model.status === "empty") {
-    return <p className="model-status">No model loaded.</p>;
+function validateGgufFiles(files: File[]): GgufValidation {
+  const ggufFiles = files.filter(isGgufFile);
+  if (ggufFiles.length === 0) {
+    return {
+      status: "invalid",
+      message: "Add GGUF files to load a model.",
+    };
   }
-  if (model.status === "loading") {
-    return <p className="model-status">Loading {model.fileName}...</p>;
+
+  const projectorCandidates = ggufFiles.filter(isProjectorFile);
+  const mainCandidates = ggufFiles.filter((file) => !isProjectorFile(file));
+
+  if (mainCandidates.length === 0 && projectorCandidates.length > 0) {
+    return {
+      status: "invalid",
+      message: [
+        "This looks like a projector file, but I still need the main model.",
+        "Please add the main Gemma GGUF model and send again.",
+      ].join("\n"),
+    };
   }
-  if (model.status === "error") {
-    return (
-      <p className="model-status model-status--error">
-        {model.fileName}: {model.message}
-      </p>
-    );
+
+  if (mainCandidates.length === 0) {
+    return {
+      status: "invalid",
+      message: [
+        "I could not find a usable main model in those files.",
+        "Please add a Gemma GGUF model file, and optionally its projector.",
+      ].join("\n"),
+    };
   }
-  return (
-    <dl className="model-details">
-      <div>
-        <dt>Model</dt>
-        <dd>{model.modelName}</dd>
-      </div>
-      <div>
-        <dt>File</dt>
-        <dd>{model.fileName}</dd>
-      </div>
-      <div>
-        <dt>Context</dt>
-        <dd>
-          {model.contextLength.toLocaleString()} chat tokens
-          {model.originalContextLength > model.contextLength
-            ? ` (${model.originalContextLength.toLocaleString()} model max)`
-            : ""}
-        </dd>
-      </div>
-      <div>
-        <dt>Weight cache</dt>
-        <dd>
-          {model.memoryProfile.resolved} / {formatBytes(model.memoryProfile.maxWeightCacheBytes)}
-          {model.memoryProfile.requested === "auto" ? " (auto)" : ""}
-          {model.memoryProfile.wasmResidentWeightCache ? " / WASM resident" : ""}
-        </dd>
-      </div>
-      <div>
-        <dt>Execution</dt>
-        <dd>{executionLabel(model.memoryProfile)}</dd>
-      </div>
-      <div>
-        <dt>Vision</dt>
-        <dd>
-          {model.supportsImages
-            ? `${model.visionFileName ?? "Loaded"} (${model.visionImageTokens?.min ?? 0}-${model.visionImageTokens?.max ?? 0} image tokens)`
-            : "Not loaded"}
-        </dd>
-      </div>
-      <div>
-        <dt>Audio</dt>
-        <dd>
-          {model.supportsAudio
-            ? `${model.audioFileName ?? "Loaded"} (${model.audioMaxSeconds ?? 30}s max)`
-            : "Not loaded"}
-        </dd>
-      </div>
-      <div>
-        <dt>Estimated weights</dt>
-        <dd>{formatBytes(model.memoryProfile.estimatedWeightCacheBytes)}</dd>
-      </div>
-    </dl>
-  );
+
+  if (mainCandidates.length > 1 || projectorCandidates.length > 1) {
+    return {
+      status: "needs-confirmation",
+      message: mainCandidates.length > 1
+        ? "I found multiple possible main models. Please choose one model to load."
+        : "I found multiple possible projectors. Please choose one projector, or select None.",
+      mainCandidates,
+      projectorCandidates,
+    };
+  }
+
+  return {
+    status: "valid",
+    mainFile: mainCandidates[0],
+    projectorFile: projectorCandidates[0],
+  };
 }
 
-function executionLabel(memoryProfile: WorkerModelInfo["memoryProfile"]): string {
-  if (memoryProfile.webGpuStatus === "suffix-enabled") {
-    const start = memoryProfile.webGpuSegmentStartLayer;
-    const count = memoryProfile.webGpuSegmentLayerCount;
-    return start === undefined || count === undefined
-      ? "CPU/WASM + WebGPU suffix"
-      : `CPU/WASM + WebGPU suffix (${start}-${start + count - 1})`;
+function resolveConfirmedGgufFiles(files: File[], confirmation: GgufConfirmation): GgufValidation {
+  const mainFile = files.find((file) => file.name === confirmation.selectedMainName);
+  const projectorFile = confirmation.selectedProjectorName
+    ? files.find((file) => file.name === confirmation.selectedProjectorName)
+    : undefined;
+
+  if (!mainFile) {
+    return {
+      status: "invalid",
+      message: "Please choose one main model to load.",
+    };
   }
-  if (memoryProfile.webGpuStatus === "blocked") {
-    return "CPU/WASM (WebGPU suffix blocked)";
+  if (projectorFile && projectorFile === mainFile) {
+    return {
+      status: "invalid",
+      message: "Please choose different files for the main model and projector.",
+    };
   }
-  if (memoryProfile.webGpuStatus === "memory-profile-disabled") {
-    return "CPU/WASM";
+  return {
+    status: "valid",
+    mainFile,
+    projectorFile,
+  };
+}
+
+function isGgufFile(file: File): boolean {
+  return file.name.toLowerCase().endsWith(".gguf");
+}
+
+function isProjectorFile(file: File): boolean {
+  const fileName = file.name.toLowerCase();
+  return fileName.includes("projector") || fileName.includes("mmproj") || fileName.includes("vision");
+}
+
+function createAssistantMessage(content: string): UiMessage {
+  return {
+    id: createId("assistant"),
+    role: "assistant",
+    content,
+  };
+}
+
+function formatModelLoadedMessage(model: WorkerModelInfo): string {
+  return [
+    `Model loaded: ${model.modelName}`,
+    `Context: ${model.contextLength.toLocaleString()} tokens`,
+    `Vision: ${model.supportsImages ? "available" : "not available"}`,
+    `Audio: ${model.supportsAudio ? "available" : "not available"}`,
+    "",
+    "I am ready. What would you like to do?",
+  ].join("\n");
+}
+
+function composerStatusLabel(model: ModelState, prompt: string, ggufFileCount: number): string {
+  if (model.status === "loading") {
+    return `Loading ${model.fileName}`;
   }
-  return "CPU/WASM";
+  if (ggufFileCount > 0) {
+    return `${ggufFileCount} GGUF ${ggufFileCount === 1 ? "file" : "files"}`;
+  }
+  if (model.status === "ready") {
+    return `${prompt.trim().length} characters`;
+  }
+  return "No model loaded";
 }
 
 function selectAudioMimeType(): string {
@@ -1058,16 +1341,6 @@ async function readSystemMemoryInfo(): Promise<SystemMemoryInfo | undefined> {
   } catch {
     return undefined;
   }
-}
-
-function formatBytes(bytes: number): string {
-  if (bytes >= 1024 * 1024 * 1024) {
-    return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GiB`;
-  }
-  if (bytes >= 1024 * 1024) {
-    return `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
-  }
-  return `${bytes.toLocaleString()} bytes`;
 }
 
 function formatDuration(durationMs: number): string {
