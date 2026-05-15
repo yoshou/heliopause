@@ -1,16 +1,16 @@
 import type { GgufMetadata, GgufTensorInfo } from "../gguf";
-import type { Gemma4LayerKind, Gemma4ModelManifest } from "../model";
+import type { LayerKind, ModelManifest } from "../model";
 import { tensorByteLength } from "../tensor-reader";
 
-export type Gemma4RunnerExecutionMode = "off" | "verify" | "enabled";
+export type RunnerExecutionMode = "off" | "verify" | "enabled";
 
-export type Gemma4RunnerPlanStatus =
+export type RunnerPlanStatus =
   | "off"
   | "unavailable"
   | "blocked"
   | "planned";
 
-export type Gemma4RunnerProviderSupport =
+export type RunnerProviderSupport =
   | {
       available: true;
       [key: string]: unknown;
@@ -21,17 +21,17 @@ export type Gemma4RunnerProviderSupport =
       error?: string;
     };
 
-export type Gemma4RunnerLayerPlacement = {
+export type RunnerLayerPlacement = {
   layer: number;
-  layerKind: Gemma4LayerKind;
+  layerKind: LayerKind;
   weightBytes: number;
   cacheBytes: number;
   totalBytes: number;
 };
 
-export type Gemma4RunnerPlacementPlan = {
-  status: Gemma4RunnerPlanStatus;
-  mode: Gemma4RunnerExecutionMode;
+export type RunnerPlacementPlan = {
+  status: RunnerPlanStatus;
+  mode: RunnerExecutionMode;
   memoryLimitBytes: number;
   enabled: false;
   reason?: string;
@@ -46,7 +46,7 @@ export type Gemma4RunnerPlacementPlan = {
   gpuCacheBytes: number;
   estimatedResidentBytes: number;
   remainingBytes: number;
-  selectedLayers: Gemma4RunnerLayerPlacement[];
+  selectedLayers: RunnerLayerPlacement[];
   copyAuditExpectations: {
     decodeTensorReads: 0;
     segmentIntermediateReadbacks: 0;
@@ -57,7 +57,7 @@ export type Gemma4RunnerPlacementPlan = {
   };
 };
 
-export type Gemma4RunnerCopyAuditObservation = {
+export type RunnerCopyAuditObservation = {
   decodeTensorReads: number;
   segmentIntermediateReadbacks: number;
   logitsReadbacks: number;
@@ -66,21 +66,21 @@ export type Gemma4RunnerCopyAuditObservation = {
   selectedTokenReadbacks?: number;
 };
 
-export type Gemma4RunnerCopyAuditResult = {
+export type RunnerCopyAuditResult = {
   ok: boolean;
   errors: string[];
-  expected: Gemma4RunnerPlacementPlan["copyAuditExpectations"];
-  observed: Gemma4RunnerCopyAuditObservation;
+  expected: RunnerPlacementPlan["copyAuditExpectations"];
+  observed: RunnerCopyAuditObservation;
 };
 
-export type Gemma4RunnerPlanningOptions = {
-  mode?: Gemma4RunnerExecutionMode;
+export type RunnerPlanningOptions = {
+  mode?: RunnerExecutionMode;
   memoryLimitBytes?: number;
   contextLength?: number;
-  support?: Gemma4RunnerProviderSupport;
+  support?: RunnerProviderSupport;
 };
 
-export type Gemma4RunnerPlanningProvider = {
+export type RunnerPlanningProvider = {
   name: string;
   defaultMemoryLimitBytes: number;
   fixedBytes: number;
@@ -88,27 +88,27 @@ export type Gemma4RunnerPlanningProvider = {
   outputTensorNames: readonly string[];
   offReason: string;
   blockedByMemoryReason: string;
-  unavailableReason: (support: Gemma4RunnerProviderSupport) => string;
+  unavailableReason: (support: RunnerProviderSupport) => string;
   plannedReason: string;
   requiredSegmentStart?: (params: {
-    manifest: Gemma4ModelManifest;
-    selectedLayers: readonly Gemma4RunnerLayerPlacement[];
+    manifest: ModelManifest;
+    selectedLayers: readonly RunnerLayerPlacement[];
   }) => number | undefined;
   layerPlacement: (params: {
     tensorsByName: ReadonlyMap<string, GgufTensorInfo>;
-    manifest: Gemma4ModelManifest;
+    manifest: ModelManifest;
     layer: number;
     contextLength: number;
-  }) => Gemma4RunnerLayerPlacement;
-  copyAuditExpectations: (selectedLayerCount: number) => Gemma4RunnerPlacementPlan["copyAuditExpectations"];
+  }) => RunnerLayerPlacement;
+  copyAuditExpectations: (selectedLayerCount: number) => RunnerPlacementPlan["copyAuditExpectations"];
 };
 
-export function planGemma4ProviderPlacement(
-  provider: Gemma4RunnerPlanningProvider,
+export function planProviderPlacement(
+  provider: RunnerPlanningProvider,
   gguf: GgufMetadata,
-  manifest: Gemma4ModelManifest,
-  options: Gemma4RunnerPlanningOptions = {},
-): Gemma4RunnerPlacementPlan {
+  manifest: ModelManifest,
+  options: RunnerPlanningOptions = {},
+): RunnerPlacementPlan {
   const mode = options.mode ?? "off";
   const memoryLimitBytes = options.memoryLimitBytes ?? provider.defaultMemoryLimitBytes;
   const contextLength = Math.min(
@@ -146,7 +146,7 @@ export function planGemma4ProviderPlacement(
   }
 
   let selectedBytes = outputBytes + provider.fixedBytes + provider.scratchBytes;
-  const selectedLayers: Gemma4RunnerLayerPlacement[] = [];
+  const selectedLayers: RunnerLayerPlacement[] = [];
 
   if (selectedBytes > memoryLimitBytes) {
     return emptyPlan(provider, {
@@ -221,10 +221,10 @@ export function planGemma4ProviderPlacement(
   };
 }
 
-export function auditGemma4RunnerPlacementCopies(
-  plan: Gemma4RunnerPlacementPlan,
-  observed: Gemma4RunnerCopyAuditObservation,
-): Gemma4RunnerCopyAuditResult {
+export function auditRunnerPlacementCopies(
+  plan: RunnerPlacementPlan,
+  observed: RunnerCopyAuditObservation,
+): RunnerCopyAuditResult {
   const expected = plan.copyAuditExpectations;
   const errors: string[] = [];
 
@@ -267,12 +267,12 @@ export function auditGemma4RunnerPlacementCopies(
 }
 
 function buildLayerPlans(
-  provider: Gemma4RunnerPlanningProvider,
+  provider: RunnerPlanningProvider,
   tensorsByName: ReadonlyMap<string, GgufTensorInfo>,
-  manifest: Gemma4ModelManifest,
+  manifest: ModelManifest,
   contextLength: number,
-): Map<number, Gemma4RunnerLayerPlacement> {
-  const plans = new Map<number, Gemma4RunnerLayerPlacement>();
+): Map<number, RunnerLayerPlacement> {
+  const plans = new Map<number, RunnerLayerPlacement>();
   for (let layer = 0; layer < manifest.blockCount; layer += 1) {
     plans.set(layer, provider.layerPlacement({
       tensorsByName,
@@ -290,16 +290,16 @@ function tensorBytes(tensorsByName: ReadonlyMap<string, GgufTensorInfo>, name: s
 }
 
 function emptyPlan(
-  provider: Gemma4RunnerPlanningProvider,
+  provider: RunnerPlanningProvider,
   params: {
-    status: Gemma4RunnerPlanStatus;
-    mode: Gemma4RunnerExecutionMode;
+    status: RunnerPlanStatus;
+    mode: RunnerExecutionMode;
     memoryLimitBytes: number;
     reason: string;
     outputBytes: number;
     blockCount: number;
   },
-): Gemma4RunnerPlacementPlan {
+): RunnerPlacementPlan {
   const estimatedResidentBytes = params.outputBytes + provider.fixedBytes + provider.scratchBytes;
   return {
     status: params.status,

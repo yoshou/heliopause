@@ -1,6 +1,6 @@
 import {
-  buildGemma4AudioManifest,
-  type Gemma4AudioManifest,
+  buildAudioManifest,
+  type AudioManifest,
 } from "./model";
 import {
   dequantizeRow,
@@ -15,13 +15,13 @@ import {
   tensorByteLength,
 } from "./tensor-reader";
 
-export type Gemma4AudioPcmInput = {
+export type AudioPcmInput = {
   pcm: Float32Array;
   sampleRate: 16000;
   durationMs: number;
 };
 
-export type Gemma4AudioFeatures = {
+export type AudioFeatures = {
   values: Float32Array;
   frameCount: number;
   featureSize: number;
@@ -29,20 +29,20 @@ export type Gemma4AudioFeatures = {
   durationMs: number;
 };
 
-export type Gemma4AudioEncodeResult = {
+export type AudioEncodeResult = {
   hidden: Float32Array;
   tokenCount: number;
   durationMs: number;
 };
 
-export type Gemma4AudioSessionOptions = {
+export type AudioSessionOptions = {
   maxWeightCacheBytes?: number;
   executionProviders?: readonly ExecutionProviderConfig[];
 };
 
-export class Gemma4AudioSession {
+export class AudioSession {
   readonly tensorReader: GgufTensorReader;
-  readonly manifest: Gemma4AudioManifest;
+  readonly manifest: AudioManifest;
   readonly epsilon: number;
   readonly executionProviders: readonly ExecutionProviderConfig[];
 
@@ -56,9 +56,9 @@ export class Gemma4AudioSession {
   private weightCacheMisses = 0;
   private weightCacheEvictions = 0;
 
-  constructor(tensorReader: GgufTensorReader, options: Gemma4AudioSessionOptions = {}) {
+  constructor(tensorReader: GgufTensorReader, options: AudioSessionOptions = {}) {
     this.tensorReader = tensorReader;
-    this.manifest = buildGemma4AudioManifest(tensorReader.metadata);
+    this.manifest = buildAudioManifest(tensorReader.metadata);
     this.epsilon = this.manifest.layerNormEpsilon;
     this.maxWeightCacheBytes = options.maxWeightCacheBytes ?? 256 * 1024 * 1024;
     this.executionProviders = (options.executionProviders ?? [{ name: "cpu" }]).map((provider) => ({
@@ -174,17 +174,17 @@ export class Gemma4AudioSession {
   }
 }
 
-export function createGemma4AudioSession(
+export function createAudioSession(
   tensorReader: GgufTensorReader,
-  options: Gemma4AudioSessionOptions = {},
-): Gemma4AudioSession {
-  return new Gemma4AudioSession(tensorReader, options);
+  options: AudioSessionOptions = {},
+): AudioSession {
+  return new AudioSession(tensorReader, options);
 }
 
-export function preprocessGemma4AudioPcm(
-  audio: Gemma4AudioPcmInput,
-  manifest?: Pick<Gemma4AudioManifest, "sampleRate" | "maxSeconds" | "frameLength" | "hopLength" | "fftLength" | "featureSize" | "melFloor">,
-): Gemma4AudioFeatures {
+export function preprocessAudioPcm(
+  audio: AudioPcmInput,
+  manifest?: Pick<AudioManifest, "sampleRate" | "maxSeconds" | "frameLength" | "hopLength" | "fftLength" | "featureSize" | "melFloor">,
+): AudioFeatures {
   const config = {
     sampleRate: 16000,
     maxSeconds: 30,
@@ -196,7 +196,7 @@ export function preprocessGemma4AudioPcm(
     ...manifest,
   };
   if (audio.sampleRate !== config.sampleRate) {
-    throw new Error(`Gemma4 audio expects ${config.sampleRate} Hz PCM, got ${audio.sampleRate}`);
+    throw new Error(` audio expects ${config.sampleRate} Hz PCM, got ${audio.sampleRate}`);
   }
 
   const maxSamples = config.sampleRate * config.maxSeconds;
@@ -270,11 +270,11 @@ export function preprocessGemma4AudioPcm(
   };
 }
 
-export async function runGemma4AudioEncoder(
-  session: Gemma4AudioSession,
-  features: Gemma4AudioFeatures,
+export async function runAudioEncoder(
+  session: AudioSession,
+  features: AudioFeatures,
   options: { signal?: AbortSignal } = {},
-): Promise<Gemma4AudioEncodeResult> {
+): Promise<AudioEncodeResult> {
   throwIfAborted(options.signal);
   const manifest = session.manifest;
   if (features.featureSize !== manifest.featureSize) {
@@ -306,8 +306,8 @@ export async function runGemma4AudioEncoder(
 }
 
 async function subsampleConvProjection(
-  session: Gemma4AudioSession,
-  features: Gemma4AudioFeatures,
+  session: AudioSession,
+  features: AudioFeatures,
 ): Promise<{ hidden: Float32Array; mask: Uint8Array }> {
   const first = await conv2dSubsampleLayer(session, features.values, features.attentionMask, features.frameCount, features.featureSize, 1, 128, "a.conv1d.0");
   const second = await conv2dSubsampleLayer(session, first.values, first.mask, first.time, first.frequency, 128, 32, "a.conv1d.1");
@@ -331,7 +331,7 @@ async function subsampleConvProjection(
 }
 
 async function conv2dSubsampleLayer(
-  session: Gemma4AudioSession,
+  session: AudioSession,
   input: Float32Array,
   mask: Uint8Array,
   time: number,
@@ -390,7 +390,7 @@ async function conv2dSubsampleLayer(
 }
 
 async function forwardAudioLayer(
-  session: Gemma4AudioSession,
+  session: AudioSession,
   input: Float32Array,
   mask: Uint8Array,
   positionEmbeddings: Float32Array,
@@ -412,7 +412,7 @@ async function forwardAudioLayer(
 }
 
 async function forwardAudioFeedForward(
-  session: Gemma4AudioSession,
+  session: AudioSession,
   input: Float32Array,
   layer: number,
   suffix: "" | "_1",
@@ -430,7 +430,7 @@ async function forwardAudioFeedForward(
 }
 
 async function forwardAudioAttention(
-  session: Gemma4AudioSession,
+  session: AudioSession,
   input: Float32Array,
   mask: Uint8Array,
   positionEmbeddings: Float32Array,
@@ -524,7 +524,7 @@ async function forwardAudioAttention(
 }
 
 async function forwardAudioLightConv(
-  session: Gemma4AudioSession,
+  session: AudioSession,
   input: Float32Array,
   layer: number,
 ): Promise<Float32Array> {
@@ -545,7 +545,7 @@ async function forwardAudioLightConv(
 }
 
 async function matMulAudioWeight(
-  session: Gemma4AudioSession,
+  session: AudioSession,
   weightName: string,
   inputColumns: Float32Array,
 ): Promise<Float32Array> {
@@ -575,7 +575,7 @@ async function matMulAudioWeight(
 }
 
 async function clampLinearInput(
-  session: Gemma4AudioSession,
+  session: AudioSession,
   weightName: string,
   input: Float32Array,
 ): Promise<Float32Array> {
@@ -583,7 +583,7 @@ async function clampLinearInput(
 }
 
 async function clampLinearOutput(
-  session: Gemma4AudioSession,
+  session: AudioSession,
   weightName: string,
   input: Float32Array,
 ): Promise<Float32Array> {
@@ -591,7 +591,7 @@ async function clampLinearOutput(
 }
 
 async function clampTensor(
-  session: Gemma4AudioSession,
+  session: AudioSession,
   input: Float32Array,
   minTensorName: string,
   maxTensorName: string,
@@ -604,7 +604,7 @@ async function clampTensor(
   return clampValues(input, min, max);
 }
 
-function audioRelativePositionEmbeddings(manifest: Gemma4AudioManifest): Float32Array {
+function audioRelativePositionEmbeddings(manifest: AudioManifest): Float32Array {
   const maxPast = 12;
   const count = maxPast + 1;
   const output = new Float32Array(count * manifest.embeddingLength);
@@ -664,14 +664,14 @@ function addBiasRows(input: Float32Array, bias: Float32Array): Float32Array {
   return output;
 }
 
-async function addOptionalBiasRows(session: Gemma4AudioSession, input: Float32Array, biasName: string): Promise<Float32Array> {
+async function addOptionalBiasRows(session: AudioSession, input: Float32Array, biasName: string): Promise<Float32Array> {
   if (!session.hasTensor(biasName)) {
     return input;
   }
   return addBiasRows(input, await session.readF32Tensor(biasName));
 }
 
-async function optionalTensor(session: Gemma4AudioSession, name: string, size: number): Promise<Float32Array> {
+async function optionalTensor(session: AudioSession, name: string, size: number): Promise<Float32Array> {
   if (session.hasTensor(name)) {
     return session.readF32Tensor(name);
   }

@@ -30,7 +30,7 @@ test("Q8_0 dequantizes one block", () => {
   assert.equal(values[31], -16);
 });
 
-test("tensorByteLength uses ggml block sizes for observed Gemma4 types", () => {
+test("tensorByteLength uses ggml block sizes for observed types", () => {
   assert.equal(tensorByteLength(tensor("f32", "F32", [4])), 16);
   assert.equal(tensorByteLength(tensor("q8", "Q8_0", [32])), 34);
   assert.equal(tensorByteLength(tensor("q4k", "Q4_K", [256])), 144);

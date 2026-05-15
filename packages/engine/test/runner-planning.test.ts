@@ -2,27 +2,27 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
-  auditGemma4RunnerPlacementCopies,
-  buildGemma4Manifest,
-  planGemma4RunnerPlacement,
+  auditRunnerPlacementCopies,
+  buildModelManifest,
+  planRunnerPlacement,
 } from "../src/index.ts";
 
 test("runner placement planning handles off, blocked, and planned WebGPU placement", () => {
   const gguf = minimalGguf();
-  const manifest = buildGemma4Manifest(gguf);
+  const manifest = buildModelManifest(gguf);
 
-  const off = planGemma4RunnerPlacement(gguf, manifest);
+  const off = planRunnerPlacement(gguf, manifest);
   assert.equal(off.status, "off");
   assert.equal(off.selectedLayerCount, 0);
 
-  const blocked = planGemma4RunnerPlacement(gguf, manifest, {
+  const blocked = planRunnerPlacement(gguf, manifest, {
     mode: "enabled",
     memoryLimitBytes: 1,
   });
   assert.equal(blocked.status, "blocked");
   assert.equal(blocked.selectedLayerCount, 0);
 
-  const planned = planGemma4RunnerPlacement(gguf, manifest, {
+  const planned = planRunnerPlacement(gguf, manifest, {
     mode: "enabled",
     memoryLimitBytes: 2 * 1024 * 1024 * 1024,
   });
@@ -35,13 +35,13 @@ test("runner placement planning handles off, blocked, and planned WebGPU placeme
 
 test("runner placement copy audit reports unexpected copies", () => {
   const gguf = minimalGguf();
-  const manifest = buildGemma4Manifest(gguf);
-  const plan = planGemma4RunnerPlacement(gguf, manifest, {
+  const manifest = buildModelManifest(gguf);
+  const plan = planRunnerPlacement(gguf, manifest, {
     mode: "enabled",
     memoryLimitBytes: 2 * 1024 * 1024 * 1024,
   });
 
-  const audit = auditGemma4RunnerPlacementCopies(plan, {
+  const audit = auditRunnerPlacementCopies(plan, {
     decodeTensorReads: 0,
     segmentIntermediateReadbacks: 1,
     logitsReadbacks: 0,
@@ -56,13 +56,13 @@ test("runner placement copy audit reports unexpected copies", () => {
 
 test("runner placement copy audit treats selected token readback as the only normal WebGPU readback", () => {
   const gguf = minimalGguf();
-  const manifest = buildGemma4Manifest(gguf);
-  const plan = planGemma4RunnerPlacement(gguf, manifest, {
+  const manifest = buildModelManifest(gguf);
+  const plan = planRunnerPlacement(gguf, manifest, {
     mode: "enabled",
     memoryLimitBytes: 2 * 1024 * 1024 * 1024,
   });
 
-  assert.equal(auditGemma4RunnerPlacementCopies(plan, {
+  assert.equal(auditRunnerPlacementCopies(plan, {
     decodeTensorReads: 0,
     segmentIntermediateReadbacks: 0,
     logitsReadbacks: 0,
@@ -71,7 +71,7 @@ test("runner placement copy audit treats selected token readback as the only nor
     selectedTokenReadbacks: 1,
   }).ok, true);
 
-  const topKReadback = auditGemma4RunnerPlacementCopies(plan, {
+  const topKReadback = auditRunnerPlacementCopies(plan, {
     decodeTensorReads: 0,
     segmentIntermediateReadbacks: 0,
     logitsReadbacks: 0,

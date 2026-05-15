@@ -9,20 +9,20 @@ import {
   tensorByteLength,
 } from "./tensor-reader";
 import {
-  buildGemma4Manifest,
-  type Gemma4LayerKind,
-  type Gemma4ModelManifest,
+  buildModelManifest,
+  type LayerKind,
+  type ModelManifest,
 } from "./model";
 
-export type Gemma4FullAttentionCache = {
+export type FullAttentionCache = {
   key: Float32Array;
   value: Float32Array;
   keyLength: number;
   valueLength: number;
 };
 
-export type Gemma4InferenceState = {
-  fullAttention: Map<number, Gemma4FullAttentionCache>;
+export type InferenceState = {
+  fullAttention: Map<number, FullAttentionCache>;
   contextLength: number;
   nextPosition: number;
 };
@@ -32,7 +32,7 @@ export type OutputResult = {
   topTokens: Array<{ id: number; value: number }>;
 };
 
-export type Gemma4ModelSessionOptions = {
+export type ModelSessionOptions = {
   maxContextLength?: number;
   maxWeightCacheBytes?: number;
   executionProviders?: readonly ExecutionProviderConfig[];
@@ -50,7 +50,7 @@ export type TimingEvent = {
   section: string;
   durationMs: number;
   layer?: number;
-  layerKind?: Gemma4LayerKind;
+  layerKind?: LayerKind;
   weightName?: string;
   tokenIndex?: number;
 };
@@ -76,9 +76,9 @@ export type CacheStats = {
 
 export type ExecutionProviderStats = Record<string, number | boolean | string>;
 
-export class Gemma4ModelSession {
+export class ModelSession {
   readonly tensorReader: GgufTensorReader;
-  readonly manifest: Gemma4ModelManifest;
+  readonly manifest: ModelManifest;
   readonly epsilon: number;
 
   private readonly maxContextLength?: number;
@@ -95,10 +95,10 @@ export class Gemma4ModelSession {
 
   constructor(
     tensorReader: GgufTensorReader,
-    options: Gemma4ModelSessionOptions = {},
+    options: ModelSessionOptions = {},
   ) {
     this.tensorReader = tensorReader;
-    this.manifest = buildGemma4Manifest(tensorReader.metadata);
+    this.manifest = buildModelManifest(tensorReader.metadata);
     this.epsilon = requiredMetadataNumber(
       tensorReader,
       "gemma4.attention.layer_norm_rms_epsilon",
@@ -111,8 +111,8 @@ export class Gemma4ModelSession {
     }));
   }
 
-  createInferenceState(): Gemma4InferenceState {
-    return createGemma4InferenceState(this.manifest, {
+  createInferenceState(): InferenceState {
+    return createInferenceState(this.manifest, {
       contextLength: this.maxContextLength === undefined
         ? this.manifest.contextLength
         : Math.min(this.manifest.contextLength, this.maxContextLength),
@@ -250,20 +250,20 @@ export function estimateWeightCacheBytes(tensorReader: GgufTensorReader): number
   return total;
 }
 
-export function createGemma4ModelSession(
+export function createModelSession(
   tensorReader: GgufTensorReader,
-  options: Gemma4ModelSessionOptions = {},
-): Gemma4ModelSession {
-  return new Gemma4ModelSession(tensorReader, options);
+  options: ModelSessionOptions = {},
+): ModelSession {
+  return new ModelSession(tensorReader, options);
 }
 
-export type Gemma4ModelInput = GgufTensorReader | Gemma4ModelSession;
+export type ModelInput = GgufTensorReader | ModelSession;
 
-export function createGemma4InferenceState(
-  manifest: Gemma4ModelManifest,
+export function createInferenceState(
+  manifest: ModelManifest,
   options: { contextLength?: number } = {},
-): Gemma4InferenceState {
-  const fullAttention = new Map<number, Gemma4FullAttentionCache>();
+): InferenceState {
+  const fullAttention = new Map<number, FullAttentionCache>();
   const contextLength = options.contextLength ?? manifest.contextLength;
   for (let layer = 0; layer < manifest.blockCount; layer += 1) {
     if (!manifest.layerHasKv[layer]) {
@@ -282,8 +282,8 @@ export function createGemma4InferenceState(
   return { fullAttention, contextLength, nextPosition: 0 };
 }
 
-export function cloneGemma4InferenceState(state: Gemma4InferenceState): Gemma4InferenceState {
-  const fullAttention = new Map<number, Gemma4FullAttentionCache>();
+export function cloneInferenceState(state: InferenceState): InferenceState {
+  const fullAttention = new Map<number, FullAttentionCache>();
 
   for (const [layer, cache] of state.fullAttention) {
     fullAttention.set(layer, {
@@ -301,10 +301,10 @@ export function cloneGemma4InferenceState(state: Gemma4InferenceState): Gemma4In
   };
 }
 
-export function modelSession(model: Gemma4ModelInput): Gemma4ModelSession {
-  return model instanceof Gemma4ModelSession
+export function modelSession(model: ModelInput): ModelSession {
+  return model instanceof ModelSession
     ? model
-    : new Gemma4ModelSession(model);
+    : new ModelSession(model);
 }
 
 export function requiredMetadataNumber(tensorReader: GgufTensorReader, key: string): number {
@@ -315,7 +315,7 @@ export function requiredMetadataNumber(tensorReader: GgufTensorReader, key: stri
   return value;
 }
 
-export function requiredFullAttentionCache(state: Gemma4InferenceState, layer: number): Gemma4FullAttentionCache {
+export function requiredFullAttentionCache(state: InferenceState, layer: number): FullAttentionCache {
   const cache = state.fullAttention.get(layer);
   if (!cache) {
     throw new Error(`Missing full-attention cache for layer ${layer}`);

@@ -1,6 +1,6 @@
 import {
-  buildGemma4VisionManifest,
-  type Gemma4VisionManifest,
+  buildVisionManifest,
+  type VisionManifest,
 } from "./model";
 import type {
   CacheStats,
@@ -8,42 +8,42 @@ import type {
   ExecutionProviderStats,
 } from "./runtime";
 import {
-  runGemma4CpuVisionEncoder,
+  runCpuVisionEncoder,
 } from "./runner/cpu/vision-runner";
 import {
-  runGemma4WebGpuVisionEncoder,
+  runWebGpuVisionEncoder,
 } from "./runner/webgpu/vision-execution-provider";
 import {
   GgufTensorReader,
 } from "./tensor-reader";
 
-export type Gemma4VisionPixelValues = {
+export type VisionPixelValues = {
   values: Float32Array;
   width: number;
   height: number;
 };
 
-export type Gemma4VisionResize = {
+export type VisionResize = {
   width: number;
   height: number;
   outputTokenCount: number;
 };
 
-export type Gemma4VisionEncodeResult = {
+export type VisionEncodeResult = {
   hidden: Float32Array;
   tokenCount: number;
   width: number;
   height: number;
 };
 
-export type Gemma4VisionSessionOptions = {
+export type VisionSessionOptions = {
   maxWeightCacheBytes?: number;
   executionProviders?: readonly ExecutionProviderConfig[];
 };
 
-export class Gemma4VisionSession {
+export class VisionSession {
   readonly tensorReader: GgufTensorReader;
-  readonly manifest: Gemma4VisionManifest;
+  readonly manifest: VisionManifest;
   readonly epsilon: number;
   readonly executionProviders: readonly ExecutionProviderConfig[];
 
@@ -57,9 +57,9 @@ export class Gemma4VisionSession {
   private weightCacheMisses = 0;
   private weightCacheEvictions = 0;
 
-  constructor(tensorReader: GgufTensorReader, options: Gemma4VisionSessionOptions = {}) {
+  constructor(tensorReader: GgufTensorReader, options: VisionSessionOptions = {}) {
     this.tensorReader = tensorReader;
-    this.manifest = buildGemma4VisionManifest(tensorReader.metadata);
+    this.manifest = buildVisionManifest(tensorReader.metadata);
     this.epsilon = this.manifest.layerNormEpsilon;
     this.maxWeightCacheBytes = options.maxWeightCacheBytes ?? 256 * 1024 * 1024;
     this.executionProviders = (options.executionProviders ?? [{ name: "cpu" }]).map((provider) => ({
@@ -175,18 +175,18 @@ export class Gemma4VisionSession {
   }
 }
 
-export function createGemma4VisionSession(
+export function createVisionSession(
   tensorReader: GgufTensorReader,
-  options: Gemma4VisionSessionOptions = {},
-): Gemma4VisionSession {
-  return new Gemma4VisionSession(tensorReader, options);
+  options: VisionSessionOptions = {},
+): VisionSession {
+  return new VisionSession(tensorReader, options);
 }
 
-export function calculateGemma4VisionResize(
-  manifest: Pick<Gemma4VisionManifest, "patchSize" | "spatialMergeSize" | "imageMinTokens" | "imageMaxTokens">,
+export function calculateVisionResize(
+  manifest: Pick<VisionManifest, "patchSize" | "spatialMergeSize" | "imageMinTokens" | "imageMaxTokens">,
   sourceWidth: number,
   sourceHeight: number,
-): Gemma4VisionResize {
+): VisionResize {
   const alignSize = manifest.patchSize * manifest.spatialMergeSize;
   const minPixels = manifest.imageMinTokens * alignSize * alignSize;
   const maxPixels = manifest.imageMaxTokens * alignSize * alignSize;
@@ -212,14 +212,14 @@ export function calculateGemma4VisionResize(
   };
 }
 
-export async function preprocessGemma4VisionImageFile(
+export async function preprocessVisionImageFile(
   file: Blob,
-  manifest: Gemma4VisionManifest,
-): Promise<Gemma4VisionPixelValues> {
+  manifest: VisionManifest,
+): Promise<VisionPixelValues> {
   const bitmap = await createImageBitmap(file);
   try {
     const rgba = imageBitmapToRgba(bitmap);
-    const resize = calculateGemma4VisionResize(manifest, bitmap.width, bitmap.height);
+    const resize = calculateVisionResize(manifest, bitmap.width, bitmap.height);
     const resized = resizeRgbaBilinear(rgba, bitmap.width, bitmap.height, resize.width, resize.height);
     const values = new Float32Array(resize.width * resize.height * 3);
     for (let pixel = 0; pixel < resize.width * resize.height; pixel += 1) {
@@ -235,17 +235,17 @@ export async function preprocessGemma4VisionImageFile(
   }
 }
 
-export async function runGemma4VisionEncoder(
-  session: Gemma4VisionSession,
-  pixels: Gemma4VisionPixelValues,
-): Promise<Gemma4VisionEncodeResult> {
+export async function runVisionEncoder(
+  session: VisionSession,
+  pixels: VisionPixelValues,
+): Promise<VisionEncodeResult> {
   if (session.executionProvider("webgpu")) {
-    const webgpu = await runGemma4WebGpuVisionEncoder(session, pixels);
+    const webgpu = await runWebGpuVisionEncoder(session, pixels);
     if (webgpu) {
       return webgpu;
     }
   }
-  return runGemma4CpuVisionEncoder(session, pixels);
+  return runCpuVisionEncoder(session, pixels);
 }
 
 function imageBitmapToRgba(bitmap: ImageBitmap): Uint8ClampedArray {

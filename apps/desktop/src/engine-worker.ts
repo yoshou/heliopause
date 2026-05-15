@@ -1,30 +1,30 @@
 import {
-  buildGemma4Manifest,
-  buildGemma4Tokenizer,
-  cloneGemma4InferenceState,
-  createGemma4AudioSession,
+  buildModelManifest,
+  buildTokenizer,
+  cloneInferenceState,
+  createAudioSession,
   createFileGgufTensorReader,
-  createGemma4ChatSession,
-  createGemma4VisionSession,
+  createChatSession,
+  createVisionSession,
   estimateWeightCacheBytes,
-  generateGemma4PreparedAudioChatTurn,
-  generateGemma4PreparedImageChatTurn,
-  generateGemma4ChatTurn,
+  generatePreparedAudioChatTurn,
+  generatePreparedImageChatTurn,
+  generateChatTurn,
   getGgufModelName,
-  isGemma4AudioGguf,
-  isGemma4VisionGguf,
-  preprocessGemma4AudioPcm,
-  planGemma4RunnerPlacement,
-  runGemma4AudioEncoder,
-  preprocessGemma4VisionImageFile,
-  prefillGemma4ChatMessages,
-  runGemma4VisionEncoder,
+  isAudioGguf,
+  isVisionGguf,
+  preprocessAudioPcm,
+  planRunnerPlacement,
+  runAudioEncoder,
+  preprocessVisionImageFile,
+  prefillChatMessages,
+  runVisionEncoder,
   type ExecutionProviderConfig,
-  type Gemma4AudioSession,
-  type Gemma4InferenceState,
-  type Gemma4ModelSession,
-  type Gemma4Tokenizer,
-  type Gemma4VisionSession,
+  type AudioSession,
+  type InferenceState,
+  type ModelSession,
+  type Tokenizer,
+  type VisionSession,
 } from "@heliopause/engine";
 import type {
   EngineWorkerRequest,
@@ -39,17 +39,17 @@ const LOW_WEIGHT_CACHE_BYTES = 768 * 1024 * 1024;
 const FULL_WEIGHT_CACHE_LIMIT_BYTES = 32 * 1024 * 1024 * 1024;
 const FULL_WEIGHT_CACHE_HEADROOM = 1.25;
 
-let session: Gemma4ModelSession | undefined;
-let visionSession: Gemma4VisionSession | undefined;
-let audioSession: Gemma4AudioSession | undefined;
-let tokenizer: Gemma4Tokenizer | undefined;
-let currentState: Gemma4InferenceState | undefined;
+let session: ModelSession | undefined;
+let visionSession: VisionSession | undefined;
+let audioSession: AudioSession | undefined;
+let tokenizer: Tokenizer | undefined;
+let currentState: InferenceState | undefined;
 let currentSystemPrompt: string | undefined;
 let activeGeneration:
   | {
       requestId: number;
       abortController: AbortController;
-      workingState?: Gemma4InferenceState;
+      workingState?: InferenceState;
     }
   | undefined;
 
@@ -93,9 +93,9 @@ async function handleLoadModel(
   currentSystemPrompt = undefined;
 
   const tensorReader = await createFileGgufTensorReader(request.file);
-  const manifest = buildGemma4Manifest(tensorReader.metadata);
-  let nextVisionSession: Gemma4VisionSession | undefined;
-  let nextAudioSession: Gemma4AudioSession | undefined;
+  const manifest = buildModelManifest(tensorReader.metadata);
+  let nextVisionSession: VisionSession | undefined;
+  let nextAudioSession: AudioSession | undefined;
   const estimatedWeightCacheBytes = estimateWeightCacheBytes(tensorReader);
   const resolvedMemoryProfile = resolveMemoryProfile(
     request.memoryProfile,
@@ -104,11 +104,11 @@ async function handleLoadModel(
   );
   if (request.visionFile) {
     const visionReader = await createFileGgufTensorReader(request.visionFile);
-    if (!isGemma4VisionGguf(visionReader.metadata) && !isGemma4AudioGguf(visionReader.metadata)) {
-      throw new Error("Projector GGUF is not a Gemma4 multimodal projector.");
+    if (!isVisionGguf(visionReader.metadata) && !isAudioGguf(visionReader.metadata)) {
+      throw new Error("Projector GGUF is not a supported multimodal projector.");
     }
-    if (isGemma4VisionGguf(visionReader.metadata)) {
-      nextVisionSession = createGemma4VisionSession(visionReader, {
+    if (isVisionGguf(visionReader.metadata)) {
+      nextVisionSession = createVisionSession(visionReader, {
         maxWeightCacheBytes: resolvedMemoryProfile.maxWeightCacheBytes,
         executionProviders: [
           {
@@ -125,8 +125,8 @@ async function handleLoadModel(
         ],
       });
     }
-    if (isGemma4AudioGguf(visionReader.metadata)) {
-      nextAudioSession = createGemma4AudioSession(visionReader, {
+    if (isAudioGguf(visionReader.metadata)) {
+      nextAudioSession = createAudioSession(visionReader, {
         maxWeightCacheBytes: resolvedMemoryProfile.maxWeightCacheBytes,
         executionProviders: [
           {
@@ -156,7 +156,7 @@ async function handleLoadModel(
   }];
 
   if (resolvedMemoryProfile.resolved === "full") {
-    const webGpuPlan = planGemma4RunnerPlacement(tensorReader.metadata, manifest, {
+    const webGpuPlan = planRunnerPlacement(tensorReader.metadata, manifest, {
       mode: "enabled",
       contextLength: CHAT_CONTEXT_LENGTH,
     });
@@ -176,12 +176,12 @@ async function handleLoadModel(
     }
   }
 
-  const nextSession = createGemma4ChatSession(tensorReader, {
+  const nextSession = createChatSession(tensorReader, {
     maxContextLength: CHAT_CONTEXT_LENGTH,
     maxWeightCacheBytes: resolvedMemoryProfile.maxWeightCacheBytes,
     executionProviders,
   });
-  const nextTokenizer = buildGemma4Tokenizer(tensorReader.metadata);
+  const nextTokenizer = buildTokenizer(tensorReader.metadata);
 
   session = nextSession;
   visionSession = nextVisionSession;
@@ -234,7 +234,7 @@ async function handleGenerateTurn(
 
     const workingState = session.executionProvider("webgpu")
       ? currentState
-      : cloneGemma4InferenceState(currentState);
+      : cloneInferenceState(currentState);
     activeGeneration.workingState = workingState;
 
     const turnOptions = {
@@ -252,14 +252,14 @@ async function handleGenerateTurn(
       if (!audioSession) {
         throw new Error("No audio encoder loaded.");
       }
-      const features = preprocessGemma4AudioPcm(request.audio, audioSession.manifest);
+      const features = preprocessAudioPcm(request.audio, audioSession.manifest);
       if (abortController.signal.aborted) {
         throw new DOMException("Generation was aborted.", "AbortError");
       }
-      const encoded = await runGemma4AudioEncoder(audioSession, features, {
+      const encoded = await runAudioEncoder(audioSession, features, {
         signal: abortController.signal,
       });
-      await generateGemma4PreparedAudioChatTurn(
+      await generatePreparedAudioChatTurn(
         session,
         tokenizer,
         workingState,
@@ -274,9 +274,9 @@ async function handleGenerateTurn(
       if (!visionSession) {
         throw new Error("No vision encoder loaded.");
       }
-      const pixels = await preprocessGemma4VisionImageFile(request.image.file, visionSession.manifest);
-      const encoded = await runGemma4VisionEncoder(visionSession, pixels);
-      await generateGemma4PreparedImageChatTurn(
+      const pixels = await preprocessVisionImageFile(request.image.file, visionSession.manifest);
+      const encoded = await runVisionEncoder(visionSession, pixels);
+      await generatePreparedImageChatTurn(
         session,
         tokenizer,
         workingState,
@@ -288,7 +288,7 @@ async function handleGenerateTurn(
         turnOptions,
       );
     } else {
-      await generateGemma4ChatTurn(
+      await generateChatTurn(
         session,
         tokenizer,
         workingState,
@@ -340,7 +340,7 @@ async function resetChatState(systemPrompt: string, signal?: AbortSignal): Promi
     return;
   }
   const state = session.createInferenceState();
-  await prefillGemma4ChatMessages(
+  await prefillChatMessages(
     session,
     tokenizer,
     state,

@@ -1,24 +1,24 @@
 import type {
   ForwardTrace,
-  Gemma4ModelSession,
+  ModelSession,
   OutputResult,
 } from "../../runtime";
-import { forwardGemma4Output } from "./layers";
+import { forwardOutput } from "./layers";
 import {
-  Gemma4CpuSegmentRunner,
-  type Gemma4CpuSegmentRunnerOptions,
+  CpuSegmentRunner,
+  type CpuSegmentRunnerOptions,
 } from "./segment-runner";
 
-export function gemma4CpuSegmentRunner(
-  options: Gemma4CpuSegmentRunnerOptions,
-): Gemma4CpuSegmentRunner {
-  return new Gemma4CpuSegmentRunner(options);
+export function cpuSegmentRunner(
+  options: CpuSegmentRunnerOptions,
+): CpuSegmentRunner {
+  return new CpuSegmentRunner(options);
 }
 
-export function gemma4CpuOutput(
-  session: Gemma4ModelSession,
+export function cpuOutput(
+  session: ModelSession,
   hidden: Float32Array,
   options: { topK: number; trace?: ForwardTrace },
 ): Promise<OutputResult> {
-  return forwardGemma4Output(session, hidden, options);
+  return forwardOutput(session, hidden, options);
 }

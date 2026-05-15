@@ -12,9 +12,9 @@ import {
   tensorByteLength,
 } from "../../tensor-reader";
 import type {
-  Gemma4VisionEncodeResult,
-  Gemma4VisionPixelValues,
-  Gemma4VisionSession,
+  VisionEncodeResult,
+  VisionPixelValues,
+  VisionSession,
 } from "../../vision";
 import {
   createWasmQuantizedWeightHandle,
@@ -44,12 +44,12 @@ type VisionWasmWeightCache = {
   misses: number;
 };
 
-const residentWeightCaches = new WeakMap<Gemma4VisionSession, VisionWasmWeightCache>();
+const residentWeightCaches = new WeakMap<VisionSession, VisionWasmWeightCache>();
 
-export async function runGemma4CpuVisionEncoder(
-  session: Gemma4VisionSession,
-  pixels: Gemma4VisionPixelValues,
-): Promise<Gemma4VisionEncodeResult> {
+export async function runCpuVisionEncoder(
+  session: VisionSession,
+  pixels: VisionPixelValues,
+): Promise<VisionEncodeResult> {
   const manifest = session.manifest;
   const patchGridX = pixels.width / manifest.patchSize;
   const patchGridY = pixels.height / manifest.patchSize;
@@ -94,7 +94,7 @@ export async function runGemma4CpuVisionEncoder(
   };
 }
 
-export function releaseGemma4CpuVisionEncoder(session: Gemma4VisionSession): void {
+export function releaseCpuVisionEncoder(session: VisionSession): void {
   const cache = residentWeightCaches.get(session);
   if (!cache) {
     return;
@@ -105,22 +105,22 @@ export function releaseGemma4CpuVisionEncoder(session: Gemma4VisionSession): voi
   residentWeightCaches.delete(session);
 }
 
-function visionResidentWeightCacheEnabled(session: Gemma4VisionSession): boolean {
+function visionResidentWeightCacheEnabled(session: VisionSession): boolean {
   const provider = session.executionProvider("cpu");
   return provider?.options?.residentWeightCache === true;
 }
 
-function visionProjectionBatchingEnabled(session: Gemma4VisionSession): boolean {
+function visionProjectionBatchingEnabled(session: VisionSession): boolean {
   const provider = session.executionProvider("cpu");
   return provider?.options?.projectionBatching !== false;
 }
 
-function visionWasmKernelsEnabled(session: Gemma4VisionSession): boolean {
+function visionWasmKernelsEnabled(session: VisionSession): boolean {
   const provider = session.executionProvider("cpu");
   return provider?.options?.wasmKernels !== false;
 }
 
-function residentWeightCache(session: Gemma4VisionSession): VisionWasmWeightCache {
+function residentWeightCache(session: VisionSession): VisionWasmWeightCache {
   let cache = residentWeightCaches.get(session);
   if (!cache) {
     cache = {
@@ -130,7 +130,7 @@ function residentWeightCache(session: Gemma4VisionSession): VisionWasmWeightCach
       misses: 0,
     };
     residentWeightCaches.set(session, cache);
-    session.addDisposeCallback(() => releaseGemma4CpuVisionEncoder(session));
+    session.addDisposeCallback(() => releaseCpuVisionEncoder(session));
     const statsCache = cache;
     session.setExecutionProviderStatsProvider(() => ({
       cpuVisionResidentWeightCacheEnabled: visionResidentWeightCacheEnabled(session),
@@ -144,7 +144,7 @@ function residentWeightCache(session: Gemma4VisionSession): VisionWasmWeightCach
 }
 
 async function readWasmWeightHandle(
-  session: Gemma4VisionSession,
+  session: VisionSession,
   weightName: string,
   type: "Q8_0",
   inputSize: number,
@@ -168,8 +168,8 @@ async function readWasmWeightHandle(
 }
 
 async function patchEmbed(
-  session: Gemma4VisionSession,
-  pixels: Gemma4VisionPixelValues,
+  session: VisionSession,
+  pixels: VisionPixelValues,
   patchGridX: number,
   patchGridY: number,
 ): Promise<Float32Array> {
@@ -212,7 +212,7 @@ async function patchEmbed(
 }
 
 async function addPositionEmbeddings(
-  session: Gemma4VisionSession,
+  session: VisionSession,
   hidden: Float32Array,
   patchGridX: number,
   nPatches: number,
@@ -249,7 +249,7 @@ async function addPositionEmbeddings(
 }
 
 async function forwardVisionLayer(
-  session: Gemma4VisionSession,
+  session: VisionSession,
   input: Float32Array,
   layer: number,
   patchGridX: number,
@@ -338,7 +338,7 @@ async function forwardVisionLayer(
 }
 
 async function matMulVisionWeight(
-  session: Gemma4VisionSession,
+  session: VisionSession,
   weightName: string,
   inputColumns: Float32Array,
 ): Promise<Float32Array> {
@@ -351,7 +351,7 @@ async function matMulVisionWeight(
 }
 
 async function matMulVisionWeightBatch(
-  session: Gemma4VisionSession,
+  session: VisionSession,
   weightNames: readonly string[],
   inputColumns: Float32Array,
 ): Promise<Float32Array[] | undefined> {
@@ -414,7 +414,7 @@ async function matMulVisionWeightBatch(
 }
 
 async function sharedInputClamp(
-  session: Gemma4VisionSession,
+  session: VisionSession,
   weightNames: readonly string[],
 ): Promise<{ min: number; max: number } | undefined> {
   let shared: { min: number; max: number } | undefined;
@@ -435,7 +435,7 @@ async function sharedInputClamp(
 }
 
 async function matMulDenseRows(
-  session: Gemma4VisionSession,
+  session: VisionSession,
   weightName: string,
   inputColumns: Float32Array,
 ): Promise<Float32Array> {
@@ -462,7 +462,7 @@ async function matMulDenseRows(
 }
 
 async function matMulQuantizedRows(
-  session: Gemma4VisionSession,
+  session: VisionSession,
   weightName: string,
   type: GgmlTypeName,
   inputColumns: Float32Array,
@@ -507,7 +507,7 @@ async function matMulQuantizedRows(
 }
 
 async function clampLinearInput(
-  session: Gemma4VisionSession,
+  session: VisionSession,
   weightName: string,
   input: Float32Array,
 ): Promise<Float32Array> {
@@ -515,7 +515,7 @@ async function clampLinearInput(
 }
 
 async function clampLinearOutput(
-  session: Gemma4VisionSession,
+  session: VisionSession,
   weightName: string,
   input: Float32Array,
 ): Promise<Float32Array> {
@@ -523,7 +523,7 @@ async function clampLinearOutput(
 }
 
 async function clampTensor(
-  session: Gemma4VisionSession,
+  session: VisionSession,
   input: Float32Array,
   minTensorName: string,
   maxTensorName: string,
@@ -536,7 +536,7 @@ async function clampTensor(
 }
 
 async function readClamp(
-  session: Gemma4VisionSession,
+  session: VisionSession,
   minTensorName: string,
   maxTensorName: string,
 ): Promise<{ min: number; max: number } | undefined> {
@@ -553,7 +553,7 @@ async function clampTensorValues(
   input: Float32Array,
   min: number,
   max: number,
-  session: Gemma4VisionSession,
+  session: VisionSession,
 ): Promise<Float32Array> {
   const wasm = visionWasmKernelsEnabled(session) ? await visionClampWasm(input, min, max) : undefined;
   if (wasm) {
@@ -573,7 +573,7 @@ async function averagePoolVisionTokens(
   embeddingLength: number,
   kernelSize: number,
   outputScale: number,
-  session: Gemma4VisionSession,
+  session: VisionSession,
 ): Promise<Float32Array> {
   const wasm = visionWasmKernelsEnabled(session)
     ? await visionAveragePoolScaleWasm(input, patchGridX, patchGridY, embeddingLength, kernelSize, outputScale)
@@ -610,7 +610,7 @@ async function rope2dNeox(
   headSize: number,
   headCount: number,
   freqBase: number,
-  session: Gemma4VisionSession,
+  session: VisionSession,
 ): Promise<Float32Array> {
   const tokenCount = input.length / (headSize * headCount);
   const wasm = visionWasmKernelsEnabled(session)
@@ -661,7 +661,7 @@ async function rmsNormRows(
   input: Float32Array,
   weight: Float32Array,
   epsilon: number,
-  session: Gemma4VisionSession,
+  session: VisionSession,
 ): Promise<Float32Array> {
   const wasm = visionWasmKernelsEnabled(session)
     ? await visionRmsNormWasm(input, weight.length, epsilon, weight)
@@ -681,7 +681,7 @@ async function rmsNormRowsNoWeight(
   input: Float32Array,
   rowSize: number,
   epsilon: number,
-  session?: Gemma4VisionSession,
+  session?: VisionSession,
 ): Promise<Float32Array> {
   const wasm = session && visionWasmKernelsEnabled(session)
     ? await visionRmsNormWasm(input, rowSize, epsilon)
@@ -709,7 +709,7 @@ function normHeads(
   input: Float32Array,
   weight: Float32Array,
   epsilon: number,
-  session: Gemma4VisionSession,
+  session: VisionSession,
 ): Promise<Float32Array> {
   return rmsNormRows(input, weight, epsilon, session);
 }
@@ -717,7 +717,7 @@ function normHeads(
 async function residualAdd(
   left: Float32Array,
   right: Float32Array,
-  session: Gemma4VisionSession,
+  session: VisionSession,
 ): Promise<Float32Array> {
   if (left.length !== right.length) {
     throw new Error(`Residual shape mismatch: left=${left.length} right=${right.length}`);
@@ -736,7 +736,7 @@ async function residualAdd(
 async function geluMul(
   gate: Float32Array,
   up: Float32Array,
-  session: Gemma4VisionSession,
+  session: VisionSession,
 ): Promise<Float32Array> {
   if (gate.length !== up.length) {
     throw new Error(`GELU multiply shape mismatch: gate=${gate.length} up=${up.length}`);
@@ -757,7 +757,7 @@ async function stdNormalizeVisionTokens(
   bias: Float32Array,
   scale: Float32Array,
   rowSize: number,
-  session: Gemma4VisionSession,
+  session: VisionSession,
 ): Promise<Float32Array> {
   const wasm = visionWasmKernelsEnabled(session) ? await visionStdNormalizeWasm(input, bias, scale, rowSize) : undefined;
   if (wasm) {

@@ -1,41 +1,41 @@
 import type {
   ForwardTrace,
-  Gemma4InferenceState,
-  Gemma4ModelSession,
+  InferenceState,
+  ModelSession,
 } from "../../runtime";
-import type { Gemma4ModelManifest } from "../../model";
+import type { ModelManifest } from "../../model";
 import {
-  forwardGemma4AttentionLayer,
+  forwardAttentionLayer,
 } from "./layers";
 import {
   prefetchWasmShardedLayerWeights,
   prefetchWasmShardedOutputWeight,
-  registerGemma4CpuExecutionProvider,
+  registerCpuExecutionProvider,
 } from "./acceleration";
 
-export type Gemma4CpuSegmentRunnerOptions = {
-  session: Gemma4ModelSession;
-  manifest?: Gemma4ModelManifest;
+export type CpuSegmentRunnerOptions = {
+  session: ModelSession;
+  manifest?: ModelManifest;
   epsilon?: number;
   segmentStartLayer?: number;
   segmentEndLayerExclusive?: number;
 };
 
-export type Gemma4CpuHiddenResult = {
+export type CpuHiddenResult = {
   hidden: Float32Array;
 };
 
-export class Gemma4CpuSegmentRunner {
+export class CpuSegmentRunner {
   readonly segmentStartLayer: number;
   readonly segmentEndLayerExclusive: number;
 
-  private readonly session: Gemma4ModelSession;
-  private readonly manifest: Gemma4ModelManifest;
+  private readonly session: ModelSession;
+  private readonly manifest: ModelManifest;
   private readonly epsilon: number;
 
-  constructor(options: Gemma4CpuSegmentRunnerOptions) {
+  constructor(options: CpuSegmentRunnerOptions) {
     this.session = options.session;
-    registerGemma4CpuExecutionProvider(this.session);
+    registerCpuExecutionProvider(this.session);
     this.manifest = options.manifest ?? options.session.manifest;
     this.epsilon = options.epsilon ?? options.session.epsilon;
     this.segmentStartLayer = options.segmentStartLayer ?? 0;
@@ -54,9 +54,9 @@ export class Gemma4CpuSegmentRunner {
   async runTokensHidden(
     inputHidden: Float32Array,
     positions: Int32Array,
-    state: Gemma4InferenceState,
+    state: InferenceState,
     options: { trace?: ForwardTrace; perLayerInputs?: Float32Array; attentionCausal?: boolean } = {},
-  ): Promise<Gemma4CpuHiddenResult> {
+  ): Promise<CpuHiddenResult> {
     let hidden = inputHidden;
     for (let layer = this.segmentStartLayer; layer < this.segmentEndLayerExclusive; layer += 1) {
       const lookaheadLayer = layer + 1;
@@ -65,7 +65,7 @@ export class Gemma4CpuSegmentRunner {
       } else if (this.segmentEndLayerExclusive === this.manifest.blockCount) {
         prefetchWasmShardedOutputWeight(this.session);
       }
-      hidden = await forwardGemma4AttentionLayer(
+      hidden = await forwardAttentionLayer(
         this.session,
         this.manifest,
         state,
@@ -84,9 +84,9 @@ export class Gemma4CpuSegmentRunner {
   async runTokenHidden(
     inputHidden: Float32Array,
     positions: Int32Array,
-    state: Gemma4InferenceState,
+    state: InferenceState,
     options: { trace?: ForwardTrace; perLayerInputs?: Float32Array; attentionCausal?: boolean } = {},
-  ): Promise<Gemma4CpuHiddenResult> {
+  ): Promise<CpuHiddenResult> {
     return this.runTokensHidden(inputHidden, positions, state, options);
   }
 }

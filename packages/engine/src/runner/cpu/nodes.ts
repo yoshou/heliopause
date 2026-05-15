@@ -6,8 +6,8 @@ import {
   type ForwardValue,
   requireCpuHidden,
 } from "../graph";
-import { forwardGemma4Output } from "./layers";
-import { Gemma4CpuSegmentRunner } from "./segment-runner";
+import { forwardOutput } from "./layers";
+import { CpuSegmentRunner } from "./segment-runner";
 
 export class EmbeddingCpuNode implements ForwardRunnerNode {
   readonly id: string;
@@ -36,7 +36,7 @@ export class CpuLayerSegmentNode implements ForwardRunnerNode {
 
   private readonly startLayer: number;
   private readonly endLayerExclusive: number;
-  private runner?: Gemma4CpuSegmentRunner;
+  private runner?: CpuSegmentRunner;
 
   constructor(
     startLayer: number,
@@ -52,7 +52,7 @@ export class CpuLayerSegmentNode implements ForwardRunnerNode {
 
   async run(context: ForwardGraphContext, inputs: ReadonlyMap<string, ForwardValue>): Promise<ForwardCpuHiddenValue> {
     const input = requireCpuHidden(inputs, this.deps[0] ?? "");
-    this.runner ??= new Gemma4CpuSegmentRunner({
+    this.runner ??= new CpuSegmentRunner({
       session: context.session,
       manifest: context.manifest,
       epsilon: context.session.epsilon,
@@ -87,7 +87,7 @@ export class OutputCpuNode implements ForwardRunnerNode {
     const input = requireCpuHidden(inputs, this.deps[0] ?? "");
     return {
       kind: "output",
-      result: await forwardGemma4Output(context.session, input.hidden, {
+      result: await forwardOutput(context.session, input.hidden, {
         topK: this.topK,
         trace: context.trace,
       }),

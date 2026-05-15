@@ -1,11 +1,11 @@
 export {
   checkWebGpuSupport,
-  planGemma4RunnerPlacement,
-  gemma4WebGpuPlanningProvider,
-  Gemma4WebGpuSegmentRunner,
+  planRunnerPlacement,
+  webGpuPlanningProvider,
+  WebGpuSegmentRunner,
   type WebGpuSupport,
-  type Gemma4WebGpuRuntimeStats,
-  type Gemma4WebGpuSegmentRunnerOptions,
+  type WebGpuRuntimeStats,
+  type WebGpuSegmentRunnerOptions,
 } from "./runner/webgpu/index";
 
 export {
@@ -20,24 +20,24 @@ export {
 } from "./gguf";
 
 export {
-  auditGemma4TensorCoverage,
-  buildGemma4AudioManifest,
-  buildGemma4Manifest,
-  buildGemma4VisionManifest,
-  isGemma4AudioGguf,
-  isGemma4VisionGguf,
+  auditTensorCoverage,
+  buildAudioManifest,
+  buildModelManifest,
+  buildVisionManifest,
+  isAudioGguf,
+  isVisionGguf,
   type ExpectedTensor,
-  type Gemma4AudioManifest,
-  type Gemma4LayerKind,
-  type Gemma4ModelManifest,
-  type Gemma4VisionManifest,
+  type AudioManifest,
+  type LayerKind,
+  type ModelManifest,
+  type VisionManifest,
   type TensorCoverageAudit,
 } from "./model";
 
 export {
-  decodeGemma4,
-  prefillGemma4,
-  prefillGemma4PreparedHidden,
+  decode,
+  prefill,
+  prefillPreparedHidden,
   type DecodeOptions,
   type DecodeResult,
   type PreparedHiddenPrefillOptions,
@@ -46,50 +46,50 @@ export {
 } from "./forward";
 
 export {
-  calculateGemma4VisionResize,
-  createGemma4VisionSession,
-  preprocessGemma4VisionImageFile,
-  runGemma4VisionEncoder,
-  Gemma4VisionSession,
-  type Gemma4VisionEncodeResult,
-  type Gemma4VisionPixelValues,
-  type Gemma4VisionResize,
-  type Gemma4VisionSessionOptions,
+  calculateVisionResize,
+  createVisionSession,
+  preprocessVisionImageFile,
+  runVisionEncoder,
+  VisionSession,
+  type VisionEncodeResult,
+  type VisionPixelValues,
+  type VisionResize,
+  type VisionSessionOptions,
 } from "./vision";
 
 export {
-  createGemma4AudioSession,
-  preprocessGemma4AudioPcm,
-  runGemma4AudioEncoder,
-  Gemma4AudioSession,
-  type Gemma4AudioEncodeResult,
-  type Gemma4AudioFeatures,
-  type Gemma4AudioPcmInput,
-  type Gemma4AudioSessionOptions,
+  createAudioSession,
+  preprocessAudioPcm,
+  runAudioEncoder,
+  AudioSession,
+  type AudioEncodeResult,
+  type AudioFeatures,
+  type AudioPcmInput,
+  type AudioSessionOptions,
 } from "./audio";
 
 export {
-  createGemma4InferenceState,
-  createGemma4ModelSession,
-  cloneGemma4InferenceState,
+  createInferenceState,
+  createModelSession,
+  cloneInferenceState,
   estimateWeightCacheBytes,
-  Gemma4ModelSession,
+  ModelSession,
   type CacheStats,
   type ExecutionProviderConfig,
   type ForwardTrace,
-  type Gemma4FullAttentionCache,
-  type Gemma4InferenceState,
-  type Gemma4ModelInput,
-  type Gemma4ModelSessionOptions,
+  type FullAttentionCache,
+  type InferenceState,
+  type ModelInput,
+  type ModelSessionOptions,
   type TimingEvent,
   type TimingPhase,
   type TimingSink,
 } from "./runtime";
 
-export { Gemma4CpuSegmentRunner } from "./runner/cpu/index";
+export { CpuSegmentRunner } from "./runner/cpu/index";
 export type {
-  Gemma4CpuHiddenResult,
-  Gemma4CpuSegmentRunnerOptions,
+  CpuHiddenResult,
+  CpuSegmentRunnerOptions,
 } from "./runner/cpu/index";
 
 export {
@@ -128,33 +128,33 @@ export {
 } from "./quant";
 
 export {
-  buildGemma4Tokenizer,
-  type Gemma4Tokenizer,
+  buildTokenizer,
+  type Tokenizer,
 } from "./tokenizer";
 
 export {
-  applyGemma4ChatTemplate,
-  applyGemma4ChatGenerationPrompt,
+  applyChatTemplate,
+  applyChatGenerationPrompt,
   createFileGgufTensorReader,
-  createGemma4ChatSession,
-  DEFAULT_GEMMA4_SYSTEM_PROMPT,
-  generateGemma4PreparedAudioChatTurn,
-  generateGemma4PreparedImageChatTurn,
-  generateGemma4ChatTurn,
-  generateGemma4ChatCompletion,
+  createChatSession,
+  DEFAULT_SYSTEM_PROMPT,
+  generatePreparedAudioChatTurn,
+  generatePreparedImageChatTurn,
+  generateChatTurn,
+  generateChatCompletion,
   getGgufModelName,
-  prefillGemma4ChatMessages,
-  stripGemma4Thinking,
+  prefillChatMessages,
+  stripThinking,
   type ChatMessage,
   type FileGgufTensorReaderOptions,
-  type Gemma4ChatCompletionChunk,
-  type Gemma4ChatCompletionOptions,
-  type Gemma4ChatPrefillOptions,
-  type Gemma4ChatTemplateOptions,
-  type Gemma4ChatTurnOptions,
-  type Gemma4ChatTurnResult,
-  type Gemma4PreparedAudioInput,
-  type Gemma4PreparedImageInput,
+  type ChatCompletionChunk,
+  type ChatCompletionOptions,
+  type ChatPrefillOptions,
+  type ChatTemplateOptions,
+  type ChatTurnOptions,
+  type ChatTurnResult,
+  type PreparedAudioInput,
+  type PreparedImageInput,
 } from "./chat";
 
 export {
@@ -168,19 +168,19 @@ export {
 } from "./runner/graph";
 
 export {
-  buildGemma4CpuOnlyForwardGraph,
-  buildGemma4ManualSegmentForwardGraph,
+  buildCpuOnlyForwardGraph,
+  buildManualSegmentForwardGraph,
 } from "./runner/nodes";
 
 export {
-  auditGemma4RunnerPlacementCopies,
-  planGemma4ProviderPlacement,
-  type Gemma4RunnerCopyAuditObservation,
-  type Gemma4RunnerCopyAuditResult,
-  type Gemma4RunnerLayerPlacement,
-  type Gemma4RunnerPlacementPlan,
-  type Gemma4RunnerPlanningOptions,
-  type Gemma4RunnerPlanningProvider,
+  auditRunnerPlacementCopies,
+  planProviderPlacement,
+  type RunnerCopyAuditObservation,
+  type RunnerCopyAuditResult,
+  type RunnerLayerPlacement,
+  type RunnerPlacementPlan,
+  type RunnerPlanningOptions,
+  type RunnerPlanningProvider,
 } from "./runner/planning";
 
 export {

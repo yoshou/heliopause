@@ -10,9 +10,9 @@ import type {
   GgufTensorInfo,
 } from "./gguf";
 
-export type Gemma4LayerKind = "sliding-attention" | "full-attention";
+export type LayerKind = "sliding-attention" | "full-attention";
 
-export type Gemma4ModelManifest = {
+export type ModelManifest = {
   architecture: "gemma4";
   tensorCount: number;
   blockCount: number;
@@ -30,7 +30,7 @@ export type Gemma4ModelManifest = {
   kvSourceLayers: number[];
   contextLength: number;
   slidingWindow: number;
-  layerKinds: Gemma4LayerKind[];
+  layerKinds: LayerKind[];
   slidingAttentionLayerCount: number;
   fullAttentionLayerCount: number;
   slidingAttentionLayers: number[];
@@ -55,7 +55,7 @@ export type ExpectedTensor = {
   dimensions: number[];
   allowedTypes: GgmlTypeName[];
   layer?: number;
-  layerKind?: Gemma4LayerKind;
+  layerKind?: LayerKind;
 };
 
 export type TensorCoverageAudit = {
@@ -70,7 +70,7 @@ export type TensorCoverageAudit = {
   wrongLayerUse: string[];
 };
 
-export type Gemma4VisionManifest = {
+export type VisionManifest = {
   architecture: "clip";
   projectorType: "gemma4";
   tensorCount: number;
@@ -90,7 +90,7 @@ export type Gemma4VisionManifest = {
   tensorTypes: Record<string, number>;
 };
 
-export type Gemma4AudioManifest = {
+export type AudioManifest = {
   architecture: "clip";
   projectorType: "gemma4";
   tensorCount: number;
@@ -123,22 +123,22 @@ export type Gemma4AudioManifest = {
 };
 
 const REQUIRED_ARCHITECTURE = "gemma4";
-const GEMMA4V_DEFAULT_IMAGE_MIN_TOKENS = 252;
-const GEMMA4V_DEFAULT_IMAGE_MAX_TOKENS = 280;
+const VISION_DEFAULT_IMAGE_MIN_TOKENS = 252;
+const VISION_DEFAULT_IMAGE_MAX_TOKENS = 280;
 
-export function isGemma4VisionGguf(gguf: GgufMetadata): boolean {
+export function isVisionGguf(gguf: GgufMetadata): boolean {
   return gguf.metadata["general.architecture"] === "clip" &&
     gguf.metadata["clip.has_vision_encoder"] === true &&
     normalizeVisionProjector(getMetadataString(gguf.metadata, "clip.vision.projector_type")) === "gemma4";
 }
 
-export function isGemma4AudioGguf(gguf: GgufMetadata): boolean {
+export function isAudioGguf(gguf: GgufMetadata): boolean {
   return gguf.metadata["general.architecture"] === "clip" &&
     gguf.metadata["clip.has_audio_encoder"] === true &&
     normalizeAudioProjector(getMetadataString(gguf.metadata, "clip.audio.projector_type")) === "gemma4";
 }
 
-export function buildGemma4VisionManifest(gguf: GgufMetadata): Gemma4VisionManifest {
+export function buildVisionManifest(gguf: GgufMetadata): VisionManifest {
   const metadata = gguf.metadata;
   const architecture = requiredString(metadata, "general.architecture");
   if (architecture !== "clip") {
@@ -169,15 +169,15 @@ export function buildGemma4VisionManifest(gguf: GgufMetadata): Gemma4VisionManif
     layerNormEpsilon: requiredNumber(metadata, "clip.vision.attention.layer_norm_epsilon"),
     projectionDim: requiredNumber(metadata, "clip.vision.projection_dim"),
     spatialMergeSize: getMetadataNumber(metadata, "clip.vision.projector.scale_factor") ?? 3,
-    imageMinTokens: GEMMA4V_DEFAULT_IMAGE_MIN_TOKENS,
-    imageMaxTokens: GEMMA4V_DEFAULT_IMAGE_MAX_TOKENS,
+    imageMinTokens: VISION_DEFAULT_IMAGE_MIN_TOKENS,
+    imageMaxTokens: VISION_DEFAULT_IMAGE_MAX_TOKENS,
     imageMean: requiredNumberTuple3(metadata, "clip.vision.image_mean"),
     imageStd: requiredNumberTuple3(metadata, "clip.vision.image_std"),
     tensorTypes,
   };
 }
 
-export function buildGemma4AudioManifest(gguf: GgufMetadata): Gemma4AudioManifest {
+export function buildAudioManifest(gguf: GgufMetadata): AudioManifest {
   const metadata = gguf.metadata;
   const architecture = requiredString(metadata, "general.architecture");
   if (architecture !== "clip") {
@@ -238,7 +238,7 @@ function normalizeAudioProjector(value: string | undefined): "gemma4" | string |
   return value === "gemma4a" ? "gemma4" : value;
 }
 
-export function buildGemma4Manifest(gguf: GgufMetadata): Gemma4ModelManifest {
+export function buildModelManifest(gguf: GgufMetadata): ModelManifest {
   const metadata = gguf.metadata;
   const architecture = requiredString(metadata, "general.architecture");
 
@@ -260,7 +260,7 @@ export function buildGemma4Manifest(gguf: GgufMetadata): Gemma4ModelManifest {
   const perLayerEmbeddingLength = getMetadataNumber(metadata, "gemma4.embedding_length_per_layer_input") ?? 0;
   const slidingPattern = boolArray(metadata, "gemma4.attention.sliding_window_pattern", blockCount) ??
     range(blockCount).map((layer) => (layer + 1) % 6 !== 0);
-  const layerKinds: Gemma4LayerKind[] = slidingPattern.map((isSliding) => isSliding ? "sliding-attention" : "full-attention");
+  const layerKinds: LayerKind[] = slidingPattern.map((isSliding) => isSliding ? "sliding-attention" : "full-attention");
   const slidingAttentionLayers = range(blockCount).filter((layer) => layerKinds[layer] === "sliding-attention");
   const fullAttentionLayers = range(blockCount).filter((layer) => layerKinds[layer] === "full-attention");
   const sharedKvLayers = getMetadataNumber(metadata, "gemma4.attention.shared_kv_layers") ?? 0;
@@ -291,7 +291,7 @@ export function buildGemma4Manifest(gguf: GgufMetadata): Gemma4ModelManifest {
     tensorTypes[tensor.type] = (tensorTypes[tensor.type] ?? 0) + 1;
   }
 
-  const expectedTensors = buildExpectedGemma4Tensors({
+  const expectedTensors = buildExpectedTensors({
     blockCount,
     embeddingLength,
     feedForwardLength,
@@ -346,9 +346,9 @@ export function buildGemma4Manifest(gguf: GgufMetadata): Gemma4ModelManifest {
   };
 }
 
-export function auditGemma4TensorCoverage(
+export function auditTensorCoverage(
   gguf: GgufMetadata,
-  manifest: Gemma4ModelManifest = buildGemma4Manifest(gguf),
+  manifest: ModelManifest = buildModelManifest(gguf),
   usedTensorNames?: Iterable<string>,
 ): TensorCoverageAudit {
   const tensorsByName = new Map<string, GgufTensorInfo>();
@@ -461,7 +461,7 @@ export function auditGemma4TensorCoverage(
   };
 }
 
-function buildExpectedGemma4Tensors(params: {
+function buildExpectedTensors(params: {
   blockCount: number;
   embeddingLength: number;
   perLayerEmbeddingLength: number;
@@ -585,7 +585,7 @@ function layerTensor(
   suffix: string,
   dimensions: number[],
   allowedTypes: GgmlTypeName[],
-  layerKind?: Gemma4LayerKind,
+  layerKind?: LayerKind,
 ): ExpectedTensor {
   return {
     name: `blk.${layer}.${suffix}`,
@@ -601,7 +601,7 @@ function parseLayerFromTensorName(name: string): number | undefined {
   return match ? Number(match[1]) : undefined;
 }
 
-function isReferenceOptionalSharedKvTensor(name: string, manifest: Gemma4ModelManifest): boolean {
+function isReferenceOptionalSharedKvTensor(name: string, manifest: ModelManifest): boolean {
   const match = /^blk\.(\d+)\.(attn_k|attn_v|attn_k_norm)\.weight$/.exec(name);
   if (!match) {
     return false;

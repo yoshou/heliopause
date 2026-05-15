@@ -1,8 +1,8 @@
-import type { Gemma4ModelManifest } from "../model";
+import type { ModelManifest } from "../model";
 import type {
   ForwardTrace,
-  Gemma4InferenceState,
-  Gemma4ModelSession,
+  InferenceState,
+  ModelSession,
   OutputResult,
 } from "../runtime";
 
@@ -31,9 +31,9 @@ export type ForwardValue =
   | ForwardOutputValue;
 
 export type ForwardGraphContext = {
-  session: Gemma4ModelSession;
-  manifest: Gemma4ModelManifest;
-  state: Gemma4InferenceState;
+  session: ModelSession;
+  manifest: ModelManifest;
+  state: InferenceState;
   positions: Int32Array;
   phase: "prefill" | "decode";
   trace?: ForwardTrace;

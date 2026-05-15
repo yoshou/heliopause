@@ -1,7 +1,7 @@
 import { ChangeEvent, ClipboardEvent, DragEvent, FormEvent, KeyboardEvent, PointerEvent, useEffect, useMemo, useRef, useState } from "react";
 import {
-  DEFAULT_GEMMA4_SYSTEM_PROMPT,
-  stripGemma4Thinking,
+  DEFAULT_SYSTEM_PROMPT,
+  stripThinking,
 } from "@heliopause/engine";
 import type {
   EngineWorkerRequest,
@@ -98,7 +98,7 @@ const INITIAL_ASSISTANT_CONTENT = [
 function App() {
   const [model, setModel] = useState<ModelState>({ status: "empty" });
   const memoryProfile: MemoryProfile = "auto";
-  const systemPrompt = DEFAULT_GEMMA4_SYSTEM_PROMPT;
+  const systemPrompt = DEFAULT_SYSTEM_PROMPT;
   const [prompt, setPrompt] = useState("");
   const [ggufFiles, setGgufFiles] = useState<File[]>([]);
   const [ggufError, setGgufError] = useState<string | undefined>();
@@ -951,7 +951,7 @@ function App() {
 function MessageBubble(
   { isGenerating, message }: { isGenerating: boolean; message: UiMessage },
 ) {
-  const visibleContent = stripGemma4Thinking(message.content);
+  const visibleContent = stripThinking(message.content);
   const textContent = message.files && message.files.length > 0 ? "" : visibleContent;
   const placeholder = message.role === "assistant" && isGenerating ? "Generating..." : "";
   return (

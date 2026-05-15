@@ -5,7 +5,7 @@ import {
   getMetadataString,
 } from "./gguf";
 
-export type Gemma4Tokenizer = {
+export type Tokenizer = {
   bosTokenId?: number;
   eosTokenId?: number;
   tokenize(input: string, options?: { addBos?: boolean }): number[];
@@ -14,21 +14,21 @@ export type Gemma4Tokenizer = {
   tokenToId(token: string): number | undefined;
 };
 
-const GEMMA4_PATTERN =
+const TOKENIZER_PATTERN =
   /(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+/gu;
 
-const GEMMA4_SPM_BPE_PATTERN = /[^\n]+|\n+/gu;
+const TOKENIZER_SPM_BPE_PATTERN = /[^\n]+|\n+/gu;
 
-type Gemma4TokenizerKind = "gpt2-byte-bpe" | "gemma4-spm-bpe";
+type TokenizerKind = "gpt2-byte-bpe" | "spm-bpe";
 
-export function buildGemma4Tokenizer(gguf: GgufMetadata): Gemma4Tokenizer {
+export function buildTokenizer(gguf: GgufMetadata): Tokenizer {
   const model = getMetadataString(gguf.metadata, "tokenizer.ggml.model");
   const pre = getMetadataString(gguf.metadata, "tokenizer.ggml.pre");
   const addBos = gguf.metadata["tokenizer.ggml.add_bos_token"] === true;
   const bosId = getMetadataNumber(gguf.metadata, "tokenizer.ggml.bos_token_id");
   const eosId = getMetadataNumber(gguf.metadata, "tokenizer.ggml.eos_token_id");
 
-  const tokenizerKind = gemma4TokenizerKind(model, pre);
+  const tokenizerKind = detectTokenizerKind(model, pre);
   if (!tokenizerKind) {
     throw new Error(`Unsupported tokenizer metadata: model=${model ?? "missing"} pre=${pre ?? "missing"}`);
   }
@@ -65,8 +65,8 @@ export function buildGemma4Tokenizer(gguf: GgufMetadata): Gemma4Tokenizer {
       }
 
       ids.push(...(
-        tokenizerKind === "gemma4-spm-bpe"
-          ? tokenizeGemma4SpmBpeText(input, tokenToId, ranks, specialTokens)
+        tokenizerKind === "spm-bpe"
+          ? tokenizeSpmBpeText(input, tokenToId, ranks, specialTokens)
           : tokenizeGpt2ByteBpeText(input, tokenToId, ranks, byteEncoder, specialTokens)
       ));
 
@@ -93,12 +93,12 @@ export function buildGemma4Tokenizer(gguf: GgufMetadata): Gemma4Tokenizer {
           output.push(token);
           continue;
         }
-        const fallbackByte = tokenizerKind === "gemma4-spm-bpe" ? byteFallbackValue(token) : undefined;
+        const fallbackByte = tokenizerKind === "spm-bpe" ? byteFallbackValue(token) : undefined;
         if (fallbackByte !== undefined) {
           pendingBytes.push(fallbackByte);
           continue;
         }
-        const text = tokenizerKind === "gemma4-spm-bpe" ? token.replaceAll("▁", " ") : token;
+        const text = tokenizerKind === "spm-bpe" ? token.replaceAll("▁", " ") : token;
         for (const char of Array.from(text)) {
           if (tokenizerKind === "gpt2-byte-bpe") {
             const byte = byteDecoder.get(char);
@@ -123,18 +123,18 @@ export function buildGemma4Tokenizer(gguf: GgufMetadata): Gemma4Tokenizer {
   };
 }
 
-function gemma4TokenizerKind(model: string | undefined, pre: string | undefined): Gemma4TokenizerKind | undefined {
+function detectTokenizerKind(model: string | undefined, pre: string | undefined): TokenizerKind | undefined {
   if (model === "gpt2" && pre === "gemma4") {
     return "gpt2-byte-bpe";
   }
   if (model === "gemma4" && pre === undefined) {
-    return "gemma4-spm-bpe";
+    return "spm-bpe";
   }
   return undefined;
 }
 
-function parseMerge(merge: string, tokenizerKind: Gemma4TokenizerKind): [string, string] | undefined {
-  const separatorIndex = tokenizerKind === "gemma4-spm-bpe" ? merge.indexOf(" ", 1) : merge.indexOf(" ");
+function parseMerge(merge: string, tokenizerKind: TokenizerKind): [string, string] | undefined {
+  const separatorIndex = tokenizerKind === "spm-bpe" ? merge.indexOf(" ", 1) : merge.indexOf(" ");
   if (separatorIndex < 0) {
     return undefined;
   }
@@ -172,7 +172,7 @@ function tokenizeGpt2ByteBpeText(
     }
 
     const chunk = input.slice(offset, nextSpecial);
-    for (const piece of chunk.match(GEMMA4_PATTERN) ?? []) {
+    for (const piece of chunk.match(TOKENIZER_PATTERN) ?? []) {
       const encoded = Array.from(new TextEncoder().encode(piece), (byte) => byteEncoder[byte]).join("");
       for (const token of applyBpe(encoded, ranks)) {
         const id = tokenToId.get(token);
@@ -188,7 +188,7 @@ function tokenizeGpt2ByteBpeText(
   return ids;
 }
 
-function tokenizeGemma4SpmBpeText(
+function tokenizeSpmBpeText(
   input: string,
   tokenToId: Map<string, number>,
   ranks: Map<string, number>,
@@ -218,7 +218,7 @@ function tokenizeGemma4SpmBpeText(
     }
 
     const chunk = input.slice(offset, nextSpecial).replaceAll(" ", "▁");
-    for (const piece of chunk.match(GEMMA4_SPM_BPE_PATTERN) ?? []) {
+    for (const piece of chunk.match(TOKENIZER_SPM_BPE_PATTERN) ?? []) {
       const tokens = piece.indexOf("\n") >= 0 && piece.replaceAll("\n", "") === "" && tokenToId.has(piece)
         ? [piece]
         : applyBpe(Array.from(piece).join(""), ranks);

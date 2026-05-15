@@ -2,9 +2,9 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
-  calculateGemma4VisionResize,
-  createGemma4VisionSession,
-  runGemma4VisionEncoder,
+  calculateVisionResize,
+  createVisionSession,
+  runVisionEncoder,
 } from "../src/vision.ts";
 import {
   GgufTensorReader,
@@ -13,7 +13,7 @@ import {
   resetPrefillWasmForTesting,
 } from "../src/runner/cpu/wasm-kernels.ts";
 
-test("Gemma4V dynamic resize follows llama.cpp token limits", () => {
+test("Vision dynamic resize follows llama.cpp token limits", () => {
   const manifest = {
     patchSize: 16,
     spatialMergeSize: 3,
@@ -21,30 +21,30 @@ test("Gemma4V dynamic resize follows llama.cpp token limits", () => {
     imageMaxTokens: 280,
   };
 
-  assert.deepEqual(calculateGemma4VisionResize(manifest, 512, 512), {
+  assert.deepEqual(calculateVisionResize(manifest, 512, 512), {
     width: 768,
     height: 768,
     outputTokenCount: 256,
   });
 
-  const wide = calculateGemma4VisionResize(manifest, 389, 244);
+  const wide = calculateVisionResize(manifest, 389, 244);
   assert.equal(wide.width % 48, 0);
   assert.equal(wide.height % 48, 0);
   assert.ok(wide.outputTokenCount >= 252);
   assert.ok(wide.outputTokenCount <= 280);
 
-  const tall = calculateGemma4VisionResize(manifest, 215, 330);
+  const tall = calculateVisionResize(manifest, 215, 330);
   assert.equal(tall.width % 48, 0);
   assert.equal(tall.height % 48, 0);
   assert.ok(tall.outputTokenCount >= 252);
   assert.ok(tall.outputTokenCount <= 280);
 });
 
-test("Gemma4V session exposes provider config, caches weights, and disposes resources", async () => {
+test("Vision session exposes provider config, caches weights, and disposes resources", async () => {
   const reader = visionTensorReader([
     f32Tensor("v.patch_embd.weight", [1, 1, 3, 2], new Float32Array(6)),
   ]);
-  const session = createGemma4VisionSession(reader, {
+  const session = createVisionSession(reader, {
     maxWeightCacheBytes: 128,
     executionProviders: [{
       name: "cpu",
@@ -66,7 +66,7 @@ test("Gemma4V session exposes provider config, caches weights, and disposes reso
   assert.deepEqual(session.cacheStats().executionProviderStats, {});
 });
 
-test("Gemma4V falls back through WebGPU and unavailable WASM paths", async () => {
+test("Vision falls back through WebGPU and unavailable WASM paths", async () => {
   const reader = visionTensorReader([
     f32Tensor("v.patch_embd.weight", [1, 1, 3, 2], new Float32Array([0.1, -0.1, 0.2, -0.2, 0.3, -0.3])),
     f32Tensor("v.position_embd.weight", [2, 1, 2], new Float32Array([0.01, 0.02, 0.03, 0.04])),
@@ -74,7 +74,7 @@ test("Gemma4V falls back through WebGPU and unavailable WASM paths", async () =>
   ], {
     "clip.vision.projector.scale_factor": 1,
   });
-  const session = createGemma4VisionSession(reader, {
+  const session = createVisionSession(reader, {
     executionProviders: [
       { name: "webgpu", options: { memoryLimitBytes: 1 } },
       { name: "cpu", options: { wasmKernels: true } },
@@ -83,7 +83,7 @@ test("Gemma4V falls back through WebGPU and unavailable WASM paths", async () =>
 
   resetPrefillWasmForTesting("");
   try {
-    const result = await runGemma4VisionEncoder(session, {
+    const result = await runVisionEncoder(session, {
       values: new Float32Array([0.25, 0.5, 0.75]),
       width: 1,
       height: 1,

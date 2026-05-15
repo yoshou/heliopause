@@ -4,38 +4,38 @@ import {
   type GgufByteReader,
 } from "./gguf";
 import {
-  createGemma4ModelSession,
-  type Gemma4InferenceState,
-  type Gemma4ModelSession,
-  type Gemma4ModelSessionOptions,
+  createModelSession,
+  type InferenceState,
+  type ModelSession,
+  type ModelSessionOptions,
 } from "./runtime";
 import {
-  decodeGemma4,
-  prefillGemma4,
-  prefillGemma4PreparedHidden,
+  decode as decodeToken,
+  prefill as prefillTokens,
+  prefillPreparedHidden,
 } from "./forward";
 import {
   GgufTensorReader,
   type GgufTensorReadTrace,
 } from "./tensor-reader";
-import type { Gemma4Tokenizer } from "./tokenizer";
+import type { Tokenizer } from "./tokenizer";
 
 export type ChatMessage = {
   role: "system" | "user" | "assistant";
   content: string;
 };
 
-export type Gemma4PreparedImageInput = {
+export type PreparedImageInput = {
   hidden: Float32Array;
   tokenCount: number;
 };
 
-export type Gemma4PreparedAudioInput = {
+export type PreparedAudioInput = {
   hidden: Float32Array;
   tokenCount: number;
 };
 
-export type Gemma4ChatTemplateOptions = {
+export type ChatTemplateOptions = {
   addGenerationPrompt?: boolean;
   enableThinking?: boolean;
 };
@@ -46,33 +46,33 @@ export type FileGgufTensorReaderOptions = {
   onRead?: GgufTensorReadTrace;
 };
 
-export type Gemma4ChatCompletionOptions = {
+export type ChatCompletionOptions = {
   maxNewTokens?: number;
   stopTokenIds?: readonly number[];
   signal?: AbortSignal;
-  onToken?: (chunk: Gemma4ChatCompletionChunk) => void;
+  onToken?: (chunk: ChatCompletionChunk) => void;
 };
 
-export type Gemma4ChatPrefillOptions = {
+export type ChatPrefillOptions = {
   signal?: AbortSignal;
 };
 
-export type Gemma4ChatTurnOptions = Gemma4ChatCompletionOptions;
+export type ChatTurnOptions = ChatCompletionOptions;
 
-export type Gemma4ChatTurnResult = {
+export type ChatTurnResult = {
   content: string;
   finishReason: "stop" | "length";
-  state: Gemma4InferenceState;
+  state: InferenceState;
 };
 
-export type Gemma4ChatCompletionChunk = {
+export type ChatCompletionChunk = {
   tokenId: number;
   token: string;
   text: string;
   content: string;
 };
 
-export const DEFAULT_GEMMA4_SYSTEM_PROMPT =
+export const DEFAULT_SYSTEM_PROMPT =
   "You are Heliopause, a helpful local assistant running entirely on this device.";
 
 const DEFAULT_MAX_NEW_TOKENS = 256;
@@ -82,9 +82,9 @@ const TOKENIZER_ARRAY_METADATA_KEYS = [
   "tokenizer.ggml.merges",
 ] as const;
 
-export function applyGemma4ChatTemplate(
+export function applyChatTemplate(
   messages: readonly ChatMessage[],
-  options: Gemma4ChatTemplateOptions = {},
+  options: ChatTemplateOptions = {},
 ): string {
   const addGenerationPrompt = options.addGenerationPrompt ?? true;
   const enableThinking = options.enableThinking ?? false;
@@ -102,8 +102,8 @@ export function applyGemma4ChatTemplate(
   return output;
 }
 
-export function applyGemma4ChatGenerationPrompt(
-  options: Pick<Gemma4ChatTemplateOptions, "enableThinking"> = {},
+export function applyChatGenerationPrompt(
+  options: Pick<ChatTemplateOptions, "enableThinking"> = {},
 ): string {
   return (options.enableThinking ?? false) ? "<|think|>\n<|turn>model\n" : "<|turn>model\n";
 }
@@ -124,52 +124,52 @@ export async function createFileGgufTensorReader(
   return new GgufTensorReader(gguf, byteReader, { onRead: options.onRead });
 }
 
-export function createGemma4ChatSession(
+export function createChatSession(
   tensorReader: GgufTensorReader,
-  options: Gemma4ModelSessionOptions = {},
-): Gemma4ModelSession {
-  return createGemma4ModelSession(tensorReader, options);
+  options: ModelSessionOptions = {},
+): ModelSession {
+  return createModelSession(tensorReader, options);
 }
 
-export async function prefillGemma4ChatMessages(
-  session: Gemma4ModelSession,
-  tokenizer: Gemma4Tokenizer,
-  state: Gemma4InferenceState,
+export async function prefillChatMessages(
+  session: ModelSession,
+  tokenizer: Tokenizer,
+  state: InferenceState,
   messages: readonly ChatMessage[],
-  options: Gemma4ChatPrefillOptions = {},
-): Promise<Gemma4InferenceState> {
-  const prompt = applyGemma4ChatTemplate(messages, { addGenerationPrompt: false });
-  await prefillGemma4ChatText(session, tokenizer, state, prompt, {
+  options: ChatPrefillOptions = {},
+): Promise<InferenceState> {
+  const prompt = applyChatTemplate(messages, { addGenerationPrompt: false });
+  await prefillChatText(session, tokenizer, state, prompt, {
     signal: options.signal,
     requireGenerationSlot: false,
   });
   return state;
 }
 
-export async function generateGemma4ChatTurn(
-  session: Gemma4ModelSession,
-  tokenizer: Gemma4Tokenizer,
-  state: Gemma4InferenceState,
+export async function generateChatTurn(
+  session: ModelSession,
+  tokenizer: Tokenizer,
+  state: InferenceState,
   userContent: string,
-  options: Gemma4ChatTurnOptions = {},
-): Promise<Gemma4ChatTurnResult> {
+  options: ChatTurnOptions = {},
+): Promise<ChatTurnResult> {
   throwIfAborted(options.signal);
 
-  await prefillGemma4ChatText(
+  await prefillChatText(
     session,
     tokenizer,
     state,
-    applyGemma4ChatTemplate([{ role: "user", content: userContent }], {
+    applyChatTemplate([{ role: "user", content: userContent }], {
       addGenerationPrompt: false,
     }),
     { signal: options.signal, requireGenerationSlot: true },
   );
 
-  const promptPrefill = await prefillGemma4ChatText(
+  const promptPrefill = await prefillChatText(
     session,
     tokenizer,
     state,
-    applyGemma4ChatGenerationPrompt(),
+    applyChatGenerationPrompt(),
     {
       signal: options.signal,
       computeLogits: true,
@@ -191,7 +191,7 @@ export async function generateGemma4ChatTurn(
   ].filter((id): id is number => typeof id === "number"));
   const maxNewTokens = options.maxNewTokens ?? DEFAULT_MAX_NEW_TOKENS;
   let content = "";
-  let finishReason: Gemma4ChatTurnResult["finishReason"] = "length";
+  let finishReason: ChatTurnResult["finishReason"] = "length";
 
   for (let index = 0; index < maxNewTokens; index += 1) {
     throwIfAborted(options.signal);
@@ -206,12 +206,12 @@ export async function generateGemma4ChatTurn(
       break;
     }
 
-    const decode = await decodeGemma4(session, tokenId, {
+    const decodeResult = await decodeToken(session, tokenId, {
       state,
       logitsTopK: 1,
     });
-    logits = decode.logits;
-    nextTokenId = nextTokenFrom(logits, decode.topTokens, decode.selectedTokenId);
+    logits = decodeResult.logits;
+    nextTokenId = nextTokenFrom(logits, decodeResult.topTokens, decodeResult.selectedTokenId);
     if (nextTokenId === undefined) {
       finishReason = "stop";
       break;
@@ -219,7 +219,7 @@ export async function generateGemma4ChatTurn(
 
     const token = tokenizer.idToToken(tokenId) ?? "";
     const text = tokenizer.detokenize([tokenId]);
-    content = sanitizeGemma4ChatOutput(content + text);
+    content = sanitizeChatOutput(content + text);
 
     options.onToken?.({
       tokenId,
@@ -230,7 +230,7 @@ export async function generateGemma4ChatTurn(
   }
 
   if (state.nextPosition < state.contextLength) {
-    await prefillGemma4ChatText(session, tokenizer, state, "<turn|>\n", {
+    await prefillChatText(session, tokenizer, state, "<turn|>\n", {
       signal: options.signal,
       requireGenerationSlot: false,
     });
@@ -239,24 +239,24 @@ export async function generateGemma4ChatTurn(
   return { content, finishReason, state };
 }
 
-export async function generateGemma4PreparedImageChatTurn(
-  session: Gemma4ModelSession,
-  tokenizer: Gemma4Tokenizer,
-  state: Gemma4InferenceState,
+export async function generatePreparedImageChatTurn(
+  session: ModelSession,
+  tokenizer: Tokenizer,
+  state: InferenceState,
   userContent: string,
-  image: Gemma4PreparedImageInput,
-  options: Gemma4ChatTurnOptions = {},
-): Promise<Gemma4ChatTurnResult> {
+  image: PreparedImageInput,
+  options: ChatTurnOptions = {},
+): Promise<ChatTurnResult> {
   throwIfAborted(options.signal);
   if (image.tokenCount <= 0 || image.hidden.length !== image.tokenCount * session.manifest.embeddingLength) {
     throw new Error(`Prepared image hidden shape mismatch: ${image.hidden.length}`);
   }
 
-  await prefillGemma4ChatText(session, tokenizer, state, "<|turn>user\n<|image>", {
+  await prefillChatText(session, tokenizer, state, "<|turn>user\n<|image>", {
     signal: options.signal,
     requireGenerationSlot: true,
   });
-  await prefillGemma4PreparedHidden(session, image.hidden, {
+  await prefillPreparedHidden(session, image.hidden, {
     state,
     positions: Int32Array.from(
       { length: image.tokenCount },
@@ -264,16 +264,16 @@ export async function generateGemma4PreparedImageChatTurn(
     ),
     attentionCausal: false,
   });
-  await prefillGemma4ChatText(session, tokenizer, state, `<image|>\n${userContent.trim()}<turn|>\n`, {
+  await prefillChatText(session, tokenizer, state, `<image|>\n${userContent.trim()}<turn|>\n`, {
     signal: options.signal,
     requireGenerationSlot: true,
   });
 
-  const promptPrefill = await prefillGemma4ChatText(
+  const promptPrefill = await prefillChatText(
     session,
     tokenizer,
     state,
-    applyGemma4ChatGenerationPrompt(),
+    applyChatGenerationPrompt(),
     {
       signal: options.signal,
       computeLogits: true,
@@ -295,7 +295,7 @@ export async function generateGemma4PreparedImageChatTurn(
   ].filter((id): id is number => typeof id === "number"));
   const maxNewTokens = options.maxNewTokens ?? DEFAULT_MAX_NEW_TOKENS;
   let content = "";
-  let finishReason: Gemma4ChatTurnResult["finishReason"] = "length";
+  let finishReason: ChatTurnResult["finishReason"] = "length";
 
   for (let index = 0; index < maxNewTokens; index += 1) {
     throwIfAborted(options.signal);
@@ -310,12 +310,12 @@ export async function generateGemma4PreparedImageChatTurn(
       break;
     }
 
-    const decode = await decodeGemma4(session, tokenId, {
+    const decodeResult = await decodeToken(session, tokenId, {
       state,
       logitsTopK: 1,
     });
-    logits = decode.logits;
-    nextTokenId = nextTokenFrom(logits, decode.topTokens, decode.selectedTokenId);
+    logits = decodeResult.logits;
+    nextTokenId = nextTokenFrom(logits, decodeResult.topTokens, decodeResult.selectedTokenId);
     if (nextTokenId === undefined) {
       finishReason = "stop";
       break;
@@ -323,7 +323,7 @@ export async function generateGemma4PreparedImageChatTurn(
 
     const token = tokenizer.idToToken(tokenId) ?? "";
     const text = tokenizer.detokenize([tokenId]);
-    content = sanitizeGemma4ChatOutput(content + text);
+    content = sanitizeChatOutput(content + text);
 
     options.onToken?.({
       tokenId,
@@ -334,7 +334,7 @@ export async function generateGemma4PreparedImageChatTurn(
   }
 
   if (state.nextPosition < state.contextLength) {
-    await prefillGemma4ChatText(session, tokenizer, state, "<turn|>\n", {
+    await prefillChatText(session, tokenizer, state, "<turn|>\n", {
       signal: options.signal,
       requireGenerationSlot: false,
     });
@@ -343,49 +343,49 @@ export async function generateGemma4PreparedImageChatTurn(
   return { content, finishReason, state };
 }
 
-export async function generateGemma4PreparedAudioChatTurn(
-  session: Gemma4ModelSession,
-  tokenizer: Gemma4Tokenizer,
-  state: Gemma4InferenceState,
+export async function generatePreparedAudioChatTurn(
+  session: ModelSession,
+  tokenizer: Tokenizer,
+  state: InferenceState,
   userContent: string,
-  audio: Gemma4PreparedAudioInput,
-  options: Gemma4ChatTurnOptions = {},
-): Promise<Gemma4ChatTurnResult> {
+  audio: PreparedAudioInput,
+  options: ChatTurnOptions = {},
+): Promise<ChatTurnResult> {
   throwIfAborted(options.signal);
   if (audio.tokenCount <= 0 || audio.hidden.length !== audio.tokenCount * session.manifest.embeddingLength) {
     throw new Error(`Prepared audio hidden shape mismatch: ${audio.hidden.length}`);
   }
 
-  await prefillGemma4ChatText(session, tokenizer, state, "<|turn>user\n<|audio>", {
+  await prefillChatText(session, tokenizer, state, "<|turn>user\n<|audio>", {
     signal: options.signal,
     requireGenerationSlot: true,
   });
-  await prefillGemma4PreparedHidden(session, audio.hidden, {
+  await prefillPreparedHidden(session, audio.hidden, {
     state,
     positions: Int32Array.from(
       { length: audio.tokenCount },
       (_, index) => state.nextPosition + index,
     ),
   });
-  await prefillGemma4ChatText(session, tokenizer, state, `<audio|>\n${userContent.trim()}<turn|>\n`, {
+  await prefillChatText(session, tokenizer, state, `<audio|>\n${userContent.trim()}<turn|>\n`, {
     signal: options.signal,
     requireGenerationSlot: true,
   });
 
-  return generateGemma4AssistantFromState(session, tokenizer, state, options);
+  return generateAssistantFromState(session, tokenizer, state, options);
 }
 
-async function generateGemma4AssistantFromState(
-  session: Gemma4ModelSession,
-  tokenizer: Gemma4Tokenizer,
-  state: Gemma4InferenceState,
-  options: Gemma4ChatTurnOptions = {},
-): Promise<Gemma4ChatTurnResult> {
-  const promptPrefill = await prefillGemma4ChatText(
+async function generateAssistantFromState(
+  session: ModelSession,
+  tokenizer: Tokenizer,
+  state: InferenceState,
+  options: ChatTurnOptions = {},
+): Promise<ChatTurnResult> {
+  const promptPrefill = await prefillChatText(
     session,
     tokenizer,
     state,
-    applyGemma4ChatGenerationPrompt(),
+    applyChatGenerationPrompt(),
     {
       signal: options.signal,
       computeLogits: true,
@@ -407,7 +407,7 @@ async function generateGemma4AssistantFromState(
   ].filter((id): id is number => typeof id === "number"));
   const maxNewTokens = options.maxNewTokens ?? DEFAULT_MAX_NEW_TOKENS;
   let content = "";
-  let finishReason: Gemma4ChatTurnResult["finishReason"] = "length";
+  let finishReason: ChatTurnResult["finishReason"] = "length";
 
   for (let index = 0; index < maxNewTokens; index += 1) {
     throwIfAborted(options.signal);
@@ -422,12 +422,12 @@ async function generateGemma4AssistantFromState(
       break;
     }
 
-    const decode = await decodeGemma4(session, tokenId, {
+    const decodeResult = await decodeToken(session, tokenId, {
       state,
       logitsTopK: 1,
     });
-    logits = decode.logits;
-    nextTokenId = nextTokenFrom(logits, decode.topTokens, decode.selectedTokenId);
+    logits = decodeResult.logits;
+    nextTokenId = nextTokenFrom(logits, decodeResult.topTokens, decodeResult.selectedTokenId);
     if (nextTokenId === undefined) {
       finishReason = "stop";
       break;
@@ -435,7 +435,7 @@ async function generateGemma4AssistantFromState(
 
     const token = tokenizer.idToToken(tokenId) ?? "";
     const text = tokenizer.detokenize([tokenId]);
-    content = sanitizeGemma4ChatOutput(content + text);
+    content = sanitizeChatOutput(content + text);
 
     options.onToken?.({
       tokenId,
@@ -446,7 +446,7 @@ async function generateGemma4AssistantFromState(
   }
 
   if (state.nextPosition < state.contextLength) {
-    await prefillGemma4ChatText(session, tokenizer, state, "<turn|>\n", {
+    await prefillChatText(session, tokenizer, state, "<turn|>\n", {
       signal: options.signal,
       requireGenerationSlot: false,
     });
@@ -455,15 +455,15 @@ async function generateGemma4AssistantFromState(
   return { content, finishReason, state };
 }
 
-export async function* generateGemma4ChatCompletion(
-  session: Gemma4ModelSession,
-  tokenizer: Gemma4Tokenizer,
+export async function* generateChatCompletion(
+  session: ModelSession,
+  tokenizer: Tokenizer,
   messages: readonly ChatMessage[],
-  options: Gemma4ChatCompletionOptions = {},
-): AsyncGenerator<Gemma4ChatCompletionChunk, string> {
+  options: ChatCompletionOptions = {},
+): AsyncGenerator<ChatCompletionChunk, string> {
   throwIfAborted(options.signal);
 
-  const prompt = applyGemma4ChatTemplate(messages);
+  const prompt = applyChatTemplate(messages);
   const promptTokenIds = tokenizer.tokenize(prompt);
   const state = session.createInferenceState();
   const stopTokenIds = new Set([
@@ -481,13 +481,13 @@ export async function* generateGemma4ChatCompletion(
     );
   }
 
-  const prefill = await prefillGemma4(session, promptTokenIds, {
+  const prefillResult = await prefillTokens(session, promptTokenIds, {
     state,
     computeLogits: true,
     logitsTopK: 1,
   });
-  let logits = prefill.logits;
-  let nextTokenId = nextTokenFrom(logits, prefill.topTokens, prefill.selectedTokenId);
+  let logits = prefillResult.logits;
+  let nextTokenId = nextTokenFrom(logits, prefillResult.topTokens, prefillResult.selectedTokenId);
   if (nextTokenId === undefined) {
     return "";
   }
@@ -503,7 +503,7 @@ export async function* generateGemma4ChatCompletion(
 
     const token = tokenizer.idToToken(tokenId) ?? "";
     const text = tokenizer.detokenize([tokenId]);
-    content = sanitizeGemma4ChatOutput(content + text);
+    content = sanitizeChatOutput(content + text);
 
     const chunk = {
       tokenId,
@@ -514,12 +514,12 @@ export async function* generateGemma4ChatCompletion(
     options.onToken?.(chunk);
     yield chunk;
 
-    const decode = await decodeGemma4(session, tokenId, {
+    const decodeResult = await decodeToken(session, tokenId, {
       state,
       logitsTopK: 1,
     });
-    logits = decode.logits;
-    nextTokenId = nextTokenFrom(logits, decode.topTokens, decode.selectedTokenId);
+    logits = decodeResult.logits;
+    nextTokenId = nextTokenFrom(logits, decodeResult.topTokens, decodeResult.selectedTokenId);
     if (nextTokenId === undefined) {
       break;
     }
@@ -528,10 +528,10 @@ export async function* generateGemma4ChatCompletion(
   return content;
 }
 
-async function prefillGemma4ChatText(
-  session: Gemma4ModelSession,
-  tokenizer: Gemma4Tokenizer,
-  state: Gemma4InferenceState,
+async function prefillChatText(
+  session: ModelSession,
+  tokenizer: Tokenizer,
+  state: InferenceState,
   text: string,
   options: {
     signal?: AbortSignal;
@@ -539,7 +539,7 @@ async function prefillGemma4ChatText(
     requireGenerationSlot?: boolean;
   } = {},
 ): Promise<{
-  state: Gemma4InferenceState;
+  state: InferenceState;
   logits?: Float32Array;
   selectedTokenId?: number;
   topTokens?: Array<{ id: number; value: number }>;
@@ -559,7 +559,7 @@ async function prefillGemma4ChatText(
     );
   }
 
-  return prefillGemma4(session, tokenIds, {
+  return prefillTokens(session, tokenIds, {
     state,
     positions: Int32Array.from(
       { length: tokenIds.length },
@@ -570,22 +570,22 @@ async function prefillGemma4ChatText(
   });
 }
 
-export function stripGemma4Thinking(content: string): string {
+export function stripThinking(content: string): string {
   let output = content;
   while (true) {
     const start = output.indexOf("<think>");
     if (start < 0) {
-      return sanitizeGemma4ChatOutput(output);
+      return sanitizeChatOutput(output);
     }
     const end = output.indexOf("</think>", start);
     if (end < 0) {
-      return sanitizeGemma4ChatOutput(output.slice(0, start).trimStart());
+      return sanitizeChatOutput(output.slice(0, start).trimStart());
     }
     output = `${output.slice(0, start)}${output.slice(end + "</think>".length)}`;
   }
 }
 
-function sanitizeGemma4ChatOutput(content: string): string {
+function sanitizeChatOutput(content: string): string {
   const stopMarkers = ["<turn|>", "<|im_end|>", "<eos>"];
   let output = content;
   for (const marker of stopMarkers) {

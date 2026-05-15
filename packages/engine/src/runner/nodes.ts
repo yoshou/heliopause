@@ -1,4 +1,4 @@
-import type { Gemma4ModelManifest } from "../model";
+import type { ModelManifest } from "../model";
 import type { ForwardRunnerNode } from "./graph";
 import {
   CpuLayerSegmentNode,
@@ -10,8 +10,8 @@ import {
   WebGpuLayerSegmentNode,
 } from "./webgpu/nodes";
 
-export function buildGemma4CpuOnlyForwardGraph(
-  manifest: Gemma4ModelManifest,
+export function buildCpuOnlyForwardGraph(
+  manifest: ModelManifest,
   tokenIds: readonly number[],
   options: { includeOutput?: boolean; outputTopK?: number } = {},
 ): ForwardRunnerNode[] {
@@ -28,8 +28,8 @@ export function buildGemma4CpuOnlyForwardGraph(
   return nodes;
 }
 
-export function buildGemma4ManualSegmentForwardGraph(
-  manifest: Gemma4ModelManifest,
+export function buildManualSegmentForwardGraph(
+  manifest: ModelManifest,
   tokenIds: readonly number[],
   segment: { startLayer: number; endLayerExclusive: number },
   options: { includeOutput?: boolean; outputTopK?: number } = {},
@@ -68,7 +68,7 @@ function maybeCpuLayerSegmentNode(
 }
 
 function validateLayerSegment(
-  manifest: Gemma4ModelManifest,
+  manifest: ModelManifest,
   segment: { startLayer: number; endLayerExclusive: number },
 ): void {
   if (

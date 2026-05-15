@@ -1,7 +1,7 @@
 import type { GgufTensorReader } from "../../tensor-reader";
-import type { Gemma4ModelManifest } from "../../model";
+import type { ModelManifest } from "../../model";
 import { dequantizeRow } from "../../quant";
-import { GPU_COPY_DST, GPU_COPY_SRC, GPU_MAP_READ, GPU_QUERY_RESOLVE, GPU_STORAGE, GEMMA4_WEBGPU_MEMORY_LIMIT_BYTES } from "./gpu-constants";
+import { GPU_COPY_DST, GPU_COPY_SRC, GPU_MAP_READ, GPU_QUERY_RESOLVE, GPU_STORAGE, WEBGPU_MEMORY_LIMIT_BYTES } from "./gpu-constants";
 import { webGpuDevice } from "./gpu-device";
 import {
   GpuMemoryArena,
@@ -51,7 +51,7 @@ import {
   loadGpuLayer,
   loadOutputStripes,
   loadQuantizedHandle,
-  type Gemma4GpuLayer,
+  type GpuLayer,
   type OutputStripe,
 } from "./segment-layer-loader";
 import {
@@ -62,9 +62,9 @@ import {
 } from "./runtime-resources";
 import type { WebGpuBufferLike, WebGpuCommandEncoderLike, WebGpuComputePassLike, WebGpuQuerySetLike, WebGpuTopToken } from "./gpu-types";
 
-export type Gemma4WebGpuSegmentRunnerOptions = {
+export type WebGpuSegmentRunnerOptions = {
   tensorReader: GgufTensorReader;
-  manifest: Gemma4ModelManifest;
+  manifest: ModelManifest;
   epsilon: number;
   contextLength: number;
   memoryLimitBytes?: number;
@@ -73,23 +73,23 @@ export type Gemma4WebGpuSegmentRunnerOptions = {
   loadOutput?: boolean;
 };
 
-export type Gemma4WebGpuStateLike = {
+export type WebGpuStateLike = {
   contextLength: number;
   nextPosition: number;
 };
 
-export type Gemma4WebGpuTokenResult = {
+export type WebGpuTokenResult = {
   selectedTokenId?: number;
   topTokens?: WebGpuTopToken[];
 };
 
-export type Gemma4WebGpuHiddenResult = {
+export type WebGpuHiddenResult = {
   hidden: Float32Array;
   selectedTokenId?: number;
   topTokens?: WebGpuTopToken[];
 };
 
-export type Gemma4WebGpuRunOptions = {
+export type WebGpuRunOptions = {
   computeSelectedToken?: boolean;
   computeTopK?: boolean;
   topK?: number;
@@ -98,14 +98,14 @@ export type Gemma4WebGpuRunOptions = {
   attentionCausal?: boolean;
 };
 
-type Gemma4WebGpuInternalRunOptions = Gemma4WebGpuRunOptions & {
+type WebGpuInternalRunOptions = WebGpuRunOptions & {
   sourceTokenCount: number;
   sourceTokenIndex: number;
   keyValueTokenCount?: number;
   skipKvUpdate?: boolean;
 };
 
-export type Gemma4WebGpuRuntimeStats = {
+export type WebGpuRuntimeStats = {
   webgpuLazyLoadMs: number;
   webgpuRunnerCreateMs: number;
   webgpuRuntimeInitMs: number;
@@ -214,15 +214,15 @@ const TIMESTAMP_QUERY_PAIR_BYTES = 2 * BigUint64Array.BYTES_PER_ELEMENT;
 const TIMESTAMP_RESOLVE_STRIDE_BYTES = 256;
 const TIMESTAMP_MAX_PASSES = 256;
 
-export class Gemma4WebGpuSegmentRunner {
+export class WebGpuSegmentRunner {
   readonly segmentStartLayer: number;
   readonly segmentEndLayerExclusive: number;
 
   private readonly states = new WeakMap<object, GpuState>();
   private readonly arena: GpuMemoryArena;
-  private readonly manifest: Gemma4ModelManifest;
+  private readonly manifest: ModelManifest;
   private readonly epsilon: number;
-  private readonly layers: Gemma4GpuLayer[];
+  private readonly layers: GpuLayer[];
   private readonly outputNorm?: F32Handle;
   private readonly outputStripes?: OutputStripe[];
   private readonly ropeFreqFactors: F32Handle;
@@ -280,10 +280,10 @@ export class Gemma4WebGpuSegmentRunner {
 
   private constructor(
     arena: GpuMemoryArena,
-    manifest: Gemma4ModelManifest,
+    manifest: ModelManifest,
     tensorReader: GgufTensorReader,
     epsilon: number,
-    layers: Gemma4GpuLayer[],
+    layers: GpuLayer[],
     ropeFreqFactors: F32Handle,
     hasRopeFreqFactors: boolean,
     outputNorm: F32Handle | undefined,
@@ -306,11 +306,11 @@ export class Gemma4WebGpuSegmentRunner {
     this.lazyLoadMs = lazyLoadMs;
   }
 
-  static async create(options: Gemma4WebGpuSegmentRunnerOptions): Promise<Gemma4WebGpuSegmentRunner> {
+  static async create(options: WebGpuSegmentRunnerOptions): Promise<WebGpuSegmentRunner> {
     const startMs = nowMs();
     const device = await webGpuDevice();
     if (!device) {
-      throw new Error("WebGPU is not available for Gemma4 segment execution.");
+      throw new Error("WebGPU is not available for  segment execution.");
     }
     const segmentStartLayer = options.segmentStartLayer;
     const segmentEndLayerExclusive = options.segmentEndLayerExclusive ?? options.manifest.blockCount;
@@ -333,8 +333,8 @@ export class Gemma4WebGpuSegmentRunner {
       }
     }
 
-    const arena = new GpuMemoryArena(device, options.memoryLimitBytes ?? GEMMA4_WEBGPU_MEMORY_LIMIT_BYTES);
-    const layers: Gemma4GpuLayer[] = [];
+    const arena = new GpuMemoryArena(device, options.memoryLimitBytes ?? WEBGPU_MEMORY_LIMIT_BYTES);
+    const layers: GpuLayer[] = [];
     for (let layer = segmentStartLayer; layer < segmentEndLayerExclusive; layer += 1) {
       layers.push(await loadGpuLayer(arena, options.tensorReader, options.manifest, layer));
     }
@@ -347,7 +347,7 @@ export class Gemma4WebGpuSegmentRunner {
       ? await loadOutputStripes(arena, options.tensorReader, options.manifest)
       : undefined;
 
-    return new Gemma4WebGpuSegmentRunner(
+    return new WebGpuSegmentRunner(
       arena,
       options.manifest,
       options.tensorReader,
@@ -367,7 +367,7 @@ export class Gemma4WebGpuSegmentRunner {
     return this.arena.residentBytes;
   }
 
-  runtimeStats(): Gemma4WebGpuRuntimeStats {
+  runtimeStats(): WebGpuRuntimeStats {
     const resourceStats = this.runtimeResourceCache?.stats();
     return {
       webgpuLazyLoadMs: this.lazyLoadMs,
@@ -819,9 +819,9 @@ export class Gemma4WebGpuSegmentRunner {
   async runTokenIds(
     tokenIds: readonly number[],
     positions: Int32Array,
-    state: Gemma4WebGpuStateLike,
-    options: Gemma4WebGpuRunOptions = {},
-  ): Promise<Gemma4WebGpuTokenResult> {
+    state: WebGpuStateLike,
+    options: WebGpuRunOptions = {},
+  ): Promise<WebGpuTokenResult> {
     this.ensureRuntimeResources();
     const runtimeRun = this.beginRuntimeRun();
     try {
@@ -870,9 +870,9 @@ export class Gemma4WebGpuSegmentRunner {
   async runToken(
     inputHidden: Float32Array,
     positions: Int32Array,
-    state: Gemma4WebGpuStateLike,
-    options: Gemma4WebGpuRunOptions = {},
-  ): Promise<Gemma4WebGpuTokenResult> {
+    state: WebGpuStateLike,
+    options: WebGpuRunOptions = {},
+  ): Promise<WebGpuTokenResult> {
     this.ensureRuntimeResources();
     const runtimeRun = this.beginRuntimeRun();
     try {
@@ -907,9 +907,9 @@ export class Gemma4WebGpuSegmentRunner {
   async runTokenHidden(
     inputHidden: Float32Array,
     positions: Int32Array,
-    state: Gemma4WebGpuStateLike,
-    options: Gemma4WebGpuRunOptions = {},
-  ): Promise<Gemma4WebGpuHiddenResult> {
+    state: WebGpuStateLike,
+    options: WebGpuRunOptions = {},
+  ): Promise<WebGpuHiddenResult> {
     this.ensureRuntimeResources();
     const runtimeRun = this.beginRuntimeRun();
     try {
@@ -940,9 +940,9 @@ export class Gemma4WebGpuSegmentRunner {
   async runTokens(
     inputHidden: Float32Array,
     positions: Int32Array,
-    state: Gemma4WebGpuStateLike,
-    options: Gemma4WebGpuRunOptions = {},
-  ): Promise<Gemma4WebGpuTokenResult> {
+    state: WebGpuStateLike,
+    options: WebGpuRunOptions = {},
+  ): Promise<WebGpuTokenResult> {
     this.ensureRuntimeResources();
     const runtimeRun = this.beginRuntimeRun();
     try {
@@ -991,9 +991,9 @@ export class Gemma4WebGpuSegmentRunner {
   async runTokensHidden(
     inputHidden: Float32Array,
     positions: Int32Array,
-    state: Gemma4WebGpuStateLike,
-    options: Gemma4WebGpuRunOptions = {},
-  ): Promise<Gemma4WebGpuHiddenResult> {
+    state: WebGpuStateLike,
+    options: WebGpuRunOptions = {},
+  ): Promise<WebGpuHiddenResult> {
     this.ensureRuntimeResources();
     const runtimeRun = this.beginRuntimeRun();
     try {
@@ -1050,10 +1050,10 @@ export class Gemma4WebGpuSegmentRunner {
   private async runTokensHiddenNonCausal(
     inputHidden: Float32Array,
     positions: Int32Array,
-    state: Gemma4WebGpuStateLike,
-    options: Gemma4WebGpuRunOptions,
+    state: WebGpuStateLike,
+    options: WebGpuRunOptions,
     tokenCount: number,
-  ): Promise<Gemma4WebGpuHiddenResult> {
+  ): Promise<WebGpuHiddenResult> {
     const tokenPositions = tokenPositionsFromBatchedMrope(positions, tokenCount);
     for (const position of tokenPositions) {
       if (position < 0 || position >= state.contextLength) {
@@ -1174,9 +1174,9 @@ export class Gemma4WebGpuSegmentRunner {
     boundary: WebGpuBufferLike,
     tokenIndex: number,
     positions: Int32Array,
-    state: Gemma4WebGpuStateLike,
-    options: Gemma4WebGpuInternalRunOptions,
-  ): Promise<Gemma4WebGpuTokenResult> {
+    state: WebGpuStateLike,
+    options: WebGpuInternalRunOptions,
+  ): Promise<WebGpuTokenResult> {
     const result = await this.runTokenFromBoundaryInternal(boundary, tokenIndex, positions, state, options, false);
     return { selectedTokenId: result.selectedTokenId, topTokens: result.topTokens };
   }
@@ -1185,9 +1185,9 @@ export class Gemma4WebGpuSegmentRunner {
     boundary: WebGpuBufferLike,
     tokenIndex: number,
     positions: Int32Array,
-    state: Gemma4WebGpuStateLike,
-    options: Gemma4WebGpuInternalRunOptions,
-  ): Promise<Gemma4WebGpuHiddenResult> {
+    state: WebGpuStateLike,
+    options: WebGpuInternalRunOptions,
+  ): Promise<WebGpuHiddenResult> {
     return this.runTokenFromBoundaryInternal(boundary, tokenIndex, positions, state, options, true);
   }
 
@@ -1326,7 +1326,7 @@ export class Gemma4WebGpuSegmentRunner {
 
   private dispatchLayerKvUpdate(
     pass: WebGpuComputePassLike,
-    layer: Gemma4GpuLayer,
+    layer: GpuLayer,
     gpuState: GpuState,
     input: WebGpuBufferLike,
     positions: Int32Array,
@@ -1537,10 +1537,10 @@ export class Gemma4WebGpuSegmentRunner {
     boundary: WebGpuBufferLike,
     tokenIndex: number,
     positions: Int32Array,
-    state: Gemma4WebGpuStateLike,
-    options: Gemma4WebGpuInternalRunOptions,
+    state: WebGpuStateLike,
+    options: WebGpuInternalRunOptions,
     readHidden: boolean,
-  ): Promise<Gemma4WebGpuHiddenResult> {
+  ): Promise<WebGpuHiddenResult> {
     const tokenPosition = tokenPositionFromSingleMrope(positions);
     if (tokenPosition < 0 || tokenPosition >= state.contextLength) {
       throw new Error(`Position ${tokenPosition} is outside context length ${state.contextLength}`);
@@ -1698,13 +1698,13 @@ export class Gemma4WebGpuSegmentRunner {
   private dispatchLayer(
     encoder: WebGpuCommandEncoderLike,
     computePass: ActiveComputePass,
-    layer: Gemma4GpuLayer,
+    layer: GpuLayer,
     gpuState: GpuState,
     input: WebGpuBufferLike,
     positions: Int32Array,
     tokenPosition: number,
     contextLength: number,
-    options: Gemma4WebGpuInternalRunOptions,
+    options: WebGpuInternalRunOptions,
     cleanup: GpuResource[],
     resources: Array<{ destroy: () => void }>,
   ): { output: WebGpuBufferLike; compute: ActiveComputePass } {
@@ -1948,7 +1948,7 @@ export class Gemma4WebGpuSegmentRunner {
 
   private dispatchFfn(
     pass: WebGpuComputePassLike,
-    layer: Gemma4GpuLayer,
+    layer: GpuLayer,
     residual: WebGpuBufferLike,
     cleanup: GpuResource[],
     resources: Array<{ destroy: () => void }>,
@@ -1977,9 +1977,9 @@ export class Gemma4WebGpuSegmentRunner {
 
   private dispatchPerLayerInput(
     pass: WebGpuComputePassLike,
-    layer: Gemma4GpuLayer,
+    layer: GpuLayer,
     input: WebGpuBufferLike,
-    options: Gemma4WebGpuInternalRunOptions,
+    options: WebGpuInternalRunOptions,
     cleanup: GpuResource[],
     resources: Array<{ destroy: () => void }>,
   ): WebGpuBufferLike {
@@ -1989,7 +1989,7 @@ export class Gemma4WebGpuSegmentRunner {
       return scaled;
     }
     if ((!options.perLayerInputs && !options.perLayerInputsBuffer) || !layer.perLayerInputGate || !layer.perLayerProjection || !layer.postNorm) {
-      throw new Error("WebGPU Gemma4 per-layer input requires prepared per-layer inputs and weights.");
+      throw new Error("WebGPU per-layer input requires prepared per-layer inputs and weights.");
     }
     const perLayerLength = this.manifest.perLayerEmbeddingLength;
     const perLayerOffset = (layer.layer * options.sourceTokenCount + options.sourceTokenIndex) * perLayerLength;
@@ -2207,7 +2207,7 @@ export class Gemma4WebGpuSegmentRunner {
     return { selectedToken, compute };
   }
 
-  private ensureGpuState(state: Gemma4WebGpuStateLike): GpuState {
+  private ensureGpuState(state: WebGpuStateLike): GpuState {
     if (state.contextLength <= 0) {
       throw new Error(`Invalid WebGPU state context length: ${state.contextLength}`);
     }
@@ -2353,13 +2353,13 @@ function mropeTextPosition(positions: Int32Array, fallback: number): number {
   return positions[0] ?? fallback;
 }
 
-function ropeDimensionCount(manifest: Gemma4ModelManifest, kind: Gemma4GpuLayer["kind"]): number {
+function ropeDimensionCount(manifest: ModelManifest, kind: GpuLayer["kind"]): number {
   return kind === "sliding-attention"
     ? manifest.rope.slidingDimensionCount
     : manifest.rope.fullDimensionCount;
 }
 
-function ropeFreqBase(manifest: Gemma4ModelManifest, kind: Gemma4GpuLayer["kind"]): number {
+function ropeFreqBase(manifest: ModelManifest, kind: GpuLayer["kind"]): number {
   return kind === "sliding-attention"
     ? manifest.rope.slidingFreqBase
     : manifest.rope.fullFreqBase;

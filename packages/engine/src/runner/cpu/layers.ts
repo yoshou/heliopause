@@ -21,15 +21,15 @@ import {
   tensorByteLength,
 } from "../../tensor-reader";
 import {
-  type Gemma4LayerKind,
-  type Gemma4ModelManifest,
+  type LayerKind,
+  type ModelManifest,
 } from "../../model";
 import {
   type ForwardTrace,
-  type Gemma4FullAttentionCache,
-  type Gemma4InferenceState,
-  type Gemma4ModelInput,
-  type Gemma4ModelSession,
+  type FullAttentionCache,
+  type InferenceState,
+  type ModelInput,
+  type ModelSession,
   type OutputResult,
   modelSession,
   requiredFullAttentionCache,
@@ -58,16 +58,16 @@ import type {
   WasmShardedQuantizedWeightHandle,
 } from "./thread-pool";
 
-export type Gemma4PreparedInput = {
+export type PreparedInput = {
   hidden: Float32Array;
   perLayerInputs?: Float32Array;
 };
 
-export async function prepareGemma4Input(
-  model: Gemma4ModelInput,
+export async function prepareInput(
+  model: ModelInput,
   tokenIds: readonly number[],
   trace?: ForwardTrace,
-): Promise<Gemma4PreparedInput> {
+): Promise<PreparedInput> {
   const session = modelSession(model);
   const manifest = session.manifest;
   const tokenCount = tokenIds.length;
@@ -93,7 +93,7 @@ export async function prepareGemma4Input(
       tokenRows[index] = Math.fround((tokenRows[index] ?? 0) * tokenScale);
     }
 
-    const projected = await matMulGemma4Weight(session, "per_layer_model_proj.weight", hidden, trace);
+    const projected = await matMulWeight(session, "per_layer_model_proj.weight", hidden, trace);
     const projectionScale = 1 / Math.sqrt(manifest.embeddingLength);
     const normWeight = await readF32ModelTensor(session, "per_layer_proj_norm.weight");
     const output = new Float32Array(manifest.blockCount * tokenCount * perLayerLength);
@@ -120,11 +120,11 @@ export async function prepareGemma4Input(
   return { hidden, perLayerInputs };
 }
 
-export async function prepareGemma4PreparedHiddenInput(
-  model: Gemma4ModelInput,
+export async function preparePreparedHiddenInput(
+  model: ModelInput,
   hidden: Float32Array,
   trace?: ForwardTrace,
-): Promise<Gemma4PreparedInput> {
+): Promise<PreparedInput> {
   const session = modelSession(model);
   const manifest = session.manifest;
   const tokenCount = hidden.length / manifest.embeddingLength;
@@ -144,7 +144,7 @@ export async function prepareGemma4PreparedHiddenInput(
       paddingRow[index] = Math.fround((paddingRow[index] ?? 0) * tokenScale);
     }
 
-    const projected = await matMulGemma4Weight(session, "per_layer_model_proj.weight", hidden, trace);
+    const projected = await matMulWeight(session, "per_layer_model_proj.weight", hidden, trace);
     const projectionScale = 1 / Math.sqrt(manifest.embeddingLength);
     const normWeight = await readF32ModelTensor(session, "per_layer_proj_norm.weight");
     const output = new Float32Array(manifest.blockCount * tokenCount * perLayerLength);
@@ -172,10 +172,10 @@ export async function prepareGemma4PreparedHiddenInput(
   return { hidden, perLayerInputs };
 }
 
-export async function forwardGemma4AttentionLayer(
-  model: Gemma4ModelInput,
-  manifest: Gemma4ModelManifest,
-  state: Gemma4InferenceState,
+export async function forwardAttentionLayer(
+  model: ModelInput,
+  manifest: ModelManifest,
+  state: InferenceState,
   layer: number,
   input: Float32Array,
   positions: Int32Array,
@@ -210,7 +210,7 @@ export async function forwardGemma4AttentionLayer(
   const q = await timedAsync(
     trace,
     "attention projection q",
-    () => matMulGemma4Weight(session, `blk.${layer}.attn_q.weight`, attnNorm, trace),
+    () => matMulWeight(session, `blk.${layer}.attn_q.weight`, attnNorm, trace),
     { layer, layerKind: kind, weightName: `blk.${layer}.attn_q.weight` },
   );
   if (q.length !== tokenCount * queryDim) {
@@ -242,13 +242,13 @@ export async function forwardGemma4AttentionLayer(
       timedAsync(
         trace,
         "attention projection k",
-        () => matMulGemma4Weight(session, `blk.${layer}.attn_k.weight`, attnNorm, trace),
+        () => matMulWeight(session, `blk.${layer}.attn_k.weight`, attnNorm, trace),
         { layer, layerKind: kind, weightName: `blk.${layer}.attn_k.weight` },
       ),
       timedAsync(
         trace,
         "attention projection v",
-        () => matMulGemma4Weight(session, `blk.${layer}.attn_v.weight`, attnNorm, trace),
+        () => matMulWeight(session, `blk.${layer}.attn_v.weight`, attnNorm, trace),
         { layer, layerKind: kind, weightName: `blk.${layer}.attn_v.weight` },
       ),
     ]);
@@ -352,7 +352,7 @@ export async function forwardGemma4AttentionLayer(
   const attentionOutput = await timedAsync(
     trace,
     "attention output projection",
-    () => matMulGemma4Weight(session, `blk.${layer}.attn_output.weight`, attentionForOutput, trace),
+    () => matMulWeight(session, `blk.${layer}.attn_output.weight`, attentionForOutput, trace),
     { layer, layerKind: kind, weightName: `blk.${layer}.attn_output.weight` },
   );
   const attentionPostNorm = await timedAsync(
@@ -362,7 +362,7 @@ export async function forwardGemma4AttentionLayer(
     { layer, layerKind: kind },
   );
   const attentionResidual = residualAdd(input, attentionPostNorm);
-  const ffn = await forwardGemma4Ffn(session, manifest, layer, attentionResidual, epsilon, trace);
+  const ffn = await forwardFfn(session, manifest, layer, attentionResidual, epsilon, trace);
   const enriched = await applyPerLayerInput(session, manifest, layer, ffn, tokenCount, perLayerInputs, epsilon, trace);
   const scaled = await timedAsync(
     trace,
@@ -383,10 +383,10 @@ export async function forwardGemma4AttentionLayer(
     : scaled;
 }
 
-export const forwardGemma4FullAttentionLayer = forwardGemma4AttentionLayer;
+export const forwardFullAttentionLayer = forwardAttentionLayer;
 
-export async function forwardGemma4Output(
-  model: Gemma4ModelInput,
+export async function forwardOutput(
+  model: ModelInput,
   hidden: Float32Array,
   options: {
     topK?: number;
@@ -409,7 +409,7 @@ export async function forwardGemma4Output(
   const logits = await timedAsync(
     options.trace,
     "output logits",
-    () => matMulGemma4Weight(session, outputWeight, norm, options.trace),
+    () => matMulWeight(session, outputWeight, norm, options.trace),
     { weightName: outputWeight },
   );
   const softcap = session.manifest.finalLogitSoftcap;
@@ -424,9 +424,9 @@ export async function forwardGemma4Output(
   };
 }
 
-async function forwardGemma4Ffn(
-  session: Gemma4ModelSession,
-  manifest: Gemma4ModelManifest,
+async function forwardFfn(
+  session: ModelSession,
+  manifest: ModelManifest,
   layer: number,
   residual: Float32Array,
   epsilon: number,
@@ -441,19 +441,19 @@ async function forwardGemma4Ffn(
   const gateUpBatch = await timedAsync(
     trace,
     "FFN gate/up projection batch",
-    () => matMulGemma4WeightBatch(session, [`blk.${layer}.ffn_gate.weight`, `blk.${layer}.ffn_up.weight`], ffnNorm, trace),
+    () => matMulWeightBatch(session, [`blk.${layer}.ffn_gate.weight`, `blk.${layer}.ffn_up.weight`], ffnNorm, trace),
     { layer },
   );
   const gate = gateUpBatch?.[0] ?? await timedAsync(
     trace,
     "FFN gate projection",
-    () => matMulGemma4Weight(session, `blk.${layer}.ffn_gate.weight`, ffnNorm, trace),
+    () => matMulWeight(session, `blk.${layer}.ffn_gate.weight`, ffnNorm, trace),
     { layer, weightName: `blk.${layer}.ffn_gate.weight` },
   );
   const up = gateUpBatch?.[1] ?? await timedAsync(
     trace,
     "FFN up projection",
-    () => matMulGemma4Weight(session, `blk.${layer}.ffn_up.weight`, ffnNorm, trace),
+    () => matMulWeight(session, `blk.${layer}.ffn_up.weight`, ffnNorm, trace),
     { layer, weightName: `blk.${layer}.ffn_up.weight` },
   );
   const gated = timedSync(trace, "FFN GeGLU", () => {
@@ -466,7 +466,7 @@ async function forwardGemma4Ffn(
   const ffnOut = await timedAsync(
     trace,
     "FFN down projection",
-    () => matMulGemma4Weight(session, `blk.${layer}.ffn_down.weight`, gated, trace),
+    () => matMulWeight(session, `blk.${layer}.ffn_down.weight`, gated, trace),
     { layer, weightName: `blk.${layer}.ffn_down.weight` },
   );
   const postNorm = await timedAsync(
@@ -482,8 +482,8 @@ async function forwardGemma4Ffn(
 }
 
 async function applyPerLayerInput(
-  session: Gemma4ModelSession,
-  manifest: Gemma4ModelManifest,
+  session: ModelSession,
+  manifest: ModelManifest,
   layer: number,
   input: Float32Array,
   tokenCount: number,
@@ -499,7 +499,7 @@ async function applyPerLayerInput(
     trace,
     "per-layer input gate",
     async () => {
-      const projected = await matMulGemma4Weight(session, `blk.${layer}.inp_gate.weight`, input, trace);
+      const projected = await matMulWeight(session, `blk.${layer}.inp_gate.weight`, input, trace);
       for (let index = 0; index < projected.length; index += 1) {
         projected[index] = gelu(projected[index] ?? 0);
       }
@@ -521,7 +521,7 @@ async function applyPerLayerInput(
   const projected = await timedAsync(
     trace,
     "per-layer output projection",
-    () => matMulGemma4Weight(session, `blk.${layer}.proj.weight`, mixed, trace),
+    () => matMulWeight(session, `blk.${layer}.proj.weight`, mixed, trace),
     { layer, weightName: `blk.${layer}.proj.weight` },
   );
   const norm = await timedAsync(
@@ -534,14 +534,14 @@ async function applyPerLayerInput(
 }
 
 async function readF32ModelTensor(
-  session: Gemma4ModelSession,
+  session: ModelSession,
   name: string,
 ): Promise<Float32Array> {
   return session.readF32Tensor(name);
 }
 
 async function readTensorRows(
-  session: Gemma4ModelSession,
+  session: ModelSession,
   tensorName: string,
   rowIds: readonly number[],
 ): Promise<Float32Array> {
@@ -565,8 +565,8 @@ async function readTensorRows(
   return rows;
 }
 
-export async function matMulGemma4Weight(
-  session: Gemma4ModelSession,
+export async function matMulWeight(
+  session: ModelSession,
   weightName: string,
   inputColumns: Float32Array,
   trace?: ForwardTrace,
@@ -581,8 +581,8 @@ export async function matMulGemma4Weight(
   throw new Error(`${weightName} has unsupported matmul type ${tensor.type}`);
 }
 
-async function matMulGemma4WeightBatch(
-  session: Gemma4ModelSession,
+async function matMulWeightBatch(
+  session: ModelSession,
   weightNames: readonly string[],
   inputColumns: Float32Array,
   trace?: ForwardTrace,
@@ -716,7 +716,7 @@ function isQuantizedMatmulWasmType(
 }
 
 async function matMulDenseRows(
-  session: Gemma4ModelSession,
+  session: ModelSession,
   weightName: string,
   inputColumns: Float32Array,
 ): Promise<Float32Array> {
@@ -743,7 +743,7 @@ async function matMulDenseRows(
 }
 
 async function matMulKQ8K(
-  session: Gemma4ModelSession,
+  session: ModelSession,
   weightName: string,
   inputColumns: Float32Array,
   type: Extract<GgmlTypeName, "Q4_K" | "Q5_K" | "Q6_K" | "IQ4_XS">,
@@ -810,7 +810,7 @@ async function matMulKQ8K(
 }
 
 async function matMulQ8_0Weight(
-  session: Gemma4ModelSession,
+  session: ModelSession,
   weightName: string,
   inputColumns: Float32Array,
   trace?: ForwardTrace,
@@ -893,7 +893,7 @@ function normHeads(input: Float32Array, weight: Float32Array, epsilon: number): 
 }
 
 function updateFullAttentionCache(
-  cache: Gemma4FullAttentionCache,
+  cache: FullAttentionCache,
   key: Float32Array,
   value: Float32Array,
   positions: Int32Array,
@@ -1014,19 +1014,19 @@ function ropeNeox(
   return output;
 }
 
-function ropeDimensionCount(manifest: Gemma4ModelManifest, kind: Gemma4LayerKind): number {
+function ropeDimensionCount(manifest: ModelManifest, kind: LayerKind): number {
   return kind === "sliding-attention"
     ? manifest.rope.slidingDimensionCount
     : manifest.rope.fullDimensionCount;
 }
 
-function ropeFreqBase(manifest: Gemma4ModelManifest, kind: Gemma4LayerKind): number {
+function ropeFreqBase(manifest: ModelManifest, kind: LayerKind): number {
   return kind === "sliding-attention"
     ? manifest.rope.slidingFreqBase
     : manifest.rope.fullFreqBase;
 }
 
-async function readRopeFreqFactors(session: Gemma4ModelSession, kind: Gemma4LayerKind): Promise<Float32Array | undefined> {
+async function readRopeFreqFactors(session: ModelSession, kind: LayerKind): Promise<Float32Array | undefined> {
   if (kind === "sliding-attention") {
     return undefined;
   }

@@ -1,5 +1,5 @@
-export { Gemma4CpuSegmentRunner } from "./segment-runner";
+export { CpuSegmentRunner } from "./segment-runner";
 export type {
-  Gemma4CpuHiddenResult,
-  Gemma4CpuSegmentRunnerOptions,
+  CpuHiddenResult,
+  CpuSegmentRunnerOptions,
 } from "./segment-runner";

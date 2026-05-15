@@ -1,15 +1,15 @@
 import type { GgufMetadata, GgufTensorInfo } from "../../gguf";
-import type { Gemma4LayerKind, Gemma4ModelManifest } from "../../model";
+import type { LayerKind, ModelManifest } from "../../model";
 import { tensorByteLength } from "../../tensor-reader";
 import {
-  planGemma4ProviderPlacement,
-  type Gemma4RunnerPlacementPlan,
-  type Gemma4RunnerPlanningOptions,
+  planProviderPlacement,
+  type RunnerPlacementPlan,
+  type RunnerPlanningOptions,
 } from "../planning";
 import {
   DEFAULT_GPU_FIXED_BYTES,
   DEFAULT_GPU_SCRATCH_BYTES,
-  GEMMA4_WEBGPU_MEMORY_LIMIT_BYTES,
+  WEBGPU_MEMORY_LIMIT_BYTES,
 } from "./gpu-constants";
 
 type WebGpuPlanningSupport =
@@ -18,7 +18,7 @@ type WebGpuPlanningSupport =
 
 type WebGpuLayerPlacementParams = {
   tensorsByName: ReadonlyMap<string, GgufTensorInfo>;
-  manifest: Gemma4ModelManifest;
+  manifest: ModelManifest;
   layer: number;
   contextLength: number;
 };
@@ -32,18 +32,18 @@ type WebGpuCopyAuditExpectations = {
   expectedSelectedTokenReadbacks: number;
 };
 
-export const gemma4WebGpuPlanningProvider = {
+export const webGpuPlanningProvider = {
   name: "webgpu",
-  defaultMemoryLimitBytes: GEMMA4_WEBGPU_MEMORY_LIMIT_BYTES,
+  defaultMemoryLimitBytes: WEBGPU_MEMORY_LIMIT_BYTES,
   fixedBytes: DEFAULT_GPU_FIXED_BYTES,
   scratchBytes: DEFAULT_GPU_SCRATCH_BYTES,
   outputTensorNames: ["token_embd.weight", "output_norm.weight"],
   offReason: "WebGPU execution is off; this is a placement plan only.",
-  blockedByMemoryReason: "WebGPU Gemma4 layer suffix plus required KV source layers exceed the configured WebGPU memory cap.",
+  blockedByMemoryReason: "WebGPU layer suffix plus required KV source layers exceed the configured WebGPU memory cap.",
   unavailableReason: (support: WebGpuPlanningSupport) => `WebGPU unavailable: ${support.available ? "unknown" : support.reason}`,
-  plannedReason: "WebGPU Gemma4 layer suffix placement is planned.",
+  plannedReason: "WebGPU layer suffix placement is planned.",
   layerPlacement: ({ tensorsByName, manifest, layer, contextLength }: WebGpuLayerPlacementParams) => {
-    const layerKind: Gemma4LayerKind = manifest.layerKinds[layer] ?? "sliding-attention";
+    const layerKind: LayerKind = manifest.layerKinds[layer] ?? "sliding-attention";
     const weightBytes = manifest.expectedTensors.reduce((sum, expected) => {
       if (expected.layer !== layer) {
         return sum;
@@ -73,7 +73,7 @@ export const gemma4WebGpuPlanningProvider = {
     manifest,
     selectedLayers,
   }: {
-    manifest: Gemma4ModelManifest;
+    manifest: ModelManifest;
     selectedLayers: readonly { layer: number }[];
   }): number | undefined => {
     if (selectedLayers.length === 0) {
@@ -90,13 +90,13 @@ export const gemma4WebGpuPlanningProvider = {
   },
 };
 
-export function planGemma4RunnerPlacement(
+export function planRunnerPlacement(
   gguf: GgufMetadata,
-  manifest: Gemma4ModelManifest,
-  options: Gemma4RunnerPlanningOptions = {},
-): Gemma4RunnerPlacementPlan {
-  return planGemma4ProviderPlacement(
-    gemma4WebGpuPlanningProvider,
+  manifest: ModelManifest,
+  options: RunnerPlanningOptions = {},
+): RunnerPlacementPlan {
+  return planProviderPlacement(
+    webGpuPlanningProvider,
     gguf,
     manifest,
     options,
@@ -109,7 +109,7 @@ function tensorBytes(tensorsByName: ReadonlyMap<string, GgufTensorInfo>, name: s
 }
 
 function attentionCacheBytes(
-  manifest: Gemma4ModelManifest,
+  manifest: ModelManifest,
   layer: number,
   contextLength: number,
 ): number {

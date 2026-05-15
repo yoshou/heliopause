@@ -2,15 +2,15 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
-  auditGemma4TensorCoverage,
-  buildGemma4Manifest,
-  cloneGemma4InferenceState,
-  createGemma4ModelSession,
-  createGemma4InferenceState,
-  decodeGemma4,
+  auditTensorCoverage,
+  buildModelManifest,
+  cloneInferenceState,
+  createModelSession,
+  createInferenceState,
+  decode,
   estimateWeightCacheBytes,
   GgufTensorReader,
-  prefillGemma4,
+  prefill,
 } from "../src/index.ts";
 
 test("tensor coverage audit fails closed on unknown and unused tensors", async () => {
@@ -59,8 +59,8 @@ test("tensor coverage audit fails closed on unknown and unused tensors", async (
     ],
   };
 
-  const manifest = buildGemma4Manifest(gguf);
-  const audit = auditGemma4TensorCoverage(gguf, manifest, ["output_norm.weight"]);
+  const manifest = buildModelManifest(gguf);
+  const audit = auditTensorCoverage(gguf, manifest, ["output_norm.weight"]);
 
   assert.equal(audit.ok, false);
   assert.ok(audit.unknown.includes("unexpected.weight"));
@@ -68,14 +68,14 @@ test("tensor coverage audit fails closed on unknown and unused tensors", async (
   assert.ok(audit.missing.length > 0);
 });
 
-test("Gemma4 inference state allocates attention caches from manifest", () => {
-  const manifest = buildGemma4Manifest({
+test("inference state allocates attention caches from manifest", () => {
+  const manifest = buildModelManifest({
     ...minimalGguf(),
     tensorCount: 0,
     tensors: [],
   });
 
-  const state = createGemma4InferenceState(manifest);
+  const state = createInferenceState(manifest);
 
   assert.deepEqual(Array.from(state.fullAttention.keys()), [0]);
   assert.equal(state.nextPosition, 0);
@@ -85,7 +85,7 @@ test("Gemma4 inference state allocates attention caches from manifest", () => {
   assert.equal(state.fullAttention.get(0)?.valueLength, 2);
 });
 
-test("Gemma4 model session can cap inference cache context", () => {
+test("model session can cap inference cache context", () => {
   const reader = tensorReaderFromTensors([
     f32Tensor("token_embd.weight", [4, 8], sequence(32)),
   ], {
@@ -93,7 +93,7 @@ test("Gemma4 model session can cap inference cache context", () => {
     "gemma4.context_length": 16,
     "gemma4.full_attention_interval": 1,
   });
-  const session = createGemma4ModelSession(reader, { maxContextLength: 4 });
+  const session = createModelSession(reader, { maxContextLength: 4 });
   const state = session.createInferenceState();
 
   assert.equal(session.manifest.contextLength, 16);
@@ -102,20 +102,20 @@ test("Gemma4 model session can cap inference cache context", () => {
   assert.equal(state.fullAttention.get(0)?.value.length, 8);
 });
 
-test("Gemma4 inference state defaults capped context to manifest context", () => {
-  const manifest = buildGemma4Manifest({
+test("inference state defaults capped context to manifest context", () => {
+  const manifest = buildModelManifest({
     ...minimalGguf(),
     tensorCount: 0,
     tensors: [],
   });
-  const state = createGemma4InferenceState(manifest, { contextLength: 1 });
+  const state = createInferenceState(manifest, { contextLength: 1 });
 
   assert.equal(state.contextLength, 1);
   assert.equal(state.fullAttention.get(0)?.key.length, 2);
 });
 
-test("Gemma4 inference state clone deep-copies cache arrays", () => {
-  const manifest = buildGemma4Manifest({
+test("inference state clone deep-copies cache arrays", () => {
+  const manifest = buildModelManifest({
     ...minimalGguf(),
     metadata: {
       ...minimalGguf().metadata,
@@ -125,14 +125,14 @@ test("Gemma4 inference state clone deep-copies cache arrays", () => {
     tensorCount: 0,
     tensors: [],
   });
-  const state = createGemma4InferenceState(manifest);
+  const state = createInferenceState(manifest);
   state.nextPosition = 3;
   const fullAttention = state.fullAttention.get(1);
   assert.ok(fullAttention);
   fullAttention.key[0] = 1;
   fullAttention.value[0] = 2;
 
-  const clone = cloneGemma4InferenceState(state);
+  const clone = cloneInferenceState(state);
   const cloneFullAttention = clone.fullAttention.get(1);
   assert.ok(cloneFullAttention);
   clone.nextPosition = 7;
@@ -144,27 +144,27 @@ test("Gemma4 inference state clone deep-copies cache arrays", () => {
   assert.equal(fullAttention.value[0], 2);
 });
 
-test("Gemma4 prefill advances nextPosition from default and explicit positions", async () => {
+test("prefill advances nextPosition from default and explicit positions", async () => {
   const reader = tensorReaderFromTensors([
     f32Tensor("token_embd.weight", [4, 8], sequence(32)),
   ]);
-  const session = createGemma4ModelSession(reader);
+  const session = createModelSession(reader);
 
-  const defaultResult = await prefillGemma4(session, [1, 2, 3]);
+  const defaultResult = await prefill(session, [1, 2, 3]);
   assert.equal(defaultResult.state.nextPosition, 3);
 
-  const explicitResult = await prefillGemma4(session, [1, 2], {
+  const explicitResult = await prefill(session, [1, 2], {
     positions: new Int32Array([4, 7]),
   });
   assert.equal(explicitResult.state.nextPosition, 8);
 
-  const mropeResult = await prefillGemma4(session, [1, 2], {
+  const mropeResult = await prefill(session, [1, 2], {
     positions: new Int32Array([5, 6, 50, 60, 70, 80, 90, 100]),
   });
   assert.equal(mropeResult.state.nextPosition, 7);
 });
 
-test("Gemma4 decode uses state position, explicit position, and returns fixed logits", async () => {
+test("decode uses state position, explicit position, and returns fixed logits", async () => {
   const reader = tensorReaderFromTensors([
     f32Tensor("token_embd.weight", [4, 8], sequence(32)),
     f32Tensor("output_norm.weight", [4], new Float32Array([1, 1, 1, 1])),
@@ -174,11 +174,11 @@ test("Gemma4 decode uses state position, explicit position, and returns fixed lo
       0.3, -0.2, 0.4, -0.3,
     ])),
   ]);
-  const session = createGemma4ModelSession(reader);
+  const session = createModelSession(reader);
   const state = session.createInferenceState();
   state.nextPosition = 4;
 
-  const first = await decodeGemma4(session, 2, { state, logitsTopK: 2 });
+  const first = await decode(session, 2, { state, logitsTopK: 2 });
   assert.equal(first.state.nextPosition, 5);
   assertFloatArrayClose(first.logits, new Float32Array([
     -0.16329793632030487,
@@ -192,7 +192,7 @@ test("Gemma4 decode uses state position, explicit position, and returns fixed lo
     2e-5,
   );
 
-  const second = await decodeGemma4(session, 3, { state, position: 9, logitsTopK: 2 });
+  const second = await decode(session, 3, { state, position: 9, logitsTopK: 2 });
   assert.equal(second.state.nextPosition, 10);
   assertFloatArrayClose(second.logits, new Float32Array([
     0.1568925976753235,
@@ -207,12 +207,12 @@ test("Gemma4 decode uses state position, explicit position, and returns fixed lo
   );
 });
 
-test("Gemma4 model session caches F32 tensors and embedding rows", async () => {
+test("model session caches F32 tensors and embedding rows", async () => {
   const reader = tensorReaderFromTensors([
     f32Tensor("token_embd.weight", [4, 8], sequence(32)),
     f32Tensor("output_norm.weight", [4], new Float32Array([1, 2, 3, 4])),
   ]);
-  const session = createGemma4ModelSession(reader);
+  const session = createModelSession(reader);
 
   await session.readF32Tensor("output_norm.weight");
   await session.readF32Tensor("output_norm.weight");
@@ -234,13 +234,13 @@ test("Gemma4 model session caches F32 tensors and embedding rows", async () => {
   });
 });
 
-test("Gemma4 model session evicts large weight bytes without evicting small F32 tensors", async () => {
+test("model session evicts large weight bytes without evicting small F32 tensors", async () => {
   const reader = tensorReaderFromTensors([
     f32Tensor("output_norm.weight", [4], new Float32Array([1, 2, 3, 4])),
     bytesTensor("a.weight", [32, 1], "Q8_0", new Uint8Array(34).fill(1)),
     bytesTensor("b.weight", [32, 1], "Q8_0", new Uint8Array(34).fill(2)),
   ]);
-  const session = createGemma4ModelSession(reader, { maxWeightCacheBytes: 40 });
+  const session = createModelSession(reader, { maxWeightCacheBytes: 40 });
 
   await session.readF32Tensor("output_norm.weight");
   await session.readWeightBytes("a.weight");
@@ -258,7 +258,7 @@ test("Gemma4 model session evicts large weight bytes without evicting small F32 
   assert.equal(session.cacheStats().weightCacheEvictions, 2);
 });
 
-test("Gemma4 weight cache estimate counts quantized matmul weights only", () => {
+test("weight cache estimate counts quantized matmul weights only", () => {
   const reader = tensorReaderFromTensors([
     f32Tensor("token_embd.weight", [4, 8], sequence(32)),
     bytesTensor("blk.0.attn_q.weight", [32, 2], "Q8_0", new Uint8Array(68).fill(1)),
@@ -269,7 +269,7 @@ test("Gemma4 weight cache estimate counts quantized matmul weights only", () => 
   assert.equal(estimateWeightCacheBytes(reader), 212);
 });
 
-test("Gemma4 full-attention decode rejects positions outside context", async () => {
+test("full-attention decode rejects positions outside context", async () => {
   const reader = tensorReaderFromTensors([
     f32Tensor("token_embd.weight", [4, 8], sequence(32)),
     f32Tensor("output_norm.weight", [4], new Float32Array([1, 1, 1, 1])),
@@ -285,10 +285,10 @@ test("Gemma4 full-attention decode rejects positions outside context", async () 
       truncated: false,
     },
   });
-  const session = createGemma4ModelSession(reader);
+  const session = createModelSession(reader);
 
   await assert.rejects(
-    decodeGemma4(session, 1, { position: 1 }),
+    decode(session, 1, { position: 1 }),
     /outside context length/,
   );
 });

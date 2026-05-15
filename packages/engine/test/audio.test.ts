@@ -2,23 +2,23 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
-  buildGemma4AudioManifest,
-  isGemma4AudioGguf,
+  buildAudioManifest,
+  isAudioGguf,
 } from "../src/model.ts";
 import {
-  createGemma4AudioSession,
-  preprocessGemma4AudioPcm,
-  runGemma4AudioEncoder,
+  createAudioSession,
+  preprocessAudioPcm,
+  runAudioEncoder,
 } from "../src/audio.ts";
 import {
   GgufTensorReader,
 } from "../src/tensor-reader.ts";
 
-test("Gemma4 audio manifest reads projector metadata", () => {
+test("audio manifest reads projector metadata", () => {
   const reader = audioTensorReader([]);
-  const manifest = buildGemma4AudioManifest(reader.metadata);
+  const manifest = buildAudioManifest(reader.metadata);
 
-  assert.equal(isGemma4AudioGguf(reader.metadata), true);
+  assert.equal(isAudioGguf(reader.metadata), true);
   assert.equal(manifest.projectorType, "gemma4");
   assert.equal(manifest.blockCount, 0);
   assert.equal(manifest.embeddingLength, 1024);
@@ -26,13 +26,13 @@ test("Gemma4 audio manifest reads projector metadata", () => {
   assert.equal(manifest.audioSeqLength, 750);
 });
 
-test("Gemma4 audio preprocessing creates 128-bin log-mel frames", () => {
+test("audio preprocessing creates 128-bin log-mel frames", () => {
   const samples = new Float32Array(16_000);
   for (let index = 0; index < samples.length; index += 1) {
     samples[index] = Math.sin(index * 2 * Math.PI * 440 / 16_000) * 0.1;
   }
 
-  const features = preprocessGemma4AudioPcm({
+  const features = preprocessAudioPcm({
     pcm: samples,
     sampleRate: 16_000,
     durationMs: 1000,
@@ -45,7 +45,7 @@ test("Gemma4 audio preprocessing creates 128-bin log-mel frames", () => {
   assert.ok(features.values.some((value) => Number.isFinite(value)));
 });
 
-test("Gemma4 audio encoder projects hidden to model embedding size", async () => {
+test("audio encoder projects hidden to model embedding size", async () => {
   const reader = audioTensorReader([
     f32Tensor("a.conv1d.0.weight", [3, 3, 1, 128], new Float32Array(3 * 3 * 128)),
     f32Tensor("a.conv1d.0.norm.weight", [128], ones(128)),
@@ -56,14 +56,14 @@ test("Gemma4 audio encoder projects hidden to model embedding size", async () =>
     f32Tensor("a.pre_encode.out.bias", [1536], new Float32Array(1536)),
     f32Tensor("mm.a.input_projection.weight", [1536, 2560], new Float32Array(1536 * 2560)),
   ]);
-  const session = createGemma4AudioSession(reader);
-  const features = preprocessGemma4AudioPcm({
+  const session = createAudioSession(reader);
+  const features = preprocessAudioPcm({
     pcm: new Float32Array(16_000),
     sampleRate: 16_000,
     durationMs: 1000,
   });
 
-  const encoded = await runGemma4AudioEncoder(session, features);
+  const encoded = await runAudioEncoder(session, features);
 
   assert.equal(encoded.tokenCount, 25);
   assert.equal(encoded.hidden.length, 25 * 2560);

@@ -1,4 +1,4 @@
-import type { Gemma4LayerKind, Gemma4ModelManifest } from "../../model";
+import type { LayerKind, ModelManifest } from "../../model";
 import type { GgufTensorReader } from "../../tensor-reader";
 import { GPU_COPY_DST, GPU_STORAGE } from "./gpu-constants";
 import { webGpuAdapterLimits } from "./gpu-device";
@@ -9,8 +9,8 @@ export type OutputStripe = QuantizedHandle & {
   readonly rowOffset: number;
 };
 
-export type Gemma4GpuLayer = {
-  kind: Gemma4LayerKind;
+export type GpuLayer = {
+  kind: LayerKind;
   layer: number;
   hasKv: boolean;
   kvSourceLayer: number;
@@ -38,9 +38,9 @@ export type Gemma4GpuLayer = {
 export async function loadGpuLayer(
   arena: GpuMemoryArena,
   tensorReader: GgufTensorReader,
-  manifest: Gemma4ModelManifest,
+  manifest: ModelManifest,
   layer: number,
-): Promise<Gemma4GpuLayer> {
+): Promise<GpuLayer> {
   const hasPerLayerInput = manifest.perLayerEmbeddingLength > 0;
   const hasKv = manifest.layerHasKv[layer] === true;
   return {
@@ -116,7 +116,7 @@ export async function loadQuantizedHandle(
 export async function loadOutputStripes(
   arena: GpuMemoryArena,
   tensorReader: GgufTensorReader,
-  manifest: Gemma4ModelManifest,
+  manifest: ModelManifest,
 ): Promise<OutputStripe[]> {
   const tensorName = tensorReader.metadata.tensors.some((tensor) => tensor.name === "output.weight")
     ? "output.weight"

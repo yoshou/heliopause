@@ -1,4 +1,4 @@
-import type { ExecutionProviderStats, Gemma4ModelSession } from "../../runtime";
+import type { ExecutionProviderStats, ModelSession } from "../../runtime";
 import {
   tensorByteLength,
   type TensorByteRange,
@@ -22,11 +22,11 @@ type WasmWeightCache = {
   misses: number;
 };
 
-const wasmWeightCaches = new WeakMap<Gemma4ModelSession, WasmWeightCache>();
-const wasmShardedWeightCaches = new WeakMap<Gemma4ModelSession, WasmShardedWeightCache>();
-const wasmThreadPools = new WeakMap<Gemma4ModelSession, WasmThreadPool>();
-const wasmThreadPoolPromises = new WeakMap<Gemma4ModelSession, Promise<WasmThreadPool | undefined>>();
-const wasmIoPrefetchStates = new WeakMap<Gemma4ModelSession, WasmIoPrefetchState>();
+const wasmWeightCaches = new WeakMap<ModelSession, WasmWeightCache>();
+const wasmShardedWeightCaches = new WeakMap<ModelSession, WasmShardedWeightCache>();
+const wasmThreadPools = new WeakMap<ModelSession, WasmThreadPool>();
+const wasmThreadPoolPromises = new WeakMap<ModelSession, Promise<WasmThreadPool | undefined>>();
+const wasmIoPrefetchStates = new WeakMap<ModelSession, WasmIoPrefetchState>();
 
 type WasmShardedWeightCache = {
   handles: Map<string, WasmShardedQuantizedWeightHandle>;
@@ -54,11 +54,11 @@ type WasmPrefetchWeight = {
   byteLength: number;
 };
 
-export function registerGemma4CpuExecutionProvider(session: Gemma4ModelSession): void {
+export function registerCpuExecutionProvider(session: ModelSession): void {
   session.setExecutionProviderStatsProvider(() => cpuExecutionProviderStats(session), "cpu");
 }
 
-export function cpuExecutionProviderStats(session: Gemma4ModelSession): ExecutionProviderStats {
+export function cpuExecutionProviderStats(session: ModelSession): ExecutionProviderStats {
   const cache = wasmWeightCaches.get(session);
   const shardedCache = wasmShardedWeightCaches.get(session);
   const pool = wasmThreadPools.get(session);
@@ -87,7 +87,7 @@ export function cpuExecutionProviderStats(session: Gemma4ModelSession): Executio
   };
 }
 
-export function shutdownGemma4CpuExecutionProvider(session: Gemma4ModelSession): void {
+export function shutdownCpuExecutionProvider(session: ModelSession): void {
   const cache = wasmWeightCaches.get(session);
   if (cache) {
     for (const handle of cache.handles.values()) {
@@ -108,21 +108,21 @@ export function shutdownGemma4CpuExecutionProvider(session: Gemma4ModelSession):
   wasmThreadPoolPromises.delete(session);
 }
 
-export function cpuProjectionBatchingEnabled(session: Gemma4ModelSession): boolean {
+export function cpuProjectionBatchingEnabled(session: ModelSession): boolean {
   return booleanCpuOption(session, "projectionBatching");
 }
 
-export function cpuResidentWeightCacheEnabled(session: Gemma4ModelSession): boolean {
+export function cpuResidentWeightCacheEnabled(session: ModelSession): boolean {
   return booleanCpuOption(session, "residentWeightCache");
 }
 
-export function cpuThreadPoolEnabled(session: Gemma4ModelSession): boolean {
+export function cpuThreadPoolEnabled(session: ModelSession): boolean {
   return cpuResidentWeightCacheEnabled(session) &&
     booleanCpuOption(session, "parallelResidentMatmul") &&
     cpuThreadPoolSize(session) > 1;
 }
 
-export function prefetchWasmShardedLayerWeights(session: Gemma4ModelSession, layer: number): void {
+export function prefetchWasmShardedLayerWeights(session: ModelSession, layer: number): void {
   if (!cpuThreadPoolEnabled(session) || !cpuIoPrefetchEnabled(session)) {
     return;
   }
@@ -132,14 +132,14 @@ export function prefetchWasmShardedLayerWeights(session: Gemma4ModelSession, lay
   enqueueWasmIoPrefetch(session, orderedPrefetchWeightsForLayer(session, layer));
 }
 
-export function prefetchWasmShardedOutputWeight(session: Gemma4ModelSession): void {
+export function prefetchWasmShardedOutputWeight(session: ModelSession): void {
   if (!cpuThreadPoolEnabled(session) || !cpuIoPrefetchEnabled(session)) {
     return;
   }
   enqueueWasmIoPrefetch(session, prefetchWeightForName(session, "output.weight"));
 }
 
-function enqueueWasmIoPrefetch(session: Gemma4ModelSession, weights: WasmPrefetchWeight[]): void {
+function enqueueWasmIoPrefetch(session: ModelSession, weights: WasmPrefetchWeight[]): void {
   if (weights.length === 0) {
     return;
   }
@@ -155,7 +155,7 @@ function enqueueWasmIoPrefetch(session: Gemma4ModelSession, weights: WasmPrefetc
 }
 
 export async function readWasmWeightHandle(
-  session: Gemma4ModelSession,
+  session: ModelSession,
   name: string,
   type: "Q4_K" | "Q5_K" | "Q6_K" | "IQ4_XS" | "Q8_0",
   inputSize: number,
@@ -194,7 +194,7 @@ export async function readWasmWeightHandle(
 }
 
 export async function readWasmShardedWeightHandle(
-  session: Gemma4ModelSession,
+  session: ModelSession,
   name: string,
   type: "Q4_K" | "Q5_K" | "Q6_K" | "IQ4_XS" | "Q8_0",
   inputSize: number,
@@ -258,16 +258,16 @@ export async function matMulWasmShardedWeightHandleBatch(
   return pool.matmulBatch(handles, inputColumns, inputSize, columnCount);
 }
 
-function booleanCpuOption(session: Gemma4ModelSession, name: string): boolean {
+function booleanCpuOption(session: ModelSession, name: string): boolean {
   return session.executionProvider("cpu")?.options?.[name] === true;
 }
 
-function numberCpuOption(session: Gemma4ModelSession, name: string): number | undefined {
+function numberCpuOption(session: ModelSession, name: string): number | undefined {
   const value = session.executionProvider("cpu")?.options?.[name];
   return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
-function cpuThreadPoolSize(session: Gemma4ModelSession): number {
+function cpuThreadPoolSize(session: ModelSession): number {
   const value = session.executionProvider("cpu")?.options?.threadPoolSize;
   if (value === "auto") {
     return Math.max(1, Math.min(8, Math.floor((globalThis.navigator?.hardwareConcurrency ?? 4) / 2)));
@@ -275,16 +275,16 @@ function cpuThreadPoolSize(session: Gemma4ModelSession): number {
   return typeof value === "number" && Number.isFinite(value) ? Math.max(1, Math.floor(value)) : 1;
 }
 
-function cpuParallelMatmulMinRows(session: Gemma4ModelSession): number {
+function cpuParallelMatmulMinRows(session: ModelSession): number {
   return numberCpuOption(session, "parallelMatmulMinRows") ?? 512;
 }
 
-function cpuIoPrefetchEnabled(session: Gemma4ModelSession): boolean {
+function cpuIoPrefetchEnabled(session: ModelSession): boolean {
   const value = session.executionProvider("cpu")?.options?.ioPrefetch;
   return typeof value === "boolean" ? value : cpuResidentWeightCacheEnabled(session);
 }
 
-function cpuIoPrefetchConcurrency(session: Gemma4ModelSession): number {
+function cpuIoPrefetchConcurrency(session: ModelSession): number {
   const value = session.executionProvider("cpu")?.options?.ioPrefetchConcurrency;
   if (value === "auto" || value === undefined) {
     const globalWithProcess = globalThis as typeof globalThis & {
@@ -297,20 +297,20 @@ function cpuIoPrefetchConcurrency(session: Gemma4ModelSession): number {
     : 1;
 }
 
-function cpuIoCoalesceMaxGapBytes(session: Gemma4ModelSession): number {
+function cpuIoCoalesceMaxGapBytes(session: ModelSession): number {
   return numberCpuOption(session, "ioCoalesceMaxGapBytes") ?? 1024 * 1024;
 }
 
-function cpuIoCoalesceMaxReadBytes(session: Gemma4ModelSession): number {
+function cpuIoCoalesceMaxReadBytes(session: ModelSession): number {
   return numberCpuOption(session, "ioCoalesceMaxReadBytes") ?? 256 * 1024 * 1024;
 }
 
-function cpuIoWorkerBlobReadEnabled(session: Gemma4ModelSession): boolean {
+function cpuIoWorkerBlobReadEnabled(session: ModelSession): boolean {
   const value = session.executionProvider("cpu")?.options?.ioWorkerBlobRead;
   return typeof value === "boolean" ? value : false;
 }
 
-function ensureWasmWeightCache(session: Gemma4ModelSession): WasmWeightCache {
+function ensureWasmWeightCache(session: ModelSession): WasmWeightCache {
   let cache = wasmWeightCaches.get(session);
   if (!cache) {
     cache = {
@@ -321,12 +321,12 @@ function ensureWasmWeightCache(session: Gemma4ModelSession): WasmWeightCache {
       misses: 0,
     };
     wasmWeightCaches.set(session, cache);
-    registerGemma4CpuExecutionProvider(session);
+    registerCpuExecutionProvider(session);
   }
   return cache;
 }
 
-function ensureWasmShardedWeightCache(session: Gemma4ModelSession): WasmShardedWeightCache {
+function ensureWasmShardedWeightCache(session: ModelSession): WasmShardedWeightCache {
   let cache = wasmShardedWeightCaches.get(session);
   if (!cache) {
     cache = {
@@ -337,12 +337,12 @@ function ensureWasmShardedWeightCache(session: Gemma4ModelSession): WasmShardedW
       misses: 0,
     };
     wasmShardedWeightCaches.set(session, cache);
-    registerGemma4CpuExecutionProvider(session);
+    registerCpuExecutionProvider(session);
   }
   return cache;
 }
 
-async function ensureWasmThreadPool(session: Gemma4ModelSession): Promise<WasmThreadPool | undefined> {
+async function ensureWasmThreadPool(session: ModelSession): Promise<WasmThreadPool | undefined> {
   let pool = wasmThreadPools.get(session);
   if (pool) {
     return pool;
@@ -354,7 +354,7 @@ async function ensureWasmThreadPool(session: Gemma4ModelSession): Promise<WasmTh
   const created = WasmThreadPool.create(cpuThreadPoolSize(session)).then((nextPool) => {
     if (nextPool) {
       wasmThreadPools.set(session, nextPool);
-      registerGemma4CpuExecutionProvider(session);
+      registerCpuExecutionProvider(session);
     }
     return nextPool;
   }).finally(() => {
@@ -365,7 +365,7 @@ async function ensureWasmThreadPool(session: Gemma4ModelSession): Promise<WasmTh
 }
 
 async function prepareWasmShardedWeightHandle(
-  session: Gemma4ModelSession,
+  session: ModelSession,
   pool: WasmThreadPool,
   name: string,
   type: "Q4_K" | "Q5_K" | "Q6_K" | "IQ4_XS" | "Q8_0",
@@ -423,7 +423,7 @@ async function prepareWasmShardedWeightHandle(
 }
 
 async function prepareWasmShardedWeightHandleFromBlob(
-  session: Gemma4ModelSession,
+  session: ModelSession,
   pool: WasmThreadPool,
   name: string,
   type: "Q4_K" | "Q5_K" | "Q6_K" | "IQ4_XS" | "Q8_0",
@@ -470,7 +470,7 @@ async function prepareWasmShardedWeightHandleFromBlob(
   return handle;
 }
 
-function ensureWasmIoPrefetchState(session: Gemma4ModelSession): WasmIoPrefetchState {
+function ensureWasmIoPrefetchState(session: ModelSession): WasmIoPrefetchState {
   let state = wasmIoPrefetchStates.get(session);
   if (!state) {
     state = {
@@ -483,12 +483,12 @@ function ensureWasmIoPrefetchState(session: Gemma4ModelSession): WasmIoPrefetchS
       workerBlobBytes: 0,
     };
     wasmIoPrefetchStates.set(session, state);
-    registerGemma4CpuExecutionProvider(session);
+    registerCpuExecutionProvider(session);
   }
   return state;
 }
 
-function pumpWasmIoPrefetch(session: Gemma4ModelSession, state: WasmIoPrefetchState): void {
+function pumpWasmIoPrefetch(session: ModelSession, state: WasmIoPrefetchState): void {
   const concurrency = cpuIoPrefetchConcurrency(session);
   while (state.active < concurrency && state.queue.length > 0) {
     const weight = state.queue.shift();
@@ -511,7 +511,7 @@ function pumpWasmIoPrefetch(session: Gemma4ModelSession, state: WasmIoPrefetchSt
   }
 }
 
-function orderedPrefetchWeightsForLayer(session: Gemma4ModelSession, layer: number): WasmPrefetchWeight[] {
+function orderedPrefetchWeightsForLayer(session: ModelSession, layer: number): WasmPrefetchWeight[] {
   const names: string[] = [];
   const manifest = session.manifest;
   names.push(`blk.${layer}.attn_q.weight`);
@@ -535,8 +535,8 @@ function orderedPrefetchWeightsForLayer(session: Gemma4ModelSession, layer: numb
   return weights;
 }
 
-function prefetchWeightForName(session: Gemma4ModelSession, name: string): WasmPrefetchWeight[] {
-  let tensor: ReturnType<Gemma4ModelSession["getTensor"]>;
+function prefetchWeightForName(session: ModelSession, name: string): WasmPrefetchWeight[] {
+  let tensor: ReturnType<ModelSession["getTensor"]>;
   try {
     tensor = session.getTensor(name);
   } catch {

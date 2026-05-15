@@ -2,21 +2,21 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
-  applyGemma4ChatTemplate,
-  buildGemma4Tokenizer,
+  applyChatTemplate,
+  buildTokenizer,
   createFileGgufTensorReader,
-  createGemma4ModelSession,
-  generateGemma4ChatTurn,
-  generateGemma4ChatCompletion,
+  createModelSession,
+  generateChatTurn,
+  generateChatCompletion,
   GgufTensorReader,
-  prefillGemma4ChatMessages,
-  stripGemma4Thinking,
+  prefillChatMessages,
+  stripThinking,
   type GgufMetadata,
 } from "../src/index.ts";
 
-test("Gemma4 chat template formats history and disables thinking by default", () => {
+test("chat template formats history and disables thinking by default", () => {
   assert.equal(
-    applyGemma4ChatTemplate([
+    applyChatTemplate([
       { role: "system", content: "Be concise." },
       { role: "user", content: "Hello" },
       { role: "assistant", content: "Hi" },
@@ -28,9 +28,9 @@ test("Gemma4 chat template formats history and disables thinking by default", ()
   );
 });
 
-test("Gemma4 chat template can leave thinking enabled", () => {
+test("chat template can leave thinking enabled", () => {
   assert.equal(
-    applyGemma4ChatTemplate([
+    applyChatTemplate([
       { role: "user", content: "Hello" },
     ], { enableThinking: true }),
     "<|turn>user\nHello<turn|>\n" +
@@ -38,8 +38,8 @@ test("Gemma4 chat template can leave thinking enabled", () => {
   );
 });
 
-test("Gemma4 tokenizer preserves special chat tokens and detokenizes text", () => {
-  const tokenizer = buildGemma4Tokenizer(tokenizerGguf([
+test("tokenizer preserves special chat tokens and detokenizes text", () => {
+  const tokenizer = buildTokenizer(tokenizerGguf([
     "H",
     "e",
     "l",
@@ -60,8 +60,8 @@ test("Gemma4 tokenizer preserves special chat tokens and detokenizes text", () =
   assert.equal(tokenizer.detokenize([10, 0, 11]), "<|im_start|>H<|im_end|>");
 });
 
-test("Gemma4 tokenizer accepts GGUF model metadata without pre field", () => {
-  const tokenizer = buildGemma4Tokenizer(tokenizerGguf([
+test("tokenizer accepts GGUF model metadata without pre field", () => {
+  const tokenizer = buildTokenizer(tokenizerGguf([
     "H",
     "e",
     "l",
@@ -72,8 +72,8 @@ test("Gemma4 tokenizer accepts GGUF model metadata without pre field", () => {
   assert.equal(tokenizer.detokenize([0, 1, 2, 2, 3]), "Hello");
 });
 
-test("Gemma4 tokenizer uses SPM-style BPE and byte fallback for model metadata", () => {
-  const tokenizer = buildGemma4Tokenizer(tokenizerGguf([
+test("tokenizer uses SPM-style BPE and byte fallback for model metadata", () => {
+  const tokenizer = buildTokenizer(tokenizerGguf([
     "▁",
     "H",
     "i",
@@ -93,7 +93,7 @@ test("Gemma4 tokenizer uses SPM-style BPE and byte fallback for model metadata",
   assert.equal(tokenizer.detokenize([4, 5, 6, 7]), " Hiあ");
 });
 
-test("Gemma4 chat generation stops on turn token", async () => {
+test("chat generation stops on turn token", async () => {
   const tokenizer = {
     eosTokenId: 3,
     tokenize() {
@@ -109,7 +109,7 @@ test("Gemma4 chat generation stops on turn token", async () => {
       return token === "<turn|>" ? 3 : undefined;
     },
   };
-  const session = createGemma4ModelSession(tensorReaderFromTensors([
+  const session = createModelSession(tensorReaderFromTensors([
     f32Tensor("token_embd.weight", [4, 12], new Float32Array([
       1, 0, 0, 0,
       0, 1, 0, 0,
@@ -142,7 +142,7 @@ test("Gemma4 chat generation stops on turn token", async () => {
   ]));
 
   const chunks = [];
-  for await (const chunk of generateGemma4ChatCompletion(
+  for await (const chunk of generateChatCompletion(
     session,
     tokenizer,
     [{ role: "user", content: "A" }],
@@ -154,7 +154,7 @@ test("Gemma4 chat generation stops on turn token", async () => {
   assert.deepEqual(chunks.map((chunk) => chunk.text), ["A"]);
 });
 
-test("Gemma4 stateful chat turn pre-fills only the new turn suffix", async () => {
+test("stateful chat turn pre-fills only the new turn suffix", async () => {
   const tokenizedTexts: string[] = [];
   const tokenizer = {
     eosTokenId: 3,
@@ -178,7 +178,7 @@ test("Gemma4 stateful chat turn pre-fills only the new turn suffix", async () =>
       return token === "<turn|>" ? 3 : undefined;
     },
   };
-  const session = createGemma4ModelSession(tensorReaderFromTensors([
+  const session = createModelSession(tensorReaderFromTensors([
     f32Tensor("token_embd.weight", [4, 12], new Float32Array([
       1, 0, 0, 0,
       0, 1, 0, 0,
@@ -203,7 +203,7 @@ test("Gemma4 stateful chat turn pre-fills only the new turn suffix", async () =>
   ]));
   const state = session.createInferenceState();
 
-  await prefillGemma4ChatMessages(
+  await prefillChatMessages(
     session,
     tokenizer,
     state,
@@ -212,7 +212,7 @@ test("Gemma4 stateful chat turn pre-fills only the new turn suffix", async () =>
   assert.equal(state.nextPosition, 1);
 
   const chunks: string[] = [];
-  const result = await generateGemma4ChatTurn(
+  const result = await generateChatTurn(
     session,
     tokenizer,
     state,
@@ -283,11 +283,11 @@ test("file GGUF tensor reader fully parses tokenizer arrays", async () => {
   });
 });
 
-test("stripGemma4Thinking hides complete and partial thinking blocks", () => {
-  assert.equal(stripGemma4Thinking("<think>\nsecret\n</think>\n\nVisible"), "\n\nVisible");
-  assert.equal(stripGemma4Thinking("<think>\nsecret"), "");
-  assert.equal(stripGemma4Thinking("Visible\n\n</think>\n<|im_end|>"), "Visible\n\n\n");
-  assert.equal(stripGemma4Thinking("Visible<turn|>\nignored"), "Visible");
+test("stripThinking hides complete and partial thinking blocks", () => {
+  assert.equal(stripThinking("<think>\nsecret\n</think>\n\nVisible"), "\n\nVisible");
+  assert.equal(stripThinking("<think>\nsecret"), "");
+  assert.equal(stripThinking("Visible\n\n</think>\n<|im_end|>"), "Visible\n\n\n");
+  assert.equal(stripThinking("Visible<turn|>\nignored"), "Visible");
 });
 
 function tokenizerGguf(

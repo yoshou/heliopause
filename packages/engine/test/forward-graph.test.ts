@@ -2,8 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
-  buildGemma4Manifest,
-  createGemma4ModelSession,
+  buildModelManifest,
+  createModelSession,
   GgufTensorReader,
 } from "../src/index.ts";
 import {
@@ -13,8 +13,8 @@ import {
   type ForwardRunnerNode,
 } from "../src/runner/graph.ts";
 import {
-  buildGemma4CpuOnlyForwardGraph,
-  buildGemma4ManualSegmentForwardGraph,
+  buildCpuOnlyForwardGraph,
+  buildManualSegmentForwardGraph,
 } from "../src/runner/nodes.ts";
 
 test("forward graph topologically sorts dependency order", () => {
@@ -77,7 +77,7 @@ test("forward graph cleans produced WebGPU values when execution fails", async (
   assert.equal(destroyed, true);
 });
 
-test("CPU-only forward graph produces fixed Gemma4 logits for synthetic tensors", async () => {
+test("CPU-only forward graph produces fixed logits for synthetic tensors", async () => {
   const reader = tensorReaderFromTensors([
     f32Tensor("token_embd.weight", [4, 8], sequence(32)),
     f32Tensor("output_norm.weight", [4], new Float32Array([1, 1, 1, 1])),
@@ -87,11 +87,11 @@ test("CPU-only forward graph produces fixed Gemma4 logits for synthetic tensors"
       0.3, -0.2, 0.4, -0.3,
     ])),
   ]);
-  const session = createGemma4ModelSession(reader);
+  const session = createModelSession(reader);
   const state = session.createInferenceState();
   const tokenIds = [2];
   const positions = new Int32Array([0]);
-  const graph = new ForwardGraphExecutor(buildGemma4CpuOnlyForwardGraph(session.manifest, tokenIds, {
+  const graph = new ForwardGraphExecutor(buildCpuOnlyForwardGraph(session.manifest, tokenIds, {
     outputTopK: 2,
   }));
   const result = await graph.run({
@@ -118,7 +118,7 @@ test("CPU-only forward graph produces fixed Gemma4 logits for synthetic tensors"
 });
 
 test("manual WebGPU segment graph is explicit and leaves transfer test-only", () => {
-  const manifest = buildGemma4Manifest({
+  const manifest = buildModelManifest({
     ...minimalGguf(),
     metadata: {
       ...minimalGguf().metadata,
@@ -126,7 +126,7 @@ test("manual WebGPU segment graph is explicit and leaves transfer test-only", ()
       "gemma4.full_attention_interval": 2,
     },
   });
-  const nodes = buildGemma4ManualSegmentForwardGraph(
+  const nodes = buildManualSegmentForwardGraph(
     manifest,
     [1],
     { startLayer: 1, endLayerExclusive: 2 },
@@ -155,7 +155,7 @@ function node(id: string, deps: string[] = []): ForwardRunnerNode {
 
 function emptyContext(): ForwardGraphContext {
   const reader = tensorReaderFromTensors([]);
-  const session = createGemma4ModelSession(reader);
+  const session = createModelSession(reader);
   return {
     session,
     manifest: session.manifest,

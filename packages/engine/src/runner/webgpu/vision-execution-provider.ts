@@ -1,12 +1,12 @@
 import type { GgmlTypeName } from "../../gguf";
 import { dequantizeRow } from "../../quant";
 import {
-  type Gemma4VisionEncodeResult,
-  type Gemma4VisionPixelValues,
-  type Gemma4VisionSession,
+  type VisionEncodeResult,
+  type VisionPixelValues,
+  type VisionSession,
 } from "../../vision";
 import { GpuMemoryArena, type F32Handle, type GpuResource } from "./arena";
-import { GPU_COPY_DST, GPU_COPY_SRC, GPU_MAP_READ, GPU_STORAGE, GEMMA4_WEBGPU_MEMORY_LIMIT_BYTES } from "./gpu-constants";
+import { GPU_COPY_DST, GPU_COPY_SRC, GPU_MAP_READ, GPU_STORAGE, WEBGPU_MEMORY_LIMIT_BYTES } from "./gpu-constants";
 import { webGpuDevice } from "./gpu-device";
 import {
   dispatchF32MatMul,
@@ -38,13 +38,13 @@ type VisionRunBuffers = {
   cleanup: GpuResource[];
 };
 
-const runners = new WeakMap<Gemma4VisionSession, Promise<Gemma4WebGpuVisionRunner | undefined>>();
-const statsBySession = new WeakMap<Gemma4VisionSession, VisionStats>();
+const runners = new WeakMap<VisionSession, Promise<WebGpuVisionRunner | undefined>>();
+const statsBySession = new WeakMap<VisionSession, VisionStats>();
 
-export async function runGemma4WebGpuVisionEncoder(
-  session: Gemma4VisionSession,
-  pixels: Gemma4VisionPixelValues,
-): Promise<Gemma4VisionEncodeResult | undefined> {
+export async function runWebGpuVisionEncoder(
+  session: VisionSession,
+  pixels: VisionPixelValues,
+): Promise<VisionEncodeResult | undefined> {
   if (!session.executionProvider("webgpu")) {
     return undefined;
   }
@@ -71,7 +71,7 @@ export async function runGemma4WebGpuVisionEncoder(
   }
 }
 
-function visionStats(session: Gemma4VisionSession): VisionStats {
+function visionStats(session: VisionSession): VisionStats {
   let stats = statsBySession.get(session);
   if (!stats) {
     stats = {
@@ -92,7 +92,7 @@ function visionStats(session: Gemma4VisionSession): VisionStats {
   return stats;
 }
 
-async function visionRunner(session: Gemma4VisionSession): Promise<Gemma4WebGpuVisionRunner | undefined> {
+async function visionRunner(session: VisionSession): Promise<WebGpuVisionRunner | undefined> {
   let runner = runners.get(session);
   if (!runner) {
     runner = createVisionRunner(session);
@@ -101,7 +101,7 @@ async function visionRunner(session: Gemma4VisionSession): Promise<Gemma4WebGpuV
   return runner;
 }
 
-async function createVisionRunner(session: Gemma4VisionSession): Promise<Gemma4WebGpuVisionRunner | undefined> {
+async function createVisionRunner(session: VisionSession): Promise<WebGpuVisionRunner | undefined> {
   const device = await webGpuDevice();
   if (!device) {
     return undefined;
@@ -109,19 +109,19 @@ async function createVisionRunner(session: Gemma4VisionSession): Promise<Gemma4W
   const options = session.executionProvider("webgpu")?.options;
   const arena = new GpuMemoryArena(
     device,
-    numberOption(options, "memoryLimitBytes") ?? GEMMA4_WEBGPU_MEMORY_LIMIT_BYTES,
+    numberOption(options, "memoryLimitBytes") ?? WEBGPU_MEMORY_LIMIT_BYTES,
   );
-  const runner = new Gemma4WebGpuVisionRunner(session, arena);
+  const runner = new WebGpuVisionRunner(session, arena);
   session.addDisposeCallback(() => runner.dispose());
   return runner;
 }
 
-class Gemma4WebGpuVisionRunner {
-  private readonly session: Gemma4VisionSession;
+class WebGpuVisionRunner {
+  private readonly session: VisionSession;
   private readonly arena: GpuMemoryArena;
   private readonly f32Handles = new Map<string, F32Handle>();
 
-  constructor(session: Gemma4VisionSession, arena: GpuMemoryArena) {
+  constructor(session: VisionSession, arena: GpuMemoryArena) {
     this.session = session;
     this.arena = arena;
   }
@@ -133,7 +133,7 @@ class Gemma4WebGpuVisionRunner {
     this.f32Handles.clear();
   }
 
-  async run(pixels: Gemma4VisionPixelValues): Promise<Gemma4VisionEncodeResult> {
+  async run(pixels: VisionPixelValues): Promise<VisionEncodeResult> {
     const manifest = this.session.manifest;
     const patchGridX = pixels.width / manifest.patchSize;
     const patchGridY = pixels.height / manifest.patchSize;
