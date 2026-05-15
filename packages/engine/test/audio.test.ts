@@ -69,6 +69,36 @@ test("audio encoder projects hidden to model embedding size", async () => {
   assert.equal(encoded.hidden.length, 25 * 2560);
 });
 
+test("audio encoder falls back when WebGPU is unavailable", async () => {
+  const reader = audioTensorReader([
+    f32Tensor("a.conv1d.0.weight", [3, 3, 1, 128], new Float32Array(3 * 3 * 128)),
+    f32Tensor("a.conv1d.0.norm.weight", [128], ones(128)),
+    f32Tensor("a.conv1d.1.weight", [3, 3, 128, 32], new Float32Array(3 * 3 * 128 * 32)),
+    f32Tensor("a.conv1d.1.norm.weight", [32], ones(32)),
+    f32Tensor("a.input_projection.weight", [1024, 1024], new Float32Array(1024 * 1024)),
+    f32Tensor("a.pre_encode.out.weight", [1024, 1536], new Float32Array(1024 * 1536)),
+    f32Tensor("mm.a.input_projection.weight", [1536, 2560], new Float32Array(1536 * 2560)),
+  ]);
+  const session = createAudioSession(reader, {
+    executionProviders: [
+      { name: "webgpu" },
+      { name: "cpu", options: { wasmKernels: false } },
+    ],
+  });
+  const features = preprocessAudioPcm({
+    pcm: new Float32Array(16_000),
+    sampleRate: 16_000,
+    durationMs: 1000,
+  });
+
+  const encoded = await runAudioEncoder(session, features);
+
+  assert.equal(encoded.tokenCount, 25);
+  assert.equal(session.cacheStats().executionProviderStats.webgpuAudioAttempts, 1);
+  assert.equal(session.cacheStats().executionProviderStats.webgpuAudioFallbacks, 1);
+  assert.equal(session.cacheStats().executionProviderStats.webgpuAudioLastFallbackReason, "webgpu-unavailable");
+});
+
 function audioTensorReader(
   tensors: Array<{
     name: string;

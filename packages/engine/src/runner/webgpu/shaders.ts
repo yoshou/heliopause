@@ -3038,3 +3038,374 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   outputValues[index] = gelu(gateValues[index]) * upValues[index];
 }
 `;
+
+export const AUDIO_CONV2D_SUBSAMPLE_WGSL = `
+struct Params {
+  epsilon: f32,
+  time: u32,
+  frequency: u32,
+  inChannels: u32,
+  outChannels: u32,
+  outTime: u32,
+  outFrequency: u32,
+  hasBias: u32,
+};
+
+@group(0) @binding(0) var<storage, read> inputValues: array<f32>;
+@group(0) @binding(1) var<storage, read> maskValues: array<u32>;
+@group(0) @binding(2) var<storage, read> weightValues: array<f32>;
+@group(0) @binding(3) var<storage, read> biasValues: array<f32>;
+@group(0) @binding(4) var<storage, read> normValues: array<f32>;
+@group(0) @binding(5) var<uniform> params: Params;
+@group(0) @binding(6) var<storage, read_write> outputValues: array<f32>;
+
+var<workgroup> channelValues: array<f32, 256>;
+var<workgroup> reduceValues: array<f32, 256>;
+
+@compute @workgroup_size(256, 1, 1)
+fn main(@builtin(workgroup_id) workgroupId: vec3<u32>, @builtin(local_invocation_id) localId: vec3<u32>) {
+  let tOut = workgroupId.x;
+  let fOut = workgroupId.y;
+  let channel = localId.x;
+  if (tOut >= params.outTime || fOut >= params.outFrequency) {
+    return;
+  }
+
+  var sum = 0.0;
+  if (channel < params.outChannels) {
+    for (var kt = 0u; kt < 3u; kt = kt + 1u) {
+      let tSigned = i32(tOut * 2u + kt) - 1;
+      if (tSigned >= 0 && tSigned < i32(params.time) && maskValues[u32(tSigned)] != 0u) {
+        let tIn = u32(tSigned);
+        for (var kf = 0u; kf < 3u; kf = kf + 1u) {
+          let fSigned = i32(fOut * 2u + kf) - 1;
+          if (fSigned >= 0 && fSigned < i32(params.frequency)) {
+            let fIn = u32(fSigned);
+            for (var inChannel = 0u; inChannel < params.inChannels; inChannel = inChannel + 1u) {
+              let inputIndex = (tIn * params.inChannels + inChannel) * params.frequency + fIn;
+              let weightIndex = kf + kt * 3u + inChannel * 9u + channel * 9u * params.inChannels;
+              sum = sum + inputValues[inputIndex] * weightValues[weightIndex];
+            }
+          }
+        }
+      }
+    }
+    if (params.hasBias == 1u) {
+      sum = sum + biasValues[channel];
+    }
+  }
+  channelValues[channel] = sum;
+  let meanTerm = select(0.0, sum, channel < params.outChannels);
+  reduceValues[channel] = meanTerm;
+  workgroupBarrier();
+  for (var stride = 128u; stride > 0u; stride = stride / 2u) {
+    if (channel < stride) {
+      reduceValues[channel] = reduceValues[channel] + reduceValues[channel + stride];
+    }
+    workgroupBarrier();
+  }
+  let mean = reduceValues[0] / f32(params.outChannels);
+  let centered = select(0.0, channelValues[channel] - mean, channel < params.outChannels);
+  reduceValues[channel] = centered * centered;
+  workgroupBarrier();
+  for (var stride = 128u; stride > 0u; stride = stride / 2u) {
+    if (channel < stride) {
+      reduceValues[channel] = reduceValues[channel] + reduceValues[channel + stride];
+    }
+    workgroupBarrier();
+  }
+  if (channel < params.outChannels) {
+    let scale = inverseSqrt(reduceValues[0] / f32(params.outChannels) + params.epsilon);
+    let normalized = centered * scale * normValues[channel];
+    outputValues[(tOut * params.outChannels + channel) * params.outFrequency + fOut] = max(0.0, normalized);
+  }
+}
+`;
+
+export const AUDIO_FLATTEN_CHANNELS_LAST_WGSL = `
+struct Params {
+  timeCount: u32,
+  frequencyCount: u32,
+  channelCount: u32,
+  _pad0: u32,
+};
+
+@group(0) @binding(0) var<storage, read> inputValues: array<f32>;
+@group(0) @binding(1) var<uniform> params: Params;
+@group(0) @binding(2) var<storage, read_write> outputValues: array<f32>;
+
+@compute @workgroup_size(256, 1, 1)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let index = id.x;
+  let total = params.timeCount * params.frequencyCount * params.channelCount;
+  if (index >= total) {
+    return;
+  }
+  let channel = index % params.channelCount;
+  let frequency = (index / params.channelCount) % params.frequencyCount;
+  let time = index / (params.frequencyCount * params.channelCount);
+  outputValues[index] = inputValues[(time * params.channelCount + channel) * params.frequencyCount + frequency];
+}
+`;
+
+export const AUDIO_SILU_WGSL = `
+struct Params {
+  length: u32,
+  _pad0: u32,
+  _pad1: u32,
+  _pad2: u32,
+};
+
+@group(0) @binding(0) var<storage, read> inputValues: array<f32>;
+@group(0) @binding(1) var<uniform> params: Params;
+@group(0) @binding(2) var<storage, read_write> outputValues: array<f32>;
+
+@compute @workgroup_size(256, 1, 1)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let index = id.x;
+  if (index >= params.length) {
+    return;
+  }
+  let value = inputValues[index];
+  outputValues[index] = value / (1.0 + exp(-value));
+}
+`;
+
+export const AUDIO_GLU_WGSL = `
+struct Params {
+  tokenCount: u32,
+  outputSize: u32,
+  _pad0: u32,
+  _pad1: u32,
+};
+
+@group(0) @binding(0) var<storage, read> inputValues: array<f32>;
+@group(0) @binding(1) var<uniform> params: Params;
+@group(0) @binding(2) var<storage, read_write> outputValues: array<f32>;
+
+@compute @workgroup_size(256, 1, 1)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let index = id.x;
+  if (index >= params.tokenCount * params.outputSize) {
+    return;
+  }
+  let dim = index % params.outputSize;
+  let token = index / params.outputSize;
+  let inputOffset = token * params.outputSize * 2u;
+  let gate = inputValues[inputOffset + params.outputSize + dim];
+  outputValues[index] = inputValues[inputOffset + dim] / (1.0 + exp(-gate));
+}
+`;
+
+export const AUDIO_DEPTHWISE_CONV1D_WGSL = `
+struct Params {
+  tokenCount: u32,
+  kernelSize: u32,
+  channels: u32,
+  _pad0: u32,
+};
+
+@group(0) @binding(0) var<storage, read> inputValues: array<f32>;
+@group(0) @binding(1) var<storage, read> weightValues: array<f32>;
+@group(0) @binding(2) var<uniform> params: Params;
+@group(0) @binding(3) var<storage, read_write> outputValues: array<f32>;
+
+@compute @workgroup_size(256, 1, 1)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let index = id.x;
+  if (index >= params.tokenCount * params.channels) {
+    return;
+  }
+  let channel = index % params.channels;
+  let token = index / params.channels;
+  let leftPad = params.kernelSize - 1u;
+  var sum = 0.0;
+  for (var kernel = 0u; kernel < params.kernelSize; kernel = kernel + 1u) {
+    let source = i32(token + kernel) - i32(leftPad);
+    if (source >= 0 && source < i32(params.tokenCount)) {
+      sum = sum + inputValues[u32(source) * params.channels + channel] * weightValues[kernel + channel * params.kernelSize];
+    }
+  }
+  outputValues[index] = sum;
+}
+`;
+
+export const AUDIO_ADD_BIAS_ROWS_WGSL = `
+struct Params {
+  length: u32,
+  rowSize: u32,
+  _pad0: u32,
+  _pad1: u32,
+};
+
+@group(0) @binding(0) var<storage, read> inputValues: array<f32>;
+@group(0) @binding(1) var<storage, read> biasValues: array<f32>;
+@group(0) @binding(2) var<uniform> params: Params;
+@group(0) @binding(3) var<storage, read_write> outputValues: array<f32>;
+
+@compute @workgroup_size(256, 1, 1)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let index = id.x;
+  if (index >= params.length) {
+    return;
+  }
+  outputValues[index] = inputValues[index] + biasValues[index % params.rowSize];
+}
+`;
+
+export const AUDIO_RESIDUAL_ADD_SCALE_WGSL = `
+struct Params {
+  scale: f32,
+  length: u32,
+  _pad0: u32,
+  _pad1: u32,
+};
+
+@group(0) @binding(0) var<storage, read> residualValues: array<f32>;
+@group(0) @binding(1) var<storage, read> hiddenValues: array<f32>;
+@group(0) @binding(2) var<uniform> params: Params;
+@group(0) @binding(3) var<storage, read_write> outputValues: array<f32>;
+
+@compute @workgroup_size(256, 1, 1)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let index = id.x;
+  if (index >= params.length) {
+    return;
+  }
+  outputValues[index] = residualValues[index] + hiddenValues[index] * params.scale;
+}
+`;
+
+export const AUDIO_ATTENTION_WGSL = `
+struct Params {
+  invalidLogit: f32,
+  logitCap: f32,
+  qScale: f32,
+  kScale: f32,
+  tokenCount: u32,
+  headCount: u32,
+  headSize: u32,
+  embeddingLength: u32,
+  attentionChunkSize: u32,
+  maxPast: u32,
+  hasPerDimKScale: u32,
+  _pad0: u32,
+};
+
+@group(0) @binding(0) var<storage, read> qValues: array<f32>;
+@group(0) @binding(1) var<storage, read> kValues: array<f32>;
+@group(0) @binding(2) var<storage, read> vValues: array<f32>;
+@group(0) @binding(3) var<storage, read> relativeKValues: array<f32>;
+@group(0) @binding(4) var<storage, read> maskValues: array<u32>;
+@group(0) @binding(5) var<storage, read> perDimScaleValues: array<f32>;
+@group(0) @binding(6) var<storage, read> perDimKScaleValues: array<f32>;
+@group(0) @binding(7) var<uniform> params: Params;
+@group(0) @binding(8) var<storage, read_write> outputValues: array<f32>;
+
+var<workgroup> scoreValues: array<f32, 256>;
+
+fn validKey(queryToken: u32, keyToken: u32) -> bool {
+  return keyToken < params.tokenCount &&
+    keyToken <= queryToken &&
+    queryToken - keyToken < params.maxPast &&
+    maskValues[keyToken] != 0u;
+}
+
+fn attentionScore(queryToken: u32, head: u32, keyToken: u32, relIndex: u32) -> f32 {
+  let qBase = queryToken * params.embeddingLength + head * params.headSize;
+  let kBase = keyToken * params.embeddingLength + head * params.headSize;
+  let relBase = relIndex * params.embeddingLength + head * params.headSize;
+  var score = 0.0;
+  for (var dim = 0u; dim < params.headSize; dim = dim + 1u) {
+    let qValue = qValues[qBase + dim] * params.qScale * perDimScaleValues[dim];
+    let kScale = select(1.0, perDimKScaleValues[dim], params.hasPerDimKScale == 1u);
+    let kValue = kValues[kBase + dim] * params.kScale * kScale;
+    let relValue = relativeKValues[relBase + dim];
+    score = score + qValue * (kValue + relValue);
+  }
+  return tanh(score / params.logitCap) * params.logitCap;
+}
+
+@compute @workgroup_size(64, 1, 1)
+fn main(@builtin(workgroup_id) workgroupId: vec3<u32>, @builtin(local_invocation_id) localId: vec3<u32>) {
+  let queryToken = workgroupId.x;
+  let head = workgroupId.y;
+  let dim = workgroupId.z;
+  let lane = localId.x;
+  let outIndex = queryToken * params.embeddingLength + head * params.headSize + dim;
+  let contextSize = params.attentionChunkSize + params.maxPast;
+  if (queryToken >= params.tokenCount || head >= params.headCount || dim >= params.headSize || maskValues[queryToken] == 0u) {
+    if (lane == 0u && queryToken < params.tokenCount && head < params.headCount && dim < params.headSize) {
+      outputValues[outIndex] = 0.0;
+    }
+    return;
+  }
+
+  let block = queryToken / params.attentionChunkSize;
+  let blockStart = block * params.attentionChunkSize;
+  let queryInBlock = queryToken - blockStart;
+  let contextStart = i32(blockStart) - i32(params.maxPast);
+  var localMax = -3.4028234663852886e38;
+  for (var context = lane; context < contextSize; context = context + 256u) {
+    let keySigned = contextStart + i32(context);
+    var score = params.invalidLogit;
+    if (keySigned >= 0) {
+      let keyToken = u32(keySigned);
+      let relIndex = context - queryInBlock;
+      if (validKey(queryToken, keyToken) && relIndex < params.maxPast + 1u) {
+        score = attentionScore(queryToken, head, keyToken, relIndex);
+      }
+    }
+    scoreValues[context] = score;
+    localMax = max(localMax, score);
+  }
+  scoreValues[128u + lane] = localMax;
+  workgroupBarrier();
+  for (var stride = 32u; stride > 0u; stride = stride / 2u) {
+    if (lane < stride) {
+      scoreValues[128u + lane] = max(scoreValues[128u + lane], scoreValues[128u + lane + stride]);
+    }
+    workgroupBarrier();
+  }
+  let maxScore = scoreValues[128u];
+  var localSum = 0.0;
+  for (var context = lane; context < contextSize; context = context + 256u) {
+    let expValue = exp(scoreValues[context] - maxScore);
+    scoreValues[context] = expValue;
+    localSum = localSum + expValue;
+  }
+  scoreValues[128u + lane] = localSum;
+  workgroupBarrier();
+  for (var stride = 32u; stride > 0u; stride = stride / 2u) {
+    if (lane < stride) {
+      scoreValues[128u + lane] = scoreValues[128u + lane] + scoreValues[128u + lane + stride];
+    }
+    workgroupBarrier();
+  }
+  let total = scoreValues[128u];
+  var local = 0.0;
+  if (total > 0.0) {
+    for (var context = lane; context < contextSize; context = context + 256u) {
+      let keySigned = contextStart + i32(context);
+      if (keySigned >= 0) {
+        let keyToken = u32(keySigned);
+        if (validKey(queryToken, keyToken)) {
+          let probability = scoreValues[context] / total;
+          local = local + probability * vValues[keyToken * params.embeddingLength + head * params.headSize + dim];
+        }
+      }
+    }
+  }
+  scoreValues[128u + lane] = local;
+  workgroupBarrier();
+  for (var stride = 32u; stride > 0u; stride = stride / 2u) {
+    if (lane < stride) {
+      scoreValues[128u + lane] = scoreValues[128u + lane] + scoreValues[128u + lane + stride];
+    }
+    workgroupBarrier();
+  }
+  if (lane == 0u) {
+    outputValues[outIndex] = scoreValues[128u];
+  }
+}
+`;

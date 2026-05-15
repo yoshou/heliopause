@@ -11,6 +11,9 @@ import {
   runCpuAudioEncoder,
 } from "./runner/cpu/audio-runner";
 import {
+  runWebGpuAudioEncoder,
+} from "./runner/webgpu/audio-execution-provider";
+import {
   GgufTensorReader,
 } from "./tensor-reader";
 
@@ -274,6 +277,12 @@ export async function runAudioEncoder(
   features: AudioFeatures,
   options: { signal?: AbortSignal } = {},
 ): Promise<AudioEncodeResult> {
+  if (session.executionProvider("webgpu")) {
+    const webgpu = await runWebGpuAudioEncoder(session, features, options);
+    if (webgpu) {
+      return webgpu;
+    }
+  }
   return runCpuAudioEncoder(session, features, options);
 }
 

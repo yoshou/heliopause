@@ -130,6 +130,9 @@ async function handleLoadModel(
         maxWeightCacheBytes: resolvedMemoryProfile.maxWeightCacheBytes,
         executionProviders: [
           {
+            name: "webgpu",
+          },
+          {
             name: "cpu",
             options: {
               projectionBatching: true,
