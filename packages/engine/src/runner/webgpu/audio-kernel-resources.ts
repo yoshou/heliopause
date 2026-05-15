@@ -7,14 +7,152 @@ import {
   AUDIO_CONV2D_SUBSAMPLE_WGSL,
   AUDIO_DEPTHWISE_CONV1D_WGSL,
   AUDIO_FLATTEN_CHANNELS_LAST_WGSL,
+  AUDIO_FFT_BIT_REVERSE_WGSL,
+  AUDIO_FFT_STAGE_WGSL,
   AUDIO_GLU_WGSL,
+  AUDIO_LOG_MEL_WGSL,
   AUDIO_RESIDUAL_ADD_SCALE_WGSL,
   AUDIO_SILU_WGSL,
+  AUDIO_WINDOW_FRAMES_WGSL,
   VISION_CLAMP_WGSL,
   VISION_RMS_NORM_WGSL,
 } from "./shaders";
 
 type Resource = { pipeline: unknown; bindGroup: unknown; destroy: () => void };
+
+export function createAudioWindowFramesResources(
+  device: WebGpuDeviceLike,
+  pcm: WebGpuBufferLike,
+  window: WebGpuBufferLike,
+  real: WebGpuBufferLike,
+  imag: WebGpuBufferLike,
+  options: {
+    sampleCount: number;
+    frameCount: number;
+    frameLength: number;
+    hopLength: number;
+    fftLength: number;
+  },
+): Resource {
+  const params = new Uint32Array([
+    options.sampleCount,
+    options.frameCount,
+    options.frameLength,
+    options.hopLength,
+    options.fftLength,
+    Math.floor(options.frameLength / 2),
+    0,
+    0,
+  ]);
+  return createResource(device, AUDIO_WINDOW_FRAMES_WGSL, [
+    storageEntry(0, "read-only-storage"),
+    storageEntry(1, "read-only-storage"),
+    uniformEntry(2),
+    storageEntry(3, "storage"),
+    storageEntry(4, "storage"),
+  ], [
+    bindBuffer(0, pcm),
+    bindBuffer(1, window),
+    uniformBuffer(device, 2, params),
+    bindBuffer(3, real),
+    bindBuffer(4, imag),
+  ]);
+}
+
+export function createAudioFftBitReverseResources(
+  device: WebGpuDeviceLike,
+  inputReal: WebGpuBufferLike,
+  inputImag: WebGpuBufferLike,
+  outputReal: WebGpuBufferLike,
+  outputImag: WebGpuBufferLike,
+  options: { frameCount: number; fftLength: number },
+): Resource {
+  const params = new Uint32Array([
+    options.frameCount,
+    options.fftLength,
+    Math.log2(options.fftLength),
+    0,
+  ]);
+  return createResource(device, AUDIO_FFT_BIT_REVERSE_WGSL, [
+    storageEntry(0, "read-only-storage"),
+    storageEntry(1, "read-only-storage"),
+    uniformEntry(2),
+    storageEntry(3, "storage"),
+    storageEntry(4, "storage"),
+  ], [
+    bindBuffer(0, inputReal),
+    bindBuffer(1, inputImag),
+    uniformBuffer(device, 2, params),
+    bindBuffer(3, outputReal),
+    bindBuffer(4, outputImag),
+  ]);
+}
+
+export function createAudioFftStageResources(
+  device: WebGpuDeviceLike,
+  inputReal: WebGpuBufferLike,
+  inputImag: WebGpuBufferLike,
+  outputReal: WebGpuBufferLike,
+  outputImag: WebGpuBufferLike,
+  options: { frameCount: number; fftLength: number; stageSize: number },
+): Resource {
+  const params = new Uint32Array([
+    options.frameCount,
+    options.fftLength,
+    options.stageSize,
+    options.stageSize / 2,
+  ]);
+  return createResource(device, AUDIO_FFT_STAGE_WGSL, [
+    storageEntry(0, "read-only-storage"),
+    storageEntry(1, "read-only-storage"),
+    uniformEntry(2),
+    storageEntry(3, "storage"),
+    storageEntry(4, "storage"),
+  ], [
+    bindBuffer(0, inputReal),
+    bindBuffer(1, inputImag),
+    uniformBuffer(device, 2, params),
+    bindBuffer(3, outputReal),
+    bindBuffer(4, outputImag),
+  ]);
+}
+
+export function createAudioLogMelResources(
+  device: WebGpuDeviceLike,
+  real: WebGpuBufferLike,
+  imag: WebGpuBufferLike,
+  filters: WebGpuBufferLike,
+  output: WebGpuBufferLike,
+  mask: WebGpuBufferLike,
+  options: {
+    frameCount: number;
+    fftLength: number;
+    featureSize: number;
+    melFloor: number;
+  },
+): Resource {
+  const paramsF32 = new Float32Array([0, 0, 0, 0, options.melFloor, 0, 0, 0]);
+  const params = new Uint32Array(paramsF32.buffer);
+  params[0] = options.frameCount;
+  params[1] = options.fftLength;
+  params[2] = options.featureSize;
+  params[3] = options.fftLength / 2 + 1;
+  return createResource(device, AUDIO_LOG_MEL_WGSL, [
+    storageEntry(0, "read-only-storage"),
+    storageEntry(1, "read-only-storage"),
+    storageEntry(2, "read-only-storage"),
+    uniformEntry(3),
+    storageEntry(4, "storage"),
+    storageEntry(5, "storage"),
+  ], [
+    bindBuffer(0, real),
+    bindBuffer(1, imag),
+    bindBuffer(2, filters),
+    uniformBuffer(device, 3, params),
+    bindBuffer(4, output),
+    bindBuffer(5, mask),
+  ]);
+}
 
 export function createAudioConv2dSubsampleResources(
   device: WebGpuDeviceLike,

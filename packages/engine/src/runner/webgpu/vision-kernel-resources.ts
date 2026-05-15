@@ -9,12 +9,56 @@ import {
   VISION_CLAMP_WGSL,
   VISION_GELU_MUL_WGSL,
   VISION_PATCH_EMBED_WGSL,
+  VISION_PREPROCESS_RGBA_WGSL,
   VISION_RMS_NORM_WGSL,
   VISION_ROPE2D_WGSL,
   VISION_STD_NORMALIZE_WGSL,
 } from "./shaders";
 
 type Resource = { pipeline: unknown; bindGroup: unknown; destroy: () => void };
+
+export function createVisionPreprocessRgbaResources(
+  device: WebGpuDeviceLike,
+  rgba: WebGpuBufferLike,
+  output: WebGpuBufferLike,
+  options: {
+    sourceWidth: number;
+    sourceHeight: number;
+    targetWidth: number;
+    targetHeight: number;
+    mean: readonly [number, number, number];
+    std: readonly [number, number, number];
+  },
+): Resource {
+  const paramsF32 = new Float32Array([
+    0,
+    0,
+    0,
+    0,
+    options.mean[0],
+    options.mean[1],
+    options.mean[2],
+    0,
+    options.std[0],
+    options.std[1],
+    options.std[2],
+    0,
+  ]);
+  const params = new Uint32Array(paramsF32.buffer);
+  params[0] = options.sourceWidth;
+  params[1] = options.sourceHeight;
+  params[2] = options.targetWidth;
+  params[3] = options.targetHeight;
+  return createResource(device, VISION_PREPROCESS_RGBA_WGSL, [
+    storageEntry(0, "read-only-storage"),
+    uniformEntry(1),
+    storageEntry(2, "storage"),
+  ], [
+    bindBuffer(0, rgba),
+    uniformBuffer(device, 1, params),
+    bindBuffer(2, output),
+  ]);
+}
 
 export function createVisionPatchEmbedResources(
   device: WebGpuDeviceLike,

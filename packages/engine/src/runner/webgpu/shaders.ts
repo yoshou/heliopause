@@ -20,6 +20,250 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 }
 `;
 
+export const VISION_PREPROCESS_RGBA_WGSL = `
+struct Params {
+  sourceWidth: u32,
+  sourceHeight: u32,
+  targetWidth: u32,
+  targetHeight: u32,
+  mean0: f32,
+  mean1: f32,
+  mean2: f32,
+  _pad0: f32,
+  std0: f32,
+  std1: f32,
+  std2: f32,
+  _pad1: f32,
+};
+
+@group(0) @binding(0) var<storage, read> rgbaValues: array<u32>;
+@group(0) @binding(1) var<uniform> params: Params;
+@group(0) @binding(2) var<storage, read_write> outputValues: array<f32>;
+
+fn byteAt(index: u32) -> u32 {
+  return rgbaValues[index];
+}
+
+fn lerp(left: f32, right: f32, amount: f32) -> f32 {
+  return left + (right - left) * amount;
+}
+
+fn mean(channel: u32) -> f32 {
+  if (channel == 0u) {
+    return params.mean0;
+  }
+  if (channel == 1u) {
+    return params.mean1;
+  }
+  return params.mean2;
+}
+
+fn stdValue(channel: u32) -> f32 {
+  if (channel == 0u) {
+    return params.std0;
+  }
+  if (channel == 1u) {
+    return params.std1;
+  }
+  return params.std2;
+}
+
+@compute @workgroup_size(256, 1, 1)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let index = id.x;
+  let length = params.targetWidth * params.targetHeight * 3u;
+  if (index >= length) {
+    return;
+  }
+
+  let channel = index % 3u;
+  let pixel = index / 3u;
+  let x = pixel % params.targetWidth;
+  let y = pixel / params.targetWidth;
+  let xRatio = select(0.0, f32(params.sourceWidth - 1u) / f32(params.targetWidth - 1u), params.targetWidth > 1u);
+  let yRatio = select(0.0, f32(params.sourceHeight - 1u) / f32(params.targetHeight - 1u), params.targetHeight > 1u);
+  let px = f32(x) * xRatio;
+  let py = f32(y) * yRatio;
+  let x0 = min(u32(px), params.sourceWidth - 1u);
+  let y0 = min(u32(py), params.sourceHeight - 1u);
+  let x1 = min(x0 + 1u, params.sourceWidth - 1u);
+  let y1 = min(y0 + 1u, params.sourceHeight - 1u);
+  let xf = px - f32(x0);
+  let yf = py - f32(y0);
+  let top = lerp(
+    f32(byteAt((y0 * params.sourceWidth + x0) * 4u + channel)),
+    f32(byteAt((y0 * params.sourceWidth + x1) * 4u + channel)),
+    xf,
+  );
+  let bottom = lerp(
+    f32(byteAt((y1 * params.sourceWidth + x0) * 4u + channel)),
+    f32(byteAt((y1 * params.sourceWidth + x1) * 4u + channel)),
+    xf,
+  );
+  let resized = floor(lerp(top, bottom, yf));
+  outputValues[index] = ((resized / 255.0) - mean(channel)) / stdValue(channel);
+}
+`;
+
+export const AUDIO_WINDOW_FRAMES_WGSL = `
+struct Params {
+  sampleCount: u32,
+  frameCount: u32,
+  frameLength: u32,
+  hopLength: u32,
+  fftLength: u32,
+  padLeft: u32,
+  _pad0: u32,
+  _pad1: u32,
+};
+
+@group(0) @binding(0) var<storage, read> pcmValues: array<f32>;
+@group(0) @binding(1) var<storage, read> windowValues: array<f32>;
+@group(0) @binding(2) var<uniform> params: Params;
+@group(0) @binding(3) var<storage, read_write> realValues: array<f32>;
+@group(0) @binding(4) var<storage, read_write> imagValues: array<f32>;
+
+@compute @workgroup_size(256, 1, 1)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let index = id.x;
+  let length = params.frameCount * params.fftLength;
+  if (index >= length) {
+    return;
+  }
+  let frame = index / params.fftLength;
+  let bin = index % params.fftLength;
+  let paddedIndex = i32(frame * params.hopLength + bin) - i32(params.padLeft);
+  var sample = 0.0;
+  if (paddedIndex >= 0 && u32(paddedIndex) < params.sampleCount) {
+    sample = pcmValues[u32(paddedIndex)];
+  }
+  realValues[index] = sample * windowValues[bin];
+  imagValues[index] = 0.0;
+}
+`;
+
+export const AUDIO_FFT_BIT_REVERSE_WGSL = `
+struct Params {
+  frameCount: u32,
+  fftLength: u32,
+  log2Length: u32,
+  _pad0: u32,
+};
+
+@group(0) @binding(0) var<storage, read> inputReal: array<f32>;
+@group(0) @binding(1) var<storage, read> inputImag: array<f32>;
+@group(0) @binding(2) var<uniform> params: Params;
+@group(0) @binding(3) var<storage, read_write> outputReal: array<f32>;
+@group(0) @binding(4) var<storage, read_write> outputImag: array<f32>;
+
+fn reverseBits(value: u32, width: u32) -> u32 {
+  var input = value;
+  var output = 0u;
+  for (var bit = 0u; bit < width; bit = bit + 1u) {
+    output = (output << 1u) | (input & 1u);
+    input = input >> 1u;
+  }
+  return output;
+}
+
+@compute @workgroup_size(256, 1, 1)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let index = id.x;
+  let length = params.frameCount * params.fftLength;
+  if (index >= length) {
+    return;
+  }
+  let frame = index / params.fftLength;
+  let bin = index % params.fftLength;
+  let reversed = reverseBits(bin, params.log2Length);
+  let outputIndex = frame * params.fftLength + reversed;
+  outputReal[outputIndex] = inputReal[index];
+  outputImag[outputIndex] = inputImag[index];
+}
+`;
+
+export const AUDIO_FFT_STAGE_WGSL = `
+struct Params {
+  frameCount: u32,
+  fftLength: u32,
+  stageSize: u32,
+  halfSize: u32,
+};
+
+@group(0) @binding(0) var<storage, read> inputReal: array<f32>;
+@group(0) @binding(1) var<storage, read> inputImag: array<f32>;
+@group(0) @binding(2) var<uniform> params: Params;
+@group(0) @binding(3) var<storage, read_write> outputReal: array<f32>;
+@group(0) @binding(4) var<storage, read_write> outputImag: array<f32>;
+
+@compute @workgroup_size(256, 1, 1)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let pairIndex = id.x;
+  let pairsPerFrame = params.fftLength / 2u;
+  let length = params.frameCount * pairsPerFrame;
+  if (pairIndex >= length) {
+    return;
+  }
+  let frame = pairIndex / pairsPerFrame;
+  let pair = pairIndex % pairsPerFrame;
+  let group = pair / params.halfSize;
+  let k = pair % params.halfSize;
+  let even = frame * params.fftLength + group * params.stageSize + k;
+  let odd = even + params.halfSize;
+  let angle = -6.283185307179586 * f32(k) / f32(params.stageSize);
+  let wr = cos(angle);
+  let wi = sin(angle);
+  let oddReal = inputReal[odd] * wr - inputImag[odd] * wi;
+  let oddImag = inputReal[odd] * wi + inputImag[odd] * wr;
+  outputReal[even] = inputReal[even] + oddReal;
+  outputImag[even] = inputImag[even] + oddImag;
+  outputReal[odd] = inputReal[even] - oddReal;
+  outputImag[odd] = inputImag[even] - oddImag;
+}
+`;
+
+export const AUDIO_LOG_MEL_WGSL = `
+struct Params {
+  frameCount: u32,
+  fftLength: u32,
+  featureSize: u32,
+  binCount: u32,
+  melFloor: f32,
+  _pad0: f32,
+  _pad1: f32,
+  _pad2: f32,
+};
+
+@group(0) @binding(0) var<storage, read> realValues: array<f32>;
+@group(0) @binding(1) var<storage, read> imagValues: array<f32>;
+@group(0) @binding(2) var<storage, read> filterValues: array<f32>;
+@group(0) @binding(3) var<uniform> params: Params;
+@group(0) @binding(4) var<storage, read_write> outputValues: array<f32>;
+@group(0) @binding(5) var<storage, read_write> maskValues: array<u32>;
+
+@compute @workgroup_size(16, 16, 1)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let mel = id.x;
+  let frame = id.y;
+  if (mel >= params.featureSize || frame >= params.frameCount) {
+    return;
+  }
+  var energy = 0.0;
+  let frameOffset = frame * params.fftLength;
+  let filterOffset = mel * params.binCount;
+  for (var bin = 0u; bin < params.binCount; bin = bin + 1u) {
+    let real = realValues[frameOffset + bin];
+    let imag = imagValues[frameOffset + bin];
+    let magnitude = sqrt(real * real + imag * imag);
+    energy = energy + magnitude * filterValues[filterOffset + bin];
+  }
+  outputValues[frame * params.featureSize + mel] = log(max(energy, params.melFloor));
+  if (mel == 0u) {
+    maskValues[frame] = 1u;
+  }
+}
+`;
+
 export const TOKEN_WRITE_WGSL = `
 struct Params {
   rowSize: u32,

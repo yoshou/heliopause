@@ -14,7 +14,6 @@ import {
 } from "./wasm-kernels";
 
 type VisionPreprocessStats = {
-  webgpu: ProviderStats;
   wasm: ProviderStats;
   cpu: ProviderStats;
 };
@@ -55,13 +54,35 @@ export async function runVisionPreprocessProviders(
   ) => VisionPixelValues,
   options: VisionPreprocessOptions = {},
 ): Promise<VisionPixelValues> {
+  const result = await tryVisionPreprocessProviders(
+    session,
+    input,
+    cpuPreprocess,
+    session.preprocessProviders,
+    options,
+  );
+  if (result) {
+    return result;
+  }
+
+  return runVisionCpuPreprocess(session, input, cpuPreprocess);
+}
+
+export async function tryVisionPreprocessProviders(
+  session: VisionPreprocessSession,
+  input: VisionRgbaPreprocessInput,
+  cpuPreprocess: (
+    rgba: Uint8ClampedArray,
+    sourceWidth: number,
+    sourceHeight: number,
+    manifest: VisionManifest,
+  ) => VisionPixelValues,
+  providers: readonly { name: string }[],
+  options: VisionPreprocessOptions = {},
+): Promise<VisionPixelValues | undefined> {
   const stats = visionPreprocessStats(session);
-  for (const provider of session.preprocessProviders) {
+  for (const provider of providers) {
     throwIfAborted(options.signal);
-    if (provider.name === "webgpu") {
-      recordFallback(stats.webgpu, "webgpu-preprocess-unimplemented");
-      continue;
-    }
     if (provider.name === "wasm") {
       const result = await tryVisionWasmProvider(session, input, stats.wasm);
       if (result) {
@@ -70,14 +91,24 @@ export async function runVisionPreprocessProviders(
       continue;
     }
     if (provider.name === "cpu") {
-      stats.cpu.attempts += 1;
-      const result = cpuPreprocess(input.rgba, input.sourceWidth, input.sourceHeight, session.manifest);
-      stats.cpu.runs += 1;
-      stats.cpu.lastFallbackReason = "";
-      return result;
+      return runVisionCpuPreprocess(session, input, cpuPreprocess);
     }
   }
 
+  return undefined;
+}
+
+function runVisionCpuPreprocess(
+  session: VisionPreprocessSession,
+  input: VisionRgbaPreprocessInput,
+  cpuPreprocess: (
+    rgba: Uint8ClampedArray,
+    sourceWidth: number,
+    sourceHeight: number,
+    manifest: VisionManifest,
+  ) => VisionPixelValues,
+): VisionPixelValues {
+  const stats = visionPreprocessStats(session);
   stats.cpu.attempts += 1;
   const result = cpuPreprocess(input.rgba, input.sourceWidth, input.sourceHeight, session.manifest);
   stats.cpu.runs += 1;
@@ -122,7 +153,6 @@ function visionPreprocessStats(session: VisionPreprocessSession): VisionPreproce
   let stats = statsBySession.get(session);
   if (!stats) {
     stats = {
-      webgpu: createProviderStats(),
       wasm: createProviderStats(),
       cpu: createProviderStats(),
     };
@@ -135,10 +165,6 @@ function visionPreprocessStats(session: VisionPreprocessSession): VisionPreproce
 
 function visionPreprocessStatsSnapshot(stats: VisionPreprocessStats): ExecutionProviderStats {
   return {
-    webgpuVisionPreprocessAttempts: stats.webgpu.attempts,
-    webgpuVisionPreprocessRuns: stats.webgpu.runs,
-    webgpuVisionPreprocessFallbacks: stats.webgpu.fallbacks,
-    webgpuVisionPreprocessLastFallbackReason: stats.webgpu.lastFallbackReason,
     wasmVisionPreprocessAttempts: stats.wasm.attempts,
     wasmVisionPreprocessRuns: stats.wasm.runs,
     wasmVisionPreprocessFallbacks: stats.wasm.fallbacks,

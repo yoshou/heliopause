@@ -14,7 +14,6 @@ import {
 } from "./wasm-kernels";
 
 type AudioPreprocessStats = {
-  webgpu: ProviderStats;
   wasm: ProviderStats;
   cpu: ProviderStats;
 };
@@ -50,13 +49,30 @@ export async function runAudioPreprocessProviders(
   cpuPreprocess: (audio: AudioPcmInput, manifest: AudioPreprocessConfig) => AudioFeatures,
   options: AudioPreprocessOptions = {},
 ): Promise<AudioFeatures> {
+  const result = await tryAudioPreprocessProviders(
+    session,
+    audio,
+    cpuPreprocess,
+    session.preprocessProviders,
+    options,
+  );
+  if (result) {
+    return result;
+  }
+
+  return runAudioCpuPreprocess(session, audio, cpuPreprocess);
+}
+
+export async function tryAudioPreprocessProviders(
+  session: AudioPreprocessSession,
+  audio: AudioPcmInput,
+  cpuPreprocess: (audio: AudioPcmInput, manifest: AudioPreprocessConfig) => AudioFeatures,
+  providers: readonly { name: string }[],
+  options: AudioPreprocessOptions = {},
+): Promise<AudioFeatures | undefined> {
   const stats = audioPreprocessStats(session);
-  for (const provider of session.preprocessProviders) {
+  for (const provider of providers) {
     throwIfAborted(options.signal);
-    if (provider.name === "webgpu") {
-      recordFallback(stats.webgpu, "webgpu-preprocess-unimplemented");
-      continue;
-    }
     if (provider.name === "wasm") {
       const result = await tryAudioWasmProvider(session.manifest, audio, stats.wasm);
       if (result) {
@@ -65,14 +81,19 @@ export async function runAudioPreprocessProviders(
       continue;
     }
     if (provider.name === "cpu") {
-      stats.cpu.attempts += 1;
-      const result = cpuPreprocess(audio, session.manifest);
-      stats.cpu.runs += 1;
-      stats.cpu.lastFallbackReason = "";
-      return result;
+      return runAudioCpuPreprocess(session, audio, cpuPreprocess);
     }
   }
 
+  return undefined;
+}
+
+function runAudioCpuPreprocess(
+  session: AudioPreprocessSession,
+  audio: AudioPcmInput,
+  cpuPreprocess: (audio: AudioPcmInput, manifest: AudioPreprocessConfig) => AudioFeatures,
+): AudioFeatures {
+  const stats = audioPreprocessStats(session);
   stats.cpu.attempts += 1;
   const result = cpuPreprocess(audio, session.manifest);
   stats.cpu.runs += 1;
@@ -213,7 +234,6 @@ function audioPreprocessStats(session: AudioPreprocessSession): AudioPreprocessS
   let stats = statsBySession.get(session);
   if (!stats) {
     stats = {
-      webgpu: createProviderStats(),
       wasm: createProviderStats(),
       cpu: createProviderStats(),
     };
@@ -226,10 +246,6 @@ function audioPreprocessStats(session: AudioPreprocessSession): AudioPreprocessS
 
 function audioPreprocessStatsSnapshot(stats: AudioPreprocessStats): ExecutionProviderStats {
   return {
-    webgpuAudioPreprocessAttempts: stats.webgpu.attempts,
-    webgpuAudioPreprocessRuns: stats.webgpu.runs,
-    webgpuAudioPreprocessFallbacks: stats.webgpu.fallbacks,
-    webgpuAudioPreprocessLastFallbackReason: stats.webgpu.lastFallbackReason,
     wasmAudioPreprocessAttempts: stats.wasm.attempts,
     wasmAudioPreprocessRuns: stats.wasm.runs,
     wasmAudioPreprocessFallbacks: stats.wasm.fallbacks,

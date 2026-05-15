@@ -94,7 +94,7 @@ test("audio preprocessor records WebGPU/WASM fallback and CPU run stats", async 
     const stats = session.cacheStats().executionProviderStats;
     assert.equal(stats.webgpuAudioPreprocessAttempts, 1);
     assert.equal(stats.webgpuAudioPreprocessFallbacks, 1);
-    assert.equal(stats.webgpuAudioPreprocessLastFallbackReason, "webgpu-preprocess-unimplemented");
+    assert.equal(stats.webgpuAudioPreprocessLastFallbackReason, "webgpu-unavailable");
     assert.equal(stats.wasmAudioPreprocessAttempts, 1);
     assert.equal(stats.wasmAudioPreprocessFallbacks, 1);
     assert.equal(stats.wasmAudioPreprocessLastFallbackReason, "wasm-unavailable");

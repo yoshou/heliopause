@@ -15,11 +15,15 @@ import {
 } from "./runner/cpu/vision-runner";
 import {
   runVisionPreprocessProviders,
+  tryVisionPreprocessProviders,
   type VisionPreprocessOptions,
 } from "./runner/cpu/vision-preprocess-runner";
 import {
   runWebGpuVisionEncoder,
 } from "./runner/webgpu/vision-execution-provider";
+import {
+  runWebGpuVisionPreprocessor,
+} from "./runner/webgpu/vision-preprocess-runner";
 import {
   GgufTensorReader,
 } from "./tensor-reader";
@@ -248,17 +252,43 @@ export async function runVisionPreprocessor(
   try {
     const rgba = imageBitmapToRgba(bitmap);
     const resize = calculateVisionResize(session.manifest, bitmap.width, bitmap.height);
-    return runVisionPreprocessProviders(
+    const input = {
+      rgba,
+      sourceWidth: bitmap.width,
+      sourceHeight: bitmap.height,
+      resize,
+    };
+    for (const provider of session.preprocessProviders) {
+      throwIfAborted(options.signal);
+      if (provider.name === "webgpu") {
+        const webgpu = await runWebGpuVisionPreprocessor(session, input, options);
+        if (webgpu) {
+          return webgpu;
+        }
+        continue;
+      }
+      const result = await tryVisionPreprocessProviders(
+        session,
+        input,
+        preprocessVisionRgbaCpu,
+        [provider],
+        options,
+      );
+      if (result) {
+        return result;
+      }
+    }
+    const cpu = await tryVisionPreprocessProviders(
       session,
-      {
-        rgba,
-        sourceWidth: bitmap.width,
-        sourceHeight: bitmap.height,
-        resize,
-      },
+      input,
       preprocessVisionRgbaCpu,
+      [{ name: "cpu" }],
       options,
     );
+    if (cpu) {
+      return cpu;
+    }
+    return runVisionPreprocessProviders(session, input, preprocessVisionRgbaCpu, options);
   } finally {
     bitmap.close();
   }
@@ -364,4 +394,10 @@ function floorByFactor(value: number, factor: number): number {
 
 function lerp(left: number, right: number, amount: number): number {
   return left + (right - left) * amount;
+}
+
+function throwIfAborted(signal: AbortSignal | undefined): void {
+  if (signal?.aborted) {
+    throw new DOMException("Vision preprocessing was aborted.", "AbortError");
+  }
 }

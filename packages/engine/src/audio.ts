@@ -15,11 +15,15 @@ import {
 } from "./runner/cpu/audio-runner";
 import {
   runAudioPreprocessProviders,
+  tryAudioPreprocessProviders,
   type AudioPreprocessOptions,
 } from "./runner/cpu/audio-preprocess-runner";
 import {
   runWebGpuAudioEncoder,
 } from "./runner/webgpu/audio-execution-provider";
+import {
+  runWebGpuAudioPreprocessor,
+} from "./runner/webgpu/audio-preprocess-runner";
 import {
   GgufTensorReader,
 } from "./tensor-reader";
@@ -291,6 +295,36 @@ export async function runAudioPreprocessor(
   audio: AudioPcmInput,
   options: AudioPreprocessOptions = {},
 ): Promise<AudioFeatures> {
+  for (const provider of session.preprocessProviders) {
+    throwIfAborted(options.signal);
+    if (provider.name === "webgpu") {
+      const webgpu = await runWebGpuAudioPreprocessor(session, audio, options);
+      if (webgpu) {
+        return webgpu;
+      }
+      continue;
+    }
+    const result = await tryAudioPreprocessProviders(
+      session,
+      audio,
+      preprocessAudioPcm,
+      [provider],
+      options,
+    );
+    if (result) {
+      return result;
+    }
+  }
+  const cpu = await tryAudioPreprocessProviders(
+    session,
+    audio,
+    preprocessAudioPcm,
+    [{ name: "cpu" }],
+    options,
+  );
+  if (cpu) {
+    return cpu;
+  }
   return runAudioPreprocessProviders(session, audio, preprocessAudioPcm, options);
 }
 

@@ -20,6 +20,9 @@ import {
 import {
   runVisionPreprocessProviders,
 } from "../src/runner/cpu/vision-preprocess-runner.ts";
+import {
+  runWebGpuVisionPreprocessor,
+} from "../src/runner/webgpu/vision-preprocess-runner.ts";
 
 test("Vision dynamic resize follows llama.cpp token limits", () => {
   const manifest = {
@@ -152,7 +155,7 @@ test("Vision WASM preprocessing matches CPU resize and normalization", async () 
   assert.ok(maxAbsDiff(cpu.values, wasm) <= 1e-6);
 });
 
-test("Vision preprocessor records WebGPU/WASM fallback and CPU run stats", async () => {
+test("Vision CPU preprocessor records WASM fallback and CPU run stats", async () => {
   const reader = visionTensorReader([
     f32Tensor("v.patch_embd.weight", [1, 1, 3, 2], new Float32Array(6)),
   ], {
@@ -160,7 +163,6 @@ test("Vision preprocessor records WebGPU/WASM fallback and CPU run stats", async
   });
   const session = createVisionSession(reader, {
     preprocessProviders: [
-      { name: "webgpu" },
       { name: "wasm" },
       { name: "cpu" },
     ],
@@ -181,9 +183,6 @@ test("Vision preprocessor records WebGPU/WASM fallback and CPU run stats", async
 
     assert.ok(result.values.length > 0);
     const stats = session.cacheStats().executionProviderStats;
-    assert.equal(stats.webgpuVisionPreprocessAttempts, 1);
-    assert.equal(stats.webgpuVisionPreprocessFallbacks, 1);
-    assert.equal(stats.webgpuVisionPreprocessLastFallbackReason, "webgpu-preprocess-unimplemented");
     assert.equal(stats.wasmVisionPreprocessAttempts, 1);
     assert.equal(stats.wasmVisionPreprocessFallbacks, 1);
     assert.equal(stats.wasmVisionPreprocessLastFallbackReason, "wasm-unavailable");
@@ -191,6 +190,30 @@ test("Vision preprocessor records WebGPU/WASM fallback and CPU run stats", async
   } finally {
     resetPrefillWasmForTesting();
   }
+});
+
+test("Vision WebGPU preprocessor records unavailable fallback stats", async () => {
+  const reader = visionTensorReader([
+    f32Tensor("v.patch_embd.weight", [1, 1, 3, 2], new Float32Array(6)),
+  ], {
+    "clip.vision.projector.scale_factor": 1,
+  });
+  const session = createVisionSession(reader, {
+    executionProviders: [{ name: "webgpu" }, { name: "cpu" }],
+  });
+
+  const result = await runWebGpuVisionPreprocessor(session, {
+    rgba: new Uint8ClampedArray([32, 64, 96, 255]),
+    sourceWidth: 1,
+    sourceHeight: 1,
+    resize: { width: 1, height: 1, outputTokenCount: 1 },
+  });
+
+  assert.equal(result, undefined);
+  const stats = session.cacheStats().executionProviderStats;
+  assert.equal(stats.webgpuVisionPreprocessAttempts, 1);
+  assert.equal(stats.webgpuVisionPreprocessFallbacks, 1);
+  assert.equal(stats.webgpuVisionPreprocessLastFallbackReason, "webgpu-unavailable");
 });
 
 function visionTensorReader(
