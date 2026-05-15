@@ -43,6 +43,35 @@ export type ExecutionProviderConfig = {
   options?: Readonly<Record<string, unknown>>;
 };
 
+export function resolvePreprocessProviders(
+  executionProviders: readonly ExecutionProviderConfig[],
+  preprocessProviders: readonly ExecutionProviderConfig[] | undefined,
+): readonly ExecutionProviderConfig[] {
+  if (preprocessProviders) {
+    return preprocessProviders.map(copyExecutionProviderConfig);
+  }
+
+  const providers: ExecutionProviderConfig[] = [];
+  const webgpu = executionProviders.find((provider) => provider.name === "webgpu");
+  if (webgpu) {
+    providers.push(copyExecutionProviderConfig(webgpu));
+  }
+
+  const cpu = executionProviders.find((provider) => provider.name === "cpu");
+  if (cpu?.options?.wasmKernels !== false) {
+    providers.push({ name: "wasm" });
+  }
+  providers.push({ name: "cpu" });
+  return providers;
+}
+
+function copyExecutionProviderConfig(provider: ExecutionProviderConfig): ExecutionProviderConfig {
+  return {
+    name: provider.name,
+    options: provider.options ? { ...provider.options } : undefined,
+  };
+}
+
 export type TimingPhase = "prefill" | "decode";
 
 export type TimingEvent = {

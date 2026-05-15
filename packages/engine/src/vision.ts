@@ -8,14 +8,25 @@ import type {
   ExecutionProviderStats,
 } from "./runtime";
 import {
+  resolvePreprocessProviders,
+} from "./runtime";
+import {
   runCpuVisionEncoder,
 } from "./runner/cpu/vision-runner";
+import {
+  runVisionPreprocessProviders,
+  type VisionPreprocessOptions,
+} from "./runner/cpu/vision-preprocess-runner";
 import {
   runWebGpuVisionEncoder,
 } from "./runner/webgpu/vision-execution-provider";
 import {
   GgufTensorReader,
 } from "./tensor-reader";
+
+export type {
+  VisionPreprocessOptions,
+} from "./runner/cpu/vision-preprocess-runner";
 
 export type VisionPixelValues = {
   values: Float32Array;
@@ -39,6 +50,7 @@ export type VisionEncodeResult = {
 export type VisionSessionOptions = {
   maxWeightCacheBytes?: number;
   executionProviders?: readonly ExecutionProviderConfig[];
+  preprocessProviders?: readonly ExecutionProviderConfig[];
 };
 
 export class VisionSession {
@@ -46,6 +58,7 @@ export class VisionSession {
   readonly manifest: VisionManifest;
   readonly epsilon: number;
   readonly executionProviders: readonly ExecutionProviderConfig[];
+  readonly preprocessProviders: readonly ExecutionProviderConfig[];
 
   private readonly maxWeightCacheBytes: number;
   private readonly f32TensorCache = new Map<string, Float32Array>();
@@ -66,6 +79,7 @@ export class VisionSession {
       name: provider.name,
       options: provider.options ? { ...provider.options } : undefined,
     }));
+    this.preprocessProviders = resolvePreprocessProviders(this.executionProviders, options.preprocessProviders);
   }
 
   getTensor(name: string) {
@@ -219,20 +233,54 @@ export async function preprocessVisionImageFile(
   const bitmap = await createImageBitmap(file);
   try {
     const rgba = imageBitmapToRgba(bitmap);
-    const resize = calculateVisionResize(manifest, bitmap.width, bitmap.height);
-    const resized = resizeRgbaBilinear(rgba, bitmap.width, bitmap.height, resize.width, resize.height);
-    const values = new Float32Array(resize.width * resize.height * 3);
-    for (let pixel = 0; pixel < resize.width * resize.height; pixel += 1) {
-      for (let channel = 0; channel < 3; channel += 1) {
-        values[pixel * 3 + channel] =
-          ((resized[pixel * 4 + channel] ?? 0) / 255 - (manifest.imageMean[channel] ?? 0)) /
-          (manifest.imageStd[channel] ?? 1);
-      }
-    }
-    return { values, width: resize.width, height: resize.height };
+    return preprocessVisionRgbaCpu(rgba, bitmap.width, bitmap.height, manifest);
   } finally {
     bitmap.close();
   }
+}
+
+export async function runVisionPreprocessor(
+  session: VisionSession,
+  file: Blob,
+  options: VisionPreprocessOptions = {},
+): Promise<VisionPixelValues> {
+  const bitmap = await createImageBitmap(file);
+  try {
+    const rgba = imageBitmapToRgba(bitmap);
+    const resize = calculateVisionResize(session.manifest, bitmap.width, bitmap.height);
+    return runVisionPreprocessProviders(
+      session,
+      {
+        rgba,
+        sourceWidth: bitmap.width,
+        sourceHeight: bitmap.height,
+        resize,
+      },
+      preprocessVisionRgbaCpu,
+      options,
+    );
+  } finally {
+    bitmap.close();
+  }
+}
+
+export function preprocessVisionRgbaCpu(
+  rgba: Uint8ClampedArray,
+  sourceWidth: number,
+  sourceHeight: number,
+  manifest: VisionManifest,
+): VisionPixelValues {
+  const resize = calculateVisionResize(manifest, sourceWidth, sourceHeight);
+  const resized = resizeRgbaBilinear(rgba, sourceWidth, sourceHeight, resize.width, resize.height);
+  const values = new Float32Array(resize.width * resize.height * 3);
+  for (let pixel = 0; pixel < resize.width * resize.height; pixel += 1) {
+    for (let channel = 0; channel < 3; channel += 1) {
+      values[pixel * 3 + channel] =
+        ((resized[pixel * 4 + channel] ?? 0) / 255 - (manifest.imageMean[channel] ?? 0)) /
+        (manifest.imageStd[channel] ?? 1);
+    }
+  }
+  return { values, width: resize.width, height: resize.height };
 }
 
 export async function runVisionEncoder(

@@ -8,14 +8,25 @@ import type {
   ExecutionProviderStats,
 } from "./runtime";
 import {
+  resolvePreprocessProviders,
+} from "./runtime";
+import {
   runCpuAudioEncoder,
 } from "./runner/cpu/audio-runner";
+import {
+  runAudioPreprocessProviders,
+  type AudioPreprocessOptions,
+} from "./runner/cpu/audio-preprocess-runner";
 import {
   runWebGpuAudioEncoder,
 } from "./runner/webgpu/audio-execution-provider";
 import {
   GgufTensorReader,
 } from "./tensor-reader";
+
+export type {
+  AudioPreprocessOptions,
+} from "./runner/cpu/audio-preprocess-runner";
 
 export type AudioPcmInput = {
   pcm: Float32Array;
@@ -40,6 +51,7 @@ export type AudioEncodeResult = {
 export type AudioSessionOptions = {
   maxWeightCacheBytes?: number;
   executionProviders?: readonly ExecutionProviderConfig[];
+  preprocessProviders?: readonly ExecutionProviderConfig[];
 };
 
 export class AudioSession {
@@ -47,6 +59,7 @@ export class AudioSession {
   readonly manifest: AudioManifest;
   readonly epsilon: number;
   readonly executionProviders: readonly ExecutionProviderConfig[];
+  readonly preprocessProviders: readonly ExecutionProviderConfig[];
 
   private readonly maxWeightCacheBytes: number;
   private readonly f32TensorCache = new Map<string, Float32Array>();
@@ -67,6 +80,7 @@ export class AudioSession {
       name: provider.name,
       options: provider.options ? { ...provider.options } : undefined,
     }));
+    this.preprocessProviders = resolvePreprocessProviders(this.executionProviders, options.preprocessProviders);
   }
 
   getTensor(name: string) {
@@ -270,6 +284,14 @@ export function preprocessAudioPcm(
     attentionMask,
     durationMs: Math.min(audio.durationMs, config.maxSeconds * 1000),
   };
+}
+
+export async function runAudioPreprocessor(
+  session: AudioSession,
+  audio: AudioPcmInput,
+  options: AudioPreprocessOptions = {},
+): Promise<AudioFeatures> {
+  return runAudioPreprocessProviders(session, audio, preprocessAudioPcm, options);
 }
 
 export async function runAudioEncoder(

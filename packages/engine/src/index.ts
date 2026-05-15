@@ -49,10 +49,12 @@ export {
   calculateVisionResize,
   createVisionSession,
   preprocessVisionImageFile,
+  runVisionPreprocessor,
   runVisionEncoder,
   VisionSession,
   type VisionEncodeResult,
   type VisionPixelValues,
+  type VisionPreprocessOptions,
   type VisionResize,
   type VisionSessionOptions,
 } from "./vision";
@@ -60,11 +62,13 @@ export {
 export {
   createAudioSession,
   preprocessAudioPcm,
+  runAudioPreprocessor,
   runAudioEncoder,
   AudioSession,
   type AudioEncodeResult,
   type AudioFeatures,
   type AudioPcmInput,
+  type AudioPreprocessOptions,
   type AudioSessionOptions,
 } from "./audio";
 
@@ -73,6 +77,7 @@ export {
   createModelSession,
   cloneInferenceState,
   estimateWeightCacheBytes,
+  resolvePreprocessProviders,
   ModelSession,
   type CacheStats,
   type ExecutionProviderConfig,

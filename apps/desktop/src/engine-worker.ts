@@ -13,11 +13,11 @@ import {
   getGgufModelName,
   isAudioGguf,
   isVisionGguf,
-  preprocessAudioPcm,
   planRunnerPlacement,
   runAudioEncoder,
-  preprocessVisionImageFile,
   prefillChatMessages,
+  runAudioPreprocessor,
+  runVisionPreprocessor,
   runVisionEncoder,
   type ExecutionProviderConfig,
   type AudioSession,
@@ -255,7 +255,9 @@ async function handleGenerateTurn(
       if (!audioSession) {
         throw new Error("No audio encoder loaded.");
       }
-      const features = preprocessAudioPcm(request.audio, audioSession.manifest);
+      const features = await runAudioPreprocessor(audioSession, request.audio, {
+        signal: abortController.signal,
+      });
       if (abortController.signal.aborted) {
         throw new DOMException("Generation was aborted.", "AbortError");
       }
@@ -277,7 +279,9 @@ async function handleGenerateTurn(
       if (!visionSession) {
         throw new Error("No vision encoder loaded.");
       }
-      const pixels = await preprocessVisionImageFile(request.image.file, visionSession.manifest);
+      const pixels = await runVisionPreprocessor(visionSession, request.image.file, {
+        signal: abortController.signal,
+      });
       const encoded = await runVisionEncoder(visionSession, pixels);
       await generatePreparedImageChatTurn(
         session,

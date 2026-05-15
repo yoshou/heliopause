@@ -920,6 +920,219 @@ pub unsafe extern "C" fn hp_vision_std_normalize_f32(
 
 #[allow(clippy::too_many_arguments)]
 #[no_mangle]
+pub unsafe extern "C" fn hp_vision_preprocess_rgba_f32(
+    rgba_ptr: *const u8,
+    rgba_len: usize,
+    source_width: usize,
+    source_height: usize,
+    target_width: usize,
+    target_height: usize,
+    mean_ptr: *const f32,
+    mean_len: usize,
+    std_ptr: *const f32,
+    std_len: usize,
+    output_ptr: *mut f32,
+    output_len: usize,
+) -> i32 {
+    if source_width == 0
+        || source_height == 0
+        || target_width == 0
+        || target_height == 0
+        || rgba_len != source_width.saturating_mul(source_height).saturating_mul(4)
+        || mean_len != 3
+        || std_len != 3
+        || output_len != target_width.saturating_mul(target_height).saturating_mul(3)
+    {
+        return ERR_SHAPE;
+    }
+
+    let rgba = slice::from_raw_parts(rgba_ptr, rgba_len);
+    let mean = slice::from_raw_parts(mean_ptr, mean_len);
+    let std = slice::from_raw_parts(std_ptr, std_len);
+    let output = slice::from_raw_parts_mut(output_ptr, output_len);
+    let x_ratio = if target_width > 1 {
+        (source_width - 1) as f64 / (target_width - 1) as f64
+    } else {
+        0.0
+    };
+    let y_ratio = if target_height > 1 {
+        (source_height - 1) as f64 / (target_height - 1) as f64
+    } else {
+        0.0
+    };
+
+    for y in 0..target_height {
+        let py = y as f64 * y_ratio;
+        let y0 = (py.trunc() as usize).min(source_height - 1);
+        let y1 = (y0 + 1).min(source_height - 1);
+        let yf = py - y0 as f64;
+        for x in 0..target_width {
+            let px = x as f64 * x_ratio;
+            let x0 = (px.trunc() as usize).min(source_width - 1);
+            let x1 = (x0 + 1).min(source_width - 1);
+            let xf = px - x0 as f64;
+            let output_pixel = (y * target_width + x) * 3;
+            for channel in 0..3 {
+                let top = lerp_f64(
+                    rgba[(y0 * source_width + x0) * 4 + channel] as f64,
+                    rgba[(y0 * source_width + x1) * 4 + channel] as f64,
+                    xf,
+                );
+                let bottom = lerp_f64(
+                    rgba[(y1 * source_width + x0) * 4 + channel] as f64,
+                    rgba[(y1 * source_width + x1) * 4 + channel] as f64,
+                    xf,
+                );
+                let resized = lerp_f64(top, bottom, yf).trunc();
+                output[output_pixel + channel] =
+                    (((resized / 255.0) - mean[channel] as f64) / std[channel] as f64) as f32;
+            }
+        }
+    }
+
+    OK
+}
+
+fn lerp_f64(left: f64, right: f64, amount: f64) -> f64 {
+    left + (right - left) * amount
+}
+
+#[allow(clippy::too_many_arguments)]
+#[no_mangle]
+pub unsafe extern "C" fn hp_audio_log_mel_f32(
+    pcm_ptr: *const f32,
+    pcm_len: usize,
+    window_ptr: *const f32,
+    window_len: usize,
+    filters_ptr: *const f32,
+    filters_len: usize,
+    frame_length: usize,
+    hop_length: usize,
+    fft_length: usize,
+    feature_size: usize,
+    mel_floor: f32,
+    output_ptr: *mut f32,
+    output_len: usize,
+    mask_ptr: *mut u8,
+    mask_len: usize,
+) -> i32 {
+    if frame_length == 0
+        || hop_length == 0
+        || fft_length == 0
+        || feature_size == 0
+        || !fft_length.is_power_of_two()
+        || frame_length > fft_length
+        || window_len != fft_length
+        || filters_len != feature_size.saturating_mul(fft_length / 2 + 1)
+        || output_len != mask_len.saturating_mul(feature_size)
+    {
+        return ERR_SHAPE;
+    }
+
+    let computed_frame_count = audio_log_mel_frame_count(pcm_len, frame_length, hop_length);
+    if mask_len != computed_frame_count {
+        return ERR_SHAPE;
+    }
+    if computed_frame_count == 0 {
+        return OK;
+    }
+
+    let pcm = slice::from_raw_parts(pcm_ptr, pcm_len);
+    let window = slice::from_raw_parts(window_ptr, window_len);
+    let filters = slice::from_raw_parts(filters_ptr, filters_len);
+    let output = slice::from_raw_parts_mut(output_ptr, output_len);
+    let mask = slice::from_raw_parts_mut(mask_ptr, mask_len);
+
+    let pad_left = frame_length / 2;
+    let padded_needed = (computed_frame_count - 1) * hop_length + fft_length;
+    let total_pad = padded_needed.saturating_sub(pcm_len).max(pad_left);
+    let mut padded = vec![0.0_f32; total_pad + pcm_len];
+    padded[pad_left..pad_left + pcm_len].copy_from_slice(pcm);
+    let mut fft_real = vec![0.0_f32; fft_length];
+    let mut fft_imag = vec![0.0_f32; fft_length];
+    let mut magnitude = vec![0.0_f32; fft_length / 2 + 1];
+
+    for frame in 0..computed_frame_count {
+        fft_real.fill(0.0);
+        fft_imag.fill(0.0);
+        let sample_offset = frame * hop_length;
+        for index in 0..fft_length {
+            fft_real[index] = padded.get(sample_offset + index).copied().unwrap_or(0.0) * window[index];
+        }
+        fft_radix2_f32(&mut fft_real, &mut fft_imag);
+        for bin in 0..magnitude.len() {
+            let real = fft_real[bin];
+            let imag = fft_imag[bin];
+            magnitude[bin] = ((real as f64 * real as f64) + (imag as f64 * imag as f64)).sqrt() as f32;
+        }
+        for mel in 0..feature_size {
+            let mut energy = 0.0_f64;
+            let filter_offset = mel * magnitude.len();
+            for bin in 0..magnitude.len() {
+                energy += magnitude[bin] as f64 * filters[filter_offset + bin] as f64;
+            }
+            output[frame * feature_size + mel] = energy.max(mel_floor as f64).ln() as f32;
+        }
+        mask[frame] = 1;
+    }
+
+    OK
+}
+
+fn audio_log_mel_frame_count(sample_count: usize, frame_length: usize, hop_length: usize) -> usize {
+    let pad_left = frame_length / 2;
+    let n_with_left = sample_count + pad_left;
+    if n_with_left < frame_length + 1 {
+        return 0;
+    }
+    (n_with_left - (frame_length + 1)) / hop_length + 1
+}
+
+fn fft_radix2_f32(real: &mut [f32], imag: &mut [f32]) {
+    let n = real.len();
+    let mut j = 0_usize;
+    for i in 1..n {
+        let mut bit = n >> 1;
+        while (j & bit) != 0 {
+            j ^= bit;
+            bit >>= 1;
+        }
+        j ^= bit;
+        if i < j {
+            real.swap(i, j);
+            imag.swap(i, j);
+        }
+    }
+    let mut length = 2_usize;
+    while length <= n {
+        let angle = -2.0_f64 * core::f64::consts::PI / length as f64;
+        let w_len_real = angle.cos();
+        let w_len_imag = angle.sin();
+        let mut i = 0_usize;
+        while i < n {
+            let mut w_real = 1.0_f64;
+            let mut w_imag = 0.0_f64;
+            for k in 0..length / 2 {
+                let even = i + k;
+                let odd = even + length / 2;
+                let odd_real = (real[odd] as f64 * w_real - imag[odd] as f64 * w_imag) as f32;
+                let odd_imag = (real[odd] as f64 * w_imag + imag[odd] as f64 * w_real) as f32;
+                real[odd] = ((real[even] as f64) - odd_real as f64) as f32;
+                imag[odd] = ((imag[even] as f64) - odd_imag as f64) as f32;
+                real[even] = ((real[even] as f64) + odd_real as f64) as f32;
+                imag[even] = ((imag[even] as f64) + odd_imag as f64) as f32;
+                let next_real = (w_real * w_len_real - w_imag * w_len_imag) as f32;
+                w_imag = (w_real * w_len_imag + w_imag * w_len_real) as f32 as f64;
+                w_real = next_real as f64;
+            }
+            i += length;
+        }
+        length <<= 1;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+#[no_mangle]
 pub unsafe extern "C" fn hp_audio_conv2d_subsample_f32(
     input_ptr: *const f32,
     input_len: usize,

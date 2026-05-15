@@ -8,11 +8,15 @@ import {
 import {
   createAudioSession,
   preprocessAudioPcm,
+  runAudioPreprocessor,
   runAudioEncoder,
 } from "../src/audio.ts";
 import {
   GgufTensorReader,
 } from "../src/tensor-reader.ts";
+import {
+  resetPrefillWasmForTesting,
+} from "../src/runner/cpu/wasm-kernels.ts";
 
 test("audio manifest reads projector metadata", () => {
   const reader = audioTensorReader([]);
@@ -43,6 +47,61 @@ test("audio preprocessing creates 128-bin log-mel frames", () => {
   assert.equal(features.values.length, 99 * 128);
   assert.equal(features.attentionMask.length, 99);
   assert.ok(features.values.some((value) => Number.isFinite(value)));
+});
+
+test("audio WASM preprocessing matches CPU log-mel features", async () => {
+  const samples = new Float32Array(16_000);
+  for (let index = 0; index < samples.length; index += 1) {
+    samples[index] = Math.sin(index * 2 * Math.PI * 440 / 16_000) * 0.1;
+  }
+  const audio = {
+    pcm: samples,
+    sampleRate: 16_000 as const,
+    durationMs: 1000,
+  };
+  const baseline = preprocessAudioPcm(audio);
+  const session = createAudioSession(audioTensorReader([]), {
+    preprocessProviders: [{ name: "wasm" }, { name: "cpu" }],
+  });
+
+  const wasm = await runAudioPreprocessor(session, audio);
+
+  assert.equal(wasm.frameCount, baseline.frameCount);
+  assert.equal(wasm.featureSize, baseline.featureSize);
+  assert.deepEqual(wasm.attentionMask, baseline.attentionMask);
+  assert.ok(maxAbsDiff(wasm.values, baseline.values) <= 1e-4);
+  assert.equal(session.cacheStats().executionProviderStats.wasmAudioPreprocessRuns, 1);
+});
+
+test("audio preprocessor records WebGPU/WASM fallback and CPU run stats", async () => {
+  const session = createAudioSession(audioTensorReader([]), {
+    preprocessProviders: [
+      { name: "webgpu" },
+      { name: "wasm" },
+      { name: "cpu" },
+    ],
+  });
+
+  resetPrefillWasmForTesting("");
+  try {
+    const features = await runAudioPreprocessor(session, {
+      pcm: new Float32Array(16_000),
+      sampleRate: 16_000,
+      durationMs: 1000,
+    });
+
+    assert.equal(features.frameCount, 99);
+    const stats = session.cacheStats().executionProviderStats;
+    assert.equal(stats.webgpuAudioPreprocessAttempts, 1);
+    assert.equal(stats.webgpuAudioPreprocessFallbacks, 1);
+    assert.equal(stats.webgpuAudioPreprocessLastFallbackReason, "webgpu-preprocess-unimplemented");
+    assert.equal(stats.wasmAudioPreprocessAttempts, 1);
+    assert.equal(stats.wasmAudioPreprocessFallbacks, 1);
+    assert.equal(stats.wasmAudioPreprocessLastFallbackReason, "wasm-unavailable");
+    assert.equal(stats.cpuAudioPreprocessRuns, 1);
+  } finally {
+    resetPrefillWasmForTesting();
+  }
 });
 
 test("audio encoder projects hidden to model embedding size", async () => {
@@ -172,4 +231,13 @@ function concatBytes(parts: Uint8Array[]): Uint8Array {
     offset += part.byteLength;
   }
   return output;
+}
+
+function maxAbsDiff(left: Float32Array, right: Float32Array): number {
+  assert.equal(left.length, right.length);
+  let max = 0;
+  for (let index = 0; index < left.length; index += 1) {
+    max = Math.max(max, Math.abs((left[index] ?? 0) - (right[index] ?? 0)));
+  }
+  return max;
 }

@@ -222,6 +222,37 @@ type KernelExports = WebAssembly.Exports & {
     outputPtr: number,
     outputLen: number,
   ): number;
+  hp_vision_preprocess_rgba_f32(
+    rgbaPtr: number,
+    rgbaLen: number,
+    sourceWidth: number,
+    sourceHeight: number,
+    targetWidth: number,
+    targetHeight: number,
+    meanPtr: number,
+    meanLen: number,
+    stdPtr: number,
+    stdLen: number,
+    outputPtr: number,
+    outputLen: number,
+  ): number;
+  hp_audio_log_mel_f32(
+    pcmPtr: number,
+    pcmLen: number,
+    windowPtr: number,
+    windowLen: number,
+    filtersPtr: number,
+    filtersLen: number,
+    frameLength: number,
+    hopLength: number,
+    fftLength: number,
+    featureSize: number,
+    melFloor: number,
+    outputPtr: number,
+    outputLen: number,
+    maskPtr: number,
+    maskLen: number,
+  ): number;
   hp_audio_conv2d_subsample_f32(
     inputPtr: number,
     inputLen: number,
@@ -1142,6 +1173,110 @@ export async function visionStdNormalizeWasm(
   }
 }
 
+export async function visionPreprocessRgbaWasm(
+  rgba: Uint8ClampedArray,
+  sourceWidth: number,
+  sourceHeight: number,
+  targetWidth: number,
+  targetHeight: number,
+  mean: readonly [number, number, number],
+  std: readonly [number, number, number],
+): Promise<Float32Array | undefined> {
+  const exports = await prefillWasmExports();
+  if (!exports) {
+    return undefined;
+  }
+  const outputLength = targetWidth * targetHeight * 3;
+  const allocations: Allocation[] = [];
+  try {
+    const meanValues = new Float32Array(mean);
+    const stdValues = new Float32Array(std);
+    const { rgbaAlloc, meanAlloc, stdAlloc, outputAlloc } = timedWasmSection("visionPreprocessRgba", "allocation + input copy", () => ({
+      rgbaAlloc: copyU8ToWasm(exports, rgba, allocations),
+      meanAlloc: copyF32ToWasm(exports, meanValues, allocations),
+      stdAlloc: copyF32ToWasm(exports, stdValues, allocations),
+      outputAlloc: allocateBytes(exports, outputLength * Float32Array.BYTES_PER_ELEMENT, allocations),
+    }), rgba.byteLength + meanValues.byteLength + stdValues.byteLength + outputLength * Float32Array.BYTES_PER_ELEMENT);
+    const code = timedWasmSection("visionPreprocessRgba", "kernel call", () => exports.hp_vision_preprocess_rgba_f32(
+      rgbaAlloc.ptr,
+      rgba.length,
+      sourceWidth,
+      sourceHeight,
+      targetWidth,
+      targetHeight,
+      meanAlloc.ptr,
+      meanValues.length,
+      stdAlloc.ptr,
+      stdValues.length,
+      outputAlloc.ptr,
+      outputLength,
+    ));
+    assertWasmOk(code, "visionPreprocessRgba");
+    return readVisionOutput(exports, allocations, outputAlloc.ptr, outputLength, "visionPreprocessRgba");
+  } finally {
+    releaseAllocations(exports, allocations);
+  }
+}
+
+export type AudioLogMelWasmConfig = {
+  frameLength: number;
+  hopLength: number;
+  fftLength: number;
+  featureSize: number;
+  melFloor: number;
+  frameCount: number;
+};
+
+export async function audioLogMelWasm(
+  pcm: Float32Array,
+  window: Float32Array,
+  filters: Float32Array,
+  config: AudioLogMelWasmConfig,
+): Promise<{ values: Float32Array; attentionMask: Uint8Array } | undefined> {
+  const exports = await prefillWasmExports();
+  if (!exports) {
+    return undefined;
+  }
+  const outputLength = config.frameCount * config.featureSize;
+  const allocations: Allocation[] = [];
+  try {
+    const { pcmAlloc, windowAlloc, filtersAlloc, outputAlloc, maskAlloc } = timedWasmSection("audioLogMel", "allocation + input copy", () => ({
+      pcmAlloc: copyF32ToWasm(exports, pcm, allocations),
+      windowAlloc: copyF32ToWasm(exports, window, allocations),
+      filtersAlloc: copyF32ToWasm(exports, filters, allocations),
+      outputAlloc: allocateBytes(exports, outputLength * Float32Array.BYTES_PER_ELEMENT, allocations),
+      maskAlloc: allocateBytes(exports, config.frameCount * Uint8Array.BYTES_PER_ELEMENT, allocations),
+    }), pcm.byteLength + window.byteLength + filters.byteLength + outputLength * Float32Array.BYTES_PER_ELEMENT + config.frameCount);
+    const code = timedWasmSection("audioLogMel", "kernel call", () => exports.hp_audio_log_mel_f32(
+      pcmAlloc.ptr,
+      pcm.length,
+      windowAlloc.ptr,
+      window.length,
+      filtersAlloc.ptr,
+      filters.length,
+      config.frameLength,
+      config.hopLength,
+      config.fftLength,
+      config.featureSize,
+      config.melFloor,
+      outputAlloc.ptr,
+      outputLength,
+      maskAlloc.ptr,
+      config.frameCount,
+    ));
+    assertWasmOk(code, "audioLogMel");
+    return timedWasmSection("audioLogMel", "output copy + free", () => {
+      const values = readF32FromWasm(exports, outputAlloc.ptr, outputLength);
+      const attentionMask = readU8FromWasm(exports, maskAlloc.ptr, config.frameCount);
+      releaseAllocations(exports, allocations);
+      allocations.length = 0;
+      return { values, attentionMask };
+    }, outputLength * Float32Array.BYTES_PER_ELEMENT + config.frameCount);
+  } finally {
+    releaseAllocations(exports, allocations);
+  }
+}
+
 export async function audioConv2dSubsampleWasm(
   input: Float32Array,
   mask: Uint8Array,
@@ -1585,7 +1720,7 @@ function copyF32ToWasm(exports: KernelExports, input: Float32Array, allocations:
   return allocation;
 }
 
-function copyU8ToWasm(exports: KernelExports, input: Uint8Array, allocations: Allocation[]): Allocation {
+function copyU8ToWasm(exports: KernelExports, input: Uint8Array | Uint8ClampedArray, allocations: Allocation[]): Allocation {
   const allocation = allocateBytes(exports, input.byteLength, allocations);
   new Uint8Array(exports.memory.buffer, allocation.ptr, input.length).set(input);
   return allocation;
@@ -1593,6 +1728,10 @@ function copyU8ToWasm(exports: KernelExports, input: Uint8Array, allocations: Al
 
 function readF32FromWasm(exports: KernelExports, ptr: number, length: number): Float32Array {
   return new Float32Array(exports.memory.buffer, ptr, length).slice();
+}
+
+function readU8FromWasm(exports: KernelExports, ptr: number, length: number): Uint8Array {
+  return new Uint8Array(exports.memory.buffer, ptr, length).slice();
 }
 
 function readVisionOutput(

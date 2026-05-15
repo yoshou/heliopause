@@ -4,14 +4,22 @@ import test from "node:test";
 import {
   calculateVisionResize,
   createVisionSession,
+  preprocessVisionRgbaCpu,
   runVisionEncoder,
 } from "../src/vision.ts";
+import type {
+  VisionManifest,
+} from "../src/model.ts";
 import {
   GgufTensorReader,
 } from "../src/tensor-reader.ts";
 import {
   resetPrefillWasmForTesting,
+  visionPreprocessRgbaWasm,
 } from "../src/runner/cpu/wasm-kernels.ts";
+import {
+  runVisionPreprocessProviders,
+} from "../src/runner/cpu/vision-preprocess-runner.ts";
 
 test("Vision dynamic resize follows llama.cpp token limits", () => {
   const manifest = {
@@ -101,6 +109,90 @@ test("Vision falls back through WebGPU and unavailable WASM paths", async () => 
   }
 });
 
+test("Vision WASM preprocessing matches CPU resize and normalization", async () => {
+  const manifest: VisionManifest = {
+    architecture: "clip",
+    projectorType: "gemma4",
+    tensorCount: 0,
+    imageSize: 2,
+    patchSize: 1,
+    embeddingLength: 2,
+    feedForwardLength: 4,
+    blockCount: 0,
+    headCount: 1,
+    layerNormEpsilon: 1e-6,
+    projectionDim: 2,
+    spatialMergeSize: 1,
+    imageMinTokens: 4,
+    imageMaxTokens: 4,
+    imageMean: [0.5, 0.25, 0.75],
+    imageStd: [0.5, 0.25, 0.75],
+    tensorTypes: {},
+  };
+  const rgba = new Uint8ClampedArray([
+    0, 64, 128, 255,
+    255, 192, 32, 128,
+    128, 16, 240, 255,
+    32, 224, 96, 0,
+  ]);
+
+  const cpu = preprocessVisionRgbaCpu(rgba, 2, 2, manifest);
+  const wasm = await visionPreprocessRgbaWasm(
+    rgba,
+    2,
+    2,
+    cpu.width,
+    cpu.height,
+    manifest.imageMean,
+    manifest.imageStd,
+  );
+
+  assert.ok(wasm);
+  assert.equal(wasm.length, cpu.values.length);
+  assert.ok(maxAbsDiff(cpu.values, wasm) <= 1e-6);
+});
+
+test("Vision preprocessor records WebGPU/WASM fallback and CPU run stats", async () => {
+  const reader = visionTensorReader([
+    f32Tensor("v.patch_embd.weight", [1, 1, 3, 2], new Float32Array(6)),
+  ], {
+    "clip.vision.projector.scale_factor": 1,
+  });
+  const session = createVisionSession(reader, {
+    preprocessProviders: [
+      { name: "webgpu" },
+      { name: "wasm" },
+      { name: "cpu" },
+    ],
+  });
+
+  resetPrefillWasmForTesting("");
+  try {
+    const result = await runVisionPreprocessProviders(
+      session,
+      {
+        rgba: new Uint8ClampedArray([32, 64, 96, 255]),
+        sourceWidth: 1,
+        sourceHeight: 1,
+        resize: { width: 1, height: 1, outputTokenCount: 1 },
+      },
+      preprocessVisionRgbaCpu,
+    );
+
+    assert.ok(result.values.length > 0);
+    const stats = session.cacheStats().executionProviderStats;
+    assert.equal(stats.webgpuVisionPreprocessAttempts, 1);
+    assert.equal(stats.webgpuVisionPreprocessFallbacks, 1);
+    assert.equal(stats.webgpuVisionPreprocessLastFallbackReason, "webgpu-preprocess-unimplemented");
+    assert.equal(stats.wasmVisionPreprocessAttempts, 1);
+    assert.equal(stats.wasmVisionPreprocessFallbacks, 1);
+    assert.equal(stats.wasmVisionPreprocessLastFallbackReason, "wasm-unavailable");
+    assert.equal(stats.cpuVisionPreprocessRuns, 1);
+  } finally {
+    resetPrefillWasmForTesting();
+  }
+});
+
 function visionTensorReader(
   tensors: Array<{
     name: string;
@@ -183,4 +275,13 @@ function concatBytes(parts: Uint8Array[]): Uint8Array {
     offset += part.byteLength;
   }
   return output;
+}
+
+function maxAbsDiff(left: Float32Array, right: Float32Array): number {
+  assert.equal(left.length, right.length);
+  let max = 0;
+  for (let index = 0; index < left.length; index += 1) {
+    max = Math.max(max, Math.abs((left[index] ?? 0) - (right[index] ?? 0)));
+  }
+  return max;
 }
