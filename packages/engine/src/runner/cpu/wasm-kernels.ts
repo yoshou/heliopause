@@ -222,6 +222,99 @@ type KernelExports = WebAssembly.Exports & {
     outputPtr: number,
     outputLen: number,
   ): number;
+  hp_audio_conv2d_subsample_f32(
+    inputPtr: number,
+    inputLen: number,
+    maskPtr: number,
+    maskLen: number,
+    weightPtr: number,
+    weightLen: number,
+    biasPtr: number,
+    biasLen: number,
+    normPtr: number,
+    normLen: number,
+    time: number,
+    frequency: number,
+    inChannels: number,
+    outChannels: number,
+    epsilon: number,
+    outputPtr: number,
+    outputLen: number,
+  ): number;
+  hp_audio_flatten_channels_last_f32(
+    inputPtr: number,
+    inputLen: number,
+    timeCount: number,
+    frequencyCount: number,
+    channelCount: number,
+    outputPtr: number,
+    outputLen: number,
+  ): number;
+  hp_audio_rms_norm_f32(
+    inputPtr: number,
+    inputLen: number,
+    weightPtr: number,
+    weightLen: number,
+    epsilon: number,
+    outputPtr: number,
+    outputLen: number,
+  ): number;
+  hp_audio_clamp_f32(
+    inputPtr: number,
+    inputLen: number,
+    min: number,
+    max: number,
+    outputPtr: number,
+    outputLen: number,
+  ): number;
+  hp_audio_residual_add_f32(
+    leftPtr: number,
+    leftLen: number,
+    rightPtr: number,
+    rightLen: number,
+    outputPtr: number,
+    outputLen: number,
+  ): number;
+  hp_audio_residual_add_scale_f32(
+    residualPtr: number,
+    residualLen: number,
+    hiddenPtr: number,
+    hiddenLen: number,
+    scale: number,
+    outputPtr: number,
+    outputLen: number,
+  ): number;
+  hp_audio_silu_f32(
+    inputPtr: number,
+    inputLen: number,
+    outputPtr: number,
+    outputLen: number,
+  ): number;
+  hp_audio_glu_f32(
+    inputPtr: number,
+    inputLen: number,
+    outputSize: number,
+    outputPtr: number,
+    outputLen: number,
+  ): number;
+  hp_audio_depthwise_conv1d_f32(
+    inputPtr: number,
+    inputLen: number,
+    weightPtr: number,
+    weightLen: number,
+    kernelSize: number,
+    channels: number,
+    outputPtr: number,
+    outputLen: number,
+  ): number;
+  hp_audio_add_bias_rows_f32(
+    inputPtr: number,
+    inputLen: number,
+    biasPtr: number,
+    biasLen: number,
+    outputPtr: number,
+    outputLen: number,
+  ): number;
 };
 
 type Allocation = {
@@ -1044,6 +1137,320 @@ export async function visionStdNormalizeWasm(
     ));
     assertWasmOk(code, "visionStdNormalize");
     return readVisionOutput(exports, allocations, outputAlloc.ptr, input.length, "visionStdNormalize");
+  } finally {
+    releaseAllocations(exports, allocations);
+  }
+}
+
+export async function audioConv2dSubsampleWasm(
+  input: Float32Array,
+  mask: Uint8Array,
+  weight: Float32Array,
+  bias: Float32Array | undefined,
+  norm: Float32Array,
+  time: number,
+  frequency: number,
+  inChannels: number,
+  outChannels: number,
+  epsilon: number,
+): Promise<Float32Array | undefined> {
+  const exports = await prefillWasmExports();
+  if (!exports) {
+    return undefined;
+  }
+  const outTime = Math.floor((time + 1) / 2);
+  const outFrequency = Math.floor((frequency + 1) / 2);
+  const outputLength = outTime * outChannels * outFrequency;
+  const allocations: Allocation[] = [];
+  try {
+    const { inputAlloc, maskAlloc, weightAlloc, biasAlloc, normAlloc, outputAlloc } = timedWasmSection("audioConv2dSubsample", "allocation + input copy", () => ({
+      inputAlloc: copyF32ToWasm(exports, input, allocations),
+      maskAlloc: copyU8ToWasm(exports, mask, allocations),
+      weightAlloc: copyF32ToWasm(exports, weight, allocations),
+      biasAlloc: bias ? copyF32ToWasm(exports, bias, allocations) : { ptr: 0, byteLength: 0, exports },
+      normAlloc: copyF32ToWasm(exports, norm, allocations),
+      outputAlloc: allocateBytes(exports, outputLength * Float32Array.BYTES_PER_ELEMENT, allocations),
+    }), input.byteLength + mask.byteLength + weight.byteLength + (bias?.byteLength ?? 0) + norm.byteLength +
+      outputLength * Float32Array.BYTES_PER_ELEMENT);
+    const code = timedWasmSection("audioConv2dSubsample", "kernel call", () => exports.hp_audio_conv2d_subsample_f32(
+      inputAlloc.ptr,
+      input.length,
+      maskAlloc.ptr,
+      mask.length,
+      weightAlloc.ptr,
+      weight.length,
+      biasAlloc.ptr,
+      bias?.length ?? 0,
+      normAlloc.ptr,
+      norm.length,
+      time,
+      frequency,
+      inChannels,
+      outChannels,
+      epsilon,
+      outputAlloc.ptr,
+      outputLength,
+    ));
+    assertWasmOk(code, "audioConv2dSubsample");
+    return readVisionOutput(exports, allocations, outputAlloc.ptr, outputLength, "audioConv2dSubsample");
+  } finally {
+    releaseAllocations(exports, allocations);
+  }
+}
+
+export async function audioFlattenChannelsLastWasm(
+  input: Float32Array,
+  timeCount: number,
+  frequencyCount: number,
+  channelCount: number,
+): Promise<Float32Array | undefined> {
+  const exports = await prefillWasmExports();
+  if (!exports) {
+    return undefined;
+  }
+  const outputLength = timeCount * frequencyCount * channelCount;
+  const allocations: Allocation[] = [];
+  try {
+    const { inputAlloc, outputAlloc } = timedWasmSection("audioFlattenChannelsLast", "allocation + input copy", () => ({
+      inputAlloc: copyF32ToWasm(exports, input, allocations),
+      outputAlloc: allocateBytes(exports, outputLength * Float32Array.BYTES_PER_ELEMENT, allocations),
+    }), input.byteLength + outputLength * Float32Array.BYTES_PER_ELEMENT);
+    const code = timedWasmSection("audioFlattenChannelsLast", "kernel call", () => exports.hp_audio_flatten_channels_last_f32(
+      inputAlloc.ptr,
+      input.length,
+      timeCount,
+      frequencyCount,
+      channelCount,
+      outputAlloc.ptr,
+      outputLength,
+    ));
+    assertWasmOk(code, "audioFlattenChannelsLast");
+    return readVisionOutput(exports, allocations, outputAlloc.ptr, outputLength, "audioFlattenChannelsLast");
+  } finally {
+    releaseAllocations(exports, allocations);
+  }
+}
+
+export async function audioRmsNormWasm(
+  input: Float32Array,
+  weight: Float32Array,
+  epsilon: number,
+): Promise<Float32Array | undefined> {
+  const exports = await prefillWasmExports();
+  if (!exports) {
+    return undefined;
+  }
+  const allocations: Allocation[] = [];
+  try {
+    const { inputAlloc, weightAlloc, outputAlloc } = timedWasmSection("audioRmsNorm", "allocation + input copy", () => ({
+      inputAlloc: copyF32ToWasm(exports, input, allocations),
+      weightAlloc: copyF32ToWasm(exports, weight, allocations),
+      outputAlloc: allocateBytes(exports, input.byteLength, allocations),
+    }), input.byteLength + weight.byteLength + input.byteLength);
+    const code = timedWasmSection("audioRmsNorm", "kernel call", () => exports.hp_audio_rms_norm_f32(
+      inputAlloc.ptr,
+      input.length,
+      weightAlloc.ptr,
+      weight.length,
+      epsilon,
+      outputAlloc.ptr,
+      input.length,
+    ));
+    assertWasmOk(code, "audioRmsNorm");
+    return readVisionOutput(exports, allocations, outputAlloc.ptr, input.length, "audioRmsNorm");
+  } finally {
+    releaseAllocations(exports, allocations);
+  }
+}
+
+export async function audioClampWasm(input: Float32Array, min: number, max: number): Promise<Float32Array | undefined> {
+  const exports = await prefillWasmExports();
+  if (!exports) {
+    return undefined;
+  }
+  const allocations: Allocation[] = [];
+  try {
+    const { inputAlloc, outputAlloc } = timedWasmSection("audioClamp", "allocation + input copy", () => ({
+      inputAlloc: copyF32ToWasm(exports, input, allocations),
+      outputAlloc: allocateBytes(exports, input.byteLength, allocations),
+    }), input.byteLength * 2);
+    const code = timedWasmSection("audioClamp", "kernel call", () => exports.hp_audio_clamp_f32(
+      inputAlloc.ptr,
+      input.length,
+      min,
+      max,
+      outputAlloc.ptr,
+      input.length,
+    ));
+    assertWasmOk(code, "audioClamp");
+    return readVisionOutput(exports, allocations, outputAlloc.ptr, input.length, "audioClamp");
+  } finally {
+    releaseAllocations(exports, allocations);
+  }
+}
+
+export async function audioResidualAddWasm(left: Float32Array, right: Float32Array): Promise<Float32Array | undefined> {
+  const exports = await prefillWasmExports();
+  if (!exports) {
+    return undefined;
+  }
+  const allocations: Allocation[] = [];
+  try {
+    const { leftAlloc, rightAlloc, outputAlloc } = timedWasmSection("audioResidualAdd", "allocation + input copy", () => ({
+      leftAlloc: copyF32ToWasm(exports, left, allocations),
+      rightAlloc: copyF32ToWasm(exports, right, allocations),
+      outputAlloc: allocateBytes(exports, left.byteLength, allocations),
+    }), left.byteLength + right.byteLength + left.byteLength);
+    const code = timedWasmSection("audioResidualAdd", "kernel call", () => exports.hp_audio_residual_add_f32(
+      leftAlloc.ptr,
+      left.length,
+      rightAlloc.ptr,
+      right.length,
+      outputAlloc.ptr,
+      left.length,
+    ));
+    assertWasmOk(code, "audioResidualAdd");
+    return readVisionOutput(exports, allocations, outputAlloc.ptr, left.length, "audioResidualAdd");
+  } finally {
+    releaseAllocations(exports, allocations);
+  }
+}
+
+export async function audioResidualAddScaleWasm(residual: Float32Array, hidden: Float32Array, scale: number): Promise<Float32Array | undefined> {
+  const exports = await prefillWasmExports();
+  if (!exports) {
+    return undefined;
+  }
+  const allocations: Allocation[] = [];
+  try {
+    const { residualAlloc, hiddenAlloc, outputAlloc } = timedWasmSection("audioResidualAddScale", "allocation + input copy", () => ({
+      residualAlloc: copyF32ToWasm(exports, residual, allocations),
+      hiddenAlloc: copyF32ToWasm(exports, hidden, allocations),
+      outputAlloc: allocateBytes(exports, residual.byteLength, allocations),
+    }), residual.byteLength + hidden.byteLength + residual.byteLength);
+    const code = timedWasmSection("audioResidualAddScale", "kernel call", () => exports.hp_audio_residual_add_scale_f32(
+      residualAlloc.ptr,
+      residual.length,
+      hiddenAlloc.ptr,
+      hidden.length,
+      scale,
+      outputAlloc.ptr,
+      residual.length,
+    ));
+    assertWasmOk(code, "audioResidualAddScale");
+    return readVisionOutput(exports, allocations, outputAlloc.ptr, residual.length, "audioResidualAddScale");
+  } finally {
+    releaseAllocations(exports, allocations);
+  }
+}
+
+export async function audioSiluWasm(input: Float32Array): Promise<Float32Array | undefined> {
+  const exports = await prefillWasmExports();
+  if (!exports) {
+    return undefined;
+  }
+  const allocations: Allocation[] = [];
+  try {
+    const { inputAlloc, outputAlloc } = timedWasmSection("audioSilu", "allocation + input copy", () => ({
+      inputAlloc: copyF32ToWasm(exports, input, allocations),
+      outputAlloc: allocateBytes(exports, input.byteLength, allocations),
+    }), input.byteLength * 2);
+    const code = timedWasmSection("audioSilu", "kernel call", () => exports.hp_audio_silu_f32(
+      inputAlloc.ptr,
+      input.length,
+      outputAlloc.ptr,
+      input.length,
+    ));
+    assertWasmOk(code, "audioSilu");
+    return readVisionOutput(exports, allocations, outputAlloc.ptr, input.length, "audioSilu");
+  } finally {
+    releaseAllocations(exports, allocations);
+  }
+}
+
+export async function audioGluWasm(input: Float32Array, outputSize: number): Promise<Float32Array | undefined> {
+  const exports = await prefillWasmExports();
+  if (!exports) {
+    return undefined;
+  }
+  const tokenCount = input.length / (outputSize * 2);
+  const outputLength = tokenCount * outputSize;
+  const allocations: Allocation[] = [];
+  try {
+    const { inputAlloc, outputAlloc } = timedWasmSection("audioGlu", "allocation + input copy", () => ({
+      inputAlloc: copyF32ToWasm(exports, input, allocations),
+      outputAlloc: allocateBytes(exports, outputLength * Float32Array.BYTES_PER_ELEMENT, allocations),
+    }), input.byteLength + outputLength * Float32Array.BYTES_PER_ELEMENT);
+    const code = timedWasmSection("audioGlu", "kernel call", () => exports.hp_audio_glu_f32(
+      inputAlloc.ptr,
+      input.length,
+      outputSize,
+      outputAlloc.ptr,
+      outputLength,
+    ));
+    assertWasmOk(code, "audioGlu");
+    return readVisionOutput(exports, allocations, outputAlloc.ptr, outputLength, "audioGlu");
+  } finally {
+    releaseAllocations(exports, allocations);
+  }
+}
+
+export async function audioDepthwiseConv1dWasm(
+  input: Float32Array,
+  weight: Float32Array,
+  kernelSize: number,
+  channels: number,
+): Promise<Float32Array | undefined> {
+  const exports = await prefillWasmExports();
+  if (!exports) {
+    return undefined;
+  }
+  const allocations: Allocation[] = [];
+  try {
+    const { inputAlloc, weightAlloc, outputAlloc } = timedWasmSection("audioDepthwiseConv1d", "allocation + input copy", () => ({
+      inputAlloc: copyF32ToWasm(exports, input, allocations),
+      weightAlloc: copyF32ToWasm(exports, weight, allocations),
+      outputAlloc: allocateBytes(exports, input.byteLength, allocations),
+    }), input.byteLength + weight.byteLength + input.byteLength);
+    const code = timedWasmSection("audioDepthwiseConv1d", "kernel call", () => exports.hp_audio_depthwise_conv1d_f32(
+      inputAlloc.ptr,
+      input.length,
+      weightAlloc.ptr,
+      weight.length,
+      kernelSize,
+      channels,
+      outputAlloc.ptr,
+      input.length,
+    ));
+    assertWasmOk(code, "audioDepthwiseConv1d");
+    return readVisionOutput(exports, allocations, outputAlloc.ptr, input.length, "audioDepthwiseConv1d");
+  } finally {
+    releaseAllocations(exports, allocations);
+  }
+}
+
+export async function audioAddBiasRowsWasm(input: Float32Array, bias: Float32Array): Promise<Float32Array | undefined> {
+  const exports = await prefillWasmExports();
+  if (!exports) {
+    return undefined;
+  }
+  const allocations: Allocation[] = [];
+  try {
+    const { inputAlloc, biasAlloc, outputAlloc } = timedWasmSection("audioAddBiasRows", "allocation + input copy", () => ({
+      inputAlloc: copyF32ToWasm(exports, input, allocations),
+      biasAlloc: copyF32ToWasm(exports, bias, allocations),
+      outputAlloc: allocateBytes(exports, input.byteLength, allocations),
+    }), input.byteLength + bias.byteLength + input.byteLength);
+    const code = timedWasmSection("audioAddBiasRows", "kernel call", () => exports.hp_audio_add_bias_rows_f32(
+      inputAlloc.ptr,
+      input.length,
+      biasAlloc.ptr,
+      bias.length,
+      outputAlloc.ptr,
+      input.length,
+    ));
+    assertWasmOk(code, "audioAddBiasRows");
+    return readVisionOutput(exports, allocations, outputAlloc.ptr, input.length, "audioAddBiasRows");
   } finally {
     releaseAllocations(exports, allocations);
   }

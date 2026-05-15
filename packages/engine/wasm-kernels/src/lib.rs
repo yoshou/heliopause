@@ -918,6 +918,336 @@ pub unsafe extern "C" fn hp_vision_std_normalize_f32(
     OK
 }
 
+#[allow(clippy::too_many_arguments)]
+#[no_mangle]
+pub unsafe extern "C" fn hp_audio_conv2d_subsample_f32(
+    input_ptr: *const f32,
+    input_len: usize,
+    mask_ptr: *const u8,
+    mask_len: usize,
+    weight_ptr: *const f32,
+    weight_len: usize,
+    bias_ptr: *const f32,
+    bias_len: usize,
+    norm_ptr: *const f32,
+    norm_len: usize,
+    time: usize,
+    frequency: usize,
+    in_channels: usize,
+    out_channels: usize,
+    epsilon: f32,
+    output_ptr: *mut f32,
+    output_len: usize,
+) -> i32 {
+    let out_time = (time + 1) / 2;
+    let out_frequency = (frequency + 1) / 2;
+    if input_len != time.saturating_mul(in_channels).saturating_mul(frequency)
+        || mask_len != time
+        || weight_len != 3_usize.saturating_mul(3).saturating_mul(in_channels).saturating_mul(out_channels)
+        || (bias_len != 0 && bias_len != out_channels)
+        || norm_len != out_channels
+        || output_len != out_time.saturating_mul(out_channels).saturating_mul(out_frequency)
+    {
+        return ERR_SHAPE;
+    }
+
+    let input = slice::from_raw_parts(input_ptr, input_len);
+    let mask = slice::from_raw_parts(mask_ptr, mask_len);
+    let weight = slice::from_raw_parts(weight_ptr, weight_len);
+    let bias = if bias_len == 0 { &[][..] } else { slice::from_raw_parts(bias_ptr, bias_len) };
+    let norm = slice::from_raw_parts(norm_ptr, norm_len);
+    let output = slice::from_raw_parts_mut(output_ptr, output_len);
+    let mut channel_values = vec![0.0_f32; out_channels];
+
+    for t_out in 0..out_time {
+        for f_out in 0..out_frequency {
+            for out_channel in 0..out_channels {
+                let mut sum = 0.0_f32;
+                for kt in 0..3 {
+                    let t_base = t_out * 2 + kt;
+                    if t_base == 0 {
+                        continue;
+                    }
+                    let t_in = t_base - 1;
+                    if t_in >= time || mask[t_in] == 0 {
+                        continue;
+                    }
+                    for kf in 0..3 {
+                        let f_base = f_out * 2 + kf;
+                        if f_base == 0 {
+                            continue;
+                        }
+                        let f_in = f_base - 1;
+                        if f_in >= frequency {
+                            continue;
+                        }
+                        for in_channel in 0..in_channels {
+                            let input_value = input[(t_in * in_channels + in_channel) * frequency + f_in];
+                            let weight_value = weight[kf + kt * 3 + in_channel * 9 + out_channel * 9 * in_channels];
+                            sum = (sum + (input_value * weight_value).round_to_f32()).round_to_f32();
+                        }
+                    }
+                }
+                if bias_len != 0 {
+                    sum = (sum + bias[out_channel]).round_to_f32();
+                }
+                channel_values[out_channel] = sum;
+            }
+            audio_layer_norm_in_place(&mut channel_values, norm, epsilon);
+            for out_channel in 0..out_channels {
+                output[(t_out * out_channels + out_channel) * out_frequency + f_out] = channel_values[out_channel].max(0.0);
+            }
+        }
+    }
+
+    OK
+}
+
+fn audio_layer_norm_in_place(values: &mut [f32], weight: &[f32], epsilon: f32) {
+    let mut mean = 0.0_f32;
+    for value in values.iter() {
+        mean += *value;
+    }
+    mean /= values.len() as f32;
+    let mut variance = 0.0_f32;
+    for value in values.iter() {
+        let centered = *value - mean;
+        variance += centered * centered;
+    }
+    let scale = 1.0 / (variance / values.len() as f32 + epsilon).sqrt();
+    for index in 0..values.len() {
+        values[index] = ((values[index] - mean) * scale * weight[index]).round_to_f32();
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn hp_audio_flatten_channels_last_f32(
+    input_ptr: *const f32,
+    input_len: usize,
+    time_count: usize,
+    frequency_count: usize,
+    channel_count: usize,
+    output_ptr: *mut f32,
+    output_len: usize,
+) -> i32 {
+    if input_len != time_count.saturating_mul(channel_count).saturating_mul(frequency_count)
+        || output_len != time_count.saturating_mul(frequency_count).saturating_mul(channel_count)
+    {
+        return ERR_SHAPE;
+    }
+    let input = slice::from_raw_parts(input_ptr, input_len);
+    let output = slice::from_raw_parts_mut(output_ptr, output_len);
+    for time in 0..time_count {
+        for frequency in 0..frequency_count {
+            for channel in 0..channel_count {
+                output[time * frequency_count * channel_count + frequency * channel_count + channel] =
+                    input[(time * channel_count + channel) * frequency_count + frequency];
+            }
+        }
+    }
+    OK
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn hp_audio_rms_norm_f32(
+    input_ptr: *const f32,
+    input_len: usize,
+    weight_ptr: *const f32,
+    weight_len: usize,
+    epsilon: f32,
+    output_ptr: *mut f32,
+    output_len: usize,
+) -> i32 {
+    if weight_len == 0 || input_len % weight_len != 0 || output_len != input_len {
+        return ERR_SHAPE;
+    }
+    let input = slice::from_raw_parts(input_ptr, input_len);
+    let weight = slice::from_raw_parts(weight_ptr, weight_len);
+    let output = slice::from_raw_parts_mut(output_ptr, output_len);
+    for row in 0..input_len / weight_len {
+        let offset = row * weight_len;
+        let mut sum_squares = 0.0_f32;
+        for index in 0..weight_len {
+            let value = input[offset + index];
+            sum_squares += value * value;
+        }
+        let scale = 1.0 / (sum_squares / weight_len as f32 + epsilon).sqrt();
+        for index in 0..weight_len {
+            output[offset + index] = (input[offset + index] * scale * weight[index]).round_to_f32();
+        }
+    }
+    OK
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn hp_audio_clamp_f32(
+    input_ptr: *const f32,
+    input_len: usize,
+    min: f32,
+    max: f32,
+    output_ptr: *mut f32,
+    output_len: usize,
+) -> i32 {
+    if output_len != input_len {
+        return ERR_SHAPE;
+    }
+    let input = slice::from_raw_parts(input_ptr, input_len);
+    let output = slice::from_raw_parts_mut(output_ptr, output_len);
+    for index in 0..input_len {
+        output[index] = input[index].max(min).min(max);
+    }
+    OK
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn hp_audio_residual_add_f32(
+    left_ptr: *const f32,
+    left_len: usize,
+    right_ptr: *const f32,
+    right_len: usize,
+    output_ptr: *mut f32,
+    output_len: usize,
+) -> i32 {
+    if left_len != right_len || output_len != left_len {
+        return ERR_SHAPE;
+    }
+    let left = slice::from_raw_parts(left_ptr, left_len);
+    let right = slice::from_raw_parts(right_ptr, right_len);
+    let output = slice::from_raw_parts_mut(output_ptr, output_len);
+    for index in 0..left_len {
+        output[index] = (left[index] + right[index]).round_to_f32();
+    }
+    OK
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn hp_audio_residual_add_scale_f32(
+    residual_ptr: *const f32,
+    residual_len: usize,
+    hidden_ptr: *const f32,
+    hidden_len: usize,
+    scale: f32,
+    output_ptr: *mut f32,
+    output_len: usize,
+) -> i32 {
+    if residual_len != hidden_len || output_len != residual_len {
+        return ERR_SHAPE;
+    }
+    let residual = slice::from_raw_parts(residual_ptr, residual_len);
+    let hidden = slice::from_raw_parts(hidden_ptr, hidden_len);
+    let output = slice::from_raw_parts_mut(output_ptr, output_len);
+    for index in 0..residual_len {
+        output[index] = (residual[index] + (hidden[index] * scale).round_to_f32()).round_to_f32();
+    }
+    OK
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn hp_audio_silu_f32(
+    input_ptr: *const f32,
+    input_len: usize,
+    output_ptr: *mut f32,
+    output_len: usize,
+) -> i32 {
+    if output_len != input_len {
+        return ERR_SHAPE;
+    }
+    let input = slice::from_raw_parts(input_ptr, input_len);
+    let output = slice::from_raw_parts_mut(output_ptr, output_len);
+    for index in 0..input_len {
+        let value = input[index];
+        output[index] = value / (1.0 + (-value).exp());
+    }
+    OK
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn hp_audio_glu_f32(
+    input_ptr: *const f32,
+    input_len: usize,
+    output_size: usize,
+    output_ptr: *mut f32,
+    output_len: usize,
+) -> i32 {
+    if output_size == 0 || input_len % (output_size * 2) != 0 || output_len != input_len / 2 {
+        return ERR_SHAPE;
+    }
+    let input = slice::from_raw_parts(input_ptr, input_len);
+    let output = slice::from_raw_parts_mut(output_ptr, output_len);
+    let token_count = input_len / (output_size * 2);
+    for token in 0..token_count {
+        let offset = token * output_size * 2;
+        for index in 0..output_size {
+            let gate = input[offset + output_size + index];
+            output[token * output_size + index] = input[offset + index] * (1.0 / (1.0 + (-gate).exp()));
+        }
+    }
+    OK
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn hp_audio_depthwise_conv1d_f32(
+    input_ptr: *const f32,
+    input_len: usize,
+    weight_ptr: *const f32,
+    weight_len: usize,
+    kernel_size: usize,
+    channels: usize,
+    output_ptr: *mut f32,
+    output_len: usize,
+) -> i32 {
+    if channels == 0 || kernel_size == 0 || input_len % channels != 0 || weight_len != kernel_size.saturating_mul(channels) || output_len != input_len {
+        return ERR_SHAPE;
+    }
+    let input = slice::from_raw_parts(input_ptr, input_len);
+    let weight = slice::from_raw_parts(weight_ptr, weight_len);
+    let output = slice::from_raw_parts_mut(output_ptr, output_len);
+    let token_count = input_len / channels;
+    let left_pad = kernel_size - 1;
+    for token in 0..token_count {
+        for channel in 0..channels {
+            let mut sum = 0.0_f32;
+            for kernel in 0..kernel_size {
+                let base = token + kernel;
+                if base < left_pad {
+                    continue;
+                }
+                let source = base - left_pad;
+                if source >= token_count {
+                    continue;
+                }
+                sum += input[source * channels + channel] * weight[kernel + channel * kernel_size];
+            }
+            output[token * channels + channel] = sum;
+        }
+    }
+    OK
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn hp_audio_add_bias_rows_f32(
+    input_ptr: *const f32,
+    input_len: usize,
+    bias_ptr: *const f32,
+    bias_len: usize,
+    output_ptr: *mut f32,
+    output_len: usize,
+) -> i32 {
+    if bias_len == 0 || input_len % bias_len != 0 || output_len != input_len {
+        return ERR_SHAPE;
+    }
+    let input = slice::from_raw_parts(input_ptr, input_len);
+    let bias = slice::from_raw_parts(bias_ptr, bias_len);
+    let output = slice::from_raw_parts_mut(output_ptr, output_len);
+    output.copy_from_slice(input);
+    for token in 0..input_len / bias_len {
+        for index in 0..bias_len {
+            output[token * bias_len + index] += bias[index];
+        }
+    }
+    OK
+}
+
 struct QuantizedQ8K {
     d: Vec<f32>,
     qs: Vec<i8>,

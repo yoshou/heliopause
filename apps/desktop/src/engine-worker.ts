@@ -134,7 +134,7 @@ async function handleLoadModel(
             options: {
               projectionBatching: true,
               residentWeightCache: resolvedMemoryProfile.wasmResidentWeightCache,
-              wasmKernels: false,
+              wasmKernels: true,
             },
           },
         ],
