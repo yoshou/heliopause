@@ -100,6 +100,15 @@ export class GpuMemoryArena {
     };
     return buffer;
   }
+
+  destroyScratchBuffers(): void {
+    for (const pool of this.scratchPools.values()) {
+      for (const buffer of pool) {
+        buffer.__heliopauseDestroyScratch?.();
+      }
+    }
+    this.scratchPools.clear();
+  }
 }
 
 type ScratchBuffer = WebGpuBufferLike & {

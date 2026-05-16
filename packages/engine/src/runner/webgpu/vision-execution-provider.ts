@@ -5,14 +5,26 @@ import {
   type VisionPixelValues,
   type VisionSession,
 } from "../../vision";
-import { GpuMemoryArena, type F32Handle, type GpuResource } from "./arena";
+import {
+  GpuMemoryArena,
+  scratchQ8_0,
+  scratchQ8K,
+  type F32Handle,
+  type GpuResource,
+  type QuantizedHandle,
+} from "./arena";
 import { GPU_COPY_DST, GPU_COPY_SRC, GPU_MAP_READ, GPU_STORAGE, WEBGPU_MEMORY_LIMIT_BYTES } from "./gpu-constants";
 import { webGpuDevice } from "./gpu-device";
 import {
   dispatchF32MatMul,
+  dispatchKMatMul,
+  dispatchQ8_0MatMul,
+  dispatchQ8_0Quantize,
+  dispatchQ8KQuantize,
   dispatchResidualAdd,
 } from "./dispatch";
 import type { WebGpuBufferLike, WebGpuComputePassLike } from "./gpu-types";
+import { createQuantizedHandleFromBytes, webGpuMatMulType } from "./quantized-handles";
 import {
   createVisionAddPositionResources,
   createVisionAttentionApplyResources,
@@ -120,6 +132,7 @@ class WebGpuVisionRunner {
   private readonly session: VisionSession;
   private readonly arena: GpuMemoryArena;
   private readonly f32Handles = new Map<string, F32Handle>();
+  private readonly quantizedHandles = new Map<string, QuantizedHandle>();
 
   constructor(session: VisionSession, arena: GpuMemoryArena) {
     this.session = session;
@@ -130,7 +143,11 @@ class WebGpuVisionRunner {
     for (const handle of this.f32Handles.values()) {
       handle.destroy();
     }
+    for (const handle of this.quantizedHandles.values()) {
+      handle.destroy();
+    }
     this.f32Handles.clear();
+    this.quantizedHandles.clear();
   }
 
   async run(pixels: VisionPixelValues): Promise<VisionEncodeResult> {
@@ -153,16 +170,27 @@ class WebGpuVisionRunner {
       const encoder = this.arena.device.createCommandEncoder();
       const pass = encoder.beginComputePass();
       let hidden = await this.dispatchPatchEmbed(pass, run, pixelsBuffer, pixels.width, patchGridX, patchGridY);
-      hidden = await this.dispatchAddPosition(pass, run, hidden, patchGridX, patchGridX * patchGridY);
+      let next = await this.dispatchAddPosition(pass, run, hidden, patchGridX, patchGridX * patchGridY);
+      this.releaseScratch(hidden);
+      hidden = next;
       for (let layer = 0; layer < manifest.blockCount; layer += 1) {
-        hidden = await this.dispatchLayer(pass, run, hidden, layer, patchGridX, patchGridX * patchGridY);
+        next = await this.dispatchLayer(pass, run, hidden, layer, patchGridX, patchGridX * patchGridY);
+        hidden = next;
       }
-      hidden = this.dispatchAveragePool(pass, run, hidden, patchGridX, patchGridY);
+      next = this.dispatchAveragePool(pass, run, hidden, patchGridX, patchGridY);
+      this.releaseScratch(hidden);
+      hidden = next;
       if (this.session.hasTensor("v.std_bias") && this.session.hasTensor("v.std_scale")) {
-        hidden = await this.dispatchStdNormalize(pass, run, hidden, outputTokenCount);
+        next = await this.dispatchStdNormalize(pass, run, hidden, outputTokenCount);
+        this.releaseScratch(hidden);
+        hidden = next;
       }
-      hidden = await this.dispatchMatMulVisionWeight(pass, run, "mm.input_projection.weight", hidden, outputTokenCount);
-      hidden = this.dispatchRowRmsNorm(pass, run, hidden, "vision.output_norm", outputTokenCount, manifest.projectionDim, undefined, manifest.layerNormEpsilon);
+      next = await this.dispatchMatMulVisionWeight(pass, run, "mm.input_projection.weight", hidden, outputTokenCount);
+      this.releaseScratch(hidden);
+      hidden = next;
+      next = this.dispatchRowRmsNorm(pass, run, hidden, "vision.output_norm", outputTokenCount, manifest.projectionDim, undefined, manifest.layerNormEpsilon);
+      this.releaseScratch(hidden);
+      hidden = next;
 
       pass.end();
       readback = this.arena.device.createBuffer({
@@ -190,6 +218,7 @@ class WebGpuVisionRunner {
       for (const item of run.cleanup.reverse()) {
         item.destroy?.();
       }
+      this.arena.destroyScratchBuffers();
     }
   }
 
@@ -257,25 +286,40 @@ class WebGpuVisionRunner {
     const qProjection = await this.dispatchMatMulVisionWeight(pass, run, `v.blk.${layer}.attn_q.weight`, norm, tokenCount);
     const kProjection = await this.dispatchMatMulVisionWeight(pass, run, `v.blk.${layer}.attn_k.weight`, norm, tokenCount);
     const vProjection = await this.dispatchMatMulVisionWeight(pass, run, `v.blk.${layer}.attn_v.weight`, norm, tokenCount);
+    this.releaseScratch(norm);
     const qNorm = this.dispatchRowRmsNorm(pass, run, qProjection, `v.blk.${layer}.attn_q_norm`, tokenCount * manifest.headCount, headSize, await this.f32Handle(`v.blk.${layer}.attn_q_norm.weight`), this.session.epsilon);
+    this.releaseScratch(qProjection);
     const kNorm = this.dispatchRowRmsNorm(pass, run, kProjection, `v.blk.${layer}.attn_k_norm`, tokenCount * manifest.headCount, headSize, await this.f32Handle(`v.blk.${layer}.attn_k_norm.weight`), this.session.epsilon);
+    this.releaseScratch(kProjection);
     const vNorm = this.dispatchRowRmsNorm(pass, run, vProjection, `v.blk.${layer}.attn_v_norm`, tokenCount * manifest.headCount, headSize, undefined, this.session.epsilon);
+    this.releaseScratch(vProjection);
     const q = this.dispatchRope2d(pass, run, qNorm, `v.blk.${layer}.q_rope`, patchGridX, tokenCount, headSize);
+    this.releaseScratch(qNorm);
     const k = this.dispatchRope2d(pass, run, kNorm, `v.blk.${layer}.k_rope`, patchGridX, tokenCount, headSize);
+    this.releaseScratch(kNorm);
     const attention = this.dispatchAttention(pass, run, q, k, vNorm, `v.blk.${layer}.attention`, tokenCount, manifest.headCount, headSize);
+    this.releaseScratch(q, k, vNorm);
     const attentionOutput = await this.dispatchMatMulVisionWeight(pass, run, `v.blk.${layer}.attn_out.weight`, attention, tokenCount);
+    this.releaseScratch(attention);
     const attentionNorm = this.dispatchRowRmsNorm(pass, run, attentionOutput, `v.blk.${layer}.attn_post_norm`, tokenCount, manifest.embeddingLength, await this.f32Handle(`v.blk.${layer}.attn_post_norm.weight`), this.session.epsilon);
+    this.releaseScratch(attentionOutput);
     const attentionResidual = this.scratchF32(`v.blk.${layer}.attention_residual`, tokenCount * manifest.embeddingLength, run.cleanup);
     dispatchResidualAdd(this.arena.device, pass, run.resources, input, attentionNorm, attentionResidual, tokenCount * manifest.embeddingLength);
+    this.releaseScratch(input, attentionNorm);
     const ffnInput = this.dispatchRowRmsNorm(pass, run, attentionResidual, `v.blk.${layer}.ln2`, tokenCount, manifest.embeddingLength, await this.f32Handle(`v.blk.${layer}.ln2.weight`), this.session.epsilon);
     const gate = await this.dispatchMatMulVisionWeight(pass, run, `v.blk.${layer}.ffn_gate.weight`, ffnInput, tokenCount);
     const up = await this.dispatchMatMulVisionWeight(pass, run, `v.blk.${layer}.ffn_up.weight`, ffnInput, tokenCount);
+    this.releaseScratch(ffnInput);
     const activated = this.scratchF32(`v.blk.${layer}.ffn_geglu`, tokenCount * manifest.feedForwardLength, run.cleanup);
     this.dispatchGeluMul(pass, run, gate, up, activated, tokenCount * manifest.feedForwardLength);
+    this.releaseScratch(gate, up);
     const ffnOutput = await this.dispatchMatMulVisionWeight(pass, run, `v.blk.${layer}.ffn_down.weight`, activated, tokenCount);
+    this.releaseScratch(activated);
     const ffnNorm = this.dispatchRowRmsNorm(pass, run, ffnOutput, `v.blk.${layer}.ffn_post_norm`, tokenCount, manifest.embeddingLength, await this.f32Handle(`v.blk.${layer}.ffn_post_norm.weight`), this.session.epsilon);
+    this.releaseScratch(ffnOutput);
     const output = this.scratchF32(`v.blk.${layer}.output`, tokenCount * manifest.embeddingLength, run.cleanup);
     dispatchResidualAdd(this.arena.device, pass, run.resources, attentionResidual, ffnNorm, output, tokenCount * manifest.embeddingLength);
+    this.releaseScratch(attentionResidual, ffnNorm);
     return output;
   }
 
@@ -359,6 +403,7 @@ class WebGpuVisionRunner {
     pass.setPipeline(apply.pipeline);
     pass.setBindGroup(0, apply.bindGroup);
     pass.dispatchWorkgroups(tokenCount, headCount, headSize);
+    this.releaseScratch(probabilities);
     return output;
   }
 
@@ -419,13 +464,30 @@ class WebGpuVisionRunner {
     const rowCount = tensor.dimensions[1] ?? 0;
     let current = await this.dispatchClamp(pass, run, input, weightName.replace(/\.weight$/, ".input_min"), weightName.replace(/\.weight$/, ".input_max"), inputSize * columnCount);
     const output = this.scratchF32(`${weightName}.output`, rowCount * columnCount, run.cleanup);
-    if (isF32LoadableType(tensor.type)) {
+    if (isDenseType(tensor.type)) {
       const handle = await this.f32Handle(weightName);
       dispatchF32MatMul(this.arena.device, pass, run.resources, handle.buffer, current, output, inputSize, rowCount, columnCount);
     } else {
-      return unsupported(`${weightName} has unsupported WebGPU vision matmul type ${tensor.type}`);
+      const handle = await this.quantizedHandle(weightName);
+      if (handle.type === "Q8_0") {
+        const q8 = scratchQ8_0(this.arena, inputSize, columnCount, handle.blockCount, run.cleanup, `${weightName}.q8_0`);
+        dispatchQ8_0Quantize(this.arena.device, pass, run.resources, current, q8, inputSize, columnCount, handle.blockCount);
+        dispatchQ8_0MatMul(pass, run.resources, handle, q8, output, columnCount);
+        this.releaseScratch(q8.scale, q8.qs);
+      } else {
+        const q8 = scratchQ8K(this.arena, inputSize, columnCount, run.cleanup, `${weightName}.q8k`);
+        dispatchQ8KQuantize(this.arena.device, pass, run.resources, current, q8, inputSize, columnCount);
+        dispatchKMatMul(pass, run.resources, handle, q8, output, columnCount);
+        this.releaseScratch(q8.scale, q8.qs, q8.bsums);
+      }
+    }
+    if (current !== input) {
+      this.releaseScratch(current);
     }
     current = await this.dispatchClamp(pass, run, output, weightName.replace(/\.weight$/, ".output_min"), weightName.replace(/\.weight$/, ".output_max"), rowCount * columnCount);
+    if (current !== output) {
+      this.releaseScratch(output);
+    }
     return current;
   }
 
@@ -472,8 +534,8 @@ class WebGpuVisionRunner {
       return cached;
     }
     const tensor = this.session.getTensor(name);
-    if (!isF32LoadableType(tensor.type)) {
-      return unsupported(`${name} must be F32-compatible for WebGPU vision, got ${tensor.type}`);
+    if (!isDenseType(tensor.type)) {
+      return unsupported(`${name} must be dense for WebGPU vision, got ${tensor.type}`);
     }
     const elementCount = tensor.dimensions.reduce((product, dimension) => product * dimension, 1);
     const bytes = await this.session.readWeightBytes(name);
@@ -493,6 +555,29 @@ class WebGpuVisionRunner {
     return handle;
   }
 
+  private async quantizedHandle(name: string): Promise<QuantizedHandle> {
+    const cached = this.quantizedHandles.get(name);
+    if (cached) {
+      return cached;
+    }
+    const tensor = this.session.getTensor(name);
+    let handle: QuantizedHandle;
+    try {
+      handle = createQuantizedHandleFromBytes(
+        this.arena,
+        name,
+        webGpuMatMulType(tensor.type, name),
+        tensor.dimensions[0] ?? 0,
+        tensor.dimensions[1] ?? 0,
+        await this.session.readWeightBytes(name),
+      );
+    } catch (error) {
+      return unsupported(error instanceof Error ? error.message : String(error));
+    }
+    this.quantizedHandles.set(name, handle);
+    return handle;
+  }
+
   private bufferFromF32(label: string, values: Float32Array, cleanup: GpuResource[]): WebGpuBufferLike {
     const buffer = this.arena.createBuffer(label, values.byteLength, GPU_STORAGE | GPU_COPY_DST);
     this.arena.device.queue.writeBuffer(buffer, 0, values);
@@ -501,9 +586,15 @@ class WebGpuVisionRunner {
   }
 
   private scratchF32(label: string, length: number, cleanup: GpuResource[]): WebGpuBufferLike {
-    const buffer = this.arena.createBuffer(label, length * Float32Array.BYTES_PER_ELEMENT, GPU_STORAGE | GPU_COPY_SRC);
+    const buffer = this.arena.createScratchBuffer(label, length * Float32Array.BYTES_PER_ELEMENT, GPU_STORAGE | GPU_COPY_SRC);
     cleanup.push(buffer);
     return buffer;
+  }
+
+  private releaseScratch(...buffers: WebGpuBufferLike[]): void {
+    for (const buffer of buffers) {
+      buffer.destroy?.();
+    }
   }
 }
 
@@ -514,10 +605,6 @@ function numberOption(options: Readonly<Record<string, unknown>> | undefined, na
 
 function isDenseType(type: GgmlTypeName): boolean {
   return type === "F32" || type === "F16" || type === "BF16";
-}
-
-function isF32LoadableType(type: GgmlTypeName): boolean {
-  return isDenseType(type) || type === "Q8_0";
 }
 
 function unsupported(message: string): never {
