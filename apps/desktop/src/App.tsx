@@ -90,6 +90,7 @@ type PendingRequest =
 const MIN_RECORDING_MS = 300;
 const MAX_RECORDING_MS = 30_000;
 const AUDIO_SAMPLE_RATE = 16_000;
+const CHAT_MAX_NEW_TOKENS = 1024;
 const INITIAL_ASSISTANT_CONTENT = [
   "Drop your GGUF files in the message box.",
   "Add the main model and optional projector together.",
@@ -314,7 +315,15 @@ function App() {
       if (!worker) {
         throw new Error("The model worker is not running. Reload the model.");
       }
-      await generateTurnInWorker(worker, userMessage.id, assistantId, trimmedPrompt, imageAttachment, undefined, 256);
+      await generateTurnInWorker(
+        worker,
+        userMessage.id,
+        assistantId,
+        trimmedPrompt,
+        imageAttachment,
+        undefined,
+        CHAT_MAX_NEW_TOKENS,
+      );
     } catch (error) {
       setGenerationError(error instanceof Error ? error.message : String(error));
       setMessages((currentMessages) =>
@@ -627,7 +636,15 @@ function App() {
       if (!worker) {
         throw new Error("The model worker is not running. Reload the model.");
       }
-      await generateTurnInWorker(worker, userMessage.id, assistantId, "", undefined, audio, 256);
+      await generateTurnInWorker(
+        worker,
+        userMessage.id,
+        assistantId,
+        "",
+        undefined,
+        audio,
+        CHAT_MAX_NEW_TOKENS,
+      );
     } catch (error) {
       setGenerationError(error instanceof Error ? error.message : String(error));
       setMessages((currentMessages) =>
