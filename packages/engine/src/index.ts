@@ -9,6 +9,11 @@ export {
 } from "./runner/webgpu/index";
 
 export {
+  checkWasmSupport,
+  type WasmSupport,
+} from "./runner/cpu/wasm-kernels";
+
+export {
   parseGguf,
   serializeGgufMetadata,
   type GgufArraySummary,

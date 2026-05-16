@@ -398,6 +398,12 @@ export type WasmResidentWeightStats = {
   residentBytes: number;
 };
 
+export type WasmSupport = {
+  available: boolean;
+  reason?: "webassembly-missing" | "module-missing" | "compile-failed";
+  error?: string;
+};
+
 type ResidentWasmInstance = {
   id: number;
   exports: KernelExports;
@@ -1593,6 +1599,26 @@ export async function audioAddBiasRowsWasm(input: Float32Array, bias: Float32Arr
 
 export async function prefillWasmBackend(): Promise<"wasm-simd" | "ts"> {
   return (await prefillWasmExports()) ? "wasm-simd" : "ts";
+}
+
+export async function checkWasmSupport(): Promise<WasmSupport> {
+  if (typeof WebAssembly === "undefined") {
+    return { available: false, reason: "webassembly-missing" };
+  }
+  if (!(wasmBase64ForTesting ?? PREFILL_WASM_SIMD_BASE64)) {
+    return { available: false, reason: "module-missing" };
+  }
+  try {
+    return (await prefillWasmModule())
+      ? { available: true }
+      : { available: false, reason: "compile-failed" };
+  } catch (error) {
+    return {
+      available: false,
+      reason: "compile-failed",
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
 }
 
 export function resetPrefillWasmForTesting(base64?: string): void {

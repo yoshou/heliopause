@@ -6,6 +6,8 @@ import {
   createFileGgufTensorReader,
   createChatSession,
   createVisionSession,
+  checkWasmSupport,
+  checkWebGpuSupport,
   estimateWeightCacheBytes,
   generatePreparedAudioChatTurn,
   generatePreparedImageChatTurn,
@@ -102,6 +104,11 @@ async function handleLoadModel(
     estimatedWeightCacheBytes,
     request.memoryInfo,
   );
+  const executionProviders = await resolveExecutionProviders(
+    tensorReader.metadata,
+    manifest,
+    resolvedMemoryProfile,
+  );
   if (request.visionFile) {
     const visionReader = await createFileGgufTensorReader(request.visionFile);
     if (!isVisionGguf(visionReader.metadata) && !isAudioGguf(visionReader.metadata)) {
@@ -110,75 +117,16 @@ async function handleLoadModel(
     if (isVisionGguf(visionReader.metadata)) {
       nextVisionSession = createVisionSession(visionReader, {
         maxWeightCacheBytes: resolvedMemoryProfile.maxWeightCacheBytes,
-        executionProviders: [
-          {
-            name: "webgpu",
-          },
-          {
-            name: "cpu",
-            options: {
-              projectionBatching: true,
-              residentWeightCache: resolvedMemoryProfile.wasmResidentWeightCache,
-              wasmKernels: true,
-            },
-          },
-        ],
+        executionProviders,
       });
     }
     if (isAudioGguf(visionReader.metadata)) {
       nextAudioSession = createAudioSession(visionReader, {
         maxWeightCacheBytes: resolvedMemoryProfile.maxWeightCacheBytes,
-        executionProviders: [
-          {
-            name: "webgpu",
-          },
-          {
-            name: "cpu",
-            options: {
-              projectionBatching: true,
-              residentWeightCache: resolvedMemoryProfile.wasmResidentWeightCache,
-              wasmKernels: true,
-            },
-          },
-        ],
+        executionProviders,
       });
     }
   }
-  const executionProviders: ExecutionProviderConfig[] = [{
-    name: "cpu",
-    options: {
-      projectionBatching: true,
-      residentWeightCache: resolvedMemoryProfile.wasmResidentWeightCache,
-      parallelResidentMatmul: resolvedMemoryProfile.wasmResidentWeightCache,
-      parallelMatmulMinRows: 512,
-      threadPoolSize: resolvedMemoryProfile.wasmResidentWeightCache ? "auto" : 1,
-      ioPrefetch: resolvedMemoryProfile.wasmResidentWeightCache,
-      ioPrefetchConcurrency: "auto",
-      ioWorkerBlobRead: false,
-    },
-  }];
-
-  if (resolvedMemoryProfile.resolved === "full") {
-    const webGpuPlan = planRunnerPlacement(tensorReader.metadata, manifest, {
-      mode: "enabled",
-      contextLength: CHAT_CONTEXT_LENGTH,
-    });
-    if (webGpuPlan.status === "planned" && webGpuPlan.segmentStartLayer !== undefined) {
-      resolvedMemoryProfile.webGpuStatus = "suffix-enabled";
-      resolvedMemoryProfile.webGpuSegmentStartLayer = webGpuPlan.segmentStartLayer;
-      resolvedMemoryProfile.webGpuSegmentLayerCount = webGpuPlan.gpuSegmentLayerCount;
-      executionProviders.push({
-        name: "webgpu",
-        options: {
-          segmentStartLayer: webGpuPlan.segmentStartLayer,
-          memoryLimitBytes: webGpuPlan.memoryLimitBytes,
-        },
-      });
-    } else {
-      resolvedMemoryProfile.webGpuStatus = "blocked";
-    }
-  }
-
   const nextSession = createChatSession(tensorReader, {
     maxContextLength: CHAT_CONTEXT_LENGTH,
     maxWeightCacheBytes: resolvedMemoryProfile.maxWeightCacheBytes,
@@ -213,6 +161,66 @@ async function handleLoadModel(
       audioMaxSeconds: nextAudioSession?.manifest.maxSeconds,
     },
   });
+}
+
+async function resolveExecutionProviders(
+  metadata: Parameters<typeof planRunnerPlacement>[0],
+  manifest: ReturnType<typeof buildModelManifest>,
+  resolvedMemoryProfile: ResolvedMemoryProfile,
+): Promise<ExecutionProviderConfig[]> {
+  const providers: ExecutionProviderConfig[] = [];
+  if (resolvedMemoryProfile.resolved === "full") {
+    const webGpuSupport = await checkWebGpuSupport();
+    if (webGpuSupport.available) {
+      const webGpuPlan = planRunnerPlacement(metadata, manifest, {
+        mode: "enabled",
+        contextLength: CHAT_CONTEXT_LENGTH,
+      });
+      if (webGpuPlan.status === "planned" && webGpuPlan.segmentStartLayer !== undefined) {
+        resolvedMemoryProfile.webGpuStatus = "suffix-enabled";
+        resolvedMemoryProfile.webGpuSegmentStartLayer = webGpuPlan.segmentStartLayer;
+        resolvedMemoryProfile.webGpuSegmentLayerCount = webGpuPlan.gpuSegmentLayerCount;
+        providers.push({
+          name: "webgpu",
+          options: {
+            segmentStartLayer: webGpuPlan.segmentStartLayer,
+            memoryLimitBytes: webGpuPlan.memoryLimitBytes,
+          },
+        });
+      } else {
+        resolvedMemoryProfile.webGpuStatus = "blocked";
+        resolvedMemoryProfile.webGpuUnavailableReason = webGpuPlan.status;
+      }
+    } else {
+      resolvedMemoryProfile.webGpuStatus = "blocked";
+      resolvedMemoryProfile.webGpuUnavailableReason = webGpuSupport.reason;
+    }
+  }
+
+  const wasmSupport = await checkWasmSupport();
+  if (wasmSupport.available) {
+    resolvedMemoryProfile.wasmStatus = "enabled";
+    providers.push({
+      name: "wasm",
+      options: {
+        projectionBatching: true,
+        residentWeightCache: resolvedMemoryProfile.wasmResidentWeightCache,
+        parallelResidentMatmul: resolvedMemoryProfile.wasmResidentWeightCache,
+        parallelMatmulMinRows: 512,
+        threadPoolSize: resolvedMemoryProfile.wasmResidentWeightCache ? "auto" : 1,
+        ioPrefetch: resolvedMemoryProfile.wasmResidentWeightCache,
+        ioPrefetchConcurrency: "auto",
+        ioWorkerBlobRead: false,
+      },
+    });
+  } else {
+    resolvedMemoryProfile.wasmStatus = "unavailable";
+    resolvedMemoryProfile.wasmUnavailableReason = wasmSupport.reason;
+  }
+
+  providers.push({ name: "reference" });
+  resolvedMemoryProfile.executionProviders = providers.map((provider) => provider.name);
+  return providers;
 }
 
 async function handleGenerateTurn(
@@ -391,6 +399,8 @@ function resolveMemoryProfile(
     estimatedWeightCacheBytes,
     wasmResidentWeightCache: resolved === "full",
     webGpuStatus: resolved === "full" ? "blocked" : "memory-profile-disabled",
+    executionProviders: [],
+    wasmStatus: "unavailable",
     availableMemoryBytes,
   };
 }

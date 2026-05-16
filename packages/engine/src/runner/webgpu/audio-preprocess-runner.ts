@@ -23,8 +23,6 @@ import {
 type AudioPreprocessStats = {
   attempts: number;
   runs: number;
-  fallbacks: number;
-  lastFallbackReason: string;
 };
 
 type AudioPreprocessSession = Pick<
@@ -42,35 +40,20 @@ type AudioPreprocessRunBuffers = {
   cleanup: GpuResource[];
 };
 
-const runners = new WeakMap<AudioPreprocessSession, Promise<WebGpuAudioPreprocessRunner | undefined>>();
+const runners = new WeakMap<AudioPreprocessSession, Promise<WebGpuAudioPreprocessRunner>>();
 const statsBySession = new WeakMap<AudioPreprocessSession, AudioPreprocessStats>();
 
 export async function runWebGpuAudioPreprocessor(
   session: AudioPreprocessSession,
   audio: AudioPcmInput,
   options: { signal?: AbortSignal } = {},
-): Promise<AudioFeatures | undefined> {
+): Promise<AudioFeatures> {
   const stats = audioPreprocessStats(session);
   stats.attempts += 1;
   const runner = await audioPreprocessRunner(session);
-  if (!runner) {
-    stats.fallbacks += 1;
-    stats.lastFallbackReason = "webgpu-unavailable";
-    return undefined;
-  }
-  try {
-    const result = await runner.run(audio, options);
-    stats.runs += 1;
-    stats.lastFallbackReason = "";
-    return result;
-  } catch (error) {
-    if (!isFallbackError(error)) {
-      throw error;
-    }
-    stats.fallbacks += 1;
-    stats.lastFallbackReason = error instanceof Error ? error.message : String(error);
-    return undefined;
-  }
+  const result = await runner.run(audio, options);
+  stats.runs += 1;
+  return result;
 }
 
 function audioPreprocessStats(session: AudioPreprocessSession): AudioPreprocessStats {
@@ -79,16 +62,12 @@ function audioPreprocessStats(session: AudioPreprocessSession): AudioPreprocessS
     stats = {
       attempts: 0,
       runs: 0,
-      fallbacks: 0,
-      lastFallbackReason: "",
     };
     statsBySession.set(session, stats);
     const captured = stats;
     session.setExecutionProviderStatsProvider((): ExecutionProviderStats => ({
       webgpuAudioPreprocessAttempts: captured.attempts,
       webgpuAudioPreprocessRuns: captured.runs,
-      webgpuAudioPreprocessFallbacks: captured.fallbacks,
-      webgpuAudioPreprocessLastFallbackReason: captured.lastFallbackReason,
     }), "webgpu-audio-preprocess");
   }
   return stats;
@@ -96,7 +75,7 @@ function audioPreprocessStats(session: AudioPreprocessSession): AudioPreprocessS
 
 async function audioPreprocessRunner(
   session: AudioPreprocessSession,
-): Promise<WebGpuAudioPreprocessRunner | undefined> {
+): Promise<WebGpuAudioPreprocessRunner> {
   let runner = runners.get(session);
   if (!runner) {
     runner = createAudioPreprocessRunner(session);
@@ -107,10 +86,10 @@ async function audioPreprocessRunner(
 
 async function createAudioPreprocessRunner(
   session: AudioPreprocessSession,
-): Promise<WebGpuAudioPreprocessRunner | undefined> {
+): Promise<WebGpuAudioPreprocessRunner> {
   const device = await webGpuDevice();
   if (!device) {
-    return undefined;
+    throw new Error("WebGPU is not available for audio preprocessing.");
   }
   const options = session.executionProvider("webgpu")?.options;
   const arena = new GpuMemoryArena(

@@ -15,13 +15,12 @@ import {
 
 type AudioPreprocessStats = {
   wasm: ProviderStats;
-  cpu: ProviderStats;
+  reference: ProviderStats;
 };
 
 type ProviderStats = {
   attempts: number;
   runs: number;
-  fallbacks: number;
   lastFallbackReason: string;
 };
 
@@ -60,7 +59,7 @@ export async function runAudioPreprocessProviders(
     return result;
   }
 
-  return runAudioCpuPreprocess(session, audio, cpuPreprocess);
+  throw new Error("No audio preprocessor provider was selected.");
 }
 
 export async function tryAudioPreprocessProviders(
@@ -80,24 +79,25 @@ export async function tryAudioPreprocessProviders(
       }
       continue;
     }
-    if (provider.name === "cpu") {
-      return runAudioCpuPreprocess(session, audio, cpuPreprocess);
+    if (provider.name === "reference") {
+      return runAudioReferencePreprocess(session, audio, cpuPreprocess);
     }
+    throw new Error(`Unsupported audio preprocess provider: ${provider.name}`);
   }
 
   return undefined;
 }
 
-function runAudioCpuPreprocess(
+function runAudioReferencePreprocess(
   session: AudioPreprocessSession,
   audio: AudioPcmInput,
   cpuPreprocess: (audio: AudioPcmInput, manifest: AudioPreprocessConfig) => AudioFeatures,
 ): AudioFeatures {
   const stats = audioPreprocessStats(session);
-  stats.cpu.attempts += 1;
+  stats.reference.attempts += 1;
   const result = cpuPreprocess(audio, session.manifest);
-  stats.cpu.runs += 1;
-  stats.cpu.lastFallbackReason = "";
+  stats.reference.runs += 1;
+  stats.reference.lastFallbackReason = "";
   return result;
 }
 
@@ -130,8 +130,7 @@ async function tryAudioWasmProvider(
       },
     );
     if (!wasm) {
-      recordFallback(stats, "wasm-unavailable", false);
-      return undefined;
+      throw new Error("WASM audio preprocessing is unavailable.");
     }
     stats.runs += 1;
     stats.lastFallbackReason = "";
@@ -143,8 +142,7 @@ async function tryAudioWasmProvider(
       durationMs: Math.min(audio.durationMs, config.maxSeconds * 1000),
     };
   } catch (error) {
-    recordFallback(stats, error instanceof Error ? error.message : String(error), false);
-    return undefined;
+    throw error;
   }
 }
 
@@ -235,7 +233,7 @@ function audioPreprocessStats(session: AudioPreprocessSession): AudioPreprocessS
   if (!stats) {
     stats = {
       wasm: createProviderStats(),
-      cpu: createProviderStats(),
+      reference: createProviderStats(),
     };
     statsBySession.set(session, stats);
     const captured = stats;
@@ -248,12 +246,8 @@ function audioPreprocessStatsSnapshot(stats: AudioPreprocessStats): ExecutionPro
   return {
     wasmAudioPreprocessAttempts: stats.wasm.attempts,
     wasmAudioPreprocessRuns: stats.wasm.runs,
-    wasmAudioPreprocessFallbacks: stats.wasm.fallbacks,
-    wasmAudioPreprocessLastFallbackReason: stats.wasm.lastFallbackReason,
-    cpuAudioPreprocessAttempts: stats.cpu.attempts,
-    cpuAudioPreprocessRuns: stats.cpu.runs,
-    cpuAudioPreprocessFallbacks: stats.cpu.fallbacks,
-    cpuAudioPreprocessLastFallbackReason: stats.cpu.lastFallbackReason,
+    referenceAudioPreprocessAttempts: stats.reference.attempts,
+    referenceAudioPreprocessRuns: stats.reference.runs,
   };
 }
 
@@ -261,17 +255,8 @@ function createProviderStats(): ProviderStats {
   return {
     attempts: 0,
     runs: 0,
-    fallbacks: 0,
     lastFallbackReason: "",
   };
-}
-
-function recordFallback(stats: ProviderStats, reason: string, countAttempt = true): void {
-  if (countAttempt) {
-    stats.attempts += 1;
-  }
-  stats.fallbacks += 1;
-  stats.lastFallbackReason = reason;
 }
 
 function throwIfAborted(signal: AbortSignal | undefined): void {

@@ -41,8 +41,6 @@ import {
 type VisionStats = {
   attempts: number;
   runs: number;
-  fallbacks: number;
-  lastFallbackReason: string;
 };
 
 type VisionRunBuffers = {
@@ -56,31 +54,19 @@ const statsBySession = new WeakMap<VisionSession, VisionStats>();
 export async function runWebGpuVisionEncoder(
   session: VisionSession,
   pixels: VisionPixelValues,
-): Promise<VisionEncodeResult | undefined> {
+): Promise<VisionEncodeResult> {
   if (!session.executionProvider("webgpu")) {
-    return undefined;
+    throw new Error("WebGPU vision encoder provider is not enabled.");
   }
   const stats = visionStats(session);
   stats.attempts += 1;
   const runner = await visionRunner(session);
   if (!runner) {
-    stats.fallbacks += 1;
-    stats.lastFallbackReason = "webgpu-unavailable";
-    return undefined;
+    throw new Error("WebGPU vision encoder is unavailable.");
   }
-  try {
-    const result = await runner.run(pixels);
-    stats.runs += 1;
-    stats.lastFallbackReason = "";
-    return result;
-  } catch (error) {
-    if (!isFallbackError(error)) {
-      throw error;
-    }
-    stats.fallbacks += 1;
-    stats.lastFallbackReason = error instanceof Error ? error.message : String(error);
-    return undefined;
-  }
+  const result = await runner.run(pixels);
+  stats.runs += 1;
+  return result;
 }
 
 function visionStats(session: VisionSession): VisionStats {
@@ -89,16 +75,12 @@ function visionStats(session: VisionSession): VisionStats {
     stats = {
       attempts: 0,
       runs: 0,
-      fallbacks: 0,
-      lastFallbackReason: "",
     };
     statsBySession.set(session, stats);
     const captured = stats;
     session.setExecutionProviderStatsProvider(() => ({
       webgpuVisionAttempts: captured.attempts,
       webgpuVisionRuns: captured.runs,
-      webgpuVisionFallbacks: captured.fallbacks,
-      webgpuVisionLastFallbackReason: captured.lastFallbackReason,
     }), "webgpu-vision");
   }
   return stats;
@@ -116,7 +98,7 @@ async function visionRunner(session: VisionSession): Promise<WebGpuVisionRunner 
 async function createVisionRunner(session: VisionSession): Promise<WebGpuVisionRunner | undefined> {
   const device = await webGpuDevice();
   if (!device) {
-    return undefined;
+    throw new Error("WebGPU is not available for vision encoder execution.");
   }
   const options = session.executionProvider("webgpu")?.options;
   const arena = new GpuMemoryArena(

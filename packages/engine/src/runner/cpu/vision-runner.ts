@@ -50,6 +50,7 @@ export async function runCpuVisionEncoder(
   session: VisionSession,
   pixels: VisionPixelValues,
 ): Promise<VisionEncodeResult> {
+  requireCpuLikeProvider(session);
   const manifest = session.manifest;
   const patchGridX = pixels.width / manifest.patchSize;
   const patchGridY = pixels.height / manifest.patchSize;
@@ -94,6 +95,12 @@ export async function runCpuVisionEncoder(
   };
 }
 
+function requireCpuLikeProvider(session: VisionSession): void {
+  if (!session.executionProvider("wasm") && !session.executionProvider("reference")) {
+    throw new Error("Vision CPU execution requires an enabled wasm or reference provider.");
+  }
+}
+
 export function releaseCpuVisionEncoder(session: VisionSession): void {
   const cache = residentWeightCaches.get(session);
   if (!cache) {
@@ -106,18 +113,17 @@ export function releaseCpuVisionEncoder(session: VisionSession): void {
 }
 
 function visionResidentWeightCacheEnabled(session: VisionSession): boolean {
-  const provider = session.executionProvider("cpu");
+  const provider = session.executionProvider("wasm");
   return provider?.options?.residentWeightCache === true;
 }
 
 function visionProjectionBatchingEnabled(session: VisionSession): boolean {
-  const provider = session.executionProvider("cpu");
-  return provider?.options?.projectionBatching !== false;
+  const provider = session.executionProvider("wasm");
+  return provider !== undefined && provider.options?.projectionBatching !== false;
 }
 
 function visionWasmKernelsEnabled(session: VisionSession): boolean {
-  const provider = session.executionProvider("cpu");
-  return provider?.options?.wasmKernels !== false;
+  return session.executionProvider("wasm") !== undefined;
 }
 
 function residentWeightCache(session: VisionSession): VisionWasmWeightCache {
@@ -133,12 +139,12 @@ function residentWeightCache(session: VisionSession): VisionWasmWeightCache {
     session.addDisposeCallback(() => releaseCpuVisionEncoder(session));
     const statsCache = cache;
     session.setExecutionProviderStatsProvider(() => ({
-      cpuVisionResidentWeightCacheEnabled: visionResidentWeightCacheEnabled(session),
-      cpuVisionResidentWeightCacheCount: statsCache.handles.size,
-      cpuVisionResidentWeightCacheBytes: statsCache.bytes,
-      cpuVisionResidentWeightCacheHits: statsCache.hits,
-      cpuVisionResidentWeightCacheMisses: statsCache.misses,
-    }), "cpu-vision");
+      wasmVisionResidentWeightCacheEnabled: visionResidentWeightCacheEnabled(session),
+      wasmVisionResidentWeightCacheCount: statsCache.handles.size,
+      wasmVisionResidentWeightCacheBytes: statsCache.bytes,
+      wasmVisionResidentWeightCacheHits: statsCache.hits,
+      wasmVisionResidentWeightCacheMisses: statsCache.misses,
+    }), "wasm-vision");
   }
   return cache;
 }
@@ -175,11 +181,11 @@ async function patchEmbed(
 ): Promise<Float32Array> {
   const manifest = session.manifest;
   const weights = await session.readF32Tensor("v.patch_embd.weight");
-  const wasm = visionWasmKernelsEnabled(session)
-    ? await visionPatchEmbedWasm(pixels.values, weights, pixels.width, manifest.patchSize, patchGridX, patchGridY, manifest.embeddingLength)
-    : undefined;
-  if (wasm) {
-    return wasm;
+  if (visionWasmKernelsEnabled(session)) {
+    return requireWasmResult(
+      await visionPatchEmbedWasm(pixels.values, weights, pixels.width, manifest.patchSize, patchGridX, patchGridY, manifest.embeddingLength),
+      "vision patch embedding",
+    );
   }
 
   const patchSize = manifest.patchSize;
@@ -221,11 +227,11 @@ async function addPositionEmbeddings(
   const positions = await session.readF32Tensor("v.position_embd.weight");
   const tensor = session.getTensor("v.position_embd.weight");
   const tableSize = tensor.dimensions[1] ?? 0;
-  const wasm = visionWasmKernelsEnabled(session)
-    ? await visionAddPositionEmbeddingsWasm(hidden, positions, patchGridX, nPatches, manifest.embeddingLength, tableSize)
-    : undefined;
-  if (wasm) {
-    return wasm;
+  if (visionWasmKernelsEnabled(session)) {
+    return requireWasmResult(
+      await visionAddPositionEmbeddingsWasm(hidden, positions, patchGridX, nPatches, manifest.embeddingLength, tableSize),
+      "vision position embedding",
+    );
   }
   const output = new Float32Array(hidden);
 
@@ -285,17 +291,7 @@ async function forwardVisionLayer(
     session,
   );
   const v = await rmsNormRowsNoWeight(vProjection!, headSize, session.epsilon, session);
-  const attention = (visionWasmKernelsEnabled(session)
-    ? await gqaAttentionWasm(q, k, v, {
-      headSize,
-      queryHeadCount: manifest.headCount,
-      keyValueHeadCount: manifest.headCount,
-      tokenCount,
-      keyValueTokenCount: tokenCount,
-      scale: 1,
-      causal: false,
-    })
-    : undefined) ?? gqaAttention(q, k, v, {
+  const attentionOptions = {
     headSize,
     queryHeadCount: manifest.headCount,
     keyValueHeadCount: manifest.headCount,
@@ -303,7 +299,10 @@ async function forwardVisionLayer(
     keyValueTokenCount: tokenCount,
     scale: 1,
     causal: false,
-  });
+  };
+  const attention = visionWasmKernelsEnabled(session)
+    ? requireWasmResult(await gqaAttentionWasm(q, k, v, attentionOptions), "vision GQA attention")
+    : gqaAttention(q, k, v, attentionOptions);
   const attentionOutput = await matMulVisionWeight(session, `v.blk.${layer}.attn_out.weight`, attention);
   const attentionNorm = await rmsNormRows(
     attentionOutput,
@@ -403,7 +402,10 @@ async function matMulVisionWeightBatch(
         rowCount: tensor.dimensions[1] ?? 0,
       });
     }
-    outputs = await matMulQuantizedMultiWasm(weights, clampedInput, inputSize, columnCount);
+    outputs = requireWasmResult(
+      await matMulQuantizedMultiWasm(weights, clampedInput, inputSize, columnCount),
+      "vision WASM matmul batch",
+    );
   }
   if (!outputs) {
     return undefined;
@@ -474,21 +476,24 @@ async function matMulQuantizedRows(
   const inputSize = tensor.dimensions[0] ?? 0;
   const rowCount = tensor.dimensions[1] ?? 0;
   const columnCount = inputColumns.length / inputSize;
-  const handle = visionResidentWeightCacheEnabled(session)
-    ? await readWasmWeightHandle(session, weightName, type, inputSize, rowCount)
-    : undefined;
-  const resident = handle
-    ? await matMulQuantizedWasmResident(handle, inputColumns, inputSize, rowCount, columnCount)
-    : undefined;
-  if (resident) {
-    return resident;
-  }
   const weightBytes = await session.readWeightBytes(weightName);
-  const wasm = visionWasmKernelsEnabled(session)
-    ? await matMulQuantizedWasm(type, weightBytes, inputColumns, inputSize, rowCount, columnCount)
-    : undefined;
-  if (wasm) {
-    return wasm;
+  if (visionWasmKernelsEnabled(session)) {
+    const handle = visionResidentWeightCacheEnabled(session)
+      ? await readWasmWeightHandle(session, weightName, type, inputSize, rowCount)
+      : undefined;
+    if (visionResidentWeightCacheEnabled(session) && !handle) {
+      throw new Error(`Vision WASM resident weight is unavailable for ${weightName}.`);
+    }
+    const resident = handle
+      ? await matMulQuantizedWasmResident(handle, inputColumns, inputSize, rowCount, columnCount)
+      : undefined;
+    if (resident) {
+      return resident;
+    }
+    return requireWasmResult(
+      await matMulQuantizedWasm(type, weightBytes, inputColumns, inputSize, rowCount, columnCount),
+      `vision WASM matmul ${weightName}`,
+    );
   }
   const output = new Float32Array(rowCount * columnCount);
   const rowByteLength = tensorByteLength({ ...tensor, dimensions: [inputSize] });
@@ -555,9 +560,8 @@ async function clampTensorValues(
   max: number,
   session: VisionSession,
 ): Promise<Float32Array> {
-  const wasm = visionWasmKernelsEnabled(session) ? await visionClampWasm(input, min, max) : undefined;
-  if (wasm) {
-    return wasm;
+  if (visionWasmKernelsEnabled(session)) {
+    return requireWasmResult(await visionClampWasm(input, min, max), "vision clamp");
   }
   const output = new Float32Array(input.length);
   for (let index = 0; index < input.length; index += 1) {
@@ -575,11 +579,11 @@ async function averagePoolVisionTokens(
   outputScale: number,
   session: VisionSession,
 ): Promise<Float32Array> {
-  const wasm = visionWasmKernelsEnabled(session)
-    ? await visionAveragePoolScaleWasm(input, patchGridX, patchGridY, embeddingLength, kernelSize, outputScale)
-    : undefined;
-  if (wasm) {
-    return wasm;
+  if (visionWasmKernelsEnabled(session)) {
+    return requireWasmResult(
+      await visionAveragePoolScaleWasm(input, patchGridX, patchGridY, embeddingLength, kernelSize, outputScale),
+      "vision average pool",
+    );
   }
   const outX = patchGridX / kernelSize;
   const outY = patchGridY / kernelSize;
@@ -613,11 +617,11 @@ async function rope2dNeox(
   session: VisionSession,
 ): Promise<Float32Array> {
   const tokenCount = input.length / (headSize * headCount);
-  const wasm = visionWasmKernelsEnabled(session)
-    ? await visionRope2dNeoxWasm(input, patchGridX, headSize, headCount, tokenCount, freqBase)
-    : undefined;
-  if (wasm) {
-    return wasm;
+  if (visionWasmKernelsEnabled(session)) {
+    return requireWasmResult(
+      await visionRope2dNeoxWasm(input, patchGridX, headSize, headCount, tokenCount, freqBase),
+      "vision RoPE",
+    );
   }
   const output = new Float32Array(input);
   applyRopeSlice(output, input, patchGridX, headSize, headCount, tokenCount, 0, headSize / 2, freqBase, "x");
@@ -663,11 +667,11 @@ async function rmsNormRows(
   epsilon: number,
   session: VisionSession,
 ): Promise<Float32Array> {
-  const wasm = visionWasmKernelsEnabled(session)
-    ? await visionRmsNormWasm(input, weight.length, epsilon, weight)
-    : undefined;
-  if (wasm) {
-    return wasm;
+  if (visionWasmKernelsEnabled(session)) {
+    return requireWasmResult(
+      await visionRmsNormWasm(input, weight.length, epsilon, weight),
+      "vision RMS norm",
+    );
   }
   const output = new Float32Array(input.length);
   for (let row = 0; row < input.length / weight.length; row += 1) {
@@ -683,11 +687,8 @@ async function rmsNormRowsNoWeight(
   epsilon: number,
   session?: VisionSession,
 ): Promise<Float32Array> {
-  const wasm = session && visionWasmKernelsEnabled(session)
-    ? await visionRmsNormWasm(input, rowSize, epsilon)
-    : undefined;
-  if (wasm) {
-    return wasm;
+  if (session && visionWasmKernelsEnabled(session)) {
+    return requireWasmResult(await visionRmsNormWasm(input, rowSize, epsilon), "vision RMS norm");
   }
   const output = new Float32Array(input.length);
   for (let row = 0; row < input.length / rowSize; row += 1) {
@@ -722,9 +723,8 @@ async function residualAdd(
   if (left.length !== right.length) {
     throw new Error(`Residual shape mismatch: left=${left.length} right=${right.length}`);
   }
-  const wasm = visionWasmKernelsEnabled(session) ? await visionResidualAddWasm(left, right) : undefined;
-  if (wasm) {
-    return wasm;
+  if (visionWasmKernelsEnabled(session)) {
+    return requireWasmResult(await visionResidualAddWasm(left, right), "vision residual add");
   }
   const output = new Float32Array(left.length);
   for (let index = 0; index < output.length; index += 1) {
@@ -741,9 +741,8 @@ async function geluMul(
   if (gate.length !== up.length) {
     throw new Error(`GELU multiply shape mismatch: gate=${gate.length} up=${up.length}`);
   }
-  const wasm = visionWasmKernelsEnabled(session) ? await visionGeluMulWasm(gate, up) : undefined;
-  if (wasm) {
-    return wasm;
+  if (visionWasmKernelsEnabled(session)) {
+    return requireWasmResult(await visionGeluMulWasm(gate, up), "vision GELU multiply");
   }
   const output = new Float32Array(gate);
   for (let index = 0; index < output.length; index += 1) {
@@ -759,9 +758,8 @@ async function stdNormalizeVisionTokens(
   rowSize: number,
   session: VisionSession,
 ): Promise<Float32Array> {
-  const wasm = visionWasmKernelsEnabled(session) ? await visionStdNormalizeWasm(input, bias, scale, rowSize) : undefined;
-  if (wasm) {
-    return wasm;
+  if (visionWasmKernelsEnabled(session)) {
+    return requireWasmResult(await visionStdNormalizeWasm(input, bias, scale, rowSize), "vision std normalize");
   }
   const output = new Float32Array(input);
   for (let token = 0; token < output.length / rowSize; token += 1) {
@@ -784,4 +782,11 @@ function gelu(value: number): number {
   }
   const inner = Math.fround(Math.fround(Math.sqrt(2 / Math.PI) * value) * Math.fround(1 + Math.fround(0.044715 * value * value)));
   return Math.fround(Math.fround(0.5 * value) * Math.fround(1 + Math.tanh(inner)));
+}
+
+function requireWasmResult<T>(value: T | undefined, operation: string): T {
+  if (!value) {
+    throw new Error(`WASM ${operation} is unavailable.`);
+  }
+  return value;
 }

@@ -80,7 +80,7 @@ export class AudioSession {
     this.manifest = buildAudioManifest(tensorReader.metadata);
     this.epsilon = this.manifest.layerNormEpsilon;
     this.maxWeightCacheBytes = options.maxWeightCacheBytes ?? 256 * 1024 * 1024;
-    this.executionProviders = (options.executionProviders ?? [{ name: "cpu" }]).map((provider) => ({
+    this.executionProviders = (options.executionProviders ?? [{ name: "reference" }]).map((provider) => ({
       name: provider.name,
       options: provider.options ? { ...provider.options } : undefined,
     }));
@@ -299,10 +299,10 @@ export async function runAudioPreprocessor(
     throwIfAborted(options.signal);
     if (provider.name === "webgpu") {
       const webgpu = await runWebGpuAudioPreprocessor(session, audio, options);
-      if (webgpu) {
-        return webgpu;
+      if (!webgpu) {
+        throw new Error("WebGPU audio preprocessor is unavailable.");
       }
-      continue;
+      return webgpu;
     }
     const result = await tryAudioPreprocessProviders(
       session,
@@ -315,17 +315,7 @@ export async function runAudioPreprocessor(
       return result;
     }
   }
-  const cpu = await tryAudioPreprocessProviders(
-    session,
-    audio,
-    preprocessAudioPcm,
-    [{ name: "cpu" }],
-    options,
-  );
-  if (cpu) {
-    return cpu;
-  }
-  return runAudioPreprocessProviders(session, audio, preprocessAudioPcm, options);
+  throw new Error("No audio preprocessor provider was selected.");
 }
 
 export async function runAudioEncoder(
@@ -335,9 +325,10 @@ export async function runAudioEncoder(
 ): Promise<AudioEncodeResult> {
   if (session.executionProvider("webgpu")) {
     const webgpu = await runWebGpuAudioEncoder(session, features, options);
-    if (webgpu) {
-      return webgpu;
+    if (!webgpu) {
+      throw new Error("WebGPU audio encoder is unavailable.");
     }
+    return webgpu;
   }
   return runCpuAudioEncoder(session, features, options);
 }

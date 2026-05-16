@@ -15,13 +15,12 @@ import {
 
 type VisionPreprocessStats = {
   wasm: ProviderStats;
-  cpu: ProviderStats;
+  reference: ProviderStats;
 };
 
 type ProviderStats = {
   attempts: number;
   runs: number;
-  fallbacks: number;
   lastFallbackReason: string;
 };
 
@@ -65,7 +64,7 @@ export async function runVisionPreprocessProviders(
     return result;
   }
 
-  return runVisionCpuPreprocess(session, input, cpuPreprocess);
+  throw new Error("No vision preprocessor provider was selected.");
 }
 
 export async function tryVisionPreprocessProviders(
@@ -90,15 +89,16 @@ export async function tryVisionPreprocessProviders(
       }
       continue;
     }
-    if (provider.name === "cpu") {
-      return runVisionCpuPreprocess(session, input, cpuPreprocess);
+    if (provider.name === "reference") {
+      return runVisionReferencePreprocess(session, input, cpuPreprocess);
     }
+    throw new Error(`Unsupported vision preprocess provider: ${provider.name}`);
   }
 
   return undefined;
 }
 
-function runVisionCpuPreprocess(
+function runVisionReferencePreprocess(
   session: VisionPreprocessSession,
   input: VisionRgbaPreprocessInput,
   cpuPreprocess: (
@@ -109,10 +109,10 @@ function runVisionCpuPreprocess(
   ) => VisionPixelValues,
 ): VisionPixelValues {
   const stats = visionPreprocessStats(session);
-  stats.cpu.attempts += 1;
+  stats.reference.attempts += 1;
   const result = cpuPreprocess(input.rgba, input.sourceWidth, input.sourceHeight, session.manifest);
-  stats.cpu.runs += 1;
-  stats.cpu.lastFallbackReason = "";
+  stats.reference.runs += 1;
+  stats.reference.lastFallbackReason = "";
   return result;
 }
 
@@ -133,8 +133,7 @@ async function tryVisionWasmProvider(
       session.manifest.imageStd,
     );
     if (!values) {
-      recordFallback(stats, "wasm-unavailable", false);
-      return undefined;
+      throw new Error("WASM vision preprocessing is unavailable.");
     }
     stats.runs += 1;
     stats.lastFallbackReason = "";
@@ -144,8 +143,7 @@ async function tryVisionWasmProvider(
       height: input.resize.height,
     };
   } catch (error) {
-    recordFallback(stats, error instanceof Error ? error.message : String(error), false);
-    return undefined;
+    throw error;
   }
 }
 
@@ -154,7 +152,7 @@ function visionPreprocessStats(session: VisionPreprocessSession): VisionPreproce
   if (!stats) {
     stats = {
       wasm: createProviderStats(),
-      cpu: createProviderStats(),
+      reference: createProviderStats(),
     };
     statsBySession.set(session, stats);
     const captured = stats;
@@ -167,12 +165,8 @@ function visionPreprocessStatsSnapshot(stats: VisionPreprocessStats): ExecutionP
   return {
     wasmVisionPreprocessAttempts: stats.wasm.attempts,
     wasmVisionPreprocessRuns: stats.wasm.runs,
-    wasmVisionPreprocessFallbacks: stats.wasm.fallbacks,
-    wasmVisionPreprocessLastFallbackReason: stats.wasm.lastFallbackReason,
-    cpuVisionPreprocessAttempts: stats.cpu.attempts,
-    cpuVisionPreprocessRuns: stats.cpu.runs,
-    cpuVisionPreprocessFallbacks: stats.cpu.fallbacks,
-    cpuVisionPreprocessLastFallbackReason: stats.cpu.lastFallbackReason,
+    referenceVisionPreprocessAttempts: stats.reference.attempts,
+    referenceVisionPreprocessRuns: stats.reference.runs,
   };
 }
 
@@ -180,17 +174,8 @@ function createProviderStats(): ProviderStats {
   return {
     attempts: 0,
     runs: 0,
-    fallbacks: 0,
     lastFallbackReason: "",
   };
-}
-
-function recordFallback(stats: ProviderStats, reason: string, countAttempt = true): void {
-  if (countAttempt) {
-    stats.attempts += 1;
-  }
-  stats.fallbacks += 1;
-  stats.lastFallbackReason = reason;
 }
 
 function throwIfAborted(signal: AbortSignal | undefined): void {

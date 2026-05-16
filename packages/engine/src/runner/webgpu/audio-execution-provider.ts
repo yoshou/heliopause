@@ -36,8 +36,6 @@ import {
 type AudioStats = {
   attempts: number;
   runs: number;
-  fallbacks: number;
-  lastFallbackReason: string;
 };
 
 type AudioRunBuffers = {
@@ -59,31 +57,19 @@ export async function runWebGpuAudioEncoder(
   session: AudioSession,
   features: AudioFeatures,
   options: { signal?: AbortSignal } = {},
-): Promise<AudioEncodeResult | undefined> {
+): Promise<AudioEncodeResult> {
   if (!session.executionProvider("webgpu")) {
-    return undefined;
+    throw new Error("WebGPU audio encoder provider is not enabled.");
   }
   const stats = audioStats(session);
   stats.attempts += 1;
   const runner = await audioRunner(session);
   if (!runner) {
-    stats.fallbacks += 1;
-    stats.lastFallbackReason = "webgpu-unavailable";
-    return undefined;
+    throw new Error("WebGPU audio encoder is unavailable.");
   }
-  try {
-    const result = await runner.run(features, options);
-    stats.runs += 1;
-    stats.lastFallbackReason = "";
-    return result;
-  } catch (error) {
-    if (!isFallbackError(error)) {
-      throw error;
-    }
-    stats.fallbacks += 1;
-    stats.lastFallbackReason = error instanceof Error ? error.message : String(error);
-    return undefined;
-  }
+  const result = await runner.run(features, options);
+  stats.runs += 1;
+  return result;
 }
 
 function audioStats(session: AudioSession): AudioStats {
@@ -92,16 +78,12 @@ function audioStats(session: AudioSession): AudioStats {
     stats = {
       attempts: 0,
       runs: 0,
-      fallbacks: 0,
-      lastFallbackReason: "",
     };
     statsBySession.set(session, stats);
     const captured = stats;
     session.setExecutionProviderStatsProvider(() => ({
       webgpuAudioAttempts: captured.attempts,
       webgpuAudioRuns: captured.runs,
-      webgpuAudioFallbacks: captured.fallbacks,
-      webgpuAudioLastFallbackReason: captured.lastFallbackReason,
     }), "webgpu-audio");
   }
   return stats;
@@ -119,7 +101,7 @@ async function audioRunner(session: AudioSession): Promise<WebGpuAudioRunner | u
 async function createAudioRunner(session: AudioSession): Promise<WebGpuAudioRunner | undefined> {
   const device = await webGpuDevice();
   if (!device) {
-    return undefined;
+    throw new Error("WebGPU is not available for audio encoder execution.");
   }
   const options = session.executionProvider("webgpu")?.options;
   const arena = new GpuMemoryArena(

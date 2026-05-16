@@ -57,18 +57,17 @@ export function releaseCpuAudioEncoder(session: AudioSession): void {
 }
 
 function audioResidentWeightCacheEnabled(session: AudioSession): boolean {
-  const provider = session.executionProvider("cpu");
+  const provider = session.executionProvider("wasm");
   return provider?.options?.residentWeightCache === true;
 }
 
 function audioProjectionBatchingEnabled(session: AudioSession): boolean {
-  const provider = session.executionProvider("cpu");
-  return provider?.options?.projectionBatching !== false;
+  const provider = session.executionProvider("wasm");
+  return provider !== undefined && provider.options?.projectionBatching !== false;
 }
 
 function audioWasmKernelsEnabled(session: AudioSession): boolean {
-  const provider = session.executionProvider("cpu");
-  return provider?.options?.wasmKernels !== false;
+  return session.executionProvider("wasm") !== undefined;
 }
 
 function residentWeightCache(session: AudioSession): AudioWasmWeightCache {
@@ -84,12 +83,12 @@ function residentWeightCache(session: AudioSession): AudioWasmWeightCache {
     session.addDisposeCallback(() => releaseCpuAudioEncoder(session));
     const statsCache = cache;
     session.setExecutionProviderStatsProvider(() => ({
-      cpuAudioResidentWeightCacheEnabled: audioResidentWeightCacheEnabled(session),
-      cpuAudioResidentWeightCacheCount: statsCache.handles.size,
-      cpuAudioResidentWeightCacheBytes: statsCache.bytes,
-      cpuAudioResidentWeightCacheHits: statsCache.hits,
-      cpuAudioResidentWeightCacheMisses: statsCache.misses,
-    }), "cpu-audio");
+      wasmAudioResidentWeightCacheEnabled: audioResidentWeightCacheEnabled(session),
+      wasmAudioResidentWeightCacheCount: statsCache.handles.size,
+      wasmAudioResidentWeightCacheBytes: statsCache.bytes,
+      wasmAudioResidentWeightCacheHits: statsCache.hits,
+      wasmAudioResidentWeightCacheMisses: statsCache.misses,
+    }), "wasm-audio");
   }
   return cache;
 }
@@ -123,6 +122,7 @@ export async function runCpuAudioEncoder(
   features: AudioFeatures,
   options: { signal?: AbortSignal } = {},
 ): Promise<AudioEncodeResult> {
+  requireCpuLikeProvider(session);
   throwIfAborted(options.signal);
   const manifest = session.manifest;
   if (features.featureSize !== manifest.featureSize) {
@@ -152,6 +152,12 @@ export async function runCpuAudioEncoder(
     tokenCount: hidden.length / manifest.projectionDim,
     durationMs: features.durationMs,
   };
+}
+
+function requireCpuLikeProvider(session: AudioSession): void {
+  if (!session.executionProvider("wasm") && !session.executionProvider("reference")) {
+    throw new Error("Audio CPU execution requires an enabled wasm or reference provider.");
+  }
 }
 
 async function subsampleConvProjection(
@@ -186,10 +192,11 @@ async function conv2dSubsampleLayer(
   const norm = await session.readF32Tensor(`${prefix}.norm.weight`);
   const outTime = Math.floor((time + 1) / 2);
   const outFrequency = Math.floor((frequency + 1) / 2);
-  const wasm = audioWasmKernelsEnabled(session)
-    ? await audioConv2dSubsampleWasm(input, mask, weight, bias, norm, time, frequency, inChannels, outChannels, session.epsilon)
-    : undefined;
-  if (wasm) {
+  if (audioWasmKernelsEnabled(session)) {
+    const wasm = requireWasmResult(
+      await audioConv2dSubsampleWasm(input, mask, weight, bias, norm, time, frequency, inChannels, outChannels, session.epsilon),
+      "audio conv2d subsample",
+    );
     return {
       values: wasm,
       mask: downsampleMaskByTwo(mask, outTime),
@@ -469,7 +476,10 @@ async function matMulAudioWeightBatch(
         rowCount: tensor.dimensions[1] ?? 0,
       });
     }
-    outputs = await matMulQuantizedMultiWasm(weights, clampedInput, inputSize, columnCount);
+    outputs = requireWasmResult(
+      await matMulQuantizedMultiWasm(weights, clampedInput, inputSize, columnCount),
+      "audio matmul batch",
+    );
   }
   if (!outputs) {
     return undefined;
@@ -540,21 +550,24 @@ async function matMulQuantizedRows(
   if (!Number.isInteger(columnCount) || inputSize <= 0) {
     throw new Error(`${weightName} input shape mismatch: ${inputColumns.length}`);
   }
-  const handle = audioResidentWeightCacheEnabled(session)
-    ? await readWasmWeightHandle(session, weightName, type, inputSize, rowCount)
-    : undefined;
-  const resident = handle
-    ? await matMulQuantizedWasmResident(handle, inputColumns, inputSize, rowCount, columnCount)
-    : undefined;
-  if (resident) {
-    return resident;
-  }
   const weightBytes = await session.readWeightBytes(weightName);
-  const wasm = audioWasmKernelsEnabled(session)
-    ? await matMulQuantizedWasm(type, weightBytes, inputColumns, inputSize, rowCount, columnCount)
-    : undefined;
-  if (wasm) {
-    return wasm;
+  if (audioWasmKernelsEnabled(session)) {
+    const handle = audioResidentWeightCacheEnabled(session)
+      ? await readWasmWeightHandle(session, weightName, type, inputSize, rowCount)
+      : undefined;
+    if (audioResidentWeightCacheEnabled(session) && !handle) {
+      throw new Error(`Audio WASM resident weight is unavailable for ${weightName}.`);
+    }
+    const resident = handle
+      ? await matMulQuantizedWasmResident(handle, inputColumns, inputSize, rowCount, columnCount)
+      : undefined;
+    if (resident) {
+      return resident;
+    }
+    return requireWasmResult(
+      await matMulQuantizedWasm(type, weightBytes, inputColumns, inputSize, rowCount, columnCount),
+      `audio matmul ${weightName}`,
+    );
   }
   const rowByteLength = tensorByteLength({ ...tensor, dimensions: [inputSize] });
   const output = new Float32Array(rowCount * columnCount);
@@ -643,11 +656,11 @@ async function flattenChannelsLast(
   frequencyCount: number,
   channelCount: number,
 ): Promise<Float32Array> {
-  const wasm = audioWasmKernelsEnabled(session)
-    ? await audioFlattenChannelsLastWasm(input, timeCount, frequencyCount, channelCount)
-    : undefined;
-  if (wasm) {
-    return wasm;
+  if (audioWasmKernelsEnabled(session)) {
+    return requireWasmResult(
+      await audioFlattenChannelsLastWasm(input, timeCount, frequencyCount, channelCount),
+      "audio channel flatten",
+    );
   }
   const output = new Float32Array(timeCount * frequencyCount * channelCount);
   for (let time = 0; time < timeCount; time += 1) {
@@ -668,11 +681,11 @@ async function depthwiseConv1d(
   kernelSize: number,
   channels: number,
 ): Promise<Float32Array> {
-  const wasm = audioWasmKernelsEnabled(session)
-    ? await audioDepthwiseConv1dWasm(input, weight, kernelSize, channels)
-    : undefined;
-  if (wasm) {
-    return wasm;
+  if (audioWasmKernelsEnabled(session)) {
+    return requireWasmResult(
+      await audioDepthwiseConv1dWasm(input, weight, kernelSize, channels),
+      "audio depthwise conv1d",
+    );
   }
   const tokenCount = input.length / channels;
   const output = new Float32Array(input.length);
@@ -694,9 +707,8 @@ async function depthwiseConv1d(
 }
 
 async function glu(session: AudioSession, input: Float32Array, outputSize: number): Promise<Float32Array> {
-  const wasm = audioWasmKernelsEnabled(session) ? await audioGluWasm(input, outputSize) : undefined;
-  if (wasm) {
-    return wasm;
+  if (audioWasmKernelsEnabled(session)) {
+    return requireWasmResult(await audioGluWasm(input, outputSize), "audio GLU");
   }
   const tokenCount = input.length / (outputSize * 2);
   const output = new Float32Array(tokenCount * outputSize);
@@ -711,9 +723,8 @@ async function glu(session: AudioSession, input: Float32Array, outputSize: numbe
 }
 
 async function addBiasRows(session: AudioSession, input: Float32Array, bias: Float32Array): Promise<Float32Array> {
-  const wasm = audioWasmKernelsEnabled(session) ? await audioAddBiasRowsWasm(input, bias) : undefined;
-  if (wasm) {
-    return wasm;
+  if (audioWasmKernelsEnabled(session)) {
+    return requireWasmResult(await audioAddBiasRowsWasm(input, bias), "audio bias add");
   }
   const output = new Float32Array(input);
   for (let token = 0; token < input.length / bias.length; token += 1) {
@@ -746,11 +757,8 @@ async function rmsNormRows(
   epsilon: number,
   session?: AudioSession,
 ): Promise<Float32Array> {
-  const wasm = session && audioWasmKernelsEnabled(session)
-    ? await audioRmsNormWasm(input, weight, epsilon)
-    : undefined;
-  if (wasm) {
-    return wasm;
+  if (session && audioWasmKernelsEnabled(session)) {
+    return requireWasmResult(await audioRmsNormWasm(input, weight, epsilon), "audio RMS norm");
   }
   const output = new Float32Array(input.length);
   for (let row = 0; row < input.length / weight.length; row += 1) {
@@ -789,9 +797,8 @@ async function residualAdd(session: AudioSession, left: Float32Array, right: Flo
   if (left.length !== right.length) {
     throw new Error(`Residual shape mismatch: ${left.length} != ${right.length}`);
   }
-  const wasm = audioWasmKernelsEnabled(session) ? await audioResidualAddWasm(left, right) : undefined;
-  if (wasm) {
-    return wasm;
+  if (audioWasmKernelsEnabled(session)) {
+    return requireWasmResult(await audioResidualAddWasm(left, right), "audio residual add");
   }
   const output = new Float32Array(left.length);
   for (let index = 0; index < output.length; index += 1) {
@@ -804,9 +811,8 @@ async function residualAddScale(session: AudioSession, residual: Float32Array, h
   if (residual.length !== hidden.length) {
     throw new Error(`Residual shape mismatch: ${residual.length} != ${hidden.length}`);
   }
-  const wasm = audioWasmKernelsEnabled(session) ? await audioResidualAddScaleWasm(residual, hidden, scale) : undefined;
-  if (wasm) {
-    return wasm;
+  if (audioWasmKernelsEnabled(session)) {
+    return requireWasmResult(await audioResidualAddScaleWasm(residual, hidden, scale), "audio residual add scale");
   }
   const output = new Float32Array(residual.length);
   for (let index = 0; index < output.length; index += 1) {
@@ -816,9 +822,8 @@ async function residualAddScale(session: AudioSession, residual: Float32Array, h
 }
 
 async function clampValues(session: AudioSession, input: Float32Array, min: number, max: number): Promise<Float32Array> {
-  const wasm = audioWasmKernelsEnabled(session) ? await audioClampWasm(input, min, max) : undefined;
-  if (wasm) {
-    return wasm;
+  if (audioWasmKernelsEnabled(session)) {
+    return requireWasmResult(await audioClampWasm(input, min, max), "audio clamp");
   }
   const output = new Float32Array(input.length);
   for (let index = 0; index < input.length; index += 1) {
@@ -828,9 +833,8 @@ async function clampValues(session: AudioSession, input: Float32Array, min: numb
 }
 
 async function siluValues(session: AudioSession, input: Float32Array): Promise<Float32Array> {
-  const wasm = audioWasmKernelsEnabled(session) ? await audioSiluWasm(input) : undefined;
-  if (wasm) {
-    return wasm;
+  if (audioWasmKernelsEnabled(session)) {
+    return requireWasmResult(await audioSiluWasm(input), "audio SiLU");
   }
   const output = new Float32Array(input.length);
   for (let index = 0; index < input.length; index += 1) {
@@ -856,4 +860,11 @@ function throwIfAborted(signal: AbortSignal | undefined): void {
   if (signal?.aborted) {
     throw new DOMException("Generation was aborted.", "AbortError");
   }
+}
+
+function requireWasmResult<T>(value: T | undefined, operation: string): T {
+  if (!value) {
+    throw new Error(`WASM ${operation} is unavailable.`);
+  }
+  return value;
 }

@@ -38,6 +38,8 @@ export type ModelSessionOptions = {
   executionProviders?: readonly ExecutionProviderConfig[];
 };
 
+export type ExecutionProviderName = "reference" | "wasm" | "webgpu";
+
 export type ExecutionProviderConfig = {
   name: string;
   options?: Readonly<Record<string, unknown>>;
@@ -51,18 +53,10 @@ export function resolvePreprocessProviders(
     return preprocessProviders.map(copyExecutionProviderConfig);
   }
 
-  const providers: ExecutionProviderConfig[] = [];
-  const webgpu = executionProviders.find((provider) => provider.name === "webgpu");
-  if (webgpu) {
-    providers.push(copyExecutionProviderConfig(webgpu));
-  }
-
-  const cpu = executionProviders.find((provider) => provider.name === "cpu");
-  if (cpu?.options?.wasmKernels !== false) {
-    providers.push({ name: "wasm" });
-  }
-  providers.push({ name: "cpu" });
-  return providers;
+  const providers = executionProviders
+    .filter((provider) => isKnownExecutionProvider(provider.name))
+    .map(copyExecutionProviderConfig);
+  return providers.length > 0 ? providers : [{ name: "reference" }];
 }
 
 function copyExecutionProviderConfig(provider: ExecutionProviderConfig): ExecutionProviderConfig {
@@ -134,7 +128,8 @@ export class ModelSession {
     );
     this.maxContextLength = options.maxContextLength;
     this.maxWeightCacheBytes = options.maxWeightCacheBytes ?? 256 * 1024 * 1024;
-    this.executionProviders = (options.executionProviders ?? []).map((provider) => ({
+    const executionProviders = options.executionProviders ?? [{ name: "reference" }];
+    this.executionProviders = executionProviders.map((provider) => ({
       name: provider.name,
       options: provider.options ? { ...provider.options } : undefined,
     }));
@@ -243,6 +238,10 @@ export class ModelSession {
     return this.executionProviders.find((provider) => provider.name === name);
   }
 
+  executionProviderEnabled(name: ExecutionProviderName): boolean {
+    return this.executionProvider(name) !== undefined;
+  }
+
   private executionProviderStats(): ExecutionProviderStats {
     const stats: ExecutionProviderStats = {};
     for (const provider of this.executionProviderStatsProviders.values()) {
@@ -263,6 +262,17 @@ export class ModelSession {
       this.weightCacheEvictions += 1;
     }
   }
+}
+
+export function isKnownExecutionProvider(name: string): name is ExecutionProviderName {
+  return name === "reference" || name === "wasm" || name === "webgpu";
+}
+
+export function hasExecutionProvider(
+  providers: readonly ExecutionProviderConfig[],
+  name: ExecutionProviderName,
+): boolean {
+  return providers.some((provider) => provider.name === name);
 }
 
 export function estimateWeightCacheBytes(tensorReader: GgufTensorReader): number {

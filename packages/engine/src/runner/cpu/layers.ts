@@ -53,6 +53,7 @@ import {
   matMulWasmShardedWeightHandleBatch,
   readWasmShardedWeightHandle,
   readWasmWeightHandle,
+  wasmExecutionProviderEnabled,
 } from "./acceleration";
 import type {
   WasmShardedQuantizedWeightHandle,
@@ -304,11 +305,8 @@ export async function forwardAttentionLayer(
   const attention = await timedAsync(
     trace,
     "GQA attention",
-    async () => (await gqaAttentionWasm(
-      qRope,
-      cache.key.subarray(0, keyValueTokenCount * manifest.headCountKv * cache.keyLength),
-      compactValue,
-      {
+    async () => {
+      const attentionOptions = {
         headSize,
         queryHeadCount: manifest.headCount,
         keyValueHeadCount: manifest.headCountKv,
@@ -317,26 +315,28 @@ export async function forwardAttentionLayer(
         scale: 1,
         causal: attentionCausal,
         mask,
-        valueLayout: "dim-head-token",
-        quantizeQueryForScore: "f16",
-      },
-    )) ?? gqaAttention(
-      qRope,
-      cache.key.subarray(0, keyValueTokenCount * manifest.headCountKv * cache.keyLength),
-      compactValue,
-      {
-        headSize,
-        queryHeadCount: manifest.headCount,
-        keyValueHeadCount: manifest.headCountKv,
-        tokenCount,
-        keyValueTokenCount,
-        scale: 1,
-        causal: attentionCausal,
-        mask,
-        valueLayout: "dim-head-token",
-        quantizeQueryForScore: "f16",
-      },
-    ),
+        valueLayout: "dim-head-token" as const,
+        quantizeQueryForScore: "f16" as const,
+      };
+      if (wasmExecutionProviderEnabled(session)) {
+        const wasm = await gqaAttentionWasm(
+          qRope,
+          cache.key.subarray(0, keyValueTokenCount * manifest.headCountKv * cache.keyLength),
+          compactValue,
+          attentionOptions,
+        );
+        if (!wasm) {
+          throw new Error("WASM GQA attention is unavailable.");
+        }
+        return wasm;
+      }
+      return gqaAttention(
+        qRope,
+        cache.key.subarray(0, keyValueTokenCount * manifest.headCountKv * cache.keyLength),
+        compactValue,
+        attentionOptions,
+      );
+    },
     { layer, layerKind: kind },
   );
   if (attention.length !== tokenCount * valueDim) {
@@ -571,6 +571,7 @@ export async function matMulWeight(
   inputColumns: Float32Array,
   trace?: ForwardTrace,
 ): Promise<Float32Array> {
+  requireCpuLikeProvider(session);
   const tensor = session.getTensor(weightName);
   if (tensor.type === "F32" || tensor.type === "F16" || tensor.type === "BF16") {
     return matMulDenseRows(session, weightName, inputColumns);
@@ -578,7 +579,16 @@ export async function matMulWeight(
   if (tensor.type === "Q4_K" || tensor.type === "Q5_K" || tensor.type === "Q6_K" || tensor.type === "IQ4_XS") {
     return matMulKQ8K(session, weightName, inputColumns, tensor.type, trace);
   }
+  if (tensor.type === "Q8_0") {
+    return matMulQ8_0Weight(session, weightName, inputColumns, trace);
+  }
   throw new Error(`${weightName} has unsupported matmul type ${tensor.type}`);
+}
+
+function requireCpuLikeProvider(session: ModelSession): void {
+  if (!wasmExecutionProviderEnabled(session) && !session.executionProvider("reference")) {
+    throw new Error("CPU tensor execution requires an enabled wasm or reference provider.");
+  }
 }
 
 async function matMulWeightBatch(
@@ -589,6 +599,7 @@ async function matMulWeightBatch(
 ): Promise<Float32Array[] | undefined> {
   const projectionBatchingEnabled = cpuProjectionBatchingEnabled(session);
   const residentWeightCacheEnabled = cpuResidentWeightCacheEnabled(session);
+  const wasmEnabled = wasmExecutionProviderEnabled(session);
   if (!projectionBatchingEnabled && !residentWeightCacheEnabled) {
     return undefined;
   }
@@ -702,11 +713,15 @@ async function matMulWeightBatch(
     });
   }
 
-  return timedAsync(
+  const output = await timedAsync(
     trace,
     "WASM matmul batch wrapper",
     () => matMulQuantizedMultiWasm(weights, inputColumns, inputSize, columnCount),
   );
+  if (!output && wasmEnabled) {
+    throw new Error("WASM quantized matmul batch is unavailable.");
+  }
+  return output;
 }
 
 function isQuantizedMatmulWasmType(
@@ -754,6 +769,10 @@ async function matMulKQ8K(
   const rowCount = tensor.dimensions[1] ?? 0;
   const columnCount = inputColumns.length / inputSize;
   const rowByteLength = tensorByteLength({ ...tensor, dimensions: [inputSize] });
+  if (!wasmExecutionProviderEnabled(session)) {
+    const weightBytes = await session.readWeightBytes(weightName);
+    return matMulKQ8KReference(type, weightBytes, inputColumns, inputSize, rowCount, columnCount, rowByteLength);
+  }
   const shardedWasmHandle = await readWasmShardedWeightHandle(session, weightName, type, inputSize, rowCount);
   if (shardedWasmHandle) {
     const wasm = await timedAsync(
@@ -788,8 +807,19 @@ async function matMulKQ8K(
   if (wasm) {
     return wasm;
   }
-  const output = new Float32Array(rowCount * columnCount);
+  throw new Error(`WASM quantized matmul is unavailable for ${weightName}.`);
+}
 
+function matMulKQ8KReference(
+  type: Extract<GgmlTypeName, "Q4_K" | "Q5_K" | "Q6_K" | "IQ4_XS">,
+  weightBytes: Uint8Array,
+  inputColumns: Float32Array,
+  inputSize: number,
+  rowCount: number,
+  columnCount: number,
+  rowByteLength: number,
+): Float32Array {
+  const output = new Float32Array(rowCount * columnCount);
   for (let column = 0; column < columnCount; column += 1) {
     const q8 = quantizeQ8_K(inputColumns.slice(column * inputSize, (column + 1) * inputSize));
     for (let row = 0; row < rowCount; row += 1) {
@@ -824,6 +854,9 @@ async function matMulQ8_0Weight(
   const columnCount = inputColumns.length / inputSize;
   const rowByteLength = tensorByteLength({ ...tensor, dimensions: [inputSize] });
   const weightBytes = await session.readWeightBytes(weightName);
+  if (!wasmExecutionProviderEnabled(session)) {
+    return matMulQ8_0Reference(weightBytes, inputColumns, inputSize, rowCount, columnCount, rowByteLength);
+  }
   const wasm = await timedAsync(
     trace,
     "WASM matmul wrapper",
@@ -833,6 +866,17 @@ async function matMulQ8_0Weight(
   if (wasm) {
     return wasm;
   }
+  throw new Error(`WASM Q8_0 matmul is unavailable for ${weightName}.`);
+}
+
+function matMulQ8_0Reference(
+  weightBytes: Uint8Array,
+  inputColumns: Float32Array,
+  inputSize: number,
+  rowCount: number,
+  columnCount: number,
+  rowByteLength: number,
+): Float32Array {
   const output = new Float32Array(rowCount * columnCount);
   for (let column = 0; column < columnCount; column += 1) {
     const q8 = quantizeQ8_0(inputColumns.slice(column * inputSize, (column + 1) * inputSize));

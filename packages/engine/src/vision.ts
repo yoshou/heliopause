@@ -79,7 +79,7 @@ export class VisionSession {
     this.manifest = buildVisionManifest(tensorReader.metadata);
     this.epsilon = this.manifest.layerNormEpsilon;
     this.maxWeightCacheBytes = options.maxWeightCacheBytes ?? 256 * 1024 * 1024;
-    this.executionProviders = (options.executionProviders ?? [{ name: "cpu" }]).map((provider) => ({
+    this.executionProviders = (options.executionProviders ?? [{ name: "reference" }]).map((provider) => ({
       name: provider.name,
       options: provider.options ? { ...provider.options } : undefined,
     }));
@@ -262,10 +262,10 @@ export async function runVisionPreprocessor(
       throwIfAborted(options.signal);
       if (provider.name === "webgpu") {
         const webgpu = await runWebGpuVisionPreprocessor(session, input, options);
-        if (webgpu) {
-          return webgpu;
+        if (!webgpu) {
+          throw new Error("WebGPU vision preprocessor is unavailable.");
         }
-        continue;
+        return webgpu;
       }
       const result = await tryVisionPreprocessProviders(
         session,
@@ -278,17 +278,7 @@ export async function runVisionPreprocessor(
         return result;
       }
     }
-    const cpu = await tryVisionPreprocessProviders(
-      session,
-      input,
-      preprocessVisionRgbaCpu,
-      [{ name: "cpu" }],
-      options,
-    );
-    if (cpu) {
-      return cpu;
-    }
-    return runVisionPreprocessProviders(session, input, preprocessVisionRgbaCpu, options);
+    throw new Error("No vision preprocessor provider was selected.");
   } finally {
     bitmap.close();
   }
@@ -319,9 +309,10 @@ export async function runVisionEncoder(
 ): Promise<VisionEncodeResult> {
   if (session.executionProvider("webgpu")) {
     const webgpu = await runWebGpuVisionEncoder(session, pixels);
-    if (webgpu) {
-      return webgpu;
+    if (!webgpu) {
+      throw new Error("WebGPU vision encoder is unavailable.");
     }
+    return webgpu;
   }
   return runCpuVisionEncoder(session, pixels);
 }

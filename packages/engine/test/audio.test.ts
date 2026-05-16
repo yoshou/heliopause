@@ -61,7 +61,7 @@ test("audio WASM preprocessing matches CPU log-mel features", async () => {
   };
   const baseline = preprocessAudioPcm(audio);
   const session = createAudioSession(audioTensorReader([]), {
-    preprocessProviders: [{ name: "wasm" }, { name: "cpu" }],
+    preprocessProviders: [{ name: "wasm" }, { name: "reference" }],
   });
 
   const wasm = await runAudioPreprocessor(session, audio);
@@ -73,32 +73,27 @@ test("audio WASM preprocessing matches CPU log-mel features", async () => {
   assert.equal(session.cacheStats().executionProviderStats.wasmAudioPreprocessRuns, 1);
 });
 
-test("audio preprocessor records WebGPU/WASM fallback and CPU run stats", async () => {
+test("audio preprocessor errors instead of falling back when WebGPU is unavailable", async () => {
   const session = createAudioSession(audioTensorReader([]), {
     preprocessProviders: [
       { name: "webgpu" },
       { name: "wasm" },
-      { name: "cpu" },
+      { name: "reference" },
     ],
   });
 
   resetPrefillWasmForTesting("");
   try {
-    const features = await runAudioPreprocessor(session, {
+    await assert.rejects(() => runAudioPreprocessor(session, {
       pcm: new Float32Array(16_000),
       sampleRate: 16_000,
       durationMs: 1000,
-    });
+    }), /WebGPU is not available for audio preprocessing/);
 
-    assert.equal(features.frameCount, 99);
     const stats = session.cacheStats().executionProviderStats;
     assert.equal(stats.webgpuAudioPreprocessAttempts, 1);
-    assert.equal(stats.webgpuAudioPreprocessFallbacks, 1);
-    assert.equal(stats.webgpuAudioPreprocessLastFallbackReason, "webgpu-unavailable");
-    assert.equal(stats.wasmAudioPreprocessAttempts, 1);
-    assert.equal(stats.wasmAudioPreprocessFallbacks, 1);
-    assert.equal(stats.wasmAudioPreprocessLastFallbackReason, "wasm-unavailable");
-    assert.equal(stats.cpuAudioPreprocessRuns, 1);
+    assert.equal(stats.wasmAudioPreprocessAttempts, undefined);
+    assert.equal(stats.referenceAudioPreprocessRuns, undefined);
   } finally {
     resetPrefillWasmForTesting();
   }
@@ -128,7 +123,7 @@ test("audio encoder projects hidden to model embedding size", async () => {
   assert.equal(encoded.hidden.length, 25 * 2560);
 });
 
-test("audio encoder falls back when WebGPU is unavailable", async () => {
+test("audio encoder errors instead of falling back when WebGPU is unavailable", async () => {
   const reader = audioTensorReader([
     f32Tensor("a.conv1d.0.weight", [3, 3, 1, 128], new Float32Array(3 * 3 * 128)),
     f32Tensor("a.conv1d.0.norm.weight", [128], ones(128)),
@@ -141,7 +136,7 @@ test("audio encoder falls back when WebGPU is unavailable", async () => {
   const session = createAudioSession(reader, {
     executionProviders: [
       { name: "webgpu" },
-      { name: "cpu", options: { wasmKernels: false } },
+      { name: "reference" },
     ],
   });
   const features = preprocessAudioPcm({
@@ -150,12 +145,9 @@ test("audio encoder falls back when WebGPU is unavailable", async () => {
     durationMs: 1000,
   });
 
-  const encoded = await runAudioEncoder(session, features);
+  await assert.rejects(() => runAudioEncoder(session, features), /WebGPU is not available for audio encoder execution/);
 
-  assert.equal(encoded.tokenCount, 25);
   assert.equal(session.cacheStats().executionProviderStats.webgpuAudioAttempts, 1);
-  assert.equal(session.cacheStats().executionProviderStats.webgpuAudioFallbacks, 1);
-  assert.equal(session.cacheStats().executionProviderStats.webgpuAudioLastFallbackReason, "webgpu-unavailable");
 });
 
 function audioTensorReader(

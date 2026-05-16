@@ -17,8 +17,6 @@ import {
 type VisionPreprocessStats = {
   attempts: number;
   runs: number;
-  fallbacks: number;
-  lastFallbackReason: string;
 };
 
 type VisionPreprocessSession = Pick<
@@ -38,35 +36,20 @@ type VisionRgbaPreprocessInput = {
   resize: VisionResize;
 };
 
-const runners = new WeakMap<VisionPreprocessSession, Promise<WebGpuVisionPreprocessRunner | undefined>>();
+const runners = new WeakMap<VisionPreprocessSession, Promise<WebGpuVisionPreprocessRunner>>();
 const statsBySession = new WeakMap<VisionPreprocessSession, VisionPreprocessStats>();
 
 export async function runWebGpuVisionPreprocessor(
   session: VisionPreprocessSession,
   input: VisionRgbaPreprocessInput,
   options: { signal?: AbortSignal } = {},
-): Promise<VisionPixelValues | undefined> {
+): Promise<VisionPixelValues> {
   const stats = visionPreprocessStats(session);
   stats.attempts += 1;
   const runner = await visionPreprocessRunner(session);
-  if (!runner) {
-    stats.fallbacks += 1;
-    stats.lastFallbackReason = "webgpu-unavailable";
-    return undefined;
-  }
-  try {
-    const result = await runner.run(input, options);
-    stats.runs += 1;
-    stats.lastFallbackReason = "";
-    return result;
-  } catch (error) {
-    if (!isFallbackError(error)) {
-      throw error;
-    }
-    stats.fallbacks += 1;
-    stats.lastFallbackReason = error instanceof Error ? error.message : String(error);
-    return undefined;
-  }
+  const result = await runner.run(input, options);
+  stats.runs += 1;
+  return result;
 }
 
 function visionPreprocessStats(session: VisionPreprocessSession): VisionPreprocessStats {
@@ -75,16 +58,12 @@ function visionPreprocessStats(session: VisionPreprocessSession): VisionPreproce
     stats = {
       attempts: 0,
       runs: 0,
-      fallbacks: 0,
-      lastFallbackReason: "",
     };
     statsBySession.set(session, stats);
     const captured = stats;
     session.setExecutionProviderStatsProvider((): ExecutionProviderStats => ({
       webgpuVisionPreprocessAttempts: captured.attempts,
       webgpuVisionPreprocessRuns: captured.runs,
-      webgpuVisionPreprocessFallbacks: captured.fallbacks,
-      webgpuVisionPreprocessLastFallbackReason: captured.lastFallbackReason,
     }), "webgpu-vision-preprocess");
   }
   return stats;
@@ -92,7 +71,7 @@ function visionPreprocessStats(session: VisionPreprocessSession): VisionPreproce
 
 async function visionPreprocessRunner(
   session: VisionPreprocessSession,
-): Promise<WebGpuVisionPreprocessRunner | undefined> {
+): Promise<WebGpuVisionPreprocessRunner> {
   let runner = runners.get(session);
   if (!runner) {
     runner = createVisionPreprocessRunner(session);
@@ -103,10 +82,10 @@ async function visionPreprocessRunner(
 
 async function createVisionPreprocessRunner(
   session: VisionPreprocessSession,
-): Promise<WebGpuVisionPreprocessRunner | undefined> {
+): Promise<WebGpuVisionPreprocessRunner> {
   const device = await webGpuDevice();
   if (!device) {
-    return undefined;
+    throw new Error("WebGPU is not available for vision preprocessing.");
   }
   const options = session.executionProvider("webgpu")?.options;
   const arena = new GpuMemoryArena(

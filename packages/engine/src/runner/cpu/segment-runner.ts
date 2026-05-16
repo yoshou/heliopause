@@ -49,6 +49,13 @@ export class CpuSegmentRunner {
     ) {
       throw new Error(`Invalid CPU layer segment: ${this.segmentStartLayer}..${this.segmentEndLayerExclusive}`);
     }
+    if (
+      this.segmentEndLayerExclusive > this.segmentStartLayer &&
+      !this.session.executionProvider("wasm") &&
+      !this.session.executionProvider("reference")
+    ) {
+      throw new Error("CPU segment execution requires an enabled wasm or reference provider.");
+    }
   }
 
   async runTokensHidden(

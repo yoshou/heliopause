@@ -7,6 +7,10 @@ export type ResolvedMemoryProfile = {
   estimatedWeightCacheBytes: number;
   wasmResidentWeightCache: boolean;
   webGpuStatus: "suffix-enabled" | "memory-profile-disabled" | "blocked";
+  executionProviders: string[];
+  wasmStatus: "enabled" | "unavailable";
+  wasmUnavailableReason?: string;
+  webGpuUnavailableReason?: string;
   webGpuSegmentStartLayer?: number;
   webGpuSegmentLayerCount?: number;
   availableMemoryBytes?: number;

@@ -65,25 +65,25 @@ export function cpuExecutionProviderStats(session: ModelSession): ExecutionProvi
   const ioStats = session.tensorReader.ioStats();
   const prefetch = wasmIoPrefetchStates.get(session);
   return {
-    cpuResidentWeightCacheEnabled: cpuResidentWeightCacheEnabled(session),
-    cpuResidentWeightCacheCount: cache?.handles.size ?? 0,
-    cpuResidentWeightCacheBytes: cache?.bytes ?? 0,
-    cpuResidentWeightCacheHits: cache?.hits ?? 0,
-    cpuResidentWeightCacheMisses: cache?.misses ?? 0,
-    cpuThreadPoolEnabled: cpuThreadPoolEnabled(session),
-    cpuThreadPoolWorkerCount: pool?.workerCount ?? 0,
-    cpuShardedResidentWeightCacheCount: shardedCache?.handles.size ?? 0,
-    cpuShardedResidentWeightCacheBytes: shardedCache?.bytes ?? 0,
-    cpuShardedResidentWeightCacheHits: shardedCache?.hits ?? 0,
-    cpuShardedResidentWeightCacheMisses: shardedCache?.misses ?? 0,
-    cpuIoPrefetchEnabled: cpuIoPrefetchEnabled(session),
-    cpuIoPrefetchReads: prefetch?.reads ?? 0,
-    cpuIoPrefetchBytes: prefetch?.bytes ?? 0,
-    cpuIoWorkerBlobReads: prefetch?.workerBlobReads ?? 0,
-    cpuIoWorkerBlobBytes: prefetch?.workerBlobBytes ?? 0,
-    cpuIoCoalescedReads: ioStats.coalescedReads,
-    cpuIoInflightHits: ioStats.inflightHits,
-    cpuIoReadMs: ioStats.readMs,
+    wasmResidentWeightCacheEnabled: cpuResidentWeightCacheEnabled(session),
+    wasmResidentWeightCacheCount: cache?.handles.size ?? 0,
+    wasmResidentWeightCacheBytes: cache?.bytes ?? 0,
+    wasmResidentWeightCacheHits: cache?.hits ?? 0,
+    wasmResidentWeightCacheMisses: cache?.misses ?? 0,
+    wasmThreadPoolEnabled: cpuThreadPoolEnabled(session),
+    wasmThreadPoolWorkerCount: pool?.workerCount ?? 0,
+    wasmShardedResidentWeightCacheCount: shardedCache?.handles.size ?? 0,
+    wasmShardedResidentWeightCacheBytes: shardedCache?.bytes ?? 0,
+    wasmShardedResidentWeightCacheHits: shardedCache?.hits ?? 0,
+    wasmShardedResidentWeightCacheMisses: shardedCache?.misses ?? 0,
+    wasmIoPrefetchEnabled: cpuIoPrefetchEnabled(session),
+    wasmIoPrefetchReads: prefetch?.reads ?? 0,
+    wasmIoPrefetchBytes: prefetch?.bytes ?? 0,
+    wasmIoWorkerBlobReads: prefetch?.workerBlobReads ?? 0,
+    wasmIoWorkerBlobBytes: prefetch?.workerBlobBytes ?? 0,
+    wasmIoCoalescedReads: ioStats.coalescedReads,
+    wasmIoInflightHits: ioStats.inflightHits,
+    wasmIoReadMs: ioStats.readMs,
   };
 }
 
@@ -109,16 +109,20 @@ export function shutdownCpuExecutionProvider(session: ModelSession): void {
 }
 
 export function cpuProjectionBatchingEnabled(session: ModelSession): boolean {
-  return booleanCpuOption(session, "projectionBatching");
+  return wasmExecutionProviderEnabled(session) && booleanWasmOption(session, "projectionBatching");
 }
 
 export function cpuResidentWeightCacheEnabled(session: ModelSession): boolean {
-  return booleanCpuOption(session, "residentWeightCache");
+  return wasmExecutionProviderEnabled(session) && booleanWasmOption(session, "residentWeightCache");
+}
+
+export function wasmExecutionProviderEnabled(session: ModelSession): boolean {
+  return session.executionProvider("wasm") !== undefined;
 }
 
 export function cpuThreadPoolEnabled(session: ModelSession): boolean {
   return cpuResidentWeightCacheEnabled(session) &&
-    booleanCpuOption(session, "parallelResidentMatmul") &&
+    booleanWasmOption(session, "parallelResidentMatmul") &&
     cpuThreadPoolSize(session) > 1;
 }
 
@@ -258,17 +262,17 @@ export async function matMulWasmShardedWeightHandleBatch(
   return pool.matmulBatch(handles, inputColumns, inputSize, columnCount);
 }
 
-function booleanCpuOption(session: ModelSession, name: string): boolean {
-  return session.executionProvider("cpu")?.options?.[name] === true;
+function booleanWasmOption(session: ModelSession, name: string): boolean {
+  return session.executionProvider("wasm")?.options?.[name] === true;
 }
 
-function numberCpuOption(session: ModelSession, name: string): number | undefined {
-  const value = session.executionProvider("cpu")?.options?.[name];
+function numberWasmOption(session: ModelSession, name: string): number | undefined {
+  const value = session.executionProvider("wasm")?.options?.[name];
   return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
 function cpuThreadPoolSize(session: ModelSession): number {
-  const value = session.executionProvider("cpu")?.options?.threadPoolSize;
+  const value = session.executionProvider("wasm")?.options?.threadPoolSize;
   if (value === "auto") {
     return Math.max(1, Math.min(8, Math.floor((globalThis.navigator?.hardwareConcurrency ?? 4) / 2)));
   }
@@ -276,16 +280,16 @@ function cpuThreadPoolSize(session: ModelSession): number {
 }
 
 function cpuParallelMatmulMinRows(session: ModelSession): number {
-  return numberCpuOption(session, "parallelMatmulMinRows") ?? 512;
+  return numberWasmOption(session, "parallelMatmulMinRows") ?? 512;
 }
 
 function cpuIoPrefetchEnabled(session: ModelSession): boolean {
-  const value = session.executionProvider("cpu")?.options?.ioPrefetch;
+  const value = session.executionProvider("wasm")?.options?.ioPrefetch;
   return typeof value === "boolean" ? value : cpuResidentWeightCacheEnabled(session);
 }
 
 function cpuIoPrefetchConcurrency(session: ModelSession): number {
-  const value = session.executionProvider("cpu")?.options?.ioPrefetchConcurrency;
+  const value = session.executionProvider("wasm")?.options?.ioPrefetchConcurrency;
   if (value === "auto" || value === undefined) {
     const globalWithProcess = globalThis as typeof globalThis & {
       process?: { versions?: { node?: string } };
@@ -298,15 +302,15 @@ function cpuIoPrefetchConcurrency(session: ModelSession): number {
 }
 
 function cpuIoCoalesceMaxGapBytes(session: ModelSession): number {
-  return numberCpuOption(session, "ioCoalesceMaxGapBytes") ?? 1024 * 1024;
+  return numberWasmOption(session, "ioCoalesceMaxGapBytes") ?? 1024 * 1024;
 }
 
 function cpuIoCoalesceMaxReadBytes(session: ModelSession): number {
-  return numberCpuOption(session, "ioCoalesceMaxReadBytes") ?? 256 * 1024 * 1024;
+  return numberWasmOption(session, "ioCoalesceMaxReadBytes") ?? 256 * 1024 * 1024;
 }
 
 function cpuIoWorkerBlobReadEnabled(session: ModelSession): boolean {
-  const value = session.executionProvider("cpu")?.options?.ioWorkerBlobRead;
+  const value = session.executionProvider("wasm")?.options?.ioWorkerBlobRead;
   return typeof value === "boolean" ? value : false;
 }
 
