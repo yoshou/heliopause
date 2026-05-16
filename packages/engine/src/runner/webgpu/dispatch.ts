@@ -1,6 +1,14 @@
 import type { WebGpuBufferLike, WebGpuComputePassLike, WebGpuDeviceLike } from "./gpu-types";
 import type { Q8_0Buffers, Q8KBuffers, QuantizedHandle } from "./arena";
 import {
+  createBatchedFullAttentionApplyResources,
+  createBatchedFullAttentionScoreResources,
+  createBatchedFullKvUpdateResources,
+  createBatchedFullQueryResources,
+  createBatchedGegluSliceResources,
+  createBatchedRmsNormQ8KQuantizeResources,
+  createBatchedRmsNormResidualAddResources,
+  createBatchedRmsNormResidualAddScaleResources,
   createDualQ4KMatMulBindResources,
   createElementwiseMulResources,
   createF16CastResources,
@@ -39,6 +47,221 @@ import {
   createTop1ChunkResources,
   createValueCacheWriteResources,
 } from "./kernel-resources";
+
+export function dispatchBatchedRmsNormQ8KQuantize(
+  device: WebGpuDeviceLike,
+  pass: WebGpuComputePassLike,
+  resources: Array<{ destroy: () => void }>,
+  input: WebGpuBufferLike,
+  weight: WebGpuBufferLike,
+  q8: Q8KBuffers,
+  options: {
+    length: number;
+    tokenCount: number;
+    epsilon: number;
+  },
+): void {
+  const resource = createBatchedRmsNormQ8KQuantizeResources(
+    device,
+    input,
+    weight,
+    q8.scale,
+    q8.qs,
+    q8.bsums,
+    options,
+  );
+  resources.push(resource);
+  pass.setPipeline(resource.pipeline);
+  pass.setBindGroup(0, resource.bindGroup);
+  pass.dispatchWorkgroups(1, options.tokenCount);
+}
+
+export function dispatchBatchedFullQuery(
+  device: WebGpuDeviceLike,
+  pass: WebGpuComputePassLike,
+  resources: Array<{ destroy: () => void }>,
+  qProjection: WebGpuBufferLike,
+  qNorm: WebGpuBufferLike,
+  freqFactors: WebGpuBufferLike,
+  positions: WebGpuBufferLike,
+  query: WebGpuBufferLike,
+  options: {
+    headCount: number;
+    headSize: number;
+    ropeDims: number;
+    epsilon: number;
+    freqBase: number;
+    tokenCount: number;
+    hasFreqFactors: boolean;
+  },
+): void {
+  const resource = createBatchedFullQueryResources(device, qProjection, qNorm, freqFactors, positions, query, options);
+  resources.push(resource);
+  pass.setPipeline(resource.pipeline);
+  pass.setBindGroup(0, resource.bindGroup);
+  pass.dispatchWorkgroups(options.headCount, options.tokenCount);
+}
+
+export function dispatchBatchedFullKvUpdate(
+  device: WebGpuDeviceLike,
+  pass: WebGpuComputePassLike,
+  resources: Array<{ destroy: () => void }>,
+  kProjection: WebGpuBufferLike,
+  vProjection: WebGpuBufferLike,
+  kNorm: WebGpuBufferLike,
+  freqFactors: WebGpuBufferLike,
+  positions: WebGpuBufferLike,
+  keyCache: WebGpuBufferLike,
+  valueCache: WebGpuBufferLike,
+  options: {
+    headCount: number;
+    headSize: number;
+    valueSize: number;
+    ropeDims: number;
+    epsilon: number;
+    freqBase: number;
+    tokenCount: number;
+    contextLength: number;
+    hasFreqFactors: boolean;
+  },
+): void {
+  const resource = createBatchedFullKvUpdateResources(
+    device,
+    kProjection,
+    vProjection,
+    kNorm,
+    freqFactors,
+    positions,
+    keyCache,
+    valueCache,
+    options,
+  );
+  resources.push(resource);
+  pass.setPipeline(resource.pipeline);
+  pass.setBindGroup(0, resource.bindGroup);
+  pass.dispatchWorkgroups(options.headCount, options.tokenCount);
+}
+
+export function dispatchBatchedFullAttentionScore(
+  device: WebGpuDeviceLike,
+  pass: WebGpuComputePassLike,
+  resources: Array<{ destroy: () => void }>,
+  query: WebGpuBufferLike,
+  key: WebGpuBufferLike,
+  positions: WebGpuBufferLike,
+  probabilities: WebGpuBufferLike,
+  options: {
+    headSize: number;
+    valueSize: number;
+    queryHeadCount: number;
+    keyValueHeadCount: number;
+    keyValueTokenCount: number;
+    contextLength: number;
+    probabilityTokenCapacity: number;
+    slidingWindow?: number;
+    tokenCount: number;
+    scale: number;
+    causal: boolean;
+  },
+): void {
+  const resource = createBatchedFullAttentionScoreResources(device, query, key, positions, probabilities, options);
+  resources.push(resource);
+  pass.setPipeline(resource.pipeline);
+  pass.setBindGroup(0, resource.bindGroup);
+  pass.dispatchWorkgroups(options.queryHeadCount, options.tokenCount);
+}
+
+export function dispatchBatchedFullAttentionApply(
+  device: WebGpuDeviceLike,
+  pass: WebGpuComputePassLike,
+  resources: Array<{ destroy: () => void }>,
+  value: WebGpuBufferLike,
+  probabilities: WebGpuBufferLike,
+  positions: WebGpuBufferLike,
+  output: WebGpuBufferLike,
+  options: {
+    valueSize: number;
+    queryHeadCount: number;
+    keyValueHeadCount: number;
+    keyValueTokenCount: number;
+    contextLength: number;
+    probabilityTokenCapacity: number;
+    slidingWindow?: number;
+    tokenCount: number;
+    scale: number;
+    causal: boolean;
+  },
+): void {
+  const resource = createBatchedFullAttentionApplyResources(device, value, probabilities, positions, output, options);
+  resources.push(resource);
+  pass.setPipeline(resource.pipeline);
+  pass.setBindGroup(0, resource.bindGroup);
+  pass.dispatchWorkgroups(options.queryHeadCount, options.valueSize, options.tokenCount);
+}
+
+export function dispatchBatchedRmsNormResidualAdd(
+  device: WebGpuDeviceLike,
+  pass: WebGpuComputePassLike,
+  resources: Array<{ destroy: () => void }>,
+  input: WebGpuBufferLike,
+  weight: WebGpuBufferLike,
+  residual: WebGpuBufferLike,
+  output: WebGpuBufferLike,
+  options: {
+    length: number;
+    tokenCount: number;
+    epsilon: number;
+  },
+): void {
+  const resource = createBatchedRmsNormResidualAddResources(device, input, weight, residual, output, options);
+  resources.push(resource);
+  pass.setPipeline(resource.pipeline);
+  pass.setBindGroup(0, resource.bindGroup);
+  pass.dispatchWorkgroups(1, options.tokenCount);
+}
+
+export function dispatchBatchedRmsNormResidualAddScale(
+  device: WebGpuDeviceLike,
+  pass: WebGpuComputePassLike,
+  resources: Array<{ destroy: () => void }>,
+  input: WebGpuBufferLike,
+  weight: WebGpuBufferLike,
+  residual: WebGpuBufferLike,
+  scale: WebGpuBufferLike,
+  output: WebGpuBufferLike,
+  options: {
+    length: number;
+    tokenCount: number;
+    epsilon: number;
+  },
+): void {
+  const resource = createBatchedRmsNormResidualAddScaleResources(device, input, weight, residual, scale, output, options);
+  resources.push(resource);
+  pass.setPipeline(resource.pipeline);
+  pass.setBindGroup(0, resource.bindGroup);
+  pass.dispatchWorkgroups(1, options.tokenCount);
+}
+
+export function dispatchBatchedGegluSlice(
+  device: WebGpuDeviceLike,
+  pass: WebGpuComputePassLike,
+  resources: Array<{ destroy: () => void }>,
+  gate: WebGpuBufferLike,
+  right: WebGpuBufferLike,
+  output: WebGpuBufferLike,
+  options: {
+    length: number;
+    tokenCount: number;
+    rightOffset: number;
+    rightStride: number;
+  },
+): void {
+  const resource = createBatchedGegluSliceResources(device, gate, right, output, options);
+  resources.push(resource);
+  pass.setPipeline(resource.pipeline);
+  pass.setBindGroup(0, resource.bindGroup);
+  pass.dispatchWorkgroups(Math.ceil(options.length / 256), options.tokenCount);
+}
 
 export function dispatchKMatMul(
   pass: WebGpuComputePassLike,

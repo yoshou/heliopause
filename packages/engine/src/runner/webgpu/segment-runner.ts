@@ -13,6 +13,14 @@ import {
   type QuantizedHandle,
 } from "./arena";
 import {
+  dispatchBatchedFullAttentionApply,
+  dispatchBatchedFullAttentionScore,
+  dispatchBatchedFullKvUpdate,
+  dispatchBatchedFullQuery,
+  dispatchBatchedGegluSlice,
+  dispatchBatchedRmsNormQ8KQuantize,
+  dispatchBatchedRmsNormResidualAdd,
+  dispatchBatchedRmsNormResidualAddScale,
   dispatchDualQ4KMatMul,
   dispatchF32GatherRowsScale,
   dispatchF32MatMul,
@@ -68,6 +76,7 @@ export type WebGpuSegmentRunnerOptions = {
   epsilon: number;
   contextLength: number;
   memoryLimitBytes?: number;
+  prefillChunkSize?: number;
   segmentStartLayer: number;
   segmentEndLayerExclusive?: number;
   loadOutput?: boolean;
@@ -228,6 +237,7 @@ export class WebGpuSegmentRunner {
   private readonly ropeFreqFactors: F32Handle;
   private readonly hasRopeFreqFactors: boolean;
   private readonly tensorReader: GgufTensorReader;
+  private readonly prefillChunkSize: number;
   private lazyLoadMs: number;
   private inputResourcesPromise?: Promise<GpuInputResources>;
   private readbackBytes = 0;
@@ -290,6 +300,7 @@ export class WebGpuSegmentRunner {
     outputStripes: OutputStripe[] | undefined,
     segmentStartLayer: number,
     segmentEndLayerExclusive: number,
+    prefillChunkSize: number,
     lazyLoadMs: number,
   ) {
     this.arena = arena;
@@ -303,6 +314,7 @@ export class WebGpuSegmentRunner {
     this.outputStripes = outputStripes;
     this.segmentStartLayer = segmentStartLayer;
     this.segmentEndLayerExclusive = segmentEndLayerExclusive;
+    this.prefillChunkSize = prefillChunkSize;
     this.lazyLoadMs = lazyLoadMs;
   }
 
@@ -359,6 +371,7 @@ export class WebGpuSegmentRunner {
       outputStripes,
       segmentStartLayer,
       segmentEndLayerExclusive,
+      normalizePrefillChunkSize(options.prefillChunkSize),
       nowMs() - startMs,
     );
   }
@@ -832,27 +845,38 @@ export class WebGpuSegmentRunner {
       const prepared = await this.prepareGpuInput(tokenIds, profileGpuPasses);
       this.tokenIdInputBatches += 1;
       this.tokenIdInputTokens += tokenCount;
+      if (tokenCount > 1 && options.attentionCausal !== false) {
+        try {
+          return await this.runCausalPrefillFromBoundary(prepared.hidden, positions, state, {
+            ...options,
+            perLayerInputsBuffer: prepared.perLayerInputs,
+            sourceTokenCount: tokenCount,
+            sourceTokenIndex: 0,
+          }, false);
+        } finally {
+          if (options.computeTopK === true || options.computeSelectedToken === true) {
+            prepared.destroy();
+          } else {
+            this.deferResourceCleanup([{ destroy: prepared.destroy }]);
+          }
+        }
+      }
       let topTokens: WebGpuTopToken[] | undefined;
       let selectedTokenId: number | undefined;
       try {
-        for (let tokenIndex = 0; tokenIndex < tokenCount; tokenIndex += 1) {
-          const tokenPositions = tokenPositionsFromBatch(positions, tokenIndex, tokenCount);
-          const computeTopK = options.computeTopK === true && tokenIndex === tokenCount - 1;
-          const computeSelectedToken = options.computeSelectedToken === true && tokenIndex === tokenCount - 1;
-          const result = await this.runTokenFromBoundary(prepared.hidden, tokenIndex, tokenPositions, state, {
+        if (tokenCount === 1) {
+          const result = await this.runTokenFromBoundary(prepared.hidden, 0, tokenPositionsFromBatch(positions, 0, 1), state, {
             ...options,
-            computeTopK,
-            computeSelectedToken,
             perLayerInputsBuffer: prepared.perLayerInputs,
-            sourceTokenCount: tokenCount,
-            sourceTokenIndex: tokenIndex,
+            sourceTokenCount: 1,
+            sourceTokenIndex: 0,
           });
-          if (computeSelectedToken) {
-            selectedTokenId = result.selectedTokenId;
-          }
-          if (computeTopK) {
-            topTokens = result.topTokens;
-          }
+          selectedTokenId = result.selectedTokenId;
+          topTokens = result.topTokens;
+        } else {
+          const result = await this.runTokenIdsNonCausalLoop(prepared, positions, state, options, tokenCount);
+          selectedTokenId = result.selectedTokenId;
+          topTokens = result.topTokens;
         }
       } finally {
         if (options.computeTopK === true || options.computeSelectedToken === true) {
@@ -950,30 +974,40 @@ export class WebGpuSegmentRunner {
       const boundary = this.arena.createBuffer(
         "segment boundary hidden batch",
         inputHidden.byteLength,
-        GPU_STORAGE | GPU_COPY_DST,
+        GPU_STORAGE | GPU_COPY_DST | GPU_COPY_SRC,
       );
       this.arena.device.queue.writeBuffer(boundary, 0, inputHidden);
       this.boundaryUploads += 1;
+      if (tokenCount > 1 && options.attentionCausal !== false) {
+        try {
+          return await this.runCausalPrefillFromBoundary(boundary, positions, state, {
+            ...options,
+            sourceTokenCount: tokenCount,
+            sourceTokenIndex: 0,
+          }, false);
+        } finally {
+          if (options.computeTopK === true || options.computeSelectedToken === true) {
+            boundary.destroy?.();
+          } else {
+            this.deferResourceCleanup([boundary]);
+          }
+        }
+      }
       let topTokens: WebGpuTopToken[] | undefined;
       let selectedTokenId: number | undefined;
       try {
-        for (let tokenIndex = 0; tokenIndex < tokenCount; tokenIndex += 1) {
-          const tokenPositions = tokenPositionsFromBatch(positions, tokenIndex, tokenCount);
-          const computeTopK = options.computeTopK === true && tokenIndex === tokenCount - 1;
-          const computeSelectedToken = options.computeSelectedToken === true && tokenIndex === tokenCount - 1;
-          const result = await this.runTokenFromBoundary(boundary, tokenIndex, tokenPositions, state, {
+        if (tokenCount === 1) {
+          const result = await this.runTokenFromBoundary(boundary, 0, tokenPositionsFromBatch(positions, 0, 1), state, {
             ...options,
-            computeTopK,
-            computeSelectedToken,
-            sourceTokenCount: tokenCount,
-            sourceTokenIndex: tokenIndex,
+            sourceTokenCount: 1,
+            sourceTokenIndex: 0,
           });
-          if (computeSelectedToken) {
-            selectedTokenId = result.selectedTokenId;
-          }
-          if (computeTopK) {
-            topTokens = result.topTokens;
-          }
+          selectedTokenId = result.selectedTokenId;
+          topTokens = result.topTokens;
+        } else {
+          const result = await this.runTokensNonCausalLoop(boundary, positions, state, options, tokenCount);
+          selectedTokenId = result.selectedTokenId;
+          topTokens = result.topTokens;
         }
       } finally {
         if (options.computeTopK === true || options.computeSelectedToken === true) {
@@ -1004,47 +1038,100 @@ export class WebGpuSegmentRunner {
       const boundary = this.arena.createBuffer(
         "segment boundary hidden batch",
         inputHidden.byteLength,
-        GPU_STORAGE | GPU_COPY_DST,
+        GPU_STORAGE | GPU_COPY_DST | GPU_COPY_SRC,
       );
       this.arena.device.queue.writeBuffer(boundary, 0, inputHidden);
       this.boundaryUploads += 1;
-      const outputTokenCount = this.segmentEndLayerExclusive === this.manifest.blockCount && tokenCount > 1
-        ? 1
-        : tokenCount;
-      const hidden = new Float32Array(outputTokenCount * this.manifest.embeddingLength);
-      let topTokens: WebGpuTopToken[] | undefined;
-      let selectedTokenId: number | undefined;
-      try {
-        for (let tokenIndex = 0; tokenIndex < tokenCount; tokenIndex += 1) {
-          const tokenPositions = tokenPositionsFromBatch(positions, tokenIndex, tokenCount);
-          const computeTopK = options.computeTopK === true && tokenIndex === tokenCount - 1;
-          const computeSelectedToken = options.computeSelectedToken === true && tokenIndex === tokenCount - 1;
-          const result = await this.runTokenFromBoundaryHidden(boundary, tokenIndex, tokenPositions, state, {
+      if (tokenCount > 1) {
+        try {
+          return await this.runCausalPrefillFromBoundary(boundary, positions, state, {
             ...options,
-            computeTopK,
-            computeSelectedToken,
             sourceTokenCount: tokenCount,
-            sourceTokenIndex: tokenIndex,
-          });
-          if (outputTokenCount === tokenCount) {
-            hidden.set(result.hidden, tokenIndex * this.manifest.embeddingLength);
-          } else if (tokenIndex === tokenCount - 1) {
-            hidden.set(result.hidden);
-          }
-          if (computeTopK) {
-            topTokens = result.topTokens;
-          }
-          if (computeSelectedToken) {
-            selectedTokenId = result.selectedTokenId;
-          }
+            sourceTokenIndex: 0,
+          }, true);
+        } finally {
+          boundary.destroy?.();
         }
+      }
+      try {
+        return await this.runTokenFromBoundaryHidden(boundary, 0, tokenPositionsFromBatch(positions, 0, 1), state, {
+          ...options,
+          sourceTokenCount: 1,
+          sourceTokenIndex: 0,
+        });
       } finally {
         boundary.destroy?.();
       }
-      return { hidden, selectedTokenId, topTokens };
     } finally {
       this.endRuntimeRun(runtimeRun);
     }
+  }
+
+  private async runTokenIdsNonCausalLoop(
+    prepared: PreparedGpuInput,
+    positions: Int32Array,
+    state: WebGpuStateLike,
+    options: WebGpuRunOptions,
+    tokenCount: number,
+  ): Promise<WebGpuTokenResult> {
+    if (options.attentionCausal !== false) {
+      throw new Error("Multi-token causal prefill must use the batched WebGPU path.");
+    }
+    let topTokens: WebGpuTopToken[] | undefined;
+    let selectedTokenId: number | undefined;
+    for (let tokenIndex = 0; tokenIndex < tokenCount; tokenIndex += 1) {
+      const tokenPositions = tokenPositionsFromBatch(positions, tokenIndex, tokenCount);
+      const computeTopK = options.computeTopK === true && tokenIndex === tokenCount - 1;
+      const computeSelectedToken = options.computeSelectedToken === true && tokenIndex === tokenCount - 1;
+      const result = await this.runTokenFromBoundary(prepared.hidden, tokenIndex, tokenPositions, state, {
+        ...options,
+        computeTopK,
+        computeSelectedToken,
+        perLayerInputsBuffer: prepared.perLayerInputs,
+        sourceTokenCount: tokenCount,
+        sourceTokenIndex: tokenIndex,
+      });
+      if (computeSelectedToken) {
+        selectedTokenId = result.selectedTokenId;
+      }
+      if (computeTopK) {
+        topTokens = result.topTokens;
+      }
+    }
+    return { selectedTokenId, topTokens };
+  }
+
+  private async runTokensNonCausalLoop(
+    boundary: WebGpuBufferLike,
+    positions: Int32Array,
+    state: WebGpuStateLike,
+    options: WebGpuRunOptions,
+    tokenCount: number,
+  ): Promise<WebGpuTokenResult> {
+    if (options.attentionCausal !== false) {
+      throw new Error("Multi-token causal prefill must use the batched WebGPU path.");
+    }
+    let topTokens: WebGpuTopToken[] | undefined;
+    let selectedTokenId: number | undefined;
+    for (let tokenIndex = 0; tokenIndex < tokenCount; tokenIndex += 1) {
+      const tokenPositions = tokenPositionsFromBatch(positions, tokenIndex, tokenCount);
+      const computeTopK = options.computeTopK === true && tokenIndex === tokenCount - 1;
+      const computeSelectedToken = options.computeSelectedToken === true && tokenIndex === tokenCount - 1;
+      const result = await this.runTokenFromBoundary(boundary, tokenIndex, tokenPositions, state, {
+        ...options,
+        computeTopK,
+        computeSelectedToken,
+        sourceTokenCount: tokenCount,
+        sourceTokenIndex: tokenIndex,
+      });
+      if (computeSelectedToken) {
+        selectedTokenId = result.selectedTokenId;
+      }
+      if (computeTopK) {
+        topTokens = result.topTokens;
+      }
+    }
+    return { selectedTokenId, topTokens };
   }
 
   private async runTokensHiddenNonCausal(
@@ -1170,6 +1257,474 @@ export class WebGpuSegmentRunner {
     }
   }
 
+  private async runCausalPrefillFromBoundary(
+    boundary: WebGpuBufferLike,
+    positions: Int32Array,
+    state: WebGpuStateLike,
+    options: WebGpuInternalRunOptions,
+    readHidden: boolean,
+  ): Promise<WebGpuHiddenResult> {
+    const tokenCount = options.sourceTokenCount;
+    const tokenPositions = tokenPositionsFromBatchedMrope(positions, tokenCount);
+    for (const position of tokenPositions) {
+      if (position < 0 || position >= state.contextLength) {
+        throw new Error(`Position ${position} is outside context length ${state.contextLength}`);
+      }
+    }
+
+    const gpuState = this.ensureGpuState(state);
+    const cleanup: GpuResource[] = [];
+    const resources: Array<{ destroy: () => void }> = [];
+    const hiddenSize = this.manifest.embeddingLength;
+    const hiddenByteLength = hiddenSize * Float32Array.BYTES_PER_ELEMENT;
+    const outputTokenCount = readHidden
+      ? this.segmentEndLayerExclusive === this.manifest.blockCount
+        ? 1
+        : tokenCount
+      : 0;
+    const outputByteLength = outputTokenCount * hiddenByteLength;
+    let hiddenReadback: WebGpuBufferLike | undefined;
+    let topReadback: WebGpuBufferLike | undefined;
+    let selectedTokenReadback: WebGpuBufferLike | undefined;
+    const profileGpuPass = webGpuGpuTimingEnabled() &&
+      (
+        options.computeTopK === true ||
+        options.computeSelectedToken === true ||
+        webGpuGpuDetailedTimingEnabled()
+      );
+
+    const perLayerInputsBuffer = this.prepareBatchedPerLayerInputBuffer(options, cleanup);
+
+    const encodeStartMs = nowMs();
+    const encoder = this.arena.device.createCommandEncoder();
+    if (readHidden) {
+      hiddenReadback = this.arena.device.createBuffer({
+        size: outputByteLength,
+        usage: GPU_MAP_READ | GPU_COPY_DST,
+      });
+    }
+
+    let candidateCount = 0;
+    let candidateByteLength = 0;
+
+    try {
+      for (let chunkStart = 0; chunkStart < tokenCount; chunkStart += this.prefillChunkSize) {
+        const chunkTokenCount = Math.min(this.prefillChunkSize, tokenCount - chunkStart);
+        const chunkByteLength = chunkTokenCount * hiddenByteLength;
+        const chunkPositions = tokenPositions.slice(chunkStart, chunkStart + chunkTokenCount);
+        const positionsBuffer = this.createPositionsBuffer(chunkPositions, cleanup, `prefill.positions.${chunkStart}`);
+        let currentBatch = this.arena.createScratchBuffer(
+          `prefill.chunk.${chunkStart}.input`,
+          chunkByteLength,
+          GPU_STORAGE | GPU_COPY_SRC | GPU_COPY_DST,
+        );
+        cleanup.push(currentBatch);
+        encoder.copyBufferToBuffer(boundary, chunkStart * hiddenByteLength, currentBatch, 0, chunkByteLength);
+
+        let compute = this.beginComputePass(encoder, profileGpuPass, `prefill.chunk.${chunkStart}`);
+        for (const layer of this.layers) {
+          currentBatch = this.dispatchBatchedLayer(
+            compute.pass,
+            layer,
+            gpuState,
+            currentBatch,
+            positionsBuffer,
+            chunkPositions,
+            state.contextLength,
+            {
+              ...options,
+              perLayerInputsBuffer,
+              sourceTokenIndex: chunkStart,
+              sourceTokenCount: tokenCount,
+            },
+            cleanup,
+            resources,
+          );
+        }
+
+        const isLastChunk = chunkStart + chunkTokenCount >= tokenCount;
+        let topBuffer: WebGpuBufferLike | undefined;
+        let selectedTokenBuffer: WebGpuBufferLike | undefined;
+        const lastHiddenOffset = (chunkTokenCount - 1) * hiddenByteLength;
+        const selectedHidden = isLastChunk &&
+            this.segmentEndLayerExclusive === this.manifest.blockCount &&
+            chunkTokenCount > 1 &&
+            (options.computeTopK === true || options.computeSelectedToken === true)
+          ? this.createLastTokenView(compute.pass, resources, currentBatch, cleanup, chunkTokenCount)
+          : currentBatch;
+
+        if (isLastChunk && options.computeTopK === true) {
+          candidateCount = Math.max(1, options.topK ?? 1);
+          const outputStripes = this.requireOutputStripes();
+          candidateByteLength = outputStripes.length * candidateCount * 2 * Float32Array.BYTES_PER_ELEMENT;
+          topBuffer = this.dispatchOutputTopK(compute.pass, selectedHidden, candidateCount, cleanup, resources);
+          topReadback = this.arena.device.createBuffer({
+            size: candidateByteLength,
+            usage: GPU_MAP_READ | GPU_COPY_DST,
+          });
+        }
+        if (isLastChunk && options.computeSelectedToken === true) {
+          selectedTokenBuffer = this.dispatchOutputSelectedToken(compute.pass, selectedHidden, cleanup, resources);
+          selectedTokenReadback = this.arena.device.createBuffer({
+            size: Uint32Array.BYTES_PER_ELEMENT,
+            usage: GPU_MAP_READ | GPU_COPY_DST,
+          });
+        }
+
+        this.endComputePass(encoder, compute);
+        if (hiddenReadback) {
+          if (this.segmentEndLayerExclusive === this.manifest.blockCount) {
+            if (isLastChunk) {
+              encoder.copyBufferToBuffer(currentBatch, lastHiddenOffset, hiddenReadback, 0, hiddenByteLength);
+            }
+          } else {
+            encoder.copyBufferToBuffer(currentBatch, 0, hiddenReadback, chunkStart * hiddenByteLength, chunkByteLength);
+          }
+        }
+        if (topReadback && topBuffer) {
+          encoder.copyBufferToBuffer(topBuffer, 0, topReadback, 0, candidateByteLength);
+        }
+        if (selectedTokenReadback && selectedTokenBuffer) {
+          encoder.copyBufferToBuffer(selectedTokenBuffer, 0, selectedTokenReadback, 0, Uint32Array.BYTES_PER_ELEMENT);
+        }
+      }
+
+      this.activeRunEncodeMs += nowMs() - encodeStartMs;
+      this.submitCommandBuffer(encoder.finish());
+
+      if (!hiddenReadback && !topReadback && !selectedTokenReadback) {
+        this.deferResourceCleanup(resources, cleanup);
+        resources.length = 0;
+        cleanup.length = 0;
+        return {
+          hidden: new Float32Array(),
+          selectedTokenId: undefined,
+          topTokens: undefined,
+        };
+      }
+
+      const hidden = readHidden ? new Float32Array(outputTokenCount * hiddenSize) : new Float32Array();
+      if (hiddenReadback) {
+        this.readbackCount += 1;
+        await this.mapReadback(hiddenReadback);
+        hidden.set(new Float32Array(hiddenReadback.getMappedRange()).slice());
+        hiddenReadback.unmap();
+        hiddenReadback.destroy?.();
+        hiddenReadback = undefined;
+        this.readbackBytes += outputByteLength;
+        this.activeRunReadbackBytes += outputByteLength;
+      }
+
+      let topTokens: WebGpuTopToken[] | undefined;
+      if (topReadback) {
+        this.readbackCount += 1;
+        await this.mapReadback(topReadback);
+        const values = new Float32Array(topReadback.getMappedRange()).slice();
+        topReadback.unmap();
+        topReadback.destroy?.();
+        topReadback = undefined;
+        this.readbackBytes += candidateByteLength;
+        this.activeRunReadbackBytes += candidateByteLength;
+        topTokens = mergeTopCandidates(values, candidateCount, this.manifest.finalLogitSoftcap);
+      }
+
+      let selectedTokenId: number | undefined;
+      if (selectedTokenReadback) {
+        this.readbackCount += 1;
+        await this.mapReadback(selectedTokenReadback);
+        selectedTokenId = new Uint32Array(selectedTokenReadback.getMappedRange()).slice()[0] ?? 0;
+        this.activeRunSelectedTokenId = selectedTokenId;
+        selectedTokenReadback.unmap();
+        selectedTokenReadback.destroy?.();
+        selectedTokenReadback = undefined;
+        this.readbackBytes += Uint32Array.BYTES_PER_ELEMENT;
+        this.activeRunReadbackBytes += Uint32Array.BYTES_PER_ELEMENT;
+        this.selectedTokenReadbacks += 1;
+      }
+
+      await this.readTimestampProfiler();
+      return { hidden, selectedTokenId, topTokens };
+    } finally {
+      hiddenReadback?.destroy?.();
+      topReadback?.destroy?.();
+      selectedTokenReadback?.destroy?.();
+      for (const resource of resources) {
+        resource.destroy();
+      }
+      for (const item of cleanup.reverse()) {
+        item.destroy?.();
+      }
+    }
+  }
+
+  private dispatchBatchedLayer(
+    pass: WebGpuComputePassLike,
+    layer: GpuLayer,
+    gpuState: GpuState,
+    input: WebGpuBufferLike,
+    positionsBuffer: WebGpuBufferLike,
+    tokenPositions: Int32Array,
+    contextLength: number,
+    options: WebGpuInternalRunOptions,
+    cleanup: GpuResource[],
+    resources: Array<{ destroy: () => void }>,
+  ): WebGpuBufferLike {
+    const hiddenSize = this.manifest.embeddingLength;
+    const tokenCount = tokenPositions.length;
+    const queryDim = this.manifest.headCount * layer.headSize;
+    const valueDim = this.manifest.headCount * layer.valueSize;
+    const kvDim = this.manifest.headCountKv * layer.headSize;
+    const kvValueDim = this.manifest.headCountKv * layer.valueSize;
+
+    const attnQ8 = scratchQ8K(this.arena, hiddenSize, tokenCount, cleanup, `blk.${layer.layer}.prefill.attn_norm.q8k`);
+    dispatchBatchedRmsNormQ8KQuantize(this.arena.device, pass, resources, input, layer.attnNorm.buffer, attnQ8, {
+      length: hiddenSize,
+      tokenCount,
+      epsilon: this.epsilon,
+    });
+
+    const qProjection = scratchF32(this.arena, queryDim * tokenCount, cleanup, `blk.${layer.layer}.prefill.q`);
+    dispatchKMatMul(pass, resources, layer.q, attnQ8, qProjection, tokenCount);
+    const query = scratchF32(this.arena, queryDim * tokenCount, cleanup, `blk.${layer.layer}.prefill.q_rope`);
+    dispatchBatchedFullQuery(
+      this.arena.device,
+      pass,
+      resources,
+      qProjection,
+      layer.qNorm.buffer,
+      this.ropeFreqFactors.buffer,
+      positionsBuffer,
+      query,
+      {
+        headCount: this.manifest.headCount,
+        headSize: layer.headSize,
+        ropeDims: ropeDimensionCount(this.manifest, layer.kind),
+        epsilon: this.epsilon,
+        freqBase: ropeFreqBase(this.manifest, layer.kind),
+        tokenCount,
+        hasFreqFactors: this.hasRopeFreqFactors && layer.kind === "full-attention",
+      },
+    );
+
+    if (layer.hasKv) {
+      const layerState = gpuState.fullAttention.get(layer.layer);
+      if (!layerState || !layer.k || !layer.v || !layer.kNorm) {
+        throw new Error(`Missing WebGPU KV state or weights for layer ${layer.layer}`);
+      }
+      const kProjection = scratchF32(this.arena, kvDim * tokenCount, cleanup, `blk.${layer.layer}.prefill.k`);
+      const vProjection = scratchF32(this.arena, kvValueDim * tokenCount, cleanup, `blk.${layer.layer}.prefill.v`);
+      const dispatchedDualKv = webGpuFusionEnabled() && dispatchDualQ4KMatMul(
+        pass,
+        resources,
+        layer.k,
+        layer.v,
+        attnQ8,
+        kProjection,
+        vProjection,
+        tokenCount,
+      );
+      if (!dispatchedDualKv) {
+        dispatchKMatMul(pass, resources, layer.k, attnQ8, kProjection, tokenCount);
+        dispatchKMatMul(pass, resources, layer.v, attnQ8, vProjection, tokenCount);
+      }
+      dispatchBatchedFullKvUpdate(
+        this.arena.device,
+        pass,
+        resources,
+        kProjection,
+        vProjection,
+        layer.kNorm.buffer,
+        this.ropeFreqFactors.buffer,
+        positionsBuffer,
+        layerState.key,
+        layerState.value,
+        {
+          headCount: this.manifest.headCountKv,
+          headSize: layer.headSize,
+          valueSize: layer.valueSize,
+          ropeDims: ropeDimensionCount(this.manifest, layer.kind),
+          epsilon: this.epsilon,
+          freqBase: ropeFreqBase(this.manifest, layer.kind),
+          tokenCount,
+          contextLength,
+          hasFreqFactors: this.hasRopeFreqFactors && layer.kind === "full-attention",
+        },
+      );
+    }
+
+    const state = gpuState.fullAttention.get(layer.hasKv ? layer.layer : layer.kvSourceLayer);
+    if (!state) {
+      throw new Error(`Missing WebGPU KV state for layer ${layer.layer}`);
+    }
+    const keyValueTokenCount = Math.min(contextLength, maxInt32(tokenPositions) + 1);
+    const probabilityTokenCapacity = bucketAttentionProbabilityTokenCount(keyValueTokenCount);
+    const probabilities = scratchF32(
+      this.arena,
+      tokenCount * this.manifest.headCount * probabilityTokenCapacity,
+      cleanup,
+      `blk.${layer.layer}.prefill.attention_probabilities`,
+    );
+    const attention = scratchF32(this.arena, tokenCount * valueDim, cleanup, `blk.${layer.layer}.prefill.attention`);
+    const slidingWindow = layer.kind === "sliding-attention" ? this.manifest.slidingWindow : undefined;
+    const attentionOptions = {
+      headSize: layer.headSize,
+      valueSize: layer.valueSize,
+      queryHeadCount: this.manifest.headCount,
+      keyValueHeadCount: this.manifest.headCountKv,
+      keyValueTokenCount,
+      contextLength,
+      probabilityTokenCapacity,
+      slidingWindow,
+      tokenCount,
+      scale: 1,
+      causal: true,
+    };
+    dispatchBatchedFullAttentionScore(this.arena.device, pass, resources, query, state.key, positionsBuffer, probabilities, attentionOptions);
+    dispatchBatchedFullAttentionApply(this.arena.device, pass, resources, state.value, probabilities, positionsBuffer, attention, attentionOptions);
+
+    const attentionOut = this.dispatchQuantizedMatMul(pass, resources, layer.attnOut, attention, tokenCount, cleanup, `blk.${layer.layer}.prefill.attention_out`);
+    const attentionResidual = scratchF32(this.arena, hiddenSize * tokenCount, cleanup, `blk.${layer.layer}.prefill.attention_residual`);
+    dispatchBatchedRmsNormResidualAdd(this.arena.device, pass, resources, attentionOut, layer.postAttentionNorm.buffer, input, attentionResidual, {
+      length: hiddenSize,
+      tokenCount,
+      epsilon: this.epsilon,
+    });
+
+    const ffn = this.dispatchBatchedFfn(pass, layer, attentionResidual, tokenCount, cleanup, resources);
+    return this.dispatchBatchedPerLayerInput(pass, layer, ffn, tokenCount, options, cleanup, resources);
+  }
+
+  private dispatchBatchedFfn(
+    pass: WebGpuComputePassLike,
+    layer: GpuLayer,
+    residual: WebGpuBufferLike,
+    tokenCount: number,
+    cleanup: GpuResource[],
+    resources: Array<{ destroy: () => void }>,
+  ): WebGpuBufferLike {
+    const hiddenSize = this.manifest.embeddingLength;
+    const ffnQ8 = scratchQ8K(this.arena, hiddenSize, tokenCount, cleanup, `blk.${layer.layer}.prefill.ffn_norm.q8k`);
+    dispatchBatchedRmsNormQ8KQuantize(this.arena.device, pass, resources, residual, layer.ffnNorm.buffer, ffnQ8, {
+      length: hiddenSize,
+      tokenCount,
+      epsilon: this.epsilon,
+    });
+    const gate = scratchF32(this.arena, this.manifest.feedForwardLength * tokenCount, cleanup, `blk.${layer.layer}.prefill.ffn_gate`);
+    const up = scratchF32(this.arena, this.manifest.feedForwardLength * tokenCount, cleanup, `blk.${layer.layer}.prefill.ffn_up`);
+    const geglu = scratchF32(this.arena, this.manifest.feedForwardLength * tokenCount, cleanup, `blk.${layer.layer}.prefill.ffn_geglu`);
+    dispatchKMatMul(pass, resources, layer.ffnGate, ffnQ8, gate, tokenCount);
+    dispatchKMatMul(pass, resources, layer.ffnUp, ffnQ8, up, tokenCount);
+    dispatchGeglu(this.arena.device, pass, resources, gate, up, geglu, this.manifest.feedForwardLength * tokenCount);
+    const ffnOut = this.dispatchQuantizedMatMul(pass, resources, layer.ffnDown, geglu, tokenCount, cleanup, `blk.${layer.layer}.prefill.ffn_out`);
+    const output = scratchF32(this.arena, hiddenSize * tokenCount, cleanup, `blk.${layer.layer}.prefill.ffn_residual`);
+    dispatchBatchedRmsNormResidualAdd(this.arena.device, pass, resources, ffnOut, layer.postFfwNorm.buffer, residual, output, {
+      length: hiddenSize,
+      tokenCount,
+      epsilon: this.epsilon,
+    });
+    return output;
+  }
+
+  private dispatchBatchedPerLayerInput(
+    pass: WebGpuComputePassLike,
+    layer: GpuLayer,
+    input: WebGpuBufferLike,
+    tokenCount: number,
+    options: WebGpuInternalRunOptions,
+    cleanup: GpuResource[],
+    resources: Array<{ destroy: () => void }>,
+  ): WebGpuBufferLike {
+    const hiddenSize = this.manifest.embeddingLength;
+    if (this.manifest.perLayerEmbeddingLength <= 0) {
+      const scaled = scratchF32(this.arena, hiddenSize * tokenCount, cleanup, `blk.${layer.layer}.prefill.scaled`);
+      dispatchScale(this.arena.device, pass, resources, input, layer.layerOutputScale.buffer, scaled, hiddenSize * tokenCount);
+      return scaled;
+    }
+    if (!options.perLayerInputsBuffer || !layer.perLayerInputGate || !layer.perLayerProjection || !layer.postNorm) {
+      throw new Error("WebGPU batched per-layer input requires prepared per-layer inputs and weights.");
+    }
+    const perLayerLength = this.manifest.perLayerEmbeddingLength;
+    const perLayerOffset = (layer.layer * options.sourceTokenCount + options.sourceTokenIndex) * perLayerLength;
+    const gate = scratchF32(this.arena, perLayerLength * tokenCount, cleanup, `blk.${layer.layer}.prefill.inp_gate`);
+    const mixed = scratchF32(this.arena, perLayerLength * tokenCount, cleanup, `blk.${layer.layer}.prefill.inp_mixed`);
+    dispatchF32MatMul(this.arena.device, pass, resources, layer.perLayerInputGate.buffer, input, gate, hiddenSize, perLayerLength, tokenCount);
+    dispatchBatchedGegluSlice(this.arena.device, pass, resources, gate, options.perLayerInputsBuffer, mixed, {
+      length: perLayerLength,
+      tokenCount,
+      rightOffset: perLayerOffset,
+      rightStride: perLayerLength,
+    });
+    const projected = scratchF32(this.arena, hiddenSize * tokenCount, cleanup, `blk.${layer.layer}.prefill.inp_projected`);
+    dispatchF32MatMul(this.arena.device, pass, resources, layer.perLayerProjection.buffer, mixed, projected, perLayerLength, hiddenSize, tokenCount);
+    const output = scratchF32(this.arena, hiddenSize * tokenCount, cleanup, `blk.${layer.layer}.prefill.scaled`);
+    dispatchBatchedRmsNormResidualAddScale(
+      this.arena.device,
+      pass,
+      resources,
+      projected,
+      layer.postNorm.buffer,
+      input,
+      layer.layerOutputScale.buffer,
+      output,
+      {
+        length: hiddenSize,
+        tokenCount,
+        epsilon: this.epsilon,
+      },
+    );
+    return output;
+  }
+
+  private prepareBatchedPerLayerInputBuffer(
+    options: WebGpuInternalRunOptions,
+    cleanup: GpuResource[],
+  ): WebGpuBufferLike | undefined {
+    if (this.manifest.perLayerEmbeddingLength <= 0) {
+      return undefined;
+    }
+    if (options.perLayerInputsBuffer) {
+      return options.perLayerInputsBuffer;
+    }
+    if (!options.perLayerInputs) {
+      throw new Error("WebGPU batched prefill requires prepared per-layer inputs.");
+    }
+    const buffer = this.arena.createBuffer(
+      "prefill.per_layer_inputs",
+      options.perLayerInputs.byteLength,
+      GPU_STORAGE | GPU_COPY_DST,
+    );
+    this.arena.device.queue.writeBuffer(buffer, 0, options.perLayerInputs);
+    cleanup.push(buffer);
+    return buffer;
+  }
+
+  private createPositionsBuffer(
+    positions: Int32Array,
+    cleanup: GpuResource[],
+    label: string,
+  ): WebGpuBufferLike {
+    const values = Uint32Array.from(positions);
+    const buffer = this.arena.createScratchBuffer(label, values.byteLength, GPU_STORAGE | GPU_COPY_DST);
+    this.arena.device.queue.writeBuffer(buffer, 0, values);
+    cleanup.push(buffer);
+    return buffer;
+  }
+
+  private createLastTokenView(
+    pass: WebGpuComputePassLike,
+    resources: Array<{ destroy: () => void }>,
+    input: WebGpuBufferLike,
+    cleanup: GpuResource[],
+    tokenCount: number,
+  ): WebGpuBufferLike {
+    const output = scratchF32(this.arena, this.manifest.embeddingLength, cleanup, "prefill.last_hidden");
+    dispatchTokenSlice(this.arena.device, pass, resources, input, output, {
+      rowSize: this.manifest.embeddingLength,
+      rowIndex: tokenCount - 1,
+    });
+    return output;
+  }
+
   private async runTokenFromBoundary(
     boundary: WebGpuBufferLike,
     tokenIndex: number,
@@ -1214,7 +1769,7 @@ export class WebGpuSegmentRunner {
     const hidden = this.arena.createScratchBuffer(
       "input.hidden.gpu",
       tokenCount * this.manifest.embeddingLength * Float32Array.BYTES_PER_ELEMENT,
-      GPU_STORAGE,
+      GPU_STORAGE | GPU_COPY_SRC,
     );
     cleanup.push(hidden);
     let perLayerInputs: WebGpuBufferLike | undefined;
@@ -2429,6 +2984,16 @@ function attentionKeyValueStart(tokenPosition: number, slidingWindow: number | u
 
 function bucketAttentionProbabilityTokenCount(tokenCount: number): number {
   return Math.max(1, Math.ceil(tokenCount / 256) * 256);
+}
+
+function normalizePrefillChunkSize(value: number | undefined): number {
+  if (value === undefined) {
+    return 64;
+  }
+  if (!Number.isInteger(value) || value <= 0) {
+    throw new Error(`Invalid WebGPU prefill chunk size: ${value}`);
+  }
+  return value;
 }
 
 function webGpuGpuTimingEnabled(): boolean {

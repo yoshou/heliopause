@@ -7,6 +7,7 @@ const segmentRunners = new WeakMap<ModelSession, Promise<WebGpuSegmentRunner>>()
 export type WebGpuExecutionProviderOptions = {
   memoryLimitBytes: number;
   segmentStartLayer?: number;
+  prefillChunkSize?: number;
 };
 
 export function webGpuExecutionProviderEnabled(session: ModelSession): boolean {
@@ -23,6 +24,7 @@ export function webGpuExecutionProviderOptions(
   return {
     memoryLimitBytes: numberOption(config.options, "memoryLimitBytes") ?? WEBGPU_MEMORY_LIMIT_BYTES,
     segmentStartLayer: numberOption(config.options, "segmentStartLayer"),
+    prefillChunkSize: numberOption(config.options, "prefillChunkSize"),
   };
 }
 
@@ -47,6 +49,7 @@ export function webGpuSegmentRunner(
       epsilon: session.epsilon,
       contextLength: state.contextLength,
       memoryLimitBytes: providerOptions.memoryLimitBytes,
+      prefillChunkSize: providerOptions.prefillChunkSize,
       segmentStartLayer,
     });
     segmentRunners.set(session, runner);

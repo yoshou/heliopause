@@ -819,6 +819,96 @@ fn main(@builtin(local_invocation_id) localId: vec3<u32>) {
 }
 `;
 
+export const BATCHED_RMS_NORM_RESIDUAL_ADD_WGSL = `
+struct Params {
+  epsilon: f32,
+  length: u32,
+  tokenCount: u32,
+  _pad0: u32,
+};
+
+@group(0) @binding(0) var<storage, read> inputValues: array<f32>;
+@group(0) @binding(1) var<storage, read> weightValues: array<f32>;
+@group(0) @binding(2) var<storage, read> residualValues: array<f32>;
+@group(0) @binding(3) var<uniform> params: Params;
+@group(0) @binding(4) var<storage, read_write> outputValues: array<f32>;
+
+var<workgroup> batchedRmsResidualReduceValues: array<f32, 256>;
+
+@compute @workgroup_size(256, 1, 1)
+fn main(@builtin(workgroup_id) workgroupId: vec3<u32>, @builtin(local_invocation_id) localId: vec3<u32>) {
+  let token = workgroupId.y;
+  let lane = localId.x;
+  if (token >= params.tokenCount) {
+    return;
+  }
+  let base = token * params.length;
+  var localSum = 0.0;
+  for (var index = lane; index < params.length; index = index + 256u) {
+    let value = inputValues[base + index];
+    localSum = localSum + value * value;
+  }
+  batchedRmsResidualReduceValues[lane] = localSum;
+  workgroupBarrier();
+  for (var stride = 128u; stride > 0u; stride = stride / 2u) {
+    if (lane < stride) {
+      batchedRmsResidualReduceValues[lane] = batchedRmsResidualReduceValues[lane] + batchedRmsResidualReduceValues[lane + stride];
+    }
+    workgroupBarrier();
+  }
+  let scale = inverseSqrt(batchedRmsResidualReduceValues[0] / f32(params.length) + params.epsilon);
+  for (var index = lane; index < params.length; index = index + 256u) {
+    outputValues[base + index] = residualValues[base + index] + inputValues[base + index] * scale * weightValues[index];
+  }
+}
+`;
+
+export const BATCHED_RMS_NORM_RESIDUAL_ADD_SCALE_WGSL = `
+struct Params {
+  epsilon: f32,
+  length: u32,
+  tokenCount: u32,
+  _pad0: u32,
+};
+
+@group(0) @binding(0) var<storage, read> inputValues: array<f32>;
+@group(0) @binding(1) var<storage, read> weightValues: array<f32>;
+@group(0) @binding(2) var<storage, read> residualValues: array<f32>;
+@group(0) @binding(3) var<storage, read> scaleValue: array<f32>;
+@group(0) @binding(4) var<uniform> params: Params;
+@group(0) @binding(5) var<storage, read_write> outputValues: array<f32>;
+
+var<workgroup> batchedRmsResidualScaleReduceValues: array<f32, 256>;
+
+@compute @workgroup_size(256, 1, 1)
+fn main(@builtin(workgroup_id) workgroupId: vec3<u32>, @builtin(local_invocation_id) localId: vec3<u32>) {
+  let token = workgroupId.y;
+  let lane = localId.x;
+  if (token >= params.tokenCount) {
+    return;
+  }
+  let base = token * params.length;
+  var localSum = 0.0;
+  for (var index = lane; index < params.length; index = index + 256u) {
+    let value = inputValues[base + index];
+    localSum = localSum + value * value;
+  }
+  batchedRmsResidualScaleReduceValues[lane] = localSum;
+  workgroupBarrier();
+  for (var stride = 128u; stride > 0u; stride = stride / 2u) {
+    if (lane < stride) {
+      batchedRmsResidualScaleReduceValues[lane] = batchedRmsResidualScaleReduceValues[lane] + batchedRmsResidualScaleReduceValues[lane + stride];
+    }
+    workgroupBarrier();
+  }
+  let normScale = inverseSqrt(batchedRmsResidualScaleReduceValues[0] / f32(params.length) + params.epsilon);
+  let outputScale = scaleValue[0];
+  for (var index = lane; index < params.length; index = index + 256u) {
+    outputValues[base + index] = (residualValues[base + index] + inputValues[base + index] * normScale * weightValues[index]) * outputScale;
+  }
+}
+`;
+
 export const HEAD_RMS_NORM_WGSL = `
 struct Params {
   epsilon: f32,
@@ -1226,6 +1316,203 @@ fn main(@builtin(workgroup_id) workgroupId: vec3<u32>, @builtin(local_invocation
 }
 `;
 
+export const BATCHED_FULL_QUERY_NORM_ROPE_WGSL = `
+struct Params {
+  epsilon: f32,
+  freqBase: f32,
+  hasFreqFactors: u32,
+  headCount: u32,
+  headSize: u32,
+  ropeDims: u32,
+  tokenCount: u32,
+  _pad0: u32,
+};
+
+@group(0) @binding(0) var<storage, read> qValues: array<f32>;
+@group(0) @binding(1) var<storage, read> normWeights: array<f32>;
+@group(0) @binding(2) var<storage, read> freqFactors: array<f32>;
+@group(0) @binding(3) var<storage, read> positions: array<u32>;
+@group(0) @binding(4) var<uniform> params: Params;
+@group(0) @binding(5) var<storage, read_write> queryValues: array<f32>;
+
+fn batchedQueryInput(token: u32, head: u32, dim: u32) -> f32 {
+  return qValues[token * params.headCount * params.headSize + head * params.headSize + dim];
+}
+
+fn batchedQueryNormed(token: u32, head: u32, dim: u32, scale: f32) -> f32 {
+  return batchedQueryInput(token, head, dim) * scale * normWeights[dim];
+}
+
+fn batchedQueryRopeFactor(index: u32) -> f32 {
+  if (params.hasFreqFactors == 0u) {
+    return 1.0;
+  }
+  return freqFactors[index];
+}
+
+fn batchedQueryRopeTheta(position: u32, pairIndex: u32) -> f32 {
+  let thetaScale = pow(params.freqBase, -2.0 / f32(params.ropeDims));
+  var theta = f32(position);
+  for (var index = 0u; index < pairIndex; index = index + 1u) {
+    theta = theta * thetaScale;
+  }
+  return theta;
+}
+
+var<workgroup> batchedQueryReduceValues: array<f32, 256>;
+
+@compute @workgroup_size(256, 1, 1)
+fn main(@builtin(workgroup_id) workgroupId: vec3<u32>, @builtin(local_invocation_id) localId: vec3<u32>) {
+  let head = workgroupId.x;
+  let token = workgroupId.y;
+  let lane = localId.x;
+  if (head >= params.headCount || token >= params.tokenCount) {
+    return;
+  }
+  var meanSquare = 0.0;
+  for (var dim = lane; dim < params.headSize; dim = dim + 256u) {
+    let value = batchedQueryInput(token, head, dim);
+    meanSquare = meanSquare + value * value;
+  }
+  batchedQueryReduceValues[lane] = meanSquare;
+  workgroupBarrier();
+  for (var stride = 128u; stride > 0u; stride = stride / 2u) {
+    if (lane < stride) {
+      batchedQueryReduceValues[lane] = batchedQueryReduceValues[lane] + batchedQueryReduceValues[lane + stride];
+    }
+    workgroupBarrier();
+  }
+  let scale = inverseSqrt(batchedQueryReduceValues[0] / f32(params.headSize) + params.epsilon);
+  let outBase = token * params.headCount * params.headSize + head * params.headSize;
+  for (var dim = lane; dim < params.headSize; dim = dim + 256u) {
+    queryValues[outBase + dim] = batchedQueryNormed(token, head, dim, scale);
+  }
+  let ropePairCount = params.ropeDims / 2u;
+  let position = positions[token];
+  for (var ic = lane; ic < ropePairCount; ic = ic + 256u) {
+    let x0 = batchedQueryNormed(token, head, ic, scale);
+    let x1 = batchedQueryNormed(token, head, ropePairCount + ic, scale);
+    let theta = batchedQueryRopeTheta(position, ic);
+    let thetaWithFactor = theta / batchedQueryRopeFactor(ic);
+    let cosTheta = cos(thetaWithFactor);
+    let sinTheta = sin(thetaWithFactor);
+    queryValues[outBase + ic] = x0 * cosTheta - x1 * sinTheta;
+    queryValues[outBase + ropePairCount + ic] = x0 * sinTheta + x1 * cosTheta;
+  }
+}
+`;
+
+export const BATCHED_FULL_KV_UPDATE_WGSL = `
+struct Params {
+  epsilon: f32,
+  freqBase: f32,
+  hasFreqFactors: u32,
+  headCount: u32,
+  headSize: u32,
+  valueSize: u32,
+  ropeDims: u32,
+  tokenCount: u32,
+  contextLength: u32,
+  _pad0: u32,
+  _pad1: u32,
+  _pad2: u32,
+};
+
+@group(0) @binding(0) var<storage, read> kProjectionValues: array<f32>;
+@group(0) @binding(1) var<storage, read> vProjectionValues: array<f32>;
+@group(0) @binding(2) var<storage, read> normWeights: array<f32>;
+@group(0) @binding(3) var<storage, read> freqFactors: array<f32>;
+@group(0) @binding(4) var<storage, read> positions: array<u32>;
+@group(0) @binding(5) var<uniform> params: Params;
+@group(0) @binding(6) var<storage, read_write> keyCache: array<f32>;
+@group(0) @binding(7) var<storage, read_write> valueCache: array<f32>;
+
+fn batchedKvInput(token: u32, head: u32, dim: u32) -> f32 {
+  return kProjectionValues[token * params.headCount * params.headSize + head * params.headSize + dim];
+}
+
+fn batchedKvNormed(token: u32, head: u32, dim: u32, scale: f32) -> f32 {
+  return batchedKvInput(token, head, dim) * scale * normWeights[dim];
+}
+
+fn batchedKvRopeFactor(index: u32) -> f32 {
+  if (params.hasFreqFactors == 0u) {
+    return 1.0;
+  }
+  return freqFactors[index];
+}
+
+fn batchedKvRopeTheta(position: u32, pairIndex: u32) -> f32 {
+  let thetaScale = pow(params.freqBase, -2.0 / f32(params.ropeDims));
+  var theta = f32(position);
+  for (var index = 0u; index < pairIndex; index = index + 1u) {
+    theta = theta * thetaScale;
+  }
+  return theta;
+}
+
+var<workgroup> batchedKvReduceValues: array<f32, 256>;
+
+@compute @workgroup_size(256, 1, 1)
+fn main(@builtin(workgroup_id) workgroupId: vec3<u32>, @builtin(local_invocation_id) localId: vec3<u32>) {
+  let head = workgroupId.x;
+  let token = workgroupId.y;
+  let lane = localId.x;
+  if (head >= params.headCount || token >= params.tokenCount) {
+    return;
+  }
+  var meanSquare = 0.0;
+  for (var dim = lane; dim < params.headSize; dim = dim + 256u) {
+    let value = batchedKvInput(token, head, dim);
+    meanSquare = meanSquare + value * value;
+  }
+  batchedKvReduceValues[lane] = meanSquare;
+  workgroupBarrier();
+  for (var stride = 128u; stride > 0u; stride = stride / 2u) {
+    if (lane < stride) {
+      batchedKvReduceValues[lane] = batchedKvReduceValues[lane] + batchedKvReduceValues[lane + stride];
+    }
+    workgroupBarrier();
+  }
+  let scale = inverseSqrt(batchedKvReduceValues[0] / f32(params.headSize) + params.epsilon);
+  let tokenPosition = positions[token];
+  let keyBase = (tokenPosition * params.headCount + head) * params.headSize;
+  for (var dim = lane; dim < params.headSize; dim = dim + 256u) {
+    keyCache[keyBase + dim] = batchedKvNormed(token, head, dim, scale);
+  }
+  var valueMeanSquare = 0.0;
+  let valueBase = token * params.headCount * params.valueSize + head * params.valueSize;
+  for (var dim = lane; dim < params.valueSize; dim = dim + 256u) {
+    let value = vProjectionValues[valueBase + dim];
+    valueMeanSquare = valueMeanSquare + value * value;
+  }
+  batchedKvReduceValues[lane] = valueMeanSquare;
+  workgroupBarrier();
+  for (var stride = 128u; stride > 0u; stride = stride / 2u) {
+    if (lane < stride) {
+      batchedKvReduceValues[lane] = batchedKvReduceValues[lane] + batchedKvReduceValues[lane + stride];
+    }
+    workgroupBarrier();
+  }
+  let valueScale = inverseSqrt(batchedKvReduceValues[0] / f32(params.valueSize) + params.epsilon);
+  for (var dim = lane; dim < params.valueSize; dim = dim + 256u) {
+    valueCache[(dim * params.headCount + head) * params.contextLength + tokenPosition] =
+      vProjectionValues[valueBase + dim] * valueScale;
+  }
+  let ropePairCount = params.ropeDims / 2u;
+  for (var ic = lane; ic < ropePairCount; ic = ic + 256u) {
+    let x0 = batchedKvNormed(token, head, ic, scale);
+    let x1 = batchedKvNormed(token, head, ropePairCount + ic, scale);
+    let theta = batchedKvRopeTheta(tokenPosition, ic);
+    let thetaWithFactor = theta / batchedKvRopeFactor(ic);
+    let cosTheta = cos(thetaWithFactor);
+    let sinTheta = sin(thetaWithFactor);
+    keyCache[keyBase + ic] = x0 * cosTheta - x1 * sinTheta;
+    keyCache[keyBase + ropePairCount + ic] = x0 * sinTheta + x1 * cosTheta;
+  }
+}
+`;
+
 export const TOPK_WGSL = `
 struct Params {
   rowCount: u32,
@@ -1531,6 +1818,91 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     return;
   }
   outputValues[index] = gelu(gateValues[index]) * rightValues[params.rightOffset + index];
+}
+`;
+
+export const BATCHED_GEGLU_SLICE_WGSL = `
+struct Params {
+  length: u32,
+  tokenCount: u32,
+  rightOffset: u32,
+  rightStride: u32,
+};
+
+@group(0) @binding(0) var<storage, read> gateValues: array<f32>;
+@group(0) @binding(1) var<storage, read> rightValues: array<f32>;
+@group(0) @binding(2) var<uniform> params: Params;
+@group(0) @binding(3) var<storage, read_write> outputValues: array<f32>;
+
+fn batchedGegluSliceF16BitsToF32(bits: u32) -> f32 {
+  let sign = select(1.0, -1.0, (bits & 0x8000u) != 0u);
+  let exponent = (bits >> 10u) & 31u;
+  let fraction = bits & 1023u;
+  if (exponent == 0u) {
+    return sign * exp2(-14.0) * (f32(fraction) / 1024.0);
+  }
+  if (exponent == 31u) {
+    return sign * 65504.0;
+  }
+  return sign * exp2(f32(exponent) - 15.0) * (1.0 + f32(fraction) / 1024.0);
+}
+
+fn batchedGegluSliceF32ToF16Bits(value: f32) -> u32 {
+  let bits = bitcast<u32>(value);
+  let sign = (bits >> 16u) & 0x8000u;
+  let absBits = bits & 0x7fffffffu;
+  if (absBits == 0u) {
+    return sign;
+  }
+  if (absBits >= 0x7f800000u) {
+    return sign | 0x7c00u;
+  }
+  var exponent = i32((absBits >> 23u) & 255u) - 127 + 15;
+  let mantissa = absBits & 0x7fffffu;
+  if (exponent <= 0) {
+    if (exponent < -10) {
+      return sign;
+    }
+    let shifted = (mantissa | 0x800000u) >> u32(1 - exponent);
+    return sign | ((shifted + 0x1000u) >> 13u);
+  }
+  var halfMantissa = (mantissa + 0x1000u) >> 13u;
+  if (halfMantissa == 0x400u) {
+    halfMantissa = 0u;
+    exponent = exponent + 1;
+  }
+  if (exponent >= 31) {
+    return sign | 0x7c00u;
+  }
+  return sign | (u32(exponent) << 10u) | halfMantissa;
+}
+
+fn batchedGegluSliceCastF16(value: f32) -> f32 {
+  return batchedGegluSliceF16BitsToF32(batchedGegluSliceF32ToF16Bits(value));
+}
+
+fn batchedGegluSliceGelu(value: f32) -> f32 {
+  if (value <= -10.0) {
+    return 0.0;
+  }
+  if (value >= 10.0) {
+    return value;
+  }
+  let x = batchedGegluSliceCastF16(value);
+  let inner = sqrt(2.0 / 3.141592653589793) * x * (1.0 + 0.044715 * x * x);
+  return batchedGegluSliceCastF16(0.5 * x * (1.0 + tanh(inner)));
+}
+
+@compute @workgroup_size(256, 1, 1)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let index = id.x;
+  let token = id.y;
+  if (index >= params.length || token >= params.tokenCount) {
+    return;
+  }
+  let leftIndex = token * params.length + index;
+  let rightIndex = params.rightOffset + token * params.rightStride + index;
+  outputValues[leftIndex] = batchedGegluSliceGelu(gateValues[leftIndex]) * rightValues[rightIndex];
 }
 `;
 
@@ -2113,6 +2485,102 @@ fn main(@builtin(local_invocation_id) localId: vec3<u32>) {
 }
 `;
 
+export const BATCHED_RMS_NORM_Q8_K_QUANTIZE_WGSL = `
+struct Params {
+  epsilon: f32,
+  length: u32,
+  blockCount: u32,
+  tokenCount: u32,
+};
+
+@group(0) @binding(0) var<storage, read> inputValues: array<f32>;
+@group(0) @binding(1) var<storage, read> weightValues: array<f32>;
+@group(0) @binding(2) var<storage, read_write> outputScales: array<f32>;
+@group(0) @binding(3) var<storage, read_write> outputQs: array<i32>;
+@group(0) @binding(4) var<storage, read_write> outputBsums: array<i32>;
+@group(0) @binding(5) var<uniform> params: Params;
+
+var<workgroup> batchedRmsQ8ReduceValues: array<f32, 256>;
+var<workgroup> batchedRmsQ8AbsValues: array<f32, 256>;
+var<workgroup> batchedRmsQ8Values: array<f32, 256>;
+var<workgroup> batchedRmsQ8Indices: array<u32, 256>;
+var<workgroup> batchedRmsQ8Quants: array<i32, 256>;
+
+@compute @workgroup_size(256, 1, 1)
+fn main(@builtin(workgroup_id) workgroupId: vec3<u32>, @builtin(local_invocation_id) localId: vec3<u32>) {
+  let token = workgroupId.y;
+  let lane = localId.x;
+  if (token >= params.tokenCount) {
+    return;
+  }
+  let tokenBase = token * params.length;
+  var localSum = 0.0;
+  for (var index = lane; index < params.length; index = index + 256u) {
+    let value = inputValues[tokenBase + index];
+    localSum = localSum + value * value;
+  }
+  batchedRmsQ8ReduceValues[lane] = localSum;
+  workgroupBarrier();
+  for (var stride = 128u; stride > 0u; stride = stride / 2u) {
+    if (lane < stride) {
+      batchedRmsQ8ReduceValues[lane] = batchedRmsQ8ReduceValues[lane] + batchedRmsQ8ReduceValues[lane + stride];
+    }
+    workgroupBarrier();
+  }
+  let rmsScale = inverseSqrt(batchedRmsQ8ReduceValues[0] / f32(params.length) + params.epsilon);
+  for (var block = 0u; block < params.blockCount; block = block + 1u) {
+    let element = block * 256u + lane;
+    let value = inputValues[tokenBase + element] * rmsScale * weightValues[element];
+    batchedRmsQ8AbsValues[lane] = abs(value);
+    batchedRmsQ8Values[lane] = value;
+    batchedRmsQ8Indices[lane] = lane;
+    workgroupBarrier();
+    for (var stride = 128u; stride > 0u; stride = stride / 2u) {
+      if (lane < stride) {
+        let otherLane = lane + stride;
+        let otherAbs = batchedRmsQ8AbsValues[otherLane];
+        let otherIndex = batchedRmsQ8Indices[otherLane];
+        if (otherAbs > batchedRmsQ8AbsValues[lane] || (otherAbs == batchedRmsQ8AbsValues[lane] && otherIndex < batchedRmsQ8Indices[lane])) {
+          batchedRmsQ8AbsValues[lane] = otherAbs;
+          batchedRmsQ8Values[lane] = batchedRmsQ8Values[otherLane];
+          batchedRmsQ8Indices[lane] = otherIndex;
+        }
+      }
+      workgroupBarrier();
+    }
+    let amax = batchedRmsQ8AbsValues[0];
+    let maxValue = batchedRmsQ8Values[0];
+    var inverseScale = 0.0;
+    if (amax != 0.0) {
+      inverseScale = -127.0 / maxValue;
+    }
+    let blockIndex = token * params.blockCount + block;
+    if (lane == 0u) {
+      var scale = 0.0;
+      if (amax != 0.0) {
+        scale = 1.0 / inverseScale;
+      }
+      outputScales[blockIndex] = scale;
+    }
+    var q = 0i;
+    if (amax != 0.0) {
+      q = min(127i, i32(round(inverseScale * value)));
+    }
+    batchedRmsQ8Quants[lane] = q;
+    outputQs[tokenBase + element] = q;
+    workgroupBarrier();
+    if (lane < 16u) {
+      var sum = 0i;
+      for (var offset = 0u; offset < 16u; offset = offset + 1u) {
+        sum = sum + batchedRmsQ8Quants[lane * 16u + offset];
+      }
+      outputBsums[blockIndex * 16u + lane] = sum;
+    }
+    workgroupBarrier();
+  }
+}
+`;
+
 export const Q8_0_QUANTIZE_WGSL = `
 struct Params {
   inputSize: u32,
@@ -2366,6 +2834,178 @@ fn main(@builtin(workgroup_id) workgroupId: vec3<u32>, @builtin(local_invocation
   if (lane == 0u) {
     let outputIndex = qHead * params.valueSize + dim;
     outputValues[outputIndex] = attentionApplyValues[0];
+  }
+}
+`;
+
+export const BATCHED_FULL_ATTENTION_SCORE_WGSL = `
+struct Params {
+  scale: f32,
+  headSize: u32,
+  queryHeadCount: u32,
+  keyValueHeadCount: u32,
+  keyValueTokenCount: u32,
+  contextLength: u32,
+  probabilityTokenCapacity: u32,
+  slidingWindow: u32,
+  hasSlidingWindow: u32,
+  tokenCount: u32,
+  causal: u32,
+  _pad0: u32,
+};
+
+@group(0) @binding(0) var<storage, read> queryValues: array<f32>;
+@group(0) @binding(1) var<storage, read> keyValues: array<f32>;
+@group(0) @binding(2) var<storage, read> positions: array<u32>;
+@group(0) @binding(3) var<uniform> params: Params;
+@group(0) @binding(4) var<storage, read_write> probabilityValues: array<f32>;
+
+fn batchedScoreAllowed(queryPosition: u32, keyToken: u32) -> bool {
+  if (params.causal != 0u && keyToken > queryPosition) {
+    return false;
+  }
+  if (params.hasSlidingWindow != 0u && keyToken + params.slidingWindow <= queryPosition) {
+    return false;
+  }
+  return keyToken < params.keyValueTokenCount;
+}
+
+fn batchedAttentionScore(token: u32, qHead: u32, kvHead: u32, keyToken: u32) -> f32 {
+  let queryOffset = token * params.queryHeadCount * params.headSize + qHead * params.headSize;
+  let keyOffset = (keyToken * params.keyValueHeadCount + kvHead) * params.headSize;
+  var dot = 0.0;
+  for (var dim = 0u; dim < params.headSize; dim = dim + 1u) {
+    dot = dot + queryValues[queryOffset + dim] * keyValues[keyOffset + dim];
+  }
+  return dot * params.scale;
+}
+
+var<workgroup> batchedAttentionScoreReduceValues: array<f32, 256>;
+
+@compute @workgroup_size(256, 1, 1)
+fn main(@builtin(workgroup_id) workgroupId: vec3<u32>, @builtin(local_invocation_id) localId: vec3<u32>) {
+  let qHead = workgroupId.x;
+  let token = workgroupId.y;
+  let lane = localId.x;
+  if (qHead >= params.queryHeadCount || token >= params.tokenCount) {
+    return;
+  }
+  let groupSize = params.queryHeadCount / params.keyValueHeadCount;
+  let kvHead = qHead / groupSize;
+  let queryPosition = positions[token];
+  let probabilityOffset = (token * params.queryHeadCount + qHead) * params.probabilityTokenCapacity;
+  var localMax = -3.4028234663852886e38;
+  for (var keyToken = lane; keyToken < params.keyValueTokenCount; keyToken = keyToken + 256u) {
+    var score = -3.4028234663852886e38;
+    if (batchedScoreAllowed(queryPosition, keyToken)) {
+      score = batchedAttentionScore(token, qHead, kvHead, keyToken);
+    }
+    probabilityValues[probabilityOffset + keyToken] = score;
+    localMax = max(localMax, score);
+  }
+  batchedAttentionScoreReduceValues[lane] = localMax;
+  workgroupBarrier();
+  for (var stride = 128u; stride > 0u; stride = stride / 2u) {
+    if (lane < stride) {
+      batchedAttentionScoreReduceValues[lane] = max(batchedAttentionScoreReduceValues[lane], batchedAttentionScoreReduceValues[lane + stride]);
+    }
+    workgroupBarrier();
+  }
+  let maxScore = batchedAttentionScoreReduceValues[0];
+  var localSum = 0.0;
+  for (var keyToken = lane; keyToken < params.keyValueTokenCount; keyToken = keyToken + 256u) {
+    let index = probabilityOffset + keyToken;
+    var probability = 0.0;
+    if (batchedScoreAllowed(queryPosition, keyToken)) {
+      probability = exp(probabilityValues[index] - maxScore);
+    }
+    probabilityValues[index] = probability;
+    localSum = localSum + probability;
+  }
+  batchedAttentionScoreReduceValues[lane] = localSum;
+  workgroupBarrier();
+  for (var stride = 128u; stride > 0u; stride = stride / 2u) {
+    if (lane < stride) {
+      batchedAttentionScoreReduceValues[lane] = batchedAttentionScoreReduceValues[lane] + batchedAttentionScoreReduceValues[lane + stride];
+    }
+    workgroupBarrier();
+  }
+  let sum = batchedAttentionScoreReduceValues[0];
+  for (var keyToken = lane; keyToken < params.keyValueTokenCount; keyToken = keyToken + 256u) {
+    let index = probabilityOffset + keyToken;
+    if (sum != 0.0) {
+      probabilityValues[index] = probabilityValues[index] / sum;
+    }
+  }
+}
+`;
+
+export const BATCHED_FULL_ATTENTION_APPLY_WGSL = `
+struct Params {
+  scale: f32,
+  valueSize: u32,
+  queryHeadCount: u32,
+  keyValueHeadCount: u32,
+  keyValueTokenCount: u32,
+  contextLength: u32,
+  probabilityTokenCapacity: u32,
+  slidingWindow: u32,
+  hasSlidingWindow: u32,
+  tokenCount: u32,
+  causal: u32,
+  _pad0: u32,
+};
+
+@group(0) @binding(0) var<storage, read> valueValues: array<f32>;
+@group(0) @binding(1) var<storage, read> probabilityValues: array<f32>;
+@group(0) @binding(2) var<storage, read> positions: array<u32>;
+@group(0) @binding(3) var<uniform> params: Params;
+@group(0) @binding(4) var<storage, read_write> outputValues: array<f32>;
+
+fn batchedApplyAllowed(queryPosition: u32, keyToken: u32) -> bool {
+  if (params.causal != 0u && keyToken > queryPosition) {
+    return false;
+  }
+  if (params.hasSlidingWindow != 0u && keyToken + params.slidingWindow <= queryPosition) {
+    return false;
+  }
+  return keyToken < params.keyValueTokenCount;
+}
+
+var<workgroup> batchedAttentionApplyValues: array<f32, 256>;
+
+@compute @workgroup_size(256, 1, 1)
+fn main(@builtin(workgroup_id) workgroupId: vec3<u32>, @builtin(local_invocation_id) localId: vec3<u32>) {
+  let qHead = workgroupId.x;
+  let dim = workgroupId.y;
+  let token = workgroupId.z;
+  let lane = localId.x;
+  if (qHead >= params.queryHeadCount || dim >= params.valueSize || token >= params.tokenCount) {
+    return;
+  }
+  let groupSize = params.queryHeadCount / params.keyValueHeadCount;
+  let kvHead = qHead / groupSize;
+  let queryPosition = positions[token];
+  let probabilityOffset = (token * params.queryHeadCount + qHead) * params.probabilityTokenCapacity;
+  var weighted = 0.0;
+  for (var keyToken = lane; keyToken < params.keyValueTokenCount; keyToken = keyToken + 256u) {
+    if (batchedApplyAllowed(queryPosition, keyToken)) {
+      let probability = probabilityValues[probabilityOffset + keyToken];
+      let valueIndex = (dim * params.keyValueHeadCount + kvHead) * params.contextLength + keyToken;
+      weighted = weighted + probability * valueValues[valueIndex];
+    }
+  }
+  batchedAttentionApplyValues[lane] = weighted;
+  workgroupBarrier();
+  for (var stride = 128u; stride > 0u; stride = stride / 2u) {
+    if (lane < stride) {
+      batchedAttentionApplyValues[lane] = batchedAttentionApplyValues[lane] + batchedAttentionApplyValues[lane + stride];
+    }
+    workgroupBarrier();
+  }
+  if (lane == 0u) {
+    let outputIndex = token * params.queryHeadCount * params.valueSize + qHead * params.valueSize + dim;
+    outputValues[outputIndex] = batchedAttentionApplyValues[0];
   }
 }
 `;
