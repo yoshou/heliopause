@@ -70,13 +70,10 @@ export {
   createModelSession,
   estimateWeightCacheBytes,
   ModelSession,
-  resolvePreprocessProviders,
   type CacheStats,
-  type ExecutionProviderConfig,
   type ForwardTrace,
   type FullAttentionCache,
   type InferenceState,
-  type ModelInput,
   type ModelSessionOptions,
   type TimingEvent,
   type TimingPhase,
@@ -157,6 +154,7 @@ export {
   createWasmProvider,
   WasmSegmentRunner,
   type WasmHiddenResult,
+  type WasmProviderOptions,
   type WasmSegmentRunnerOptions,
 } from "./runner/wasm/index";
 
@@ -170,12 +168,17 @@ export {
   createWebGpuProvider,
   WebGpuSegmentRunner,
   type WebGpuRuntimeStats,
+  type WebGpuProviderOptions,
   type WebGpuSegmentRunnerOptions,
   type WebGpuSupport,
 } from "./runner/webgpu/index";
 
 export type {
+  AudioRunnerProvider,
+  ModelRunnerProvider,
+  MultimodalRunnerProvider,
   RunnerProvider,
+  VisionRunnerProvider,
 } from "./runner/provider";
 
 export type {

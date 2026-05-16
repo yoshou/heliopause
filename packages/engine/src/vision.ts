@@ -4,12 +4,7 @@ import {
 } from "./model";
 import type {
   CacheStats,
-  ExecutionProviderConfig,
   ExecutionProviderStats,
-} from "./runtime";
-import {
-  resolveSessionExecutionProviders,
-  resolvePreprocessProviders,
 } from "./runtime";
 import {
   dispatchVisionEncoder,
@@ -21,7 +16,15 @@ import type {
 } from "./runner/vision-runner";
 import type {
   RunnerProvider,
+  VisionRunnerProvider,
 } from "./runner/provider";
+import {
+  resolveProviderOrder,
+  validateProviderList,
+} from "./runner/provider";
+import type {
+  SegmentRunnerProvider,
+} from "./runner/segment-runner";
 import {
   GgufTensorReader,
 } from "./tensor-reader";
@@ -51,18 +54,16 @@ export type VisionEncodeResult = {
 
 export type VisionSessionOptions = {
   maxWeightCacheBytes?: number;
-  executionProviders?: readonly ExecutionProviderConfig[];
-  preprocessProviders?: readonly ExecutionProviderConfig[];
-  runnerProviders?: readonly RunnerProvider[];
-  visionRunners?: readonly VisionRunners[];
+  providers: readonly VisionRunnerProvider[];
+  preprocessProviderOrder?: readonly SegmentRunnerProvider[];
 };
 
 export class VisionSession {
   readonly tensorReader: GgufTensorReader;
   readonly manifest: VisionManifest;
   readonly epsilon: number;
-  readonly executionProviders: readonly ExecutionProviderConfig[];
-  readonly preprocessProviders: readonly ExecutionProviderConfig[];
+  readonly providers: readonly VisionRunnerProvider[];
+  readonly preprocessProviders: readonly VisionRunnerProvider[];
   readonly visionRunners: readonly VisionRunners[];
 
   private readonly maxWeightCacheBytes: number;
@@ -75,14 +76,14 @@ export class VisionSession {
   private weightCacheMisses = 0;
   private weightCacheEvictions = 0;
 
-  constructor(tensorReader: GgufTensorReader, options: VisionSessionOptions = {}) {
+  constructor(tensorReader: GgufTensorReader, options: VisionSessionOptions) {
     this.tensorReader = tensorReader;
     this.manifest = buildVisionManifest(tensorReader.metadata);
     this.epsilon = this.manifest.layerNormEpsilon;
     this.maxWeightCacheBytes = options.maxWeightCacheBytes ?? 256 * 1024 * 1024;
-    this.executionProviders = resolveSessionExecutionProviders(options);
-    this.preprocessProviders = resolvePreprocessProviders(this.executionProviders, options.preprocessProviders);
-    this.visionRunners = options.visionRunners ?? createVisionRunners(options.runnerProviders ?? []);
+    this.providers = validateProviderList(options.providers, "createVisionRunners");
+    this.preprocessProviders = resolveProviderOrder(this.providers, options.preprocessProviderOrder);
+    this.visionRunners = createVisionRunners(this.providers);
   }
 
   getTensor(name: string) {
@@ -140,8 +141,12 @@ export class VisionSession {
     };
   }
 
-  executionProvider(name: string): ExecutionProviderConfig | undefined {
-    return this.executionProviders.find((provider) => provider.name === name);
+  provider<TProvider extends RunnerProvider = RunnerProvider>(name: SegmentRunnerProvider): TProvider | undefined {
+    return this.providers.find((provider) => provider.name === name) as TProvider | undefined;
+  }
+
+  hasProvider(name: SegmentRunnerProvider): boolean {
+    return this.provider(name) !== undefined;
   }
 
   setExecutionProviderStatsProvider(
@@ -194,7 +199,7 @@ export class VisionSession {
 
 export function createVisionSession(
   tensorReader: GgufTensorReader,
-  options: VisionSessionOptions = {},
+  options: VisionSessionOptions,
 ): VisionSession {
   return new VisionSession(tensorReader, options);
 }
@@ -289,10 +294,8 @@ export async function runVisionEncoder(
   return dispatchVisionEncoder(session.visionRunners, session, pixels);
 }
 
-function createVisionRunners(providers: readonly RunnerProvider[]): readonly VisionRunners[] {
-  return providers
-    .map((provider) => provider.createVisionRunners?.())
-    .filter((runner): runner is VisionRunners => runner !== undefined);
+function createVisionRunners(providers: readonly VisionRunnerProvider[]): readonly VisionRunners[] {
+  return providers.map((provider) => provider.createVisionRunners());
 }
 
 function imageBitmapToRgba(bitmap: ImageBitmap): Uint8ClampedArray {

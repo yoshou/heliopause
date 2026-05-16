@@ -35,6 +35,9 @@ import {
   visionRope2dNeoxWasm,
   visionStdNormalizeWasm,
 } from "./wasm-kernels";
+import type {
+  WasmConfiguredProvider,
+} from "./options";
 
 type VisionWasmWeightCache = {
   handles: Map<string, WasmQuantizedWeightHandle>;
@@ -100,7 +103,7 @@ export async function runWasmVisionEncoder(
 }
 
 function requireWasmProvider(session: VisionSession): void {
-  if (!session.executionProvider("wasm")) {
+  if (!session.hasProvider("wasm")) {
     throw new Error("Vision WASM execution requires an enabled wasm provider.");
   }
 }
@@ -117,17 +120,17 @@ export function releaseWasmVisionEncoder(session: VisionSession): void {
 }
 
 function visionResidentWeightCacheEnabled(session: VisionSession): boolean {
-  const provider = session.executionProvider("wasm");
+  const provider = session.provider<WasmConfiguredProvider>("wasm");
   return provider?.options?.residentWeightCache === true;
 }
 
 function visionProjectionBatchingEnabled(session: VisionSession): boolean {
-  const provider = session.executionProvider("wasm");
+  const provider = session.provider<WasmConfiguredProvider>("wasm");
   return provider !== undefined && provider.options?.projectionBatching !== false;
 }
 
 function visionWasmKernelsEnabled(session: VisionSession): boolean {
-  return session.executionProvider("wasm") !== undefined;
+  return session.hasProvider("wasm");
 }
 
 function residentWeightCache(session: VisionSession): VisionWasmWeightCache {

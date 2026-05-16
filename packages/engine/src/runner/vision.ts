@@ -32,6 +32,7 @@ export async function dispatchVisionPreprocessor(
     if (result) {
       return result;
     }
+    throw new Error(`Vision preprocess provider ${provider.name} did not return a result.`);
   }
   throw new Error("No vision preprocessor provider was selected.");
 }
@@ -41,7 +42,7 @@ export async function dispatchVisionEncoder(
   session: VisionSession,
   pixels: VisionPixelValues,
 ): Promise<VisionEncodeResult> {
-  for (const provider of session.executionProviders) {
+  for (const provider of session.providers) {
     const runner = visionEncoderRunner(runners, provider.name);
     return runner.run(session, pixels);
   }

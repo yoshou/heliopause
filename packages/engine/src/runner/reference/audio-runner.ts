@@ -68,7 +68,7 @@ export async function runReferenceAudioEncoder(
 }
 
 function requireReferenceProvider(session: AudioSession): void {
-  if (!session.executionProvider("reference")) {
+  if (!session.hasProvider("reference")) {
     throw new Error("Audio reference execution requires an enabled reference provider.");
   }
 }

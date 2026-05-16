@@ -22,11 +22,10 @@ import {
   runAudioPreprocessor,
   runVisionPreprocessor,
   runVisionEncoder,
-  type ExecutionProviderConfig,
   type AudioSession,
   type InferenceState,
   type ModelSession,
-  type RunnerProvider,
+  type MultimodalRunnerProvider,
   type Tokenizer,
   type VisionSession,
 } from "@heliopause/engine";
@@ -105,10 +104,9 @@ async function handleLoadModel(
     estimatedWeightCacheBytes,
     request.memoryInfo,
   );
-  const executionProviders = await resolveExecutionProviders(
+  const providers = await resolveRunnerProviders(
     runtimeProfile,
   );
-  const runnerProviders = instantiateRunnerProviderList(executionProviders);
   if (request.visionFile) {
     const visionReader = await createFileGgufTensorReader(request.visionFile);
     if (!isVisionGguf(visionReader.metadata) && !isAudioGguf(visionReader.metadata)) {
@@ -117,23 +115,20 @@ async function handleLoadModel(
     if (isVisionGguf(visionReader.metadata)) {
       nextVisionSession = createVisionSession(visionReader, {
         maxWeightCacheBytes: runtimeProfile.maxWeightCacheBytes,
-        executionProviders,
-        runnerProviders,
+        providers,
       });
     }
     if (isAudioGguf(visionReader.metadata)) {
       nextAudioSession = createAudioSession(visionReader, {
         maxWeightCacheBytes: runtimeProfile.maxWeightCacheBytes,
-        executionProviders,
-        runnerProviders,
+        providers,
       });
     }
   }
   const nextSession = createChatSession(tensorReader, {
     maxContextLength: CHAT_CONTEXT_LENGTH,
     maxWeightCacheBytes: runtimeProfile.maxWeightCacheBytes,
-    executionProviders,
-    runnerProviders,
+    providers,
   });
   const nextTokenizer = buildTokenizer(tensorReader.metadata);
 
@@ -166,31 +161,14 @@ async function handleLoadModel(
   });
 }
 
-function instantiateRunnerProviderList(
-  executionProviders: readonly ExecutionProviderConfig[],
-): readonly RunnerProvider[] {
-  return executionProviders.map((provider) => {
-    switch (provider.name) {
-      case "webgpu":
-        return createWebGpuProvider();
-      case "wasm":
-        return createWasmProvider();
-      case "reference":
-        return createReferenceProvider();
-      default:
-        throw new Error(`Unsupported execution provider: ${provider.name}`);
-    }
-  });
-}
-
-async function resolveExecutionProviders(
+async function resolveRunnerProviders(
   runtimeProfile: ResolvedRuntimeProfile,
-): Promise<ExecutionProviderConfig[]> {
-  const providers: ExecutionProviderConfig[] = [];
+): Promise<MultimodalRunnerProvider[]> {
+  const providers: MultimodalRunnerProvider[] = [];
   const webGpuSupport = await checkWebGpuSupport();
   if (webGpuSupport.available) {
     runtimeProfile.webGpuStatus = "enabled";
-    providers.push({ name: "webgpu" });
+    providers.push(createWebGpuProvider());
   } else {
     runtimeProfile.webGpuStatus = "blocked";
     runtimeProfile.webGpuUnavailableReason = webGpuSupport.reason;
@@ -199,26 +177,23 @@ async function resolveExecutionProviders(
   const wasmSupport = await checkWasmSupport();
   if (wasmSupport.available) {
     runtimeProfile.wasmStatus = "enabled";
-    providers.push({
-      name: "wasm",
-      options: {
-        projectionBatching: true,
-        residentWeightCache: runtimeProfile.wasmResidentWeightCache,
-        parallelResidentMatmul: runtimeProfile.wasmResidentWeightCache,
-        parallelMatmulMinRows: 512,
-        threadPoolSize: runtimeProfile.wasmResidentWeightCache ? "auto" : 1,
-        ioPrefetch: runtimeProfile.wasmResidentWeightCache,
-        ioPrefetchConcurrency: "auto",
-        ioWorkerBlobRead: false,
-      },
-    });
+    providers.push(createWasmProvider({
+      projectionBatching: true,
+      residentWeightCache: runtimeProfile.wasmResidentWeightCache,
+      parallelResidentMatmul: runtimeProfile.wasmResidentWeightCache,
+      parallelMatmulMinRows: 512,
+      threadPoolSize: runtimeProfile.wasmResidentWeightCache ? "auto" : 1,
+      ioPrefetch: runtimeProfile.wasmResidentWeightCache,
+      ioPrefetchConcurrency: "auto",
+      ioWorkerBlobRead: false,
+    }));
   } else {
     runtimeProfile.wasmStatus = "unavailable";
     runtimeProfile.wasmUnavailableReason = wasmSupport.reason;
   }
 
-  providers.push({ name: "reference" });
-  runtimeProfile.executionProviders = providers.map((provider) => provider.name);
+  providers.push(createReferenceProvider());
+  runtimeProfile.providerNames = providers.map((provider) => provider.name);
   return providers;
 }
 
@@ -242,7 +217,7 @@ async function handleGenerateTurn(
       throw new Error("Chat state was not initialized.");
     }
 
-    const workingState = session.executionProvider("webgpu")
+    const workingState = session.hasProvider("webgpu")
       ? currentState
       : cloneInferenceState(currentState);
     activeGeneration.workingState = workingState;
@@ -398,7 +373,7 @@ function resolveRuntimeProfile(
     estimatedWeightCacheBytes,
     wasmResidentWeightCache: resolved === "full",
     webGpuStatus: "blocked",
-    executionProviders: [],
+    providerNames: [],
     wasmStatus: "unavailable",
     availableMemoryBytes,
   };

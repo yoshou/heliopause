@@ -48,7 +48,7 @@ export class ReferenceSegmentRunner implements SegmentRunner {
     }
     if (
       this.segmentEndLayerExclusive > this.segmentStartLayer &&
-      !options.session.executionProvider("reference")
+      !options.session.hasProvider("reference")
     ) {
       throw new Error("Reference segment execution requires an enabled reference provider.");
     }

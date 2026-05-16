@@ -84,7 +84,7 @@ export async function runReferenceVisionEncoder(
 }
 
 function requireReferenceProvider(session: VisionSession): void {
-  if (!session.executionProvider("reference")) {
+  if (!session.hasProvider("reference")) {
     throw new Error("Vision reference execution requires an enabled reference provider.");
   }
 }

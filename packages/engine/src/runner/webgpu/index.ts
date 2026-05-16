@@ -18,12 +18,13 @@ import {
   WebGpuOutputNode,
 } from "./nodes";
 import type {
-  RunnerProvider,
+  MultimodalRunnerProvider,
 } from "../provider";
 import {
   createWebGpuModelRunner,
 } from "./model-runner";
 import {
+  type WebGpuProviderOptions,
   webGpuExecutionProviderOptions,
 } from "./execution-provider";
 import {
@@ -57,9 +58,13 @@ export function createWebGpuVisionRunners() {
   };
 }
 
-export function createWebGpuProvider(): RunnerProvider {
+export function createWebGpuProvider(options: WebGpuProviderOptions = {}): MultimodalRunnerProvider & {
+  readonly name: "webgpu";
+  readonly options: Readonly<WebGpuProviderOptions>;
+} {
   return {
     name: "webgpu",
+    options: { ...options },
     createModelRunner: createWebGpuModelRunner,
     createModelGraphRunner: createWebGpuGraphRunner,
     planModelPlacement: (session, options) => {
@@ -81,6 +86,10 @@ export type {
   WebGpuSmokeTest,
   WebGpuSupport,
 } from "./gpu-types";
+export type {
+  WebGpuProviderOptions,
+} from "./execution-provider";
+
 export type {
   WebGpuHiddenResult,
   WebGpuRuntimeStats,

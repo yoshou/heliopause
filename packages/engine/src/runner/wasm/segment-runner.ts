@@ -54,7 +54,7 @@ export class WasmSegmentRunner implements SegmentRunner {
     }
     if (
       this.segmentEndLayerExclusive > this.segmentStartLayer &&
-      !this.session.executionProvider("wasm")
+      !this.session.hasProvider("wasm")
     ) {
       throw new Error("WASM segment execution requires an enabled wasm provider.");
     }

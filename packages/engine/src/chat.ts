@@ -126,7 +126,7 @@ export async function createFileGgufTensorReader(
 
 export function createChatSession(
   tensorReader: GgufTensorReader,
-  options: ModelSessionOptions = {},
+  options: ModelSessionOptions,
 ): ModelSession {
   return createModelSession(tensorReader, options);
 }

@@ -17,10 +17,8 @@ import {
   type ForwardTrace,
   type FullAttentionCache,
   type InferenceState,
-  type ModelInput,
   type ModelSession,
   type OutputResult,
-  modelSession,
   requiredFullAttentionCache,
   timedAsync,
   timedSync,
@@ -54,11 +52,10 @@ export type PreparedInput = {
 };
 
 export async function prepareInput(
-  model: ModelInput,
+  session: ModelSession,
   tokenIds: readonly number[],
   trace?: ForwardTrace,
 ): Promise<PreparedInput> {
-  const session = modelSession(model);
   const manifest = session.manifest;
   const tokenCount = tokenIds.length;
   const hidden = await timedAsync(trace, "embedding read", async () => {
@@ -111,11 +108,10 @@ export async function prepareInput(
 }
 
 export async function preparePreparedHiddenInput(
-  model: ModelInput,
+  session: ModelSession,
   hidden: Float32Array,
   trace?: ForwardTrace,
 ): Promise<PreparedInput> {
-  const session = modelSession(model);
   const manifest = session.manifest;
   const tokenCount = hidden.length / manifest.embeddingLength;
   if (!Number.isInteger(tokenCount)) {
@@ -163,18 +159,17 @@ export async function preparePreparedHiddenInput(
 }
 
 export async function forwardAttentionLayer(
-  model: ModelInput,
+  session: ModelSession,
   manifest: ModelManifest,
   state: InferenceState,
   layer: number,
   input: Float32Array,
   positions: Int32Array,
   perLayerInputs?: Float32Array,
-  epsilon = modelSession(model).epsilon,
+  epsilon = session.epsilon,
   trace?: ForwardTrace,
   attentionCausal = true,
 ): Promise<Float32Array> {
-  const session = modelSession(model);
   const kind = manifest.layerKinds[layer] ?? "sliding-attention";
   const cacheLayer = manifest.layerHasKv[layer] ? layer : manifest.kvSourceLayers[layer] ?? layer;
   const cache = requiredFullAttentionCache(state, cacheLayer);
@@ -367,14 +362,13 @@ export async function forwardAttentionLayer(
 export const forwardFullAttentionLayer = forwardAttentionLayer;
 
 export async function forwardOutput(
-  model: ModelInput,
+  session: ModelSession,
   hidden: Float32Array,
   options: {
     topK?: number;
     trace?: ForwardTrace;
   } = {},
 ): Promise<OutputResult> {
-  const session = modelSession(model);
   const norm = await timedAsync(
     options.trace,
     "final norm",

@@ -22,6 +22,9 @@ import {
   createAudioLogMelResources,
   createAudioWindowFramesResources,
 } from "./audio-kernel-resources";
+import type {
+  WebGpuConfiguredProvider,
+} from "./execution-provider";
 
 type AudioPreprocessStats = {
   attempts: number;
@@ -30,7 +33,7 @@ type AudioPreprocessStats = {
 
 type AudioPreprocessSession = Pick<
   AudioSession,
-  "manifest" | "executionProvider" | "setExecutionProviderStatsProvider" | "addDisposeCallback"
+  "manifest" | "provider" | "setExecutionProviderStatsProvider" | "addDisposeCallback"
 >;
 
 type AudioPreprocessConfig = Pick<
@@ -100,10 +103,10 @@ async function createAudioPreprocessRunner(
   if (!device) {
     throw new Error("WebGPU is not available for audio preprocessing.");
   }
-  const options = session.executionProvider("webgpu")?.options;
+  const options = session.provider<WebGpuConfiguredProvider>("webgpu")?.options;
   const arena = new GpuMemoryArena(
     device,
-    numberOption(options, "memoryLimitBytes") ?? WEBGPU_MEMORY_LIMIT_BYTES,
+    options?.memoryLimitBytes ?? WEBGPU_MEMORY_LIMIT_BYTES,
   );
   const runner = new WebGpuAudioPreprocessRunner(session, arena);
   session.addDisposeCallback(() => runner.dispose());

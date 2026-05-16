@@ -4,11 +4,12 @@ import test from "node:test";
 import {
   buildModelManifest,
   createModelSession,
+  createReferenceProvider,
   createWasmProvider,
   createWebGpuProvider,
   GgufTensorReader,
   prefill,
-  type RunnerProvider,
+  type ModelRunnerProvider,
 } from "../src/index.ts";
 import {
   cpuRunnerBuffer,
@@ -137,7 +138,7 @@ test("WASM-only forward graph produces fixed logits for synthetic tensors", asyn
     ])),
   ]);
   const session = createModelSession(reader, {
-    executionProviders: [{ name: "wasm" }],
+    providers: [createWasmProvider()],
   });
   const state = session.createInferenceState();
   const tokenIds = [2];
@@ -204,8 +205,7 @@ test("prefill follows planned provider graph instead of a full primary segment",
     },
   });
   const session = createModelSession(reader, {
-    executionProviders: [{ name: "webgpu" }, { name: "wasm" }],
-    runnerProviders: [
+    providers: [
       fakeProvider("webgpu", executed, [
         { kind: "embedding", provider: "wasm" },
         {
@@ -256,8 +256,7 @@ test("prefill keeps WebGPU-only planned graph on WebGPU", async () => {
     },
   });
   const session = createModelSession(reader, {
-    executionProviders: [{ name: "webgpu" }, { name: "wasm" }],
-    runnerProviders: [
+    providers: [
       fakeProvider("webgpu", executed, [
         { kind: "embedding", provider: "webgpu" },
         {
@@ -300,7 +299,7 @@ function fakeProvider(
   name: "wasm" | "webgpu",
   executed: string[],
   planNodes?: RunnerNodePlacement[],
-): RunnerProvider {
+): ModelRunnerProvider {
   const hidden = () => new Float32Array([1, 0, 0, 0]);
   const hiddenNode = (id: string, deps: string[] = []): ForwardRunnerNode => ({
     id,
@@ -400,7 +399,7 @@ function tensorReaderFromGguf(gguf: ReturnType<typeof minimalGguf>) {
 
 function emptyContext(): ForwardGraphContext {
   const reader = tensorReaderFromTensors([]);
-  const session = createModelSession(reader);
+  const session = createModelSession(reader, { providers: [createReferenceProvider()] });
   return {
     session,
     manifest: session.manifest,
@@ -478,7 +477,7 @@ function maybeLayerSegmentNode(
 }
 
 function requireModelGraphRunner(
-  provider: RunnerProvider,
+  provider: ModelRunnerProvider,
   name: string,
 ): ModelGraphRunner {
   const graph = provider.createModelGraphRunner?.();

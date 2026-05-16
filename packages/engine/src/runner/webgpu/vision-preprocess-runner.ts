@@ -16,6 +16,9 @@ import type { WebGpuBufferLike } from "./gpu-types";
 import {
   createVisionPreprocessRgbaResources,
 } from "./vision-kernel-resources";
+import type {
+  WebGpuConfiguredProvider,
+} from "./execution-provider";
 
 type VisionPreprocessStats = {
   attempts: number;
@@ -24,7 +27,7 @@ type VisionPreprocessStats = {
 
 type VisionPreprocessSession = Pick<
   VisionSession,
-  "manifest" | "executionProvider" | "setExecutionProviderStatsProvider" | "addDisposeCallback"
+  "manifest" | "provider" | "setExecutionProviderStatsProvider" | "addDisposeCallback"
 >;
 
 type VisionPreprocessRunBuffers = {
@@ -96,10 +99,10 @@ async function createVisionPreprocessRunner(
   if (!device) {
     throw new Error("WebGPU is not available for vision preprocessing.");
   }
-  const options = session.executionProvider("webgpu")?.options;
+  const options = session.provider<WebGpuConfiguredProvider>("webgpu")?.options;
   const arena = new GpuMemoryArena(
     device,
-    numberOption(options, "memoryLimitBytes") ?? WEBGPU_MEMORY_LIMIT_BYTES,
+    options?.memoryLimitBytes ?? WEBGPU_MEMORY_LIMIT_BYTES,
   );
   const runner = new WebGpuVisionPreprocessRunner(session, arena);
   session.addDisposeCallback(() => runner.dispose());

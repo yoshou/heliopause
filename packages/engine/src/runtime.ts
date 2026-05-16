@@ -14,8 +14,15 @@ import {
   type ModelManifest,
 } from "./model";
 import type {
+  ModelRunnerProvider,
   RunnerProvider,
 } from "./runner/provider";
+import {
+  validateProviderList,
+} from "./runner/provider";
+import type {
+  SegmentRunnerProvider,
+} from "./runner/segment-runner";
 
 export type FullAttentionCache = {
   key: Float32Array;
@@ -38,38 +45,8 @@ export type OutputResult = {
 export type ModelSessionOptions = {
   maxContextLength?: number;
   maxWeightCacheBytes?: number;
-  executionProviders?: readonly ExecutionProviderConfig[];
-  runnerProviders?: readonly RunnerProvider[];
+  providers: readonly ModelRunnerProvider[];
 };
-
-export type ExecutionProviderConfig = {
-  name: string;
-  options?: Readonly<Record<string, unknown>>;
-};
-
-export function resolvePreprocessProviders(
-  executionProviders: readonly ExecutionProviderConfig[],
-  preprocessProviders: readonly ExecutionProviderConfig[] | undefined,
-): readonly ExecutionProviderConfig[] {
-  if (preprocessProviders) {
-    return preprocessProviders.map(copyExecutionProviderConfig);
-  }
-
-  return executionProviders.map(copyExecutionProviderConfig);
-}
-
-export function resolveSessionExecutionProviders(
-  options: Pick<ModelSessionOptions, "executionProviders">,
-): readonly ExecutionProviderConfig[] {
-  return (options.executionProviders ?? [{ name: "reference" }]).map(copyExecutionProviderConfig);
-}
-
-function copyExecutionProviderConfig(provider: ExecutionProviderConfig): ExecutionProviderConfig {
-  return {
-    name: provider.name,
-    options: provider.options ? { ...provider.options } : undefined,
-  };
-}
 
 export type TimingPhase = "prefill" | "decode";
 
@@ -111,8 +88,7 @@ export class ModelSession {
 
   private readonly maxContextLength?: number;
   private readonly maxWeightCacheBytes: number;
-  readonly executionProviders: readonly ExecutionProviderConfig[];
-  readonly runnerProviders: readonly RunnerProvider[];
+  readonly providers: readonly ModelRunnerProvider[];
   private readonly f32TensorCache = new Map<string, Float32Array>();
   private readonly weightBytesCache = new Map<string, Uint8Array>();
   private readonly embeddingRowCache = new Map<number, Float32Array>();
@@ -124,7 +100,7 @@ export class ModelSession {
 
   constructor(
     tensorReader: GgufTensorReader,
-    options: ModelSessionOptions = {},
+    options: ModelSessionOptions,
   ) {
     this.tensorReader = tensorReader;
     this.manifest = buildModelManifest(tensorReader.metadata);
@@ -134,8 +110,7 @@ export class ModelSession {
     );
     this.maxContextLength = options.maxContextLength;
     this.maxWeightCacheBytes = options.maxWeightCacheBytes ?? 256 * 1024 * 1024;
-    this.executionProviders = resolveSessionExecutionProviders(options);
-    this.runnerProviders = options.runnerProviders ?? [];
+    this.providers = validateProviderList(options.providers, "createModelRunner");
   }
 
   createInferenceState(): InferenceState {
@@ -237,8 +212,12 @@ export class ModelSession {
     this.executionProviderStatsProviders.set(name, provider);
   }
 
-  executionProvider(name: string): ExecutionProviderConfig | undefined {
-    return this.executionProviders.find((provider) => provider.name === name);
+  provider<TProvider extends RunnerProvider = RunnerProvider>(name: SegmentRunnerProvider): TProvider | undefined {
+    return this.providers.find((provider) => provider.name === name) as TProvider | undefined;
+  }
+
+  hasProvider(name: SegmentRunnerProvider): boolean {
+    return this.provider(name) !== undefined;
   }
 
   private executionProviderStats(): ExecutionProviderStats {
@@ -279,12 +258,10 @@ export function estimateWeightCacheBytes(tensorReader: GgufTensorReader): number
 
 export function createModelSession(
   tensorReader: GgufTensorReader,
-  options: ModelSessionOptions = {},
+  options: ModelSessionOptions,
 ): ModelSession {
   return new ModelSession(tensorReader, options);
 }
-
-export type ModelInput = GgufTensorReader | ModelSession;
 
 export function createInferenceState(
   manifest: ModelManifest,
@@ -326,12 +303,6 @@ export function cloneInferenceState(state: InferenceState): InferenceState {
     contextLength: state.contextLength,
     nextPosition: state.nextPosition,
   };
-}
-
-export function modelSession(model: ModelInput): ModelSession {
-  return model instanceof ModelSession
-    ? model
-    : new ModelSession(model);
 }
 
 export function requiredMetadataNumber(tensorReader: GgufTensorReader, key: string): number {

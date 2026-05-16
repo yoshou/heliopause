@@ -38,6 +38,9 @@ import {
   type QuantizedMatMulInput,
   type WasmQuantizedWeightHandle,
 } from "./wasm-kernels";
+import type {
+  WasmConfiguredProvider,
+} from "./options";
 
 type AudioWasmWeightCache = {
   handles: Map<string, WasmQuantizedWeightHandle>;
@@ -65,17 +68,17 @@ export function releaseWasmAudioEncoder(session: AudioSession): void {
 }
 
 function audioResidentWeightCacheEnabled(session: AudioSession): boolean {
-  const provider = session.executionProvider("wasm");
+  const provider = session.provider<WasmConfiguredProvider>("wasm");
   return provider?.options?.residentWeightCache === true;
 }
 
 function audioProjectionBatchingEnabled(session: AudioSession): boolean {
-  const provider = session.executionProvider("wasm");
+  const provider = session.provider<WasmConfiguredProvider>("wasm");
   return provider !== undefined && provider.options?.projectionBatching !== false;
 }
 
 function audioWasmKernelsEnabled(session: AudioSession): boolean {
-  return session.executionProvider("wasm") !== undefined;
+  return session.hasProvider("wasm");
 }
 
 function residentWeightCache(session: AudioSession): AudioWasmWeightCache {
@@ -163,7 +166,7 @@ export async function runWasmAudioEncoder(
 }
 
 function requireWasmProvider(session: AudioSession): void {
-  if (!session.executionProvider("wasm")) {
+  if (!session.hasProvider("wasm")) {
     throw new Error("Audio WASM execution requires an enabled wasm provider.");
   }
 }

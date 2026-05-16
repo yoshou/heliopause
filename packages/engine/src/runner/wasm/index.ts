@@ -2,8 +2,11 @@ import type {
   ModelRunner,
 } from "../model-runner";
 import type {
-  RunnerProvider,
+  MultimodalRunnerProvider,
 } from "../provider";
+import type {
+  WasmProviderOptions,
+} from "./options";
 import {
   wasmOutput,
   wasmSegmentRunner,
@@ -51,9 +54,13 @@ export function createWasmModelRunner(): ModelRunner {
   };
 }
 
-export function createWasmProvider(): RunnerProvider {
+export function createWasmProvider(options: WasmProviderOptions = {}): MultimodalRunnerProvider & {
+  readonly name: "wasm";
+  readonly options: Readonly<WasmProviderOptions>;
+} {
   return {
     name: "wasm",
+    options: { ...options },
     createModelRunner: createWasmModelRunner,
     createModelGraphRunner: () => createWasmModelRunner().graph as NonNullable<ModelRunner["graph"]>,
     createAudioRunners: createWasmAudioRunners,
@@ -76,6 +83,10 @@ export function createWasmVisionRunners() {
 }
 
 export { WasmSegmentRunner } from "./segment-runner";
+export type {
+  WasmProviderOptions,
+} from "./options";
+
 export type {
   WasmHiddenResult,
   WasmSegmentRunnerOptions,

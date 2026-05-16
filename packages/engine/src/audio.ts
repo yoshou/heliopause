@@ -4,12 +4,7 @@ import {
 } from "./model";
 import type {
   CacheStats,
-  ExecutionProviderConfig,
   ExecutionProviderStats,
-} from "./runtime";
-import {
-  resolveSessionExecutionProviders,
-  resolvePreprocessProviders,
 } from "./runtime";
 import {
   dispatchAudioEncoder,
@@ -20,8 +15,16 @@ import type {
   AudioPreprocessOptions,
 } from "./runner/audio-runner";
 import type {
+  AudioRunnerProvider,
   RunnerProvider,
 } from "./runner/provider";
+import {
+  resolveProviderOrder,
+  validateProviderList,
+} from "./runner/provider";
+import type {
+  SegmentRunnerProvider,
+} from "./runner/segment-runner";
 import {
   GgufTensorReader,
 } from "./tensor-reader";
@@ -52,18 +55,16 @@ export type AudioEncodeResult = {
 
 export type AudioSessionOptions = {
   maxWeightCacheBytes?: number;
-  executionProviders?: readonly ExecutionProviderConfig[];
-  preprocessProviders?: readonly ExecutionProviderConfig[];
-  runnerProviders?: readonly RunnerProvider[];
-  audioRunners?: readonly AudioRunners[];
+  providers: readonly AudioRunnerProvider[];
+  preprocessProviderOrder?: readonly SegmentRunnerProvider[];
 };
 
 export class AudioSession {
   readonly tensorReader: GgufTensorReader;
   readonly manifest: AudioManifest;
   readonly epsilon: number;
-  readonly executionProviders: readonly ExecutionProviderConfig[];
-  readonly preprocessProviders: readonly ExecutionProviderConfig[];
+  readonly providers: readonly AudioRunnerProvider[];
+  readonly preprocessProviders: readonly AudioRunnerProvider[];
   readonly audioRunners: readonly AudioRunners[];
 
   private readonly maxWeightCacheBytes: number;
@@ -76,14 +77,14 @@ export class AudioSession {
   private weightCacheMisses = 0;
   private weightCacheEvictions = 0;
 
-  constructor(tensorReader: GgufTensorReader, options: AudioSessionOptions = {}) {
+  constructor(tensorReader: GgufTensorReader, options: AudioSessionOptions) {
     this.tensorReader = tensorReader;
     this.manifest = buildAudioManifest(tensorReader.metadata);
     this.epsilon = this.manifest.layerNormEpsilon;
     this.maxWeightCacheBytes = options.maxWeightCacheBytes ?? 256 * 1024 * 1024;
-    this.executionProviders = resolveSessionExecutionProviders(options);
-    this.preprocessProviders = resolvePreprocessProviders(this.executionProviders, options.preprocessProviders);
-    this.audioRunners = options.audioRunners ?? createAudioRunners(options.runnerProviders ?? []);
+    this.providers = validateProviderList(options.providers, "createAudioRunners");
+    this.preprocessProviders = resolveProviderOrder(this.providers, options.preprocessProviderOrder);
+    this.audioRunners = createAudioRunners(this.providers);
   }
 
   getTensor(name: string) {
@@ -141,8 +142,12 @@ export class AudioSession {
     };
   }
 
-  executionProvider(name: string): ExecutionProviderConfig | undefined {
-    return this.executionProviders.find((provider) => provider.name === name);
+  provider<TProvider extends RunnerProvider = RunnerProvider>(name: SegmentRunnerProvider): TProvider | undefined {
+    return this.providers.find((provider) => provider.name === name) as TProvider | undefined;
+  }
+
+  hasProvider(name: SegmentRunnerProvider): boolean {
+    return this.provider(name) !== undefined;
   }
 
   setExecutionProviderStatsProvider(
@@ -195,7 +200,7 @@ export class AudioSession {
 
 export function createAudioSession(
   tensorReader: GgufTensorReader,
-  options: AudioSessionOptions = {},
+  options: AudioSessionOptions,
 ): AudioSession {
   return new AudioSession(tensorReader, options);
 }
@@ -305,10 +310,8 @@ export async function runAudioEncoder(
   return dispatchAudioEncoder(session.audioRunners, session, features, options);
 }
 
-function createAudioRunners(providers: readonly RunnerProvider[]): readonly AudioRunners[] {
-  return providers
-    .map((provider) => provider.createAudioRunners?.())
-    .filter((runner): runner is AudioRunners => runner !== undefined);
+function createAudioRunners(providers: readonly AudioRunnerProvider[]): readonly AudioRunners[] {
+  return providers.map((provider) => provider.createAudioRunners());
 }
 
 function hannWindow(length: number, fftLength: number): Float32Array {

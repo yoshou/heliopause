@@ -62,14 +62,10 @@ test("Vision session exposes provider config, caches weights, and disposes resou
   ]);
   const session = createVisionSession(reader, {
     maxWeightCacheBytes: 128,
-    executionProviders: [{
-      name: "wasm",
-      options: { residentWeightCache: true },
-    }],
-    runnerProviders: [createWasmProvider()],
+    providers: [createWasmProvider({ residentWeightCache: true })],
   });
 
-  assert.equal(session.executionProvider("wasm")?.options?.residentWeightCache, true);
+  assert.equal(session.provider<ReturnType<typeof createWasmProvider>>("wasm")?.options.residentWeightCache, true);
   await session.readWeightBytes("v.patch_embd.weight");
   await session.readWeightBytes("v.patch_embd.weight");
 
@@ -92,11 +88,7 @@ test("Vision encoder errors instead of falling back when WebGPU is unavailable",
     "clip.vision.projector.scale_factor": 1,
   });
   const session = createVisionSession(reader, {
-    executionProviders: [
-      { name: "webgpu", options: { memoryLimitBytes: 1 } },
-      { name: "reference" },
-    ],
-    runnerProviders: [createWebGpuProvider(), createReferenceProvider()],
+    providers: [createWebGpuProvider({ memoryLimitBytes: 1 }), createReferenceProvider()],
   });
 
   resetPrefillWasmForTesting("");
@@ -121,7 +113,7 @@ test("Vision reference encoder projects hidden to model embedding size", async (
   ], {
     "clip.vision.projector.scale_factor": 1,
   });
-  const session = createVisionSession(reader, { runnerProviders: [createReferenceProvider()] });
+  const session = createVisionSession(reader, { providers: [createReferenceProvider()] });
 
   const encoded = await runVisionEncoder(session, {
     values: new Float32Array([0.25, 0.5, 0.75]),
@@ -183,11 +175,11 @@ test("Vision preprocessor errors instead of falling back when WASM is unavailabl
     "clip.vision.projector.scale_factor": 1,
   });
   const session = createVisionSession(reader, {
-    preprocessProviders: [
-      { name: "wasm" },
-      { name: "reference" },
+    preprocessProviderOrder: [
+      "wasm",
+      "reference",
     ],
-    runnerProviders: [createWasmProvider(), createReferenceProvider()],
+    providers: [createWasmProvider(), createReferenceProvider()],
   });
 
   resetPrefillWasmForTesting("");
@@ -218,8 +210,7 @@ test("Vision WebGPU preprocessor errors when unavailable", async () => {
     "clip.vision.projector.scale_factor": 1,
   });
   const session = createVisionSession(reader, {
-    executionProviders: [{ name: "webgpu" }, { name: "reference" }],
-    runnerProviders: [createWebGpuProvider(), createReferenceProvider()],
+    providers: [createWebGpuProvider(), createReferenceProvider()],
   });
 
   await assert.rejects(() => runWebGpuVisionPreprocessor(session, {

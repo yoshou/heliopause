@@ -26,6 +26,9 @@ import {
   dispatchQ8KQuantize,
   dispatchResidualAdd,
 } from "./dispatch";
+import type {
+  WebGpuConfiguredProvider,
+} from "./execution-provider";
 import type { WebGpuBufferLike, WebGpuComputePassLike } from "./gpu-types";
 import { createQuantizedHandleFromBytes, webGpuMatMulType } from "./quantized-handles";
 import {
@@ -63,7 +66,7 @@ export async function runWebGpuVisionEncoder(
   session: VisionSession,
   pixels: VisionPixelValues,
 ): Promise<VisionEncodeResult> {
-  if (!session.executionProvider("webgpu")) {
+  if (!session.hasProvider("webgpu")) {
     throw new Error("WebGPU vision encoder provider is not enabled.");
   }
   const stats = visionStats(session);
@@ -108,10 +111,10 @@ async function createVisionRunner(session: VisionSession): Promise<WebGpuVisionR
   if (!device) {
     throw new Error("WebGPU is not available for vision encoder execution.");
   }
-  const options = session.executionProvider("webgpu")?.options;
+  const options = session.provider<WebGpuConfiguredProvider>("webgpu")?.options;
   const arena = new GpuMemoryArena(
     device,
-    numberOption(options, "memoryLimitBytes") ?? WEBGPU_MEMORY_LIMIT_BYTES,
+    options?.memoryLimitBytes ?? WEBGPU_MEMORY_LIMIT_BYTES,
   );
   const runner = new WebGpuVisionRunner(session, arena);
   session.addDisposeCallback(() => runner.dispose());

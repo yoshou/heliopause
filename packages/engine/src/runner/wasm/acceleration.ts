@@ -13,6 +13,9 @@ import {
   WasmThreadPool,
   type WasmShardedQuantizedWeightHandle,
 } from "./thread-pool";
+import type {
+  WasmConfiguredProvider,
+} from "./options";
 
 type WasmWeightCache = {
   handles: Map<string, WasmQuantizedWeightHandle>;
@@ -117,7 +120,7 @@ export function wasmResidentWeightCacheEnabled(session: ModelSession): boolean {
 }
 
 export function wasmExecutionProviderEnabled(session: ModelSession): boolean {
-  return session.executionProvider("wasm") !== undefined;
+  return session.hasProvider("wasm");
 }
 
 export function wasmThreadPoolEnabled(session: ModelSession): boolean {
@@ -263,16 +266,16 @@ export async function matMulWasmShardedWeightHandleBatch(
 }
 
 function booleanWasmOption(session: ModelSession, name: string): boolean {
-  return session.executionProvider("wasm")?.options?.[name] === true;
+  return session.provider<WasmConfiguredProvider>("wasm")?.options[name as keyof WasmConfiguredProvider["options"]] === true;
 }
 
 function numberWasmOption(session: ModelSession, name: string): number | undefined {
-  const value = session.executionProvider("wasm")?.options?.[name];
+  const value = session.provider<WasmConfiguredProvider>("wasm")?.options[name as keyof WasmConfiguredProvider["options"]];
   return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
 function wasmThreadPoolSize(session: ModelSession): number {
-  const value = session.executionProvider("wasm")?.options?.threadPoolSize;
+  const value = session.provider<WasmConfiguredProvider>("wasm")?.options.threadPoolSize;
   if (value === "auto") {
     return Math.max(1, Math.min(8, Math.floor((globalThis.navigator?.hardwareConcurrency ?? 4) / 2)));
   }
@@ -284,12 +287,12 @@ function wasmParallelMatmulMinRows(session: ModelSession): number {
 }
 
 function wasmIoPrefetchEnabled(session: ModelSession): boolean {
-  const value = session.executionProvider("wasm")?.options?.ioPrefetch;
+  const value = session.provider<WasmConfiguredProvider>("wasm")?.options.ioPrefetch;
   return typeof value === "boolean" ? value : wasmResidentWeightCacheEnabled(session);
 }
 
 function wasmIoPrefetchConcurrency(session: ModelSession): number {
-  const value = session.executionProvider("wasm")?.options?.ioPrefetchConcurrency;
+  const value = session.provider<WasmConfiguredProvider>("wasm")?.options.ioPrefetchConcurrency;
   if (value === "auto" || value === undefined) {
     const globalWithProcess = globalThis as typeof globalThis & {
       process?: { versions?: { node?: string } };
@@ -310,7 +313,7 @@ function wasmIoCoalesceMaxReadBytes(session: ModelSession): number {
 }
 
 function wasmIoWorkerBlobReadEnabled(session: ModelSession): boolean {
-  const value = session.executionProvider("wasm")?.options?.ioWorkerBlobRead;
+  const value = session.provider<WasmConfiguredProvider>("wasm")?.options.ioWorkerBlobRead;
   return typeof value === "boolean" ? value : false;
 }
 

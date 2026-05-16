@@ -20,9 +20,60 @@ import type {
 
 export type RunnerProvider = {
   readonly name: SegmentRunnerProvider;
-  createModelRunner?(): ModelRunner;
+};
+
+export type ModelRunnerProvider = RunnerProvider & {
+  createModelRunner(): ModelRunner;
   createModelGraphRunner?(): ModelGraphRunner;
   planModelPlacement?(session: ModelSession, options: { contextLength: number }): RunnerPlacementPlan;
-  createAudioRunners?(): AudioRunners;
-  createVisionRunners?(): VisionRunners;
 };
+
+export type AudioRunnerProvider = RunnerProvider & {
+  createAudioRunners(): AudioRunners;
+};
+
+export type VisionRunnerProvider = RunnerProvider & {
+  createVisionRunners(): VisionRunners;
+};
+
+export type MultimodalRunnerProvider = ModelRunnerProvider & AudioRunnerProvider & VisionRunnerProvider;
+
+export function validateProviderList<TProvider extends RunnerProvider>(
+  providers: readonly TProvider[],
+  capability: keyof ModelRunnerProvider | keyof AudioRunnerProvider | keyof VisionRunnerProvider,
+): readonly TProvider[] {
+  if (providers.length === 0) {
+    throw new Error("At least one runner provider is required.");
+  }
+
+  const names = new Set<SegmentRunnerProvider>();
+  for (const provider of providers) {
+    if (names.has(provider.name)) {
+      throw new Error(`Duplicate runner provider: ${provider.name}`);
+    }
+    names.add(provider.name);
+    if (typeof (provider as Record<string, unknown>)[capability] !== "function") {
+      throw new Error(`Runner provider ${provider.name} is missing ${String(capability)}.`);
+    }
+  }
+
+  return providers.slice();
+}
+
+export function resolveProviderOrder<TProvider extends RunnerProvider>(
+  providers: readonly TProvider[],
+  order: readonly SegmentRunnerProvider[] | undefined,
+): readonly TProvider[] {
+  if (!order) {
+    return providers;
+  }
+
+  const providerByName = new Map(providers.map((provider) => [provider.name, provider]));
+  return order.map((name) => {
+    const provider = providerByName.get(name);
+    if (!provider) {
+      throw new Error(`Unknown preprocess provider: ${name}`);
+    }
+    return provider;
+  });
+}

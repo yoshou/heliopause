@@ -1,8 +1,6 @@
 import {
   createForwardTrace,
-  modelSession,
   type InferenceState,
-  type ModelInput,
   type ModelSession,
   type TimingSink,
 } from "./runtime";
@@ -24,7 +22,7 @@ import {
   type ForwardValue,
 } from "./runner/graph";
 import {
-  type RunnerProvider,
+  type ModelRunnerProvider,
 } from "./runner/provider";
 import type {
   RunnerNodePlacement,
@@ -71,11 +69,10 @@ export type DecodeResult = {
 export type { OutputResult } from "./runtime";
 
 export async function prefillPreparedHidden(
-  model: ModelInput,
+  session: ModelSession,
   hiddenInput: Float32Array,
   options: PreparedHiddenPrefillOptions = {},
 ): Promise<PrefillResult> {
-  const session = modelSession(model);
   const tokenCount = hiddenInput.length / session.manifest.embeddingLength;
   if (!Number.isInteger(tokenCount)) {
     throw new Error(`Prepared hidden shape mismatch: ${hiddenInput.length}`);
@@ -122,11 +119,10 @@ export async function prefillPreparedHidden(
 }
 
 export async function prefill(
-  model: ModelInput,
+  session: ModelSession,
   tokenIds: readonly number[],
   options: PrefillOptions = {},
 ): Promise<PrefillResult> {
-  const session = modelSession(model);
   const state = options.state ?? session.createInferenceState();
   const runtime = modelRuntimeForForward(session, state);
   const positions = normalizePositions(options.positions, tokenIds.length);
@@ -165,11 +161,10 @@ export async function prefill(
 }
 
 export async function decode(
-  model: ModelInput,
+  session: ModelSession,
   tokenId: number,
   options: DecodeOptions = {},
 ): Promise<DecodeResult> {
-  const session = modelSession(model);
   const state = options.state ?? session.createInferenceState();
   const runtime = modelRuntimeForForward(session, state);
   const position = options.position ?? state.nextPosition;
@@ -371,7 +366,7 @@ function normalizePositions(positions: PrefillOptions["positions"], tokenCount: 
 }
 
 type ModelRuntimeForForward = {
-  provider: RunnerProvider;
+  provider: ModelRunnerProvider;
   runner: ModelRunner;
   graph: ModelGraphRunner;
 };
@@ -390,8 +385,8 @@ type BuiltForwardGraph = {
 
 function modelRuntimeForForward(session: ModelSession, state: InferenceState): PlannedModelForward {
   const providers = modelRuntimesForForward(session);
-  for (const config of session.executionProviders) {
-    const runtime = providers.get(config.name as SegmentRunnerProvider);
+  for (const provider of session.providers) {
+    const runtime = providers.get(provider.name);
     if (runtime) {
       const plan = runtime.provider.planModelPlacement?.(session, {
         contextLength: state.contextLength,
@@ -408,11 +403,8 @@ function modelRuntimeForForward(session: ModelSession, state: InferenceState): P
 
 function modelRuntimesForForward(session: ModelSession): ReadonlyMap<SegmentRunnerProvider, ModelRuntimeForForward> {
   const providers = new Map<SegmentRunnerProvider, ModelRuntimeForForward>();
-  for (const provider of session.runnerProviders) {
-    const runner = provider.createModelRunner?.();
-    if (!runner) {
-      continue;
-    }
+  for (const provider of session.providers) {
+    const runner = provider.createModelRunner();
     const graph = provider.createModelGraphRunner?.() ?? runner.graph;
     if (!graph) {
       throw new Error(`Model graph runner is not available for ${provider.name}.`);

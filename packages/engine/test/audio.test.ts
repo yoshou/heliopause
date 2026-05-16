@@ -66,8 +66,8 @@ test("audio WASM preprocessing matches CPU log-mel features", async () => {
   };
   const baseline = preprocessAudioPcm(audio);
   const session = createAudioSession(audioTensorReader([]), {
-    preprocessProviders: [{ name: "wasm" }, { name: "reference" }],
-    runnerProviders: [createWasmProvider(), createReferenceProvider()],
+    preprocessProviderOrder: ["wasm", "reference"],
+    providers: [createWasmProvider(), createReferenceProvider()],
   });
 
   const wasm = await runAudioPreprocessor(session, audio);
@@ -79,14 +79,24 @@ test("audio WASM preprocessing matches CPU log-mel features", async () => {
   assert.equal(session.cacheStats().executionProviderStats.wasmAudioPreprocessRuns, 1);
 });
 
+test("audio session rejects unknown preprocess provider order", () => {
+  assert.throws(
+    () => createAudioSession(audioTensorReader([]), {
+      providers: [createReferenceProvider()],
+      preprocessProviderOrder: ["wasm"],
+    }),
+    /Unknown preprocess provider: wasm/,
+  );
+});
+
 test("audio preprocessor errors instead of falling back when WebGPU is unavailable", async () => {
   const session = createAudioSession(audioTensorReader([]), {
-    preprocessProviders: [
-      { name: "webgpu" },
-      { name: "wasm" },
-      { name: "reference" },
+    preprocessProviderOrder: [
+      "webgpu",
+      "wasm",
+      "reference",
     ],
-    runnerProviders: [createWebGpuProvider(), createWasmProvider(), createReferenceProvider()],
+    providers: [createWebGpuProvider(), createWasmProvider(), createReferenceProvider()],
   });
 
   resetPrefillWasmForTesting("");
@@ -117,7 +127,7 @@ test("audio encoder projects hidden to model embedding size", async () => {
     f32Tensor("a.pre_encode.out.bias", [1536], new Float32Array(1536)),
     f32Tensor("mm.a.input_projection.weight", [1536, 2560], new Float32Array(1536 * 2560)),
   ]);
-  const session = createAudioSession(reader, { runnerProviders: [createReferenceProvider()] });
+  const session = createAudioSession(reader, { providers: [createReferenceProvider()] });
   const features = preprocessAudioPcm({
     pcm: new Float32Array(16_000),
     sampleRate: 16_000,
@@ -141,11 +151,7 @@ test("audio encoder errors instead of falling back when WebGPU is unavailable", 
     f32Tensor("mm.a.input_projection.weight", [1536, 2560], new Float32Array(1536 * 2560)),
   ]);
   const session = createAudioSession(reader, {
-    executionProviders: [
-      { name: "webgpu" },
-      { name: "reference" },
-    ],
-    runnerProviders: [createWebGpuProvider(), createReferenceProvider()],
+    providers: [createWebGpuProvider(), createReferenceProvider()],
   });
   const features = preprocessAudioPcm({
     pcm: new Float32Array(16_000),

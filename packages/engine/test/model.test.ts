@@ -12,6 +12,7 @@ import {
   estimateWeightCacheBytes,
   GgufTensorReader,
   prefill,
+  type ModelRunnerProvider,
 } from "../src/index.ts";
 
 test("tensor coverage audit fails closed on unknown and unused tensors", async () => {
@@ -94,13 +95,37 @@ test("model session can cap inference cache context", () => {
     "gemma4.context_length": 16,
     "gemma4.full_attention_interval": 1,
   });
-  const session = createModelSession(reader, { maxContextLength: 4 });
+  const session = createModelSession(reader, {
+    maxContextLength: 4,
+    providers: [createReferenceProvider()],
+  });
   const state = session.createInferenceState();
 
   assert.equal(session.manifest.contextLength, 16);
   assert.equal(state.contextLength, 4);
   assert.equal(state.fullAttention.get(0)?.key.length, 8);
   assert.equal(state.fullAttention.get(0)?.value.length, 8);
+});
+
+test("model session validates provider list at construction", () => {
+  const reader = tensorReaderFromTensors([
+    f32Tensor("token_embd.weight", [4, 8], sequence(32)),
+  ]);
+
+  assert.throws(
+    () => createModelSession(reader, { providers: [] }),
+    /At least one runner provider is required/,
+  );
+  assert.throws(
+    () => createModelSession(reader, { providers: [createReferenceProvider(), createReferenceProvider()] }),
+    /Duplicate runner provider: reference/,
+  );
+  assert.throws(
+    () => createModelSession(reader, {
+      providers: [{ name: "reference" } as unknown as ModelRunnerProvider],
+    }),
+    /Runner provider reference is missing createModelRunner/,
+  );
 });
 
 test("inference state defaults capped context to manifest context", () => {
@@ -149,7 +174,7 @@ test("prefill advances nextPosition from default and explicit positions", async 
   const reader = tensorReaderFromTensors([
     f32Tensor("token_embd.weight", [4, 8], sequence(32)),
   ]);
-  const session = createModelSession(reader, { runnerProviders: [createReferenceProvider()] });
+  const session = createModelSession(reader, { providers: [createReferenceProvider()] });
 
   const defaultResult = await prefill(session, [1, 2, 3]);
   assert.equal(defaultResult.state.nextPosition, 3);
@@ -175,7 +200,7 @@ test("decode uses state position, explicit position, and returns fixed logits", 
       0.3, -0.2, 0.4, -0.3,
     ])),
   ]);
-  const session = createModelSession(reader, { runnerProviders: [createReferenceProvider()] });
+  const session = createModelSession(reader, { providers: [createReferenceProvider()] });
   const state = session.createInferenceState();
   state.nextPosition = 4;
 
@@ -213,7 +238,7 @@ test("model session caches F32 tensors and embedding rows", async () => {
     f32Tensor("token_embd.weight", [4, 8], sequence(32)),
     f32Tensor("output_norm.weight", [4], new Float32Array([1, 2, 3, 4])),
   ]);
-  const session = createModelSession(reader, { runnerProviders: [createReferenceProvider()] });
+  const session = createModelSession(reader, { providers: [createReferenceProvider()] });
 
   await session.readF32Tensor("output_norm.weight");
   await session.readF32Tensor("output_norm.weight");
@@ -241,7 +266,10 @@ test("model session evicts large weight bytes without evicting small F32 tensors
     bytesTensor("a.weight", [32, 1], "Q8_0", new Uint8Array(34).fill(1)),
     bytesTensor("b.weight", [32, 1], "Q8_0", new Uint8Array(34).fill(2)),
   ]);
-  const session = createModelSession(reader, { maxWeightCacheBytes: 40 });
+  const session = createModelSession(reader, {
+    maxWeightCacheBytes: 40,
+    providers: [createReferenceProvider()],
+  });
 
   await session.readF32Tensor("output_norm.weight");
   await session.readWeightBytes("a.weight");
@@ -286,7 +314,7 @@ test("full-attention decode rejects positions outside context", async () => {
       truncated: false,
     },
   });
-  const session = createModelSession(reader, { runnerProviders: [createReferenceProvider()] });
+  const session = createModelSession(reader, { providers: [createReferenceProvider()] });
 
   await assert.rejects(
     decode(session, 1, { position: 1 }),

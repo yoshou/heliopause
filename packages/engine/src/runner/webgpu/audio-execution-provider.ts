@@ -22,6 +22,7 @@ import {
   dispatchResidualAdd,
 } from "./dispatch";
 import type { WebGpuBufferLike, WebGpuComputePassLike } from "./gpu-types";
+import type { WebGpuConfiguredProvider } from "./execution-provider";
 import { createQuantizedHandleFromBytes, webGpuMatMulType } from "./quantized-handles";
 import {
   createAudioAddBiasRowsResources,
@@ -66,7 +67,7 @@ export async function runWebGpuAudioEncoder(
   features: AudioFeatures,
   options: { signal?: AbortSignal } = {},
 ): Promise<AudioEncodeResult> {
-  if (!session.executionProvider("webgpu")) {
+  if (!session.hasProvider("webgpu")) {
     throw new Error("WebGPU audio encoder provider is not enabled.");
   }
   const stats = audioStats(session);
@@ -111,10 +112,10 @@ async function createAudioRunner(session: AudioSession): Promise<WebGpuAudioRunn
   if (!device) {
     throw new Error("WebGPU is not available for audio encoder execution.");
   }
-  const options = session.executionProvider("webgpu")?.options;
+  const options = session.provider<WebGpuConfiguredProvider>("webgpu")?.options;
   const arena = new GpuMemoryArena(
     device,
-    numberOption(options, "memoryLimitBytes") ?? WEBGPU_MEMORY_LIMIT_BYTES,
+    options?.memoryLimitBytes ?? WEBGPU_MEMORY_LIMIT_BYTES,
   );
   const runner = new WebGpuAudioRunner(session, arena);
   session.addDisposeCallback(() => runner.dispose());

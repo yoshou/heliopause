@@ -10,19 +10,26 @@ export type WebGpuExecutionProviderOptions = {
   prefillChunkSize?: number;
 };
 
+export type WebGpuProviderOptions = Partial<WebGpuExecutionProviderOptions>;
+
+export type WebGpuConfiguredProvider = {
+  readonly name: "webgpu";
+  readonly options: Readonly<WebGpuProviderOptions>;
+};
+
 export function webGpuExecutionProviderEnabled(session: ModelSession): boolean {
-  return session.executionProvider("webgpu") !== undefined;
+  return session.hasProvider("webgpu");
 }
 
 export function webGpuExecutionProviderOptions(
   session: ModelSession,
 ): WebGpuExecutionProviderOptions | undefined {
-  const config = session.executionProvider("webgpu");
+  const config = session.provider<WebGpuConfiguredProvider>("webgpu");
   if (!config) {
     return undefined;
   }
   return {
-    memoryLimitBytes: numberOption(config.options, "memoryLimitBytes") ?? WEBGPU_MEMORY_LIMIT_BYTES,
+    memoryLimitBytes: config.options.memoryLimitBytes ?? WEBGPU_MEMORY_LIMIT_BYTES,
     segmentStartLayer: numberOption(config.options, "segmentStartLayer"),
     prefillChunkSize: numberOption(config.options, "prefillChunkSize"),
   };

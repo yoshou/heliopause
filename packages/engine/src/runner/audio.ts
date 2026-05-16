@@ -28,6 +28,7 @@ export async function dispatchAudioPreprocessor(
     if (result) {
       return result;
     }
+    throw new Error(`Audio preprocess provider ${provider.name} did not return a result.`);
   }
   throw new Error("No audio preprocessor provider was selected.");
 }
@@ -38,7 +39,7 @@ export async function dispatchAudioEncoder(
   features: AudioFeatures,
   options: { signal?: AbortSignal } = {},
 ): Promise<AudioEncodeResult> {
-  for (const provider of session.executionProviders) {
+  for (const provider of session.providers) {
     const runner = audioEncoderRunner(runners, provider.name);
     return runner.run(session, features, options);
   }

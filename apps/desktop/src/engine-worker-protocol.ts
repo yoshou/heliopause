@@ -7,7 +7,7 @@ export type ResolvedRuntimeProfile = {
   estimatedWeightCacheBytes: number;
   wasmResidentWeightCache: boolean;
   webGpuStatus: "enabled" | "blocked";
-  executionProviders: string[];
+  providerNames: string[];
   wasmStatus: "enabled" | "unavailable";
   wasmUnavailableReason?: string;
   webGpuUnavailableReason?: string;

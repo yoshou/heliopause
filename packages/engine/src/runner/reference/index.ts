@@ -2,7 +2,7 @@ import type {
   ModelRunner,
 } from "../model-runner";
 import type {
-  RunnerProvider,
+  MultimodalRunnerProvider,
 } from "../provider";
 import {
   referenceAudioEncoderRunner,
@@ -47,7 +47,7 @@ export function createReferenceModelRunner(): ModelRunner {
   };
 }
 
-export function createReferenceProvider(): RunnerProvider {
+export function createReferenceProvider(): MultimodalRunnerProvider {
   return {
     name: "reference",
     createModelRunner: createReferenceModelRunner,
