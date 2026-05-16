@@ -8,29 +8,27 @@ import type {
   ExecutionProviderStats,
 } from "./runtime";
 import {
+  resolveSessionExecutionProviders,
   resolvePreprocessProviders,
 } from "./runtime";
 import {
-  runCpuAudioEncoder,
-} from "./runner/cpu/audio-runner";
-import {
-  runAudioPreprocessProviders,
-  tryAudioPreprocessProviders,
-  type AudioPreprocessOptions,
-} from "./runner/cpu/audio-preprocess-runner";
-import {
-  runWebGpuAudioEncoder,
-} from "./runner/webgpu/audio-execution-provider";
-import {
-  runWebGpuAudioPreprocessor,
-} from "./runner/webgpu/audio-preprocess-runner";
+  dispatchAudioEncoder,
+  dispatchAudioPreprocessor,
+} from "./runner/audio";
+import type {
+  AudioRunners,
+  AudioPreprocessOptions,
+} from "./runner/audio-runner";
+import type {
+  RunnerProvider,
+} from "./runner/provider";
 import {
   GgufTensorReader,
 } from "./tensor-reader";
 
 export type {
   AudioPreprocessOptions,
-} from "./runner/cpu/audio-preprocess-runner";
+} from "./runner/audio-runner";
 
 export type AudioPcmInput = {
   pcm: Float32Array;
@@ -56,6 +54,8 @@ export type AudioSessionOptions = {
   maxWeightCacheBytes?: number;
   executionProviders?: readonly ExecutionProviderConfig[];
   preprocessProviders?: readonly ExecutionProviderConfig[];
+  runnerProviders?: readonly RunnerProvider[];
+  audioRunners?: readonly AudioRunners[];
 };
 
 export class AudioSession {
@@ -64,6 +64,7 @@ export class AudioSession {
   readonly epsilon: number;
   readonly executionProviders: readonly ExecutionProviderConfig[];
   readonly preprocessProviders: readonly ExecutionProviderConfig[];
+  readonly audioRunners: readonly AudioRunners[];
 
   private readonly maxWeightCacheBytes: number;
   private readonly f32TensorCache = new Map<string, Float32Array>();
@@ -80,11 +81,9 @@ export class AudioSession {
     this.manifest = buildAudioManifest(tensorReader.metadata);
     this.epsilon = this.manifest.layerNormEpsilon;
     this.maxWeightCacheBytes = options.maxWeightCacheBytes ?? 256 * 1024 * 1024;
-    this.executionProviders = (options.executionProviders ?? [{ name: "reference" }]).map((provider) => ({
-      name: provider.name,
-      options: provider.options ? { ...provider.options } : undefined,
-    }));
+    this.executionProviders = resolveSessionExecutionProviders(options);
     this.preprocessProviders = resolvePreprocessProviders(this.executionProviders, options.preprocessProviders);
+    this.audioRunners = options.audioRunners ?? createAudioRunners(options.runnerProviders ?? []);
   }
 
   getTensor(name: string) {
@@ -295,27 +294,7 @@ export async function runAudioPreprocessor(
   audio: AudioPcmInput,
   options: AudioPreprocessOptions = {},
 ): Promise<AudioFeatures> {
-  for (const provider of session.preprocessProviders) {
-    throwIfAborted(options.signal);
-    if (provider.name === "webgpu") {
-      const webgpu = await runWebGpuAudioPreprocessor(session, audio, options);
-      if (!webgpu) {
-        throw new Error("WebGPU audio preprocessor is unavailable.");
-      }
-      return webgpu;
-    }
-    const result = await tryAudioPreprocessProviders(
-      session,
-      audio,
-      preprocessAudioPcm,
-      [provider],
-      options,
-    );
-    if (result) {
-      return result;
-    }
-  }
-  throw new Error("No audio preprocessor provider was selected.");
+  return dispatchAudioPreprocessor(session.audioRunners, session, audio, preprocessAudioPcm, options);
 }
 
 export async function runAudioEncoder(
@@ -323,14 +302,13 @@ export async function runAudioEncoder(
   features: AudioFeatures,
   options: { signal?: AbortSignal } = {},
 ): Promise<AudioEncodeResult> {
-  if (session.executionProvider("webgpu")) {
-    const webgpu = await runWebGpuAudioEncoder(session, features, options);
-    if (!webgpu) {
-      throw new Error("WebGPU audio encoder is unavailable.");
-    }
-    return webgpu;
-  }
-  return runCpuAudioEncoder(session, features, options);
+  return dispatchAudioEncoder(session.audioRunners, session, features, options);
+}
+
+function createAudioRunners(providers: readonly RunnerProvider[]): readonly AudioRunners[] {
+  return providers
+    .map((provider) => provider.createAudioRunners?.())
+    .filter((runner): runner is AudioRunners => runner !== undefined);
 }
 
 function hannWindow(length: number, fftLength: number): Float32Array {
@@ -414,11 +392,5 @@ function fftRadix2(real: Float32Array, imag: Float32Array): void {
         wReal = nextReal;
       }
     }
-  }
-}
-
-function throwIfAborted(signal: AbortSignal | undefined): void {
-  if (signal?.aborted) {
-    throw new DOMException("Generation was aborted.", "AbortError");
   }
 }

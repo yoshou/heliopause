@@ -9,13 +9,15 @@ import type {
 import type {
   ExecutionProviderStats,
 } from "../../runtime";
+import type {
+  AudioPreprocessRunner,
+} from "../audio-runner";
 import {
   audioLogMelWasm,
 } from "./wasm-kernels";
 
 type AudioPreprocessStats = {
   wasm: ProviderStats;
-  reference: ProviderStats;
 };
 
 type ProviderStats = {
@@ -42,16 +44,22 @@ const statsBySession = new WeakMap<AudioPreprocessSession, AudioPreprocessStats>
 const windowCache = new Map<string, Float32Array>();
 const filterCache = new Map<string, Float32Array>();
 
+export const wasmAudioPreprocessRunner: AudioPreprocessRunner = {
+  provider: "wasm",
+  run: (session, audio, audioPreprocess, options) =>
+    tryAudioPreprocessProviders(session, audio, audioPreprocess, [{ name: "wasm" }], options),
+};
+
 export async function runAudioPreprocessProviders(
   session: AudioPreprocessSession,
   audio: AudioPcmInput,
-  cpuPreprocess: (audio: AudioPcmInput, manifest: AudioPreprocessConfig) => AudioFeatures,
+  _cpuPreprocess: (audio: AudioPcmInput, manifest: AudioPreprocessConfig) => AudioFeatures,
   options: AudioPreprocessOptions = {},
 ): Promise<AudioFeatures> {
   const result = await tryAudioPreprocessProviders(
     session,
     audio,
-    cpuPreprocess,
+    _cpuPreprocess,
     session.preprocessProviders,
     options,
   );
@@ -65,7 +73,7 @@ export async function runAudioPreprocessProviders(
 export async function tryAudioPreprocessProviders(
   session: AudioPreprocessSession,
   audio: AudioPcmInput,
-  cpuPreprocess: (audio: AudioPcmInput, manifest: AudioPreprocessConfig) => AudioFeatures,
+  _cpuPreprocess: (audio: AudioPcmInput, manifest: AudioPreprocessConfig) => AudioFeatures,
   providers: readonly { name: string }[],
   options: AudioPreprocessOptions = {},
 ): Promise<AudioFeatures | undefined> {
@@ -79,26 +87,10 @@ export async function tryAudioPreprocessProviders(
       }
       continue;
     }
-    if (provider.name === "reference") {
-      return runAudioReferencePreprocess(session, audio, cpuPreprocess);
-    }
     throw new Error(`Unsupported audio preprocess provider: ${provider.name}`);
   }
 
   return undefined;
-}
-
-function runAudioReferencePreprocess(
-  session: AudioPreprocessSession,
-  audio: AudioPcmInput,
-  cpuPreprocess: (audio: AudioPcmInput, manifest: AudioPreprocessConfig) => AudioFeatures,
-): AudioFeatures {
-  const stats = audioPreprocessStats(session);
-  stats.reference.attempts += 1;
-  const result = cpuPreprocess(audio, session.manifest);
-  stats.reference.runs += 1;
-  stats.reference.lastFallbackReason = "";
-  return result;
 }
 
 async function tryAudioWasmProvider(
@@ -233,7 +225,6 @@ function audioPreprocessStats(session: AudioPreprocessSession): AudioPreprocessS
   if (!stats) {
     stats = {
       wasm: createProviderStats(),
-      reference: createProviderStats(),
     };
     statsBySession.set(session, stats);
     const captured = stats;
@@ -246,8 +237,6 @@ function audioPreprocessStatsSnapshot(stats: AudioPreprocessStats): ExecutionPro
   return {
     wasmAudioPreprocessAttempts: stats.wasm.attempts,
     wasmAudioPreprocessRuns: stats.wasm.runs,
-    referenceAudioPreprocessAttempts: stats.reference.attempts,
-    referenceAudioPreprocessRuns: stats.reference.runs,
   };
 }
 

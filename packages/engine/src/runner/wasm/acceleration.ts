@@ -54,29 +54,29 @@ type WasmPrefetchWeight = {
   byteLength: number;
 };
 
-export function registerCpuExecutionProvider(session: ModelSession): void {
-  session.setExecutionProviderStatsProvider(() => cpuExecutionProviderStats(session), "cpu");
+export function registerWasmExecutionProvider(session: ModelSession): void {
+  session.setExecutionProviderStatsProvider(() => wasmExecutionProviderStats(session), "wasm");
 }
 
-export function cpuExecutionProviderStats(session: ModelSession): ExecutionProviderStats {
+export function wasmExecutionProviderStats(session: ModelSession): ExecutionProviderStats {
   const cache = wasmWeightCaches.get(session);
   const shardedCache = wasmShardedWeightCaches.get(session);
   const pool = wasmThreadPools.get(session);
   const ioStats = session.tensorReader.ioStats();
   const prefetch = wasmIoPrefetchStates.get(session);
   return {
-    wasmResidentWeightCacheEnabled: cpuResidentWeightCacheEnabled(session),
+    wasmResidentWeightCacheEnabled: wasmResidentWeightCacheEnabled(session),
     wasmResidentWeightCacheCount: cache?.handles.size ?? 0,
     wasmResidentWeightCacheBytes: cache?.bytes ?? 0,
     wasmResidentWeightCacheHits: cache?.hits ?? 0,
     wasmResidentWeightCacheMisses: cache?.misses ?? 0,
-    wasmThreadPoolEnabled: cpuThreadPoolEnabled(session),
+    wasmThreadPoolEnabled: wasmThreadPoolEnabled(session),
     wasmThreadPoolWorkerCount: pool?.workerCount ?? 0,
     wasmShardedResidentWeightCacheCount: shardedCache?.handles.size ?? 0,
     wasmShardedResidentWeightCacheBytes: shardedCache?.bytes ?? 0,
     wasmShardedResidentWeightCacheHits: shardedCache?.hits ?? 0,
     wasmShardedResidentWeightCacheMisses: shardedCache?.misses ?? 0,
-    wasmIoPrefetchEnabled: cpuIoPrefetchEnabled(session),
+    wasmIoPrefetchEnabled: wasmIoPrefetchEnabled(session),
     wasmIoPrefetchReads: prefetch?.reads ?? 0,
     wasmIoPrefetchBytes: prefetch?.bytes ?? 0,
     wasmIoWorkerBlobReads: prefetch?.workerBlobReads ?? 0,
@@ -87,7 +87,7 @@ export function cpuExecutionProviderStats(session: ModelSession): ExecutionProvi
   };
 }
 
-export function shutdownCpuExecutionProvider(session: ModelSession): void {
+export function shutdownWasmExecutionProvider(session: ModelSession): void {
   const cache = wasmWeightCaches.get(session);
   if (cache) {
     for (const handle of cache.handles.values()) {
@@ -108,11 +108,11 @@ export function shutdownCpuExecutionProvider(session: ModelSession): void {
   wasmThreadPoolPromises.delete(session);
 }
 
-export function cpuProjectionBatchingEnabled(session: ModelSession): boolean {
+export function wasmProjectionBatchingEnabled(session: ModelSession): boolean {
   return wasmExecutionProviderEnabled(session) && booleanWasmOption(session, "projectionBatching");
 }
 
-export function cpuResidentWeightCacheEnabled(session: ModelSession): boolean {
+export function wasmResidentWeightCacheEnabled(session: ModelSession): boolean {
   return wasmExecutionProviderEnabled(session) && booleanWasmOption(session, "residentWeightCache");
 }
 
@@ -120,14 +120,14 @@ export function wasmExecutionProviderEnabled(session: ModelSession): boolean {
   return session.executionProvider("wasm") !== undefined;
 }
 
-export function cpuThreadPoolEnabled(session: ModelSession): boolean {
-  return cpuResidentWeightCacheEnabled(session) &&
+export function wasmThreadPoolEnabled(session: ModelSession): boolean {
+  return wasmResidentWeightCacheEnabled(session) &&
     booleanWasmOption(session, "parallelResidentMatmul") &&
-    cpuThreadPoolSize(session) > 1;
+    wasmThreadPoolSize(session) > 1;
 }
 
 export function prefetchWasmShardedLayerWeights(session: ModelSession, layer: number): void {
-  if (!cpuThreadPoolEnabled(session) || !cpuIoPrefetchEnabled(session)) {
+  if (!wasmThreadPoolEnabled(session) || !wasmIoPrefetchEnabled(session)) {
     return;
   }
   if (layer < 0 || layer >= session.manifest.blockCount) {
@@ -137,7 +137,7 @@ export function prefetchWasmShardedLayerWeights(session: ModelSession, layer: nu
 }
 
 export function prefetchWasmShardedOutputWeight(session: ModelSession): void {
-  if (!cpuThreadPoolEnabled(session) || !cpuIoPrefetchEnabled(session)) {
+  if (!wasmThreadPoolEnabled(session) || !wasmIoPrefetchEnabled(session)) {
     return;
   }
   enqueueWasmIoPrefetch(session, prefetchWeightForName(session, "output.weight"));
@@ -165,7 +165,7 @@ export async function readWasmWeightHandle(
   inputSize: number,
   rowCount: number,
 ): Promise<WasmQuantizedWeightHandle | undefined> {
-  if (!cpuResidentWeightCacheEnabled(session)) {
+  if (!wasmResidentWeightCacheEnabled(session)) {
     return undefined;
   }
   const cache = ensureWasmWeightCache(session);
@@ -204,7 +204,7 @@ export async function readWasmShardedWeightHandle(
   inputSize: number,
   rowCount: number,
 ): Promise<WasmShardedQuantizedWeightHandle | undefined> {
-  if (!cpuThreadPoolEnabled(session) || rowCount < cpuParallelMatmulMinRows(session)) {
+  if (!wasmThreadPoolEnabled(session) || rowCount < wasmParallelMatmulMinRows(session)) {
     return undefined;
   }
   const pool = await ensureWasmThreadPool(session);
@@ -271,7 +271,7 @@ function numberWasmOption(session: ModelSession, name: string): number | undefin
   return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
-function cpuThreadPoolSize(session: ModelSession): number {
+function wasmThreadPoolSize(session: ModelSession): number {
   const value = session.executionProvider("wasm")?.options?.threadPoolSize;
   if (value === "auto") {
     return Math.max(1, Math.min(8, Math.floor((globalThis.navigator?.hardwareConcurrency ?? 4) / 2)));
@@ -279,16 +279,16 @@ function cpuThreadPoolSize(session: ModelSession): number {
   return typeof value === "number" && Number.isFinite(value) ? Math.max(1, Math.floor(value)) : 1;
 }
 
-function cpuParallelMatmulMinRows(session: ModelSession): number {
+function wasmParallelMatmulMinRows(session: ModelSession): number {
   return numberWasmOption(session, "parallelMatmulMinRows") ?? 512;
 }
 
-function cpuIoPrefetchEnabled(session: ModelSession): boolean {
+function wasmIoPrefetchEnabled(session: ModelSession): boolean {
   const value = session.executionProvider("wasm")?.options?.ioPrefetch;
-  return typeof value === "boolean" ? value : cpuResidentWeightCacheEnabled(session);
+  return typeof value === "boolean" ? value : wasmResidentWeightCacheEnabled(session);
 }
 
-function cpuIoPrefetchConcurrency(session: ModelSession): number {
+function wasmIoPrefetchConcurrency(session: ModelSession): number {
   const value = session.executionProvider("wasm")?.options?.ioPrefetchConcurrency;
   if (value === "auto" || value === undefined) {
     const globalWithProcess = globalThis as typeof globalThis & {
@@ -301,15 +301,15 @@ function cpuIoPrefetchConcurrency(session: ModelSession): number {
     : 1;
 }
 
-function cpuIoCoalesceMaxGapBytes(session: ModelSession): number {
+function wasmIoCoalesceMaxGapBytes(session: ModelSession): number {
   return numberWasmOption(session, "ioCoalesceMaxGapBytes") ?? 1024 * 1024;
 }
 
-function cpuIoCoalesceMaxReadBytes(session: ModelSession): number {
+function wasmIoCoalesceMaxReadBytes(session: ModelSession): number {
   return numberWasmOption(session, "ioCoalesceMaxReadBytes") ?? 256 * 1024 * 1024;
 }
 
-function cpuIoWorkerBlobReadEnabled(session: ModelSession): boolean {
+function wasmIoWorkerBlobReadEnabled(session: ModelSession): boolean {
   const value = session.executionProvider("wasm")?.options?.ioWorkerBlobRead;
   return typeof value === "boolean" ? value : false;
 }
@@ -325,7 +325,7 @@ function ensureWasmWeightCache(session: ModelSession): WasmWeightCache {
       misses: 0,
     };
     wasmWeightCaches.set(session, cache);
-    registerCpuExecutionProvider(session);
+    registerWasmExecutionProvider(session);
   }
   return cache;
 }
@@ -341,7 +341,7 @@ function ensureWasmShardedWeightCache(session: ModelSession): WasmShardedWeightC
       misses: 0,
     };
     wasmShardedWeightCaches.set(session, cache);
-    registerCpuExecutionProvider(session);
+    registerWasmExecutionProvider(session);
   }
   return cache;
 }
@@ -355,10 +355,10 @@ async function ensureWasmThreadPool(session: ModelSession): Promise<WasmThreadPo
   if (pending) {
     return pending;
   }
-  const created = WasmThreadPool.create(cpuThreadPoolSize(session)).then((nextPool) => {
+  const created = WasmThreadPool.create(wasmThreadPoolSize(session)).then((nextPool) => {
     if (nextPool) {
       wasmThreadPools.set(session, nextPool);
-      registerCpuExecutionProvider(session);
+      registerWasmExecutionProvider(session);
     }
     return nextPool;
   }).finally(() => {
@@ -387,7 +387,7 @@ async function prepareWasmShardedWeightHandle(
     return undefined;
   }
   const sourceBlob = session.tensorReader.sourceBlob();
-  if (sourceBlob && cpuIoWorkerBlobReadEnabled(session)) {
+  if (sourceBlob && wasmIoWorkerBlobReadEnabled(session)) {
     const blobHandle = await prepareWasmShardedWeightHandleFromBlob(
       session,
       pool,
@@ -410,8 +410,8 @@ async function prepareWasmShardedWeightHandle(
     length: shard.rowCount * rowByteLength,
   }));
   const rangeBytes = await session.tensorReader.readTensorRangesCoalesced(ranges, {
-    maxGapBytes: cpuIoCoalesceMaxGapBytes(session),
-    maxReadBytes: cpuIoCoalesceMaxReadBytes(session),
+    maxGapBytes: wasmIoCoalesceMaxGapBytes(session),
+    maxReadBytes: wasmIoCoalesceMaxReadBytes(session),
   });
   const weightShards = rowShards.map((shard, index) => ({
     ...shard,
@@ -487,13 +487,13 @@ function ensureWasmIoPrefetchState(session: ModelSession): WasmIoPrefetchState {
       workerBlobBytes: 0,
     };
     wasmIoPrefetchStates.set(session, state);
-    registerCpuExecutionProvider(session);
+    registerWasmExecutionProvider(session);
   }
   return state;
 }
 
 function pumpWasmIoPrefetch(session: ModelSession, state: WasmIoPrefetchState): void {
-  const concurrency = cpuIoPrefetchConcurrency(session);
+  const concurrency = wasmIoPrefetchConcurrency(session);
   while (state.active < concurrency && state.queue.length > 0) {
     const weight = state.queue.shift();
     if (!weight) {
@@ -551,7 +551,7 @@ function prefetchWeightForName(session: ModelSession, name: string): WasmPrefetc
   }
   const inputSize = tensor.dimensions[0] ?? 0;
   const rowCount = tensor.dimensions[1] ?? 0;
-  if (inputSize <= 0 || rowCount < cpuParallelMatmulMinRows(session)) {
+  if (inputSize <= 0 || rowCount < wasmParallelMatmulMinRows(session)) {
     return [];
   }
   return [{

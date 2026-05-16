@@ -2,7 +2,7 @@ import type { InferenceState, ModelSession } from "../../runtime";
 import { WEBGPU_MEMORY_LIMIT_BYTES } from "./gpu-constants";
 import { WebGpuSegmentRunner } from "./segment-runner";
 
-const segmentRunners = new WeakMap<ModelSession, Promise<WebGpuSegmentRunner>>();
+const segmentRunners = new WeakMap<ModelSession, Map<string, Promise<WebGpuSegmentRunner>>>();
 
 export type WebGpuExecutionProviderOptions = {
   memoryLimitBytes: number;
@@ -31,18 +31,25 @@ export function webGpuExecutionProviderOptions(
 export function webGpuSegmentRunner(
   session: ModelSession,
   state: InferenceState,
-  options: { segmentStartLayer?: number } = {},
+  options: { segmentStartLayer?: number; segmentEndLayerExclusive?: number } = {},
 ): Promise<WebGpuSegmentRunner> {
   const providerOptions = webGpuExecutionProviderOptions(session);
   if (!providerOptions) {
     throw new Error("WebGPU segment runner is not enabled for this  session.");
   }
-  let runner = segmentRunners.get(session);
+  let runners = segmentRunners.get(session);
+  if (!runners) {
+    runners = new Map();
+    segmentRunners.set(session, runners);
+  }
+  const segmentStartLayer = options.segmentStartLayer ?? providerOptions.segmentStartLayer;
+  if (segmentStartLayer === undefined) {
+    throw new Error("WebGPU segment planning selected no layers.");
+  }
+  const segmentEndLayerExclusive = options.segmentEndLayerExclusive ?? session.manifest.blockCount;
+  const cacheKey = `${segmentStartLayer}:${segmentEndLayerExclusive}`;
+  let runner = runners.get(cacheKey);
   if (!runner) {
-    const segmentStartLayer = options.segmentStartLayer ?? providerOptions.segmentStartLayer;
-    if (segmentStartLayer === undefined) {
-      throw new Error("WebGPU segment planning selected no layers.");
-    }
     runner = WebGpuSegmentRunner.create({
       tensorReader: session.tensorReader,
       manifest: session.manifest,
@@ -51,8 +58,9 @@ export function webGpuSegmentRunner(
       memoryLimitBytes: providerOptions.memoryLimitBytes,
       prefillChunkSize: providerOptions.prefillChunkSize,
       segmentStartLayer,
+      segmentEndLayerExclusive,
     });
-    segmentRunners.set(session, runner);
+    runners.set(cacheKey, runner);
     void runner.then((resolved) => {
       session.setExecutionProviderStatsProvider(() => resolved.runtimeStats(), "webgpu");
     });

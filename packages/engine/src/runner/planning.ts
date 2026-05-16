@@ -29,6 +29,43 @@ export type RunnerLayerPlacement = {
   totalBytes: number;
 };
 
+export type RunnerSegmentProvider = "reference" | "wasm" | "webgpu";
+
+export type RunnerSegmentPlacement = {
+  provider: RunnerSegmentProvider;
+  startLayer: number;
+  endLayerExclusive: number;
+  layerCount: number;
+  weightBytes: number;
+  cacheBytes: number;
+};
+
+export type RunnerNodePlacement =
+  | {
+      kind: "embedding";
+      provider: RunnerSegmentProvider;
+    }
+  | {
+      kind: "segment";
+      provider: RunnerSegmentProvider;
+      startLayer: number;
+      endLayerExclusive: number;
+      layerCount: number;
+      weightBytes: number;
+      cacheBytes: number;
+    }
+  | {
+      kind: "transfer";
+      from: RunnerSegmentProvider;
+      to: RunnerSegmentProvider;
+      via: "cpu";
+      value: "hidden";
+    }
+  | {
+      kind: "output";
+      provider: RunnerSegmentProvider;
+    };
+
 export type RunnerPlacementPlan = {
   status: RunnerPlanStatus;
   mode: RunnerExecutionMode;
@@ -39,14 +76,16 @@ export type RunnerPlacementPlan = {
   fixedBytes: number;
   scratchBytes: number;
   selectedLayerCount: number;
-  segmentStartLayer?: number;
-  cpuSegmentLayerCount: number;
-  gpuSegmentLayerCount: number;
-  gpuWeightBytes: number;
-  gpuCacheBytes: number;
+  webGpuSegmentStartLayer?: number;
+  wasmSegmentLayerCount: number;
+  webGpuSegmentLayerCount: number;
+  webGpuWeightBytes: number;
+  webGpuCacheBytes: number;
   estimatedResidentBytes: number;
   remainingBytes: number;
-  selectedLayers: RunnerLayerPlacement[];
+  webGpuSelectedLayers: RunnerLayerPlacement[];
+  segments: RunnerSegmentPlacement[];
+  nodes: RunnerNodePlacement[];
   copyAuditExpectations: {
     decodeTensorReads: 0;
     segmentIntermediateReadbacks: 0;
@@ -194,10 +233,18 @@ export function planProviderPlacement(
     }
   }
 
-  const segmentStartLayer = selectedLayers[0]?.layer;
-  const gpuWeightBytes = outputBytes +
+  const webGpuSegmentStartLayer = selectedLayers[0]?.layer;
+  const webGpuWeightBytes = outputBytes +
     selectedLayers.reduce((sum, layer) => sum + layer.weightBytes, 0);
-  const gpuCacheBytes = selectedLayers.reduce((sum, layer) => sum + layer.cacheBytes, 0);
+  const webGpuCacheBytes = selectedLayers.reduce((sum, layer) => sum + layer.cacheBytes, 0);
+  const segments = buildHybridSegments({
+    blockCount: manifest.blockCount,
+    webGpuSegmentStartLayer,
+    webGpuSegmentEndLayer: selectedLayers.length > 0 ? manifest.blockCount : undefined,
+    webGpuWeightBytes,
+    webGpuCacheBytes,
+  });
+  const nodes = buildHybridNodes(segments);
 
   return {
     status: "planned",
@@ -209,15 +256,22 @@ export function planProviderPlacement(
     fixedBytes: provider.fixedBytes,
     scratchBytes: provider.scratchBytes,
     selectedLayerCount: selectedLayers.length,
-    segmentStartLayer,
-    cpuSegmentLayerCount: segmentStartLayer === undefined ? manifest.blockCount : segmentStartLayer,
-    gpuSegmentLayerCount: selectedLayers.length,
-    gpuWeightBytes,
-    gpuCacheBytes,
+    webGpuSegmentStartLayer,
+    wasmSegmentLayerCount: webGpuSegmentStartLayer === undefined ? manifest.blockCount : webGpuSegmentStartLayer,
+    webGpuSegmentLayerCount: selectedLayers.length,
+    webGpuWeightBytes,
+    webGpuCacheBytes,
     estimatedResidentBytes: selectedBytes,
     remainingBytes: Math.max(0, memoryLimitBytes - selectedBytes),
-    selectedLayers,
-    copyAuditExpectations: provider.copyAuditExpectations(selectedLayers.length),
+    webGpuSelectedLayers: selectedLayers,
+    segments,
+    nodes,
+    copyAuditExpectations: {
+      ...provider.copyAuditExpectations(selectedLayers.length),
+      expectedBoundaryUploads: nodes.some((node) =>
+        node.kind === "transfer" && node.to === "webgpu"
+      ) ? 1 : 0,
+    },
   };
 }
 
@@ -289,6 +343,90 @@ function tensorBytes(tensorsByName: ReadonlyMap<string, GgufTensorInfo>, name: s
   return tensor ? tensorByteLength(tensor) : 0;
 }
 
+function buildHybridSegments(params: {
+  blockCount: number;
+  webGpuSegmentStartLayer?: number;
+  webGpuSegmentEndLayer?: number;
+  webGpuWeightBytes: number;
+  webGpuCacheBytes: number;
+}): RunnerSegmentPlacement[] {
+  const webGpuStart = params.webGpuSegmentStartLayer;
+  if (webGpuStart === undefined || params.webGpuSegmentEndLayer === undefined) {
+    return [{
+      provider: "wasm",
+      startLayer: 0,
+      endLayerExclusive: params.blockCount,
+      layerCount: params.blockCount,
+      weightBytes: 0,
+      cacheBytes: 0,
+    }];
+  }
+
+  const segments: RunnerSegmentPlacement[] = [];
+  if (webGpuStart > 0) {
+    segments.push({
+      provider: "wasm",
+      startLayer: 0,
+      endLayerExclusive: webGpuStart,
+      layerCount: webGpuStart,
+      weightBytes: 0,
+      cacheBytes: 0,
+    });
+  }
+  segments.push({
+    provider: "webgpu",
+    startLayer: webGpuStart,
+    endLayerExclusive: params.webGpuSegmentEndLayer,
+    layerCount: params.webGpuSegmentEndLayer - webGpuStart,
+    weightBytes: params.webGpuWeightBytes,
+    cacheBytes: params.webGpuCacheBytes,
+  });
+  return segments;
+}
+
+function buildHybridNodes(segments: readonly RunnerSegmentPlacement[]): RunnerNodePlacement[] {
+  const first = segments[0];
+  if (!first) {
+    return [];
+  }
+
+  const nodes: RunnerNodePlacement[] = [
+    {
+      kind: "embedding",
+      provider: first.provider,
+    },
+  ];
+  let previousProvider = first.provider;
+  for (const segment of segments) {
+    if (segment.provider !== previousProvider) {
+      nodes.push({
+        kind: "transfer",
+        from: previousProvider,
+        to: segment.provider,
+        via: "cpu",
+        value: "hidden",
+      });
+    }
+    if (segment.layerCount > 0) {
+      nodes.push({
+        kind: "segment",
+        provider: segment.provider,
+        startLayer: segment.startLayer,
+        endLayerExclusive: segment.endLayerExclusive,
+        layerCount: segment.layerCount,
+        weightBytes: segment.weightBytes,
+        cacheBytes: segment.cacheBytes,
+      });
+    }
+    previousProvider = segment.provider;
+  }
+  nodes.push({
+    kind: "output",
+    provider: previousProvider,
+  });
+  return nodes;
+}
+
 function emptyPlan(
   provider: RunnerPlanningProvider,
   params: {
@@ -301,6 +439,14 @@ function emptyPlan(
   },
 ): RunnerPlacementPlan {
   const estimatedResidentBytes = params.outputBytes + provider.fixedBytes + provider.scratchBytes;
+  const segments: RunnerSegmentPlacement[] = [{
+    provider: "wasm",
+    startLayer: 0,
+    endLayerExclusive: params.blockCount,
+    layerCount: params.blockCount,
+    weightBytes: 0,
+    cacheBytes: 0,
+  }];
   return {
     status: params.status,
     mode: params.mode,
@@ -311,13 +457,15 @@ function emptyPlan(
     fixedBytes: provider.fixedBytes,
     scratchBytes: provider.scratchBytes,
     selectedLayerCount: 0,
-    cpuSegmentLayerCount: params.blockCount,
-    gpuSegmentLayerCount: 0,
-    gpuWeightBytes: params.outputBytes,
-    gpuCacheBytes: 0,
+    wasmSegmentLayerCount: params.blockCount,
+    webGpuSegmentLayerCount: 0,
+    webGpuWeightBytes: params.outputBytes,
+    webGpuCacheBytes: 0,
     estimatedResidentBytes,
     remainingBytes: Math.max(0, params.memoryLimitBytes - estimatedResidentBytes),
-    selectedLayers: [],
+    webGpuSelectedLayers: [],
+    segments,
+    nodes: buildHybridNodes(segments),
     copyAuditExpectations: provider.copyAuditExpectations(0),
   };
 }

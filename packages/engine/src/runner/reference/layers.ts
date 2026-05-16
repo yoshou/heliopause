@@ -4,7 +4,7 @@ import {
 import {
   gqaAttention,
   rmsNorm,
-} from "../../ops";
+} from "./kernels";
 import {
   dequantizeRow,
   float16ToFloat32,
@@ -37,27 +37,6 @@ import {
   timedSync,
   topK,
 } from "../../runtime";
-import {
-  gqaAttentionWasm,
-  matMulQuantizedMultiWasm,
-  matMulQuantizedWasm,
-  matMulQuantizedWasmResident,
-  matMulQuantizedWasmResidentMulti,
-  type QuantizedMatMulInput,
-  type WasmQuantizedWeightHandle,
-} from "./wasm-kernels";
-import {
-  cpuProjectionBatchingEnabled,
-  cpuResidentWeightCacheEnabled,
-  matMulWasmShardedWeightHandle,
-  matMulWasmShardedWeightHandleBatch,
-  readWasmShardedWeightHandle,
-  readWasmWeightHandle,
-  wasmExecutionProviderEnabled,
-} from "./acceleration";
-import type {
-  WasmShardedQuantizedWeightHandle,
-} from "./thread-pool";
 
 export type PreparedInput = {
   hidden: Float32Array;
@@ -318,18 +297,6 @@ export async function forwardAttentionLayer(
         valueLayout: "dim-head-token" as const,
         quantizeQueryForScore: "f16" as const,
       };
-      if (wasmExecutionProviderEnabled(session)) {
-        const wasm = await gqaAttentionWasm(
-          qRope,
-          cache.key.subarray(0, keyValueTokenCount * manifest.headCountKv * cache.keyLength),
-          compactValue,
-          attentionOptions,
-        );
-        if (!wasm) {
-          throw new Error("WASM GQA attention is unavailable.");
-        }
-        return wasm;
-      }
       return gqaAttention(
         qRope,
         cache.key.subarray(0, keyValueTokenCount * manifest.headCountKv * cache.keyLength),
@@ -571,7 +538,7 @@ export async function matMulWeight(
   inputColumns: Float32Array,
   trace?: ForwardTrace,
 ): Promise<Float32Array> {
-  requireCpuLikeProvider(session);
+  requireReferenceProvider(session);
   const tensor = session.getTensor(weightName);
   if (tensor.type === "F32" || tensor.type === "F16" || tensor.type === "BF16") {
     return matMulDenseRows(session, weightName, inputColumns);
@@ -585,149 +552,19 @@ export async function matMulWeight(
   throw new Error(`${weightName} has unsupported matmul type ${tensor.type}`);
 }
 
-function requireCpuLikeProvider(session: ModelSession): void {
-  if (!wasmExecutionProviderEnabled(session) && !session.executionProvider("reference")) {
-    throw new Error("CPU tensor execution requires an enabled wasm or reference provider.");
+function requireReferenceProvider(session: ModelSession): void {
+  if (!session.executionProvider("reference")) {
+    throw new Error("Reference tensor execution requires an enabled reference provider.");
   }
 }
 
 async function matMulWeightBatch(
-  session: ModelSession,
-  weightNames: readonly string[],
-  inputColumns: Float32Array,
-  trace?: ForwardTrace,
+  _session: ModelSession,
+  _weightNames: readonly string[],
+  _inputColumns: Float32Array,
+  _trace?: ForwardTrace,
 ): Promise<Float32Array[] | undefined> {
-  const projectionBatchingEnabled = cpuProjectionBatchingEnabled(session);
-  const residentWeightCacheEnabled = cpuResidentWeightCacheEnabled(session);
-  const wasmEnabled = wasmExecutionProviderEnabled(session);
-  if (!projectionBatchingEnabled && !residentWeightCacheEnabled) {
-    return undefined;
-  }
-  if (weightNames.length < 2 || weightNames.length > 4) {
-    return undefined;
-  }
-
-  const tensors = weightNames.map((name) => session.getTensor(name));
-  const inputSize = tensors[0]?.dimensions[0] ?? 0;
-  if (inputSize <= 0 || inputColumns.length % inputSize !== 0) {
-    return undefined;
-  }
-  const columnCount = inputColumns.length / inputSize;
-
-  for (const tensor of tensors) {
-    if (tensor.dimensions[0] !== inputSize || !isQuantizedMatmulWasmType(tensor.type)) {
-      return undefined;
-    }
-  }
-
-  if (residentWeightCacheEnabled) {
-    const shardedHandles = await Promise.all(weightNames.map((name, index) => {
-      const tensor = tensors[index];
-      if (!name || !tensor || !isQuantizedMatmulWasmType(tensor.type)) {
-        return Promise.resolve(undefined);
-      }
-      return readWasmShardedWeightHandle(session, name, tensor.type, inputSize, tensor.dimensions[1] ?? 0);
-    }));
-    if (shardedHandles.every((handle): handle is WasmShardedQuantizedWeightHandle => Boolean(handle))) {
-      const shardedOutputs = await timedAsync(
-        trace,
-        "WASM threaded resident matmul batch wrapper",
-        () => matMulWasmShardedWeightHandleBatch(shardedHandles, inputColumns, inputSize, columnCount),
-      );
-      if (shardedOutputs && shardedOutputs.length === shardedHandles.length) {
-        return shardedOutputs;
-      }
-    }
-
-    const handles = await Promise.all(weightNames.map((name, index) => {
-      const tensor = tensors[index];
-      if (!name || !tensor || !isQuantizedMatmulWasmType(tensor.type)) {
-        return Promise.resolve(undefined);
-      }
-      return readWasmWeightHandle(session, name, tensor.type, inputSize, tensor.dimensions[1] ?? 0);
-    }));
-    if (!handles.every((handle): handle is WasmQuantizedWeightHandle => Boolean(handle))) {
-      return undefined;
-    }
-
-    const outputs: Array<Float32Array | undefined> = new Array(handles.length);
-    const groups = new Map<number, number[]>();
-    for (let index = 0; index < handles.length; index += 1) {
-      const handle = handles[index];
-      if (!handle) {
-        return undefined;
-      }
-      const group = groups.get(handle.instanceId) ?? [];
-      group.push(index);
-      groups.set(handle.instanceId, group);
-    }
-
-    for (const indices of groups.values()) {
-      if (indices.length >= 2) {
-        const groupHandles = indices.map((index) => handles[index]).filter((handle): handle is WasmQuantizedWeightHandle => Boolean(handle));
-        const groupOutputs = await timedAsync(
-          trace,
-          "WASM resident matmul batch wrapper",
-          () => matMulQuantizedWasmResidentMulti(groupHandles, inputColumns, inputSize, columnCount),
-        );
-        if (!groupOutputs || groupOutputs.length !== groupHandles.length) {
-          throw new Error("Resident matmul batch did not return the expected outputs");
-        }
-        for (let outputIndex = 0; outputIndex < groupOutputs.length; outputIndex += 1) {
-          outputs[indices[outputIndex] ?? 0] = groupOutputs[outputIndex];
-        }
-      } else {
-        const index = indices[0] ?? 0;
-        const handle = handles[index];
-        if (!handle) {
-          return undefined;
-        }
-        outputs[index] = await timedAsync(
-          trace,
-          "WASM resident matmul wrapper",
-          () => matMulQuantizedWasmResident(handle, inputColumns, inputSize, handle.rowCount, columnCount),
-        );
-      }
-    }
-
-    if (outputs.every((output): output is Float32Array => output !== undefined)) {
-      return outputs as Float32Array[];
-    }
-  }
-
-  if (!projectionBatchingEnabled) {
-    return undefined;
-  }
-
-  const weights: QuantizedMatMulInput[] = [];
-  for (let index = 0; index < weightNames.length; index += 1) {
-    const name = weightNames[index];
-    const tensor = tensors[index];
-    if (!name || !tensor || !isQuantizedMatmulWasmType(tensor.type)) {
-      return undefined;
-    }
-    weights.push({
-      type: tensor.type,
-      weightBytes: await session.readWeightBytes(name),
-      rowCount: tensor.dimensions[1] ?? 0,
-    });
-  }
-
-  const output = await timedAsync(
-    trace,
-    "WASM matmul batch wrapper",
-    () => matMulQuantizedMultiWasm(weights, inputColumns, inputSize, columnCount),
-  );
-  if (!output && wasmEnabled) {
-    throw new Error("WASM quantized matmul batch is unavailable.");
-  }
-  return output;
-}
-
-function isQuantizedMatmulWasmType(
-  type: GgmlTypeName,
-): type is Extract<GgmlTypeName, "Q4_K" | "Q5_K" | "Q6_K" | "IQ4_XS" | "Q8_0"> {
-  return type === "Q4_K" || type === "Q5_K" || type === "Q6_K" || type === "IQ4_XS" || type === "Q8_0";
+  return undefined;
 }
 
 async function matMulDenseRows(
@@ -769,45 +606,13 @@ async function matMulKQ8K(
   const rowCount = tensor.dimensions[1] ?? 0;
   const columnCount = inputColumns.length / inputSize;
   const rowByteLength = tensorByteLength({ ...tensor, dimensions: [inputSize] });
-  if (!wasmExecutionProviderEnabled(session)) {
-    const weightBytes = await session.readWeightBytes(weightName);
-    return matMulKQ8KReference(type, weightBytes, inputColumns, inputSize, rowCount, columnCount, rowByteLength);
-  }
-  const shardedWasmHandle = await readWasmShardedWeightHandle(session, weightName, type, inputSize, rowCount);
-  if (shardedWasmHandle) {
-    const wasm = await timedAsync(
-      trace,
-      "WASM threaded resident matmul wrapper",
-      () => matMulWasmShardedWeightHandle(shardedWasmHandle, inputColumns, inputSize, rowCount, columnCount),
-      { weightName },
-    );
-    if (wasm) {
-      return wasm;
-    }
-  }
-  const wasmHandle = await readWasmWeightHandle(session, weightName, type, inputSize, rowCount);
-  if (wasmHandle) {
-    const wasm = await timedAsync(
-      trace,
-      "WASM resident matmul wrapper",
-      () => matMulQuantizedWasmResident(wasmHandle, inputColumns, inputSize, rowCount, columnCount),
-      { weightName },
-    );
-    if (wasm) {
-      return wasm;
-    }
-  }
   const weightBytes = await session.readWeightBytes(weightName);
-  const wasm = await timedAsync(
+  return timedAsync(
     trace,
-    "WASM matmul wrapper",
-    () => matMulQuantizedWasm(type, weightBytes, inputColumns, inputSize, rowCount, columnCount),
+    "reference matmul",
+    () => matMulKQ8KReference(type, weightBytes, inputColumns, inputSize, rowCount, columnCount, rowByteLength),
     { weightName },
   );
-  if (wasm) {
-    return wasm;
-  }
-  throw new Error(`WASM quantized matmul is unavailable for ${weightName}.`);
 }
 
 function matMulKQ8KReference(
@@ -854,19 +659,12 @@ async function matMulQ8_0Weight(
   const columnCount = inputColumns.length / inputSize;
   const rowByteLength = tensorByteLength({ ...tensor, dimensions: [inputSize] });
   const weightBytes = await session.readWeightBytes(weightName);
-  if (!wasmExecutionProviderEnabled(session)) {
-    return matMulQ8_0Reference(weightBytes, inputColumns, inputSize, rowCount, columnCount, rowByteLength);
-  }
-  const wasm = await timedAsync(
+  return timedAsync(
     trace,
-    "WASM matmul wrapper",
-    () => matMulQuantizedWasm("Q8_0", weightBytes, inputColumns, inputSize, rowCount, columnCount),
+    "reference Q8_0 matmul",
+    () => matMulQ8_0Reference(weightBytes, inputColumns, inputSize, rowCount, columnCount, rowByteLength),
     { weightName },
   );
-  if (wasm) {
-    return wasm;
-  }
-  throw new Error(`WASM Q8_0 matmul is unavailable for ${weightName}.`);
 }
 
 function matMulQ8_0Reference(

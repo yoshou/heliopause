@@ -1,11 +1,13 @@
 import {
-  buildModelManifest,
   buildTokenizer,
   cloneInferenceState,
   createAudioSession,
   createFileGgufTensorReader,
   createChatSession,
+  createReferenceProvider,
   createVisionSession,
+  createWasmProvider,
+  createWebGpuProvider,
   checkWasmSupport,
   checkWebGpuSupport,
   estimateWeightCacheBytes,
@@ -15,7 +17,6 @@ import {
   getGgufModelName,
   isAudioGguf,
   isVisionGguf,
-  planRunnerPlacement,
   runAudioEncoder,
   prefillChatMessages,
   runAudioPreprocessor,
@@ -25,6 +26,7 @@ import {
   type AudioSession,
   type InferenceState,
   type ModelSession,
+  type RunnerProvider,
   type Tokenizer,
   type VisionSession,
 } from "@heliopause/engine";
@@ -32,7 +34,7 @@ import type {
   EngineWorkerRequest,
   EngineWorkerResponse,
   MemoryProfile,
-  ResolvedMemoryProfile,
+  ResolvedRuntimeProfile,
   SystemMemoryInfo,
 } from "./engine-worker-protocol";
 
@@ -95,20 +97,18 @@ async function handleLoadModel(
   currentSystemPrompt = undefined;
 
   const tensorReader = await createFileGgufTensorReader(request.file);
-  const manifest = buildModelManifest(tensorReader.metadata);
   let nextVisionSession: VisionSession | undefined;
   let nextAudioSession: AudioSession | undefined;
   const estimatedWeightCacheBytes = estimateWeightCacheBytes(tensorReader);
-  const resolvedMemoryProfile = resolveMemoryProfile(
+  const runtimeProfile = resolveRuntimeProfile(
     request.memoryProfile,
     estimatedWeightCacheBytes,
     request.memoryInfo,
   );
   const executionProviders = await resolveExecutionProviders(
-    tensorReader.metadata,
-    manifest,
-    resolvedMemoryProfile,
+    runtimeProfile,
   );
+  const runnerProviders = instantiateRunnerProviderList(executionProviders);
   if (request.visionFile) {
     const visionReader = await createFileGgufTensorReader(request.visionFile);
     if (!isVisionGguf(visionReader.metadata) && !isAudioGguf(visionReader.metadata)) {
@@ -116,21 +116,24 @@ async function handleLoadModel(
     }
     if (isVisionGguf(visionReader.metadata)) {
       nextVisionSession = createVisionSession(visionReader, {
-        maxWeightCacheBytes: resolvedMemoryProfile.maxWeightCacheBytes,
+        maxWeightCacheBytes: runtimeProfile.maxWeightCacheBytes,
         executionProviders,
+        runnerProviders,
       });
     }
     if (isAudioGguf(visionReader.metadata)) {
       nextAudioSession = createAudioSession(visionReader, {
-        maxWeightCacheBytes: resolvedMemoryProfile.maxWeightCacheBytes,
+        maxWeightCacheBytes: runtimeProfile.maxWeightCacheBytes,
         executionProviders,
+        runnerProviders,
       });
     }
   }
   const nextSession = createChatSession(tensorReader, {
     maxContextLength: CHAT_CONTEXT_LENGTH,
-    maxWeightCacheBytes: resolvedMemoryProfile.maxWeightCacheBytes,
+    maxWeightCacheBytes: runtimeProfile.maxWeightCacheBytes,
     executionProviders,
+    runnerProviders,
   });
   const nextTokenizer = buildTokenizer(tensorReader.metadata);
 
@@ -147,7 +150,7 @@ async function handleLoadModel(
       modelName: getGgufModelName(tensorReader),
       contextLength: Math.min(nextSession.manifest.contextLength, CHAT_CONTEXT_LENGTH),
       originalContextLength: nextSession.manifest.contextLength,
-      memoryProfile: resolvedMemoryProfile,
+      runtimeProfile,
       visionFileName: request.visionFileName,
       supportsImages: Boolean(nextVisionSession),
       visionImageTokens: nextVisionSession
@@ -163,63 +166,59 @@ async function handleLoadModel(
   });
 }
 
+function instantiateRunnerProviderList(
+  executionProviders: readonly ExecutionProviderConfig[],
+): readonly RunnerProvider[] {
+  return executionProviders.map((provider) => {
+    switch (provider.name) {
+      case "webgpu":
+        return createWebGpuProvider();
+      case "wasm":
+        return createWasmProvider();
+      case "reference":
+        return createReferenceProvider();
+      default:
+        throw new Error(`Unsupported execution provider: ${provider.name}`);
+    }
+  });
+}
+
 async function resolveExecutionProviders(
-  metadata: Parameters<typeof planRunnerPlacement>[0],
-  manifest: ReturnType<typeof buildModelManifest>,
-  resolvedMemoryProfile: ResolvedMemoryProfile,
+  runtimeProfile: ResolvedRuntimeProfile,
 ): Promise<ExecutionProviderConfig[]> {
   const providers: ExecutionProviderConfig[] = [];
-  if (resolvedMemoryProfile.resolved === "full") {
-    const webGpuSupport = await checkWebGpuSupport();
-    if (webGpuSupport.available) {
-      const webGpuPlan = planRunnerPlacement(metadata, manifest, {
-        mode: "enabled",
-        contextLength: CHAT_CONTEXT_LENGTH,
-      });
-      if (webGpuPlan.status === "planned" && webGpuPlan.segmentStartLayer !== undefined) {
-        resolvedMemoryProfile.webGpuStatus = "suffix-enabled";
-        resolvedMemoryProfile.webGpuSegmentStartLayer = webGpuPlan.segmentStartLayer;
-        resolvedMemoryProfile.webGpuSegmentLayerCount = webGpuPlan.gpuSegmentLayerCount;
-        providers.push({
-          name: "webgpu",
-          options: {
-            segmentStartLayer: webGpuPlan.segmentStartLayer,
-            memoryLimitBytes: webGpuPlan.memoryLimitBytes,
-          },
-        });
-      } else {
-        resolvedMemoryProfile.webGpuStatus = "blocked";
-        resolvedMemoryProfile.webGpuUnavailableReason = webGpuPlan.status;
-      }
-    } else {
-      resolvedMemoryProfile.webGpuStatus = "blocked";
-      resolvedMemoryProfile.webGpuUnavailableReason = webGpuSupport.reason;
-    }
+  const webGpuSupport = await checkWebGpuSupport();
+  if (webGpuSupport.available) {
+    runtimeProfile.webGpuStatus = "enabled";
+    providers.push({ name: "webgpu" });
+  } else {
+    runtimeProfile.webGpuStatus = "blocked";
+    runtimeProfile.webGpuUnavailableReason = webGpuSupport.reason;
   }
 
   const wasmSupport = await checkWasmSupport();
   if (wasmSupport.available) {
-    resolvedMemoryProfile.wasmStatus = "enabled";
+    runtimeProfile.wasmStatus = "enabled";
     providers.push({
       name: "wasm",
       options: {
         projectionBatching: true,
-        residentWeightCache: resolvedMemoryProfile.wasmResidentWeightCache,
-        parallelResidentMatmul: resolvedMemoryProfile.wasmResidentWeightCache,
+        residentWeightCache: runtimeProfile.wasmResidentWeightCache,
+        parallelResidentMatmul: runtimeProfile.wasmResidentWeightCache,
         parallelMatmulMinRows: 512,
-        threadPoolSize: resolvedMemoryProfile.wasmResidentWeightCache ? "auto" : 1,
-        ioPrefetch: resolvedMemoryProfile.wasmResidentWeightCache,
+        threadPoolSize: runtimeProfile.wasmResidentWeightCache ? "auto" : 1,
+        ioPrefetch: runtimeProfile.wasmResidentWeightCache,
         ioPrefetchConcurrency: "auto",
         ioWorkerBlobRead: false,
       },
     });
   } else {
-    resolvedMemoryProfile.wasmStatus = "unavailable";
-    resolvedMemoryProfile.wasmUnavailableReason = wasmSupport.reason;
+    runtimeProfile.wasmStatus = "unavailable";
+    runtimeProfile.wasmUnavailableReason = wasmSupport.reason;
   }
 
   providers.push({ name: "reference" });
-  resolvedMemoryProfile.executionProviders = providers.map((provider) => provider.name);
+  runtimeProfile.executionProviders = providers.map((provider) => provider.name);
   return providers;
 }
 
@@ -373,11 +372,11 @@ function handleCancelGeneration(requestId: number): void {
   activeGeneration.abortController.abort();
 }
 
-function resolveMemoryProfile(
+function resolveRuntimeProfile(
   requested: MemoryProfile,
   estimatedWeightCacheBytes: number,
   memoryInfo: SystemMemoryInfo | undefined,
-): ResolvedMemoryProfile {
+): ResolvedRuntimeProfile {
   const fullBytes = Math.min(
     FULL_WEIGHT_CACHE_LIMIT_BYTES,
     Math.ceil(estimatedWeightCacheBytes * FULL_WEIGHT_CACHE_HEADROOM),
@@ -398,7 +397,7 @@ function resolveMemoryProfile(
     maxWeightCacheBytes: resolved === "full" ? fullBytes : LOW_WEIGHT_CACHE_BYTES,
     estimatedWeightCacheBytes,
     wasmResidentWeightCache: resolved === "full",
-    webGpuStatus: resolved === "full" ? "blocked" : "memory-profile-disabled",
+    webGpuStatus: "blocked",
     executionProviders: [],
     wasmStatus: "unavailable",
     availableMemoryBytes,

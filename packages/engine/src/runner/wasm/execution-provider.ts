@@ -5,17 +5,17 @@ import type {
 } from "../../runtime";
 import { forwardOutput } from "./layers";
 import {
-  CpuSegmentRunner,
-  type CpuSegmentRunnerOptions,
+  WasmSegmentRunner,
+  type WasmSegmentRunnerOptions,
 } from "./segment-runner";
 
-export function cpuSegmentRunner(
-  options: CpuSegmentRunnerOptions,
-): CpuSegmentRunner {
-  return new CpuSegmentRunner(options);
+export function wasmSegmentRunner(
+  options: WasmSegmentRunnerOptions,
+): WasmSegmentRunner {
+  return new WasmSegmentRunner(options);
 }
 
-export function cpuOutput(
+export function wasmOutput(
   session: ModelSession,
   hidden: Float32Array,
   options: { topK: number; trace?: ForwardTrace },

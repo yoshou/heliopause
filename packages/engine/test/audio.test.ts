@@ -15,8 +15,13 @@ import {
   GgufTensorReader,
 } from "../src/tensor-reader.ts";
 import {
+  createReferenceProvider,
+  createWasmProvider,
+  createWebGpuProvider,
+} from "../src/index.ts";
+import {
   resetPrefillWasmForTesting,
-} from "../src/runner/cpu/wasm-kernels.ts";
+} from "../src/runner/wasm/wasm-kernels.ts";
 
 test("audio manifest reads projector metadata", () => {
   const reader = audioTensorReader([]);
@@ -62,6 +67,7 @@ test("audio WASM preprocessing matches CPU log-mel features", async () => {
   const baseline = preprocessAudioPcm(audio);
   const session = createAudioSession(audioTensorReader([]), {
     preprocessProviders: [{ name: "wasm" }, { name: "reference" }],
+    runnerProviders: [createWasmProvider(), createReferenceProvider()],
   });
 
   const wasm = await runAudioPreprocessor(session, audio);
@@ -80,6 +86,7 @@ test("audio preprocessor errors instead of falling back when WebGPU is unavailab
       { name: "wasm" },
       { name: "reference" },
     ],
+    runnerProviders: [createWebGpuProvider(), createWasmProvider(), createReferenceProvider()],
   });
 
   resetPrefillWasmForTesting("");
@@ -110,7 +117,7 @@ test("audio encoder projects hidden to model embedding size", async () => {
     f32Tensor("a.pre_encode.out.bias", [1536], new Float32Array(1536)),
     f32Tensor("mm.a.input_projection.weight", [1536, 2560], new Float32Array(1536 * 2560)),
   ]);
-  const session = createAudioSession(reader);
+  const session = createAudioSession(reader, { runnerProviders: [createReferenceProvider()] });
   const features = preprocessAudioPcm({
     pcm: new Float32Array(16_000),
     sampleRate: 16_000,
@@ -138,6 +145,7 @@ test("audio encoder errors instead of falling back when WebGPU is unavailable", 
       { name: "webgpu" },
       { name: "reference" },
     ],
+    runnerProviders: [createWebGpuProvider(), createReferenceProvider()],
   });
   const features = preprocessAudioPcm({
     pcm: new Float32Array(16_000),

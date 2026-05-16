@@ -5,19 +5,27 @@ import type {
   ModelSession,
   OutputResult,
 } from "../runtime";
+import {
+  destroyRunnerBuffer,
+  type RunnerBuffer,
+} from "./buffer";
 
-export type ForwardRunnerBackend = "cpu" | "webgpu" | "transfer";
+export type ForwardRunnerBackend = "reference" | "wasm" | "webgpu" | "transfer";
 
 export type ForwardCpuHiddenValue = {
   kind: "cpu-hidden";
+  buffer: RunnerBuffer;
   hidden: Float32Array;
+  perLayerInputs?: Float32Array;
 };
 
 export type ForwardProviderHiddenValue = {
   kind: "provider-hidden";
   provider: string;
-  hidden: Float32Array;
-  destroy?: () => void;
+  buffer: RunnerBuffer;
+  perLayerInputs?: Float32Array;
+  selectedTokenId?: number;
+  topTokens?: Array<{ id: number; value: number }>;
 };
 
 export type ForwardOutputValue = {
@@ -25,10 +33,19 @@ export type ForwardOutputValue = {
   result: OutputResult;
 };
 
+export type ForwardDecodeValue = {
+  kind: "decode";
+  hidden: Float32Array;
+  logits?: Float32Array;
+  selectedTokenId?: number;
+  topTokens?: Array<{ id: number; value: number }>;
+};
+
 export type ForwardValue =
   | ForwardCpuHiddenValue
   | ForwardProviderHiddenValue
-  | ForwardOutputValue;
+  | ForwardOutputValue
+  | ForwardDecodeValue;
 
 export type ForwardGraphContext = {
   session: ModelSession;
@@ -36,6 +53,7 @@ export type ForwardGraphContext = {
   state: InferenceState;
   positions: Int32Array;
   phase: "prefill" | "decode";
+  outputTopK?: number;
   trace?: ForwardTrace;
 };
 
@@ -82,8 +100,8 @@ export class ForwardGraphExecutor {
       };
     } catch (error) {
       for (const value of cleanup.reverse()) {
-        if (value.kind === "provider-hidden") {
-          value.destroy?.();
+        if (value.kind === "cpu-hidden" || value.kind === "provider-hidden") {
+          destroyRunnerBuffer(value.buffer);
         }
       }
       throw error;
@@ -99,6 +117,17 @@ export function requireCpuHidden(inputs: ReadonlyMap<string, ForwardValue>, id: 
   const input = inputs.get(id);
   if (!input || input.kind !== "cpu-hidden") {
     throw new Error(`Expected CPU hidden input from ${id}`);
+  }
+  return input;
+}
+
+export function requireHidden(
+  inputs: ReadonlyMap<string, ForwardValue>,
+  id: string,
+): ForwardCpuHiddenValue | ForwardProviderHiddenValue {
+  const input = inputs.get(id);
+  if (!input || (input.kind !== "cpu-hidden" && input.kind !== "provider-hidden")) {
+    throw new Error(`Expected hidden input from ${id}`);
   }
   return input;
 }

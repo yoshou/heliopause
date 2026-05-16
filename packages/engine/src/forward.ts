@@ -1,26 +1,37 @@
 import {
   createForwardTrace,
   modelSession,
-  timedAsync,
   type InferenceState,
   type ModelInput,
   type ModelSession,
   type TimingSink,
 } from "./runtime";
-import { planRunnerPlacement } from "./runner/webgpu/planning";
+import type {
+  ModelGraphRunner,
+  ModelRunner,
+} from "./runner/model-runner";
 import {
-  cpuOutput,
-  cpuSegmentRunner,
-} from "./runner/cpu/execution-provider";
+  cpuRunnerBuffer,
+  runnerBufferToCpu,
+} from "./runner/buffer";
 import {
-  prepareInput,
-  preparePreparedHiddenInput,
-} from "./runner/cpu/layers";
+  ForwardGraphExecutor,
+  requireCpuHidden,
+  type ForwardCpuHiddenValue,
+  type ForwardGraphContext,
+  type ForwardOutputValue,
+  type ForwardRunnerNode,
+  type ForwardValue,
+} from "./runner/graph";
 import {
-  webGpuSegmentRunner,
-  webGpuExecutionProviderEnabled,
-  webGpuExecutionProviderOptions,
-} from "./runner/webgpu/execution-provider";
+  type RunnerProvider,
+} from "./runner/provider";
+import type {
+  RunnerNodePlacement,
+} from "./runner/planning";
+import type {
+  SegmentRunnerProvider,
+} from "./runner/segment-runner";
 
 export type PrefillOptions = {
   positions?: Int32Array | number[];
@@ -65,14 +76,12 @@ export async function prefillPreparedHidden(
   options: PreparedHiddenPrefillOptions = {},
 ): Promise<PrefillResult> {
   const session = modelSession(model);
-  if (webGpuExecutionProviderEnabled(session)) {
-    return prefillPreparedHiddenHybridWebGpu(session, hiddenInput, options);
-  }
   const tokenCount = hiddenInput.length / session.manifest.embeddingLength;
   if (!Number.isInteger(tokenCount)) {
     throw new Error(`Prepared hidden shape mismatch: ${hiddenInput.length}`);
   }
   const state = options.state ?? session.createInferenceState();
+  const runtime = modelRuntimeForForward(session, state);
   const positions = normalizePositions(options.positions, tokenCount);
   const trace = createForwardTrace("prefill", options.onTiming);
 
@@ -80,85 +89,34 @@ export async function prefillPreparedHidden(
     return { hidden: new Float32Array(), state };
   }
 
-  const prepared = await preparePreparedHiddenInput(session, hiddenInput, trace);
-  const runner = cpuSegmentRunner({
+  const input = new PreparedHiddenInputNode(runtime.primary.runner, hiddenInput);
+  const built = buildForwardGraphFromPlan(runtime, {
+    input,
+    computeLogits: options.computeLogits === true,
+    logitsTopK: options.logitsTopK ?? 10,
+    segmentOptions: {
+      attentionCausal: options.attentionCausal ?? true,
+    },
+  });
+  const graph = new ForwardGraphExecutor(built.nodes);
+  const graphResult = await graph.run({
     session,
     manifest: session.manifest,
-    epsilon: session.epsilon,
-    segmentStartLayer: 0,
-    segmentEndLayerExclusive: session.manifest.blockCount,
-  });
-  const hidden = (await runner.runTokensHidden(prepared.hidden, positions, state, {
+    state,
+    positions,
+    phase: "prefill",
+    outputTopK: options.computeLogits ? options.logitsTopK ?? 10 : undefined,
     trace,
-    perLayerInputs: prepared.perLayerInputs,
-    attentionCausal: options.attentionCausal ?? true,
-  })).hidden;
+  });
+  const hidden = graphHiddenForResult(graphResult.values, built.hiddenId);
   updateNextPosition(state, positions, tokenCount);
 
   const result: PrefillResult = { hidden, state };
   if (options.computeLogits) {
-    const output = await cpuOutput(session, hidden, {
-      topK: options.logitsTopK ?? 10,
-      trace,
-    });
+    const output = requireGraphOutput(graphResult.values, built.outputId ?? "output").result;
     result.logits = output.logits;
     result.selectedTokenId = output.topTokens[0]?.id;
     result.topTokens = output.topTokens;
-  }
-  return result;
-}
-
-async function prefillPreparedHiddenHybridWebGpu(
-  session: ModelSession,
-  hiddenInput: Float32Array,
-  options: PreparedHiddenPrefillOptions = {},
-): Promise<PrefillResult> {
-  const tokenCount = hiddenInput.length / session.manifest.embeddingLength;
-  if (!Number.isInteger(tokenCount)) {
-    throw new Error(`Prepared hidden shape mismatch: ${hiddenInput.length}`);
-  }
-  const state = options.state ?? session.createInferenceState();
-  const positions = normalizePositions(options.positions, tokenCount);
-  const trace = createForwardTrace("prefill", options.onTiming);
-  const runner = await webGpuSegmentRunnerForForward(session, state);
-
-  if (tokenCount === 0) {
-    return { hidden: new Float32Array(), state };
-  }
-
-  const prepared = await preparePreparedHiddenInput(session, hiddenInput, trace);
-  const cpuPrefix = cpuSegmentRunner({
-    session,
-    manifest: session.manifest,
-    epsilon: session.epsilon,
-    segmentStartLayer: 0,
-    segmentEndLayerExclusive: runner.segmentStartLayer,
-  });
-  const segmentInputHidden = runner.segmentStartLayer > 0
-    ? (await cpuPrefix.runTokensHidden(prepared.hidden, positions, state, {
-      trace,
-      perLayerInputs: prepared.perLayerInputs,
-      attentionCausal: options.attentionCausal ?? true,
-    })).hidden
-    : prepared.hidden;
-
-  const gpu = await timedAsync(
-    trace,
-    "WebGPU prepared hidden segment",
-    () => runner.runTokensHidden(segmentInputHidden, positions, state, {
-      computeSelectedToken: options.computeLogits === true,
-      topK: options.logitsTopK ?? 10,
-      perLayerInputs: prepared.perLayerInputs,
-      attentionCausal: options.attentionCausal ?? true,
-    }),
-  );
-  updateNextPosition(state, positions, tokenCount);
-  logWebGpuRunnerTiming(session, "prefill");
-
-  const result: PrefillResult = { hidden: gpu.hidden, state };
-  if (options.computeLogits) {
-    result.selectedTokenId = gpu.selectedTokenId;
-    result.topTokens = gpu.topTokens ?? [];
   }
   return result;
 }
@@ -169,10 +127,8 @@ export async function prefill(
   options: PrefillOptions = {},
 ): Promise<PrefillResult> {
   const session = modelSession(model);
-  if (webGpuExecutionProviderEnabled(session)) {
-    return prefillHybridWebGpu(session, tokenIds, options);
-  }
   const state = options.state ?? session.createInferenceState();
+  const runtime = modelRuntimeForForward(session, state);
   const positions = normalizePositions(options.positions, tokenIds.length);
   const trace = createForwardTrace("prefill", options.onTiming);
 
@@ -180,26 +136,27 @@ export async function prefill(
     return { hidden: new Float32Array(), state };
   }
 
-  const prepared = await prepareInput(session, tokenIds, trace);
-  const runner = cpuSegmentRunner({
+  const built = buildForwardGraphFromPlan(runtime, {
+    tokenIds,
+    computeLogits: options.computeLogits === true,
+    logitsTopK: options.logitsTopK ?? 10,
+  });
+  const graph = new ForwardGraphExecutor(built.nodes);
+  const graphResult = await graph.run({
     session,
     manifest: session.manifest,
-    epsilon: session.epsilon,
-    segmentStartLayer: 0,
-    segmentEndLayerExclusive: session.manifest.blockCount,
-  });
-  const hidden = (await runner.runTokensHidden(prepared.hidden, positions, state, {
+    state,
+    positions,
+    phase: "prefill",
+    outputTopK: options.computeLogits ? options.logitsTopK ?? 10 : undefined,
     trace,
-    perLayerInputs: prepared.perLayerInputs,
-  })).hidden;
+  });
+  const hidden = graphHiddenForResult(graphResult.values, built.hiddenId);
   updateNextPosition(state, positions, tokenIds.length);
 
   const result: PrefillResult = { hidden, state };
   if (options.computeLogits) {
-    const output = await cpuOutput(session, hidden, {
-      topK: options.logitsTopK ?? 10,
-      trace,
-    });
+    const output = requireGraphOutput(graphResult.values, built.outputId ?? "output").result;
     result.logits = output.logits;
     result.selectedTokenId = output.topTokens[0]?.id;
     result.topTokens = output.topTokens;
@@ -213,30 +170,29 @@ export async function decode(
   options: DecodeOptions = {},
 ): Promise<DecodeResult> {
   const session = modelSession(model);
-  if (webGpuExecutionProviderEnabled(session)) {
-    return decodeHybridWebGpu(session, tokenId, options);
-  }
   const state = options.state ?? session.createInferenceState();
+  const runtime = modelRuntimeForForward(session, state);
   const position = options.position ?? state.nextPosition;
   const positions = new Int32Array([position]);
   const trace = createForwardTrace("decode", options.onTiming);
-  const prepared = await prepareInput(session, [tokenId], trace);
-  const runner = cpuSegmentRunner({
+  const built = buildForwardGraphFromPlan(runtime, {
+    tokenIds: [tokenId],
+    computeLogits: true,
+    logitsTopK: options.logitsTopK ?? 10,
+  });
+  const graph = new ForwardGraphExecutor(built.nodes);
+  const graphResult = await graph.run({
     session,
     manifest: session.manifest,
-    epsilon: session.epsilon,
-    segmentStartLayer: 0,
-    segmentEndLayerExclusive: session.manifest.blockCount,
-  });
-  const hidden = (await runner.runTokenHidden(prepared.hidden, positions, state, {
+    state,
+    positions,
+    phase: "decode",
+    outputTopK: options.logitsTopK ?? 10,
     trace,
-    perLayerInputs: prepared.perLayerInputs,
-  })).hidden;
+  });
+  const hidden = graphHiddenForResult(graphResult.values, built.hiddenId);
   state.nextPosition = Math.max(state.nextPosition, position + 1);
-  const output = await cpuOutput(session, hidden, {
-    topK: options.logitsTopK ?? 10,
-    trace,
-  });
+  const output = requireGraphOutput(graphResult.values, built.outputId ?? "output").result;
   return {
     hidden,
     state,
@@ -246,132 +202,161 @@ export async function decode(
   };
 }
 
-async function prefillHybridWebGpu(
-  session: ModelSession,
-  tokenIds: readonly number[],
-  options: PrefillOptions = {},
-): Promise<PrefillResult> {
-  const state = options.state ?? session.createInferenceState();
-  const positions = normalizePositions(options.positions, tokenIds.length);
-  const trace = createForwardTrace("prefill", options.onTiming);
-  const runner = await webGpuSegmentRunnerForForward(session, state);
-  if (tokenIds.length === 0) {
-    return { hidden: new Float32Array(), state };
+class PreparedHiddenInputNode implements ForwardRunnerNode {
+  readonly id = "input";
+  readonly deps: readonly string[] = [];
+  readonly backend = "transfer" as const;
+  private readonly runner: ModelRunner;
+  private readonly hidden: Float32Array;
+
+  constructor(
+    runner: ModelRunner,
+    hidden: Float32Array,
+  ) {
+    this.runner = runner;
+    this.hidden = hidden;
   }
 
-  if (runner.supportsGpuInputPreparation()) {
-    const gpu = await timedAsync(
-      trace,
-      "WebGPU token-id input segment",
-      () => runner.runTokenIds(tokenIds, positions, state, {
-        computeSelectedToken: options.computeLogits === true,
-        topK: options.logitsTopK ?? 10,
-      }),
-    );
-    updateNextPosition(state, positions, tokenIds.length);
-    logWebGpuRunnerTiming(session, "prefill");
+  async run(context: ForwardGraphContext): Promise<ForwardCpuHiddenValue> {
+    const prepared = await this.runner.preparePreparedHiddenInput(context.session, this.hidden, context.trace);
     return {
-      hidden: new Float32Array(),
-      state,
-      selectedTokenId: options.computeLogits ? gpu.selectedTokenId : undefined,
-      topTokens: options.computeLogits ? [] : undefined,
+      kind: "cpu-hidden",
+      buffer: cpuRunnerBuffer(prepared.hidden, [prepared.hidden.length / context.manifest.embeddingLength, context.manifest.embeddingLength]),
+      hidden: prepared.hidden,
+      perLayerInputs: prepared.perLayerInputs,
     };
   }
-
-  const prepared = await prepareInput(session, tokenIds, trace);
-  const cpuPrefix = cpuSegmentRunner({
-    session,
-    manifest: session.manifest,
-    epsilon: session.epsilon,
-    segmentStartLayer: 0,
-    segmentEndLayerExclusive: runner.segmentStartLayer,
-  });
-  const segmentInputHidden = (await cpuPrefix.runTokensHidden(prepared.hidden, positions, state, {
-    trace,
-    perLayerInputs: prepared.perLayerInputs,
-  })).hidden;
-  const gpu = await timedAsync(
-    trace,
-    "WebGPU segment",
-    () => runner.runTokens(segmentInputHidden, positions, state, {
-      computeSelectedToken: options.computeLogits === true,
-      topK: options.logitsTopK ?? 10,
-      perLayerInputs: prepared.perLayerInputs,
-    }),
-  );
-  updateNextPosition(state, positions, tokenIds.length);
-  logWebGpuRunnerTiming(session, "prefill");
-
-  const result: PrefillResult = {
-    hidden: new Float32Array(),
-    state,
-  };
-  if (options.computeLogits) {
-    result.selectedTokenId = gpu.selectedTokenId;
-    result.topTokens = [];
-  }
-  return result;
 }
 
-async function decodeHybridWebGpu(
-  session: ModelSession,
-  tokenId: number,
-  options: DecodeOptions = {},
-): Promise<DecodeResult> {
-  const state = options.state ?? session.createInferenceState();
-  const position = options.position ?? state.nextPosition;
-  const positions = new Int32Array([position]);
-  const trace = createForwardTrace("decode", options.onTiming);
-  const runner = await webGpuSegmentRunnerForForward(session, state);
+class CpuHiddenAliasNode implements ForwardRunnerNode {
+  readonly id: string;
+  readonly deps: readonly string[];
+  readonly backend = "transfer" as const;
 
-  if (runner.supportsGpuInputPreparation()) {
-    const gpu = await timedAsync(
-      trace,
-      "WebGPU token-id input segment",
-      () => runner.runTokenIds([tokenId], positions, state, {
-        computeSelectedToken: true,
-        topK: options.logitsTopK ?? 10,
-      }),
-    );
-    state.nextPosition = Math.max(state.nextPosition, position + 1);
-    logWebGpuRunnerTiming(session, "decode");
-    return {
-      hidden: new Float32Array(),
-      state,
-      selectedTokenId: gpu.selectedTokenId,
-      topTokens: [],
-    };
+  constructor(inputId: string, id = "hidden") {
+    this.id = id;
+    this.deps = [inputId];
   }
 
-  const prepared = await prepareInput(session, [tokenId], trace);
-  const cpuPrefix = cpuSegmentRunner({
-    session,
-    manifest: session.manifest,
-    epsilon: session.epsilon,
-    segmentStartLayer: 0,
-    segmentEndLayerExclusive: runner.segmentStartLayer,
-  });
-  const segmentInputHidden = (await cpuPrefix.runTokenHidden(prepared.hidden, positions, state, {
-    trace,
-    perLayerInputs: prepared.perLayerInputs,
-  })).hidden;
-  const gpu = await timedAsync(
-    trace,
-    "WebGPU segment",
-    () => runner.runToken(segmentInputHidden, positions, state, {
-      computeSelectedToken: true,
-      topK: options.logitsTopK ?? 10,
-      perLayerInputs: prepared.perLayerInputs,
-    }),
-  );
-  state.nextPosition = Math.max(state.nextPosition, position + 1);
-  logWebGpuRunnerTiming(session, "decode");
-  return {
-    hidden: new Float32Array(),
-    state,
-    selectedTokenId: gpu.selectedTokenId,
-    topTokens: [],
+  run(_context: ForwardGraphContext, inputs: ReadonlyMap<string, ForwardValue>): ForwardCpuHiddenValue {
+    return requireCpuHidden(inputs, this.deps[0] ?? "");
+  }
+}
+
+class ModelSegmentNode implements ForwardRunnerNode {
+  readonly id = "segment";
+  readonly deps: readonly string[];
+  readonly backend: ForwardRunnerNode["backend"];
+  private readonly runner: ModelRunner;
+  private readonly options: {
+    attentionCausal?: boolean;
+    segmentStartLayer: number;
+    segmentEndLayerExclusive: number;
   };
+
+  constructor(
+    runner: ModelRunner,
+    inputId: string,
+    options: {
+      attentionCausal?: boolean;
+      segmentStartLayer?: number;
+      segmentEndLayerExclusive?: number;
+    } = {},
+  ) {
+    this.runner = runner;
+    this.options = {
+      ...options,
+      segmentStartLayer: options.segmentStartLayer ?? 0,
+      segmentEndLayerExclusive: options.segmentEndLayerExclusive ?? Number.POSITIVE_INFINITY,
+    };
+    this.deps = [inputId];
+    this.backend = runner.provider;
+  }
+
+  async run(context: ForwardGraphContext, inputs: ReadonlyMap<string, ForwardValue>): Promise<ForwardCpuHiddenValue> {
+    const input = requireCpuHidden(inputs, this.deps[0] ?? "");
+    const segment = await this.runner.segmentRunner({
+      session: context.session,
+      state: context.state,
+      manifest: context.manifest,
+      epsilon: context.session.epsilon,
+      segmentStartLayer: this.options.segmentStartLayer,
+      segmentEndLayerExclusive: Math.min(this.options.segmentEndLayerExclusive, context.manifest.blockCount),
+    });
+    const inputHidden = await runnerBufferToCpu(input.buffer);
+    const hidden = inputHidden.length === context.manifest.embeddingLength
+      ? (await segment.runTokenHidden(inputHidden, context.positions, context.state, {
+        trace: context.trace,
+        perLayerInputs: input.perLayerInputs,
+        attentionCausal: this.options.attentionCausal,
+      })).hidden
+      : (await segment.runTokensHidden(inputHidden, context.positions, context.state, {
+        trace: context.trace,
+        perLayerInputs: input.perLayerInputs,
+        attentionCausal: this.options.attentionCausal,
+      })).hidden;
+    return {
+      kind: "cpu-hidden",
+      buffer: cpuRunnerBuffer(hidden, [hidden.length / context.manifest.embeddingLength, context.manifest.embeddingLength]),
+      hidden,
+      perLayerInputs: input.perLayerInputs,
+    };
+  }
+}
+
+class ModelOutputNode implements ForwardRunnerNode {
+  readonly id = "output";
+  readonly deps: readonly string[];
+  readonly backend: ForwardRunnerNode["backend"];
+  private readonly runner: ModelRunner;
+  private readonly topK: number;
+
+  constructor(
+    runner: ModelRunner,
+    inputId: string,
+    topK: number,
+  ) {
+    this.runner = runner;
+    this.topK = topK;
+    this.deps = [inputId];
+    this.backend = runner.provider;
+  }
+
+  async run(context: ForwardGraphContext, inputs: ReadonlyMap<string, ForwardValue>): Promise<ForwardOutputValue> {
+    const input = requireCpuHidden(inputs, this.deps[0] ?? "");
+    const hidden = await runnerBufferToCpu(input.buffer);
+    return {
+      kind: "output",
+      result: await this.runner.output(context.session, hidden, {
+        topK: this.topK,
+        trace: context.trace,
+      }),
+    };
+  }
+}
+
+function requireGraphCpuHidden(values: ReadonlyMap<string, ForwardValue>, id: string): ForwardCpuHiddenValue {
+  const value = values.get(id);
+  if (!value || value.kind !== "cpu-hidden") {
+    throw new Error(`Expected CPU hidden graph value from ${id}`);
+  }
+  return value;
+}
+
+function graphHiddenForResult(values: ReadonlyMap<string, ForwardValue>, id: string): Float32Array {
+  const value = values.get(id);
+  if (!value || (value.kind !== "cpu-hidden" && value.kind !== "provider-hidden")) {
+    throw new Error(`Expected hidden graph value from ${id}`);
+  }
+  return value.kind === "cpu-hidden" ? value.hidden : new Float32Array();
+}
+
+function requireGraphOutput(values: ReadonlyMap<string, ForwardValue>, id: string): ForwardOutputValue {
+  const value = values.get(id);
+  if (!value || value.kind !== "output") {
+    throw new Error(`Expected output graph value from ${id}`);
+  }
+  return value;
 }
 
 function normalizePositions(positions: PrefillOptions["positions"], tokenCount: number): Int32Array {
@@ -385,25 +370,218 @@ function normalizePositions(positions: PrefillOptions["positions"], tokenCount: 
   return output;
 }
 
-async function webGpuSegmentRunnerForForward(
-  session: ModelSession,
-  state: InferenceState,
-) {
-  const providerOptions = webGpuExecutionProviderOptions(session);
-  if (!providerOptions) {
-    throw new Error("WebGPU segment runner is not enabled for this  session.");
-  }
-  const segmentStartLayer = providerOptions.segmentStartLayer ??
-    planRunnerPlacement(
-      session.tensorReader.metadata,
-      session.manifest,
-      {
-        mode: "enabled",
+type ModelRuntimeForForward = {
+  provider: RunnerProvider;
+  runner: ModelRunner;
+  graph: ModelGraphRunner;
+};
+
+type PlannedModelForward = {
+  primary: ModelRuntimeForForward;
+  providers: ReadonlyMap<SegmentRunnerProvider, ModelRuntimeForForward>;
+  nodes: readonly RunnerNodePlacement[];
+};
+
+type BuiltForwardGraph = {
+  nodes: ForwardRunnerNode[];
+  hiddenId: string;
+  outputId?: string;
+};
+
+function modelRuntimeForForward(session: ModelSession, state: InferenceState): PlannedModelForward {
+  const providers = modelRuntimesForForward(session);
+  for (const config of session.executionProviders) {
+    const runtime = providers.get(config.name as SegmentRunnerProvider);
+    if (runtime) {
+      const plan = runtime.provider.planModelPlacement?.(session, {
         contextLength: state.contextLength,
-        memoryLimitBytes: providerOptions.memoryLimitBytes,
-      },
-    ).segmentStartLayer;
-  return webGpuSegmentRunner(session, state, { segmentStartLayer });
+      });
+      return {
+        primary: runtime,
+        providers,
+        nodes: plan?.nodes ?? fullModelNodes(runtime.runner.provider, session.manifest.blockCount),
+      };
+    }
+  }
+  throw new Error("No model runner was selected.");
+}
+
+function modelRuntimesForForward(session: ModelSession): ReadonlyMap<SegmentRunnerProvider, ModelRuntimeForForward> {
+  const providers = new Map<SegmentRunnerProvider, ModelRuntimeForForward>();
+  for (const provider of session.runnerProviders) {
+    const runner = provider.createModelRunner?.();
+    if (!runner) {
+      continue;
+    }
+    const graph = provider.createModelGraphRunner?.() ?? runner.graph;
+    if (!graph) {
+      throw new Error(`Model graph runner is not available for ${provider.name}.`);
+    }
+    providers.set(provider.name, {
+      provider,
+      runner,
+      graph,
+    });
+  }
+  return providers;
+}
+
+function fullModelNodes(provider: SegmentRunnerProvider, blockCount: number): RunnerNodePlacement[] {
+  return [
+    {
+      kind: "embedding",
+      provider,
+    },
+    {
+      kind: "segment",
+      provider,
+      startLayer: 0,
+      endLayerExclusive: blockCount,
+      layerCount: blockCount,
+      weightBytes: 0,
+      cacheBytes: 0,
+    },
+    {
+      kind: "output",
+      provider,
+    },
+  ];
+}
+
+function buildForwardGraphFromPlan(
+  planned: PlannedModelForward,
+  options: {
+    tokenIds?: readonly number[];
+    input?: ForwardRunnerNode;
+    computeLogits: boolean;
+    logitsTopK: number;
+    segmentOptions?: { attentionCausal?: boolean };
+  },
+): BuiltForwardGraph {
+  const nodes: ForwardRunnerNode[] = [];
+  let currentId: string | undefined;
+  let currentProvider: SegmentRunnerProvider | undefined;
+  let hiddenId: string | undefined;
+  let outputId: string | undefined;
+
+  if (options.input) {
+    nodes.push(options.input);
+    currentId = options.input.id;
+  }
+
+  for (const planNode of planned.nodes) {
+    if (planNode.kind === "embedding") {
+      if (!options.tokenIds) {
+        continue;
+      }
+      const runtime = requirePlannedProvider(planned, planNode.provider);
+      const embedding = runtime.graph.embeddingNode(options.tokenIds);
+      nodes.push(embedding);
+      currentId = embedding.id;
+      currentProvider = planNode.provider;
+      continue;
+    }
+
+    if (planNode.kind === "segment") {
+      if (!currentId) {
+        throw new Error(`Cannot run ${planNode.provider} segment without an input node.`);
+      }
+      if (!currentProvider && planNode.provider !== "reference" && planNode.provider !== "wasm") {
+        const imported = importHiddenNode(requirePlannedProvider(planned, planNode.provider), currentId);
+        nodes.push(imported);
+        currentId = imported.id;
+      }
+      const runtime = requirePlannedProvider(planned, planNode.provider);
+      const segment = segmentNode(
+        runtime,
+        currentId,
+        planNode.startLayer,
+        planNode.endLayerExclusive,
+        options.segmentOptions,
+      );
+      nodes.push(segment);
+      currentId = segment.id;
+      currentProvider = planNode.provider;
+      continue;
+    }
+
+    if (planNode.kind === "transfer") {
+      if (!currentId) {
+        throw new Error(`Cannot transfer ${planNode.from} hidden without an input node.`);
+      }
+      const exported = exportHiddenNode(requirePlannedProvider(planned, planNode.from), currentId);
+      nodes.push(exported);
+      const imported = importHiddenNode(requirePlannedProvider(planned, planNode.to), exported.id);
+      nodes.push(imported);
+      currentId = imported.id;
+      currentProvider = planNode.to;
+      continue;
+    }
+
+    if (planNode.kind === "output") {
+      if (!currentId) {
+        throw new Error(`Cannot produce ${planNode.provider} output without hidden input.`);
+      }
+      const outputRuntime = requirePlannedProvider(planned, planNode.provider);
+      if (currentProvider !== planNode.provider || !outputRuntime.graph.outputNode) {
+        const exported = exportHiddenNode(requirePlannedProvider(planned, currentProvider ?? planNode.provider), currentId);
+        nodes.push(exported);
+        currentId = exported.id;
+      }
+      hiddenId = currentId;
+      if (options.computeLogits) {
+        const output = outputNode(outputRuntime, currentId, options.logitsTopK);
+        nodes.push(output);
+        outputId = output.id;
+      }
+    }
+  }
+
+  if (!currentId) {
+    throw new Error("Forward graph plan produced no hidden value.");
+  }
+  if (!hiddenId) {
+    hiddenId = currentId;
+  }
+  return { nodes, hiddenId, outputId };
+}
+
+function segmentNode(
+  runtime: ModelRuntimeForForward,
+  inputId: string,
+  startLayer: number,
+  endLayerExclusive: number,
+  options: { attentionCausal?: boolean } = {},
+): ForwardRunnerNode {
+  return runtime.graph.layerSegmentNode?.(startLayer, endLayerExclusive, inputId) ??
+    new ModelSegmentNode(runtime.runner, inputId, {
+      ...options,
+      segmentStartLayer: startLayer,
+      segmentEndLayerExclusive: endLayerExclusive,
+    });
+}
+
+function importHiddenNode(runtime: ModelRuntimeForForward, inputId: string): ForwardRunnerNode {
+  return runtime.graph.importHiddenNode?.(inputId) ?? new CpuHiddenAliasNode(inputId, `${runtime.runner.provider}-import-hidden`);
+}
+
+function exportHiddenNode(runtime: ModelRuntimeForForward, inputId: string): ForwardRunnerNode {
+  return runtime.graph.exportHiddenNode?.(inputId) ?? new CpuHiddenAliasNode(inputId, "hidden");
+}
+
+function outputNode(runtime: ModelRuntimeForForward, inputId: string, topK: number): ForwardRunnerNode {
+  return runtime.graph.outputNode?.(inputId, topK) ?? new ModelOutputNode(runtime.runner, inputId, topK);
+}
+
+function requirePlannedProvider(
+  planned: PlannedModelForward,
+  provider: SegmentRunnerProvider,
+): ModelRuntimeForForward {
+  const runtime = planned.providers.get(provider);
+  if (!runtime) {
+    throw new Error(`No runner provider was supplied for planned ${provider} node.`);
+  }
+  return runtime;
 }
 
 function updateNextPosition(
@@ -430,184 +608,4 @@ function tokenPositionsFromMrope(positions: Int32Array, tokenCount: number): Int
     return positions.slice(0, tokenCount);
   }
   throw new Error(`Expected ${tokenCount} or ${tokenCount * 4} positions, got ${positions.length}`);
-}
-
-function logWebGpuRunnerTiming(session: ModelSession, phase: "prefill" | "decode"): void {
-  if (typeof console === "undefined") {
-    return;
-  }
-  const stats = session.cacheStats().executionProviderStats;
-  if (typeof stats.webgpuRunnerCreateMs !== "number") {
-    return;
-  }
-  const row: WebGpuRunnerTimingRow = {
-    phase,
-    runnerCreateMs: roundMs(stats.webgpuRunnerCreateMs),
-    runtimeInitMs: roundMs(numberStat(stats.webgpuRuntimeInitMs)),
-    firstRunTotalMs: roundMs(numberStat(stats.webgpuFirstRunTotalMs)),
-    steadyRunMs: roundMs(numberStat(stats.webgpuSteadyRunMs)),
-    runtimeResizeMs: roundMs(numberStat(stats.webgpuRuntimeResizeMs)),
-    submitCount: numberStat(stats.webgpuSubmitCount),
-    blockingWaitCount: numberStat(stats.webgpuBlockingWaitCount),
-    readbackCount: numberStat(stats.webgpuReadbackCount),
-    pipelineHit: numberStat(stats.webgpuComputePipelineCacheHits),
-    pipelineMiss: numberStat(stats.webgpuComputePipelineCacheMisses),
-    bindGroupHit: numberStat(stats.webgpuBindGroupCacheHits),
-    bindGroupMiss: numberStat(stats.webgpuBindGroupCacheMisses),
-    lastRunDurationMs: roundMs(stats.webgpuLastRunDurationMs),
-    lastRunSubmitCount: numberStat(stats.webgpuLastRunSubmitCount),
-    lastRunReadbackCount: numberStat(stats.webgpuLastRunReadbackCount),
-    lastRunBindGroupCreates: numberStat(stats.webgpuLastRunBindGroupCreates),
-    lastRunBindGroupCreateMs: roundMs(stats.webgpuLastRunBindGroupCreateMs),
-    lastRunBufferCreates: numberStat(stats.webgpuLastRunBufferCreates),
-    lastRunBufferCreateMs: roundMs(stats.webgpuLastRunBufferCreateMs),
-    lastRunBufferCreateLabels: stringStat(stats.webgpuLastRunBufferCreateLabels),
-    lastRunEncodeMs: roundMs(stats.webgpuLastRunEncodeMs),
-    lastRunSubmitMs: roundMs(stats.webgpuLastRunSubmitMs),
-    lastRunReadbackWaitMs: roundMs(stats.webgpuLastRunReadbackWaitMs),
-    lastRunReadbackWaitMinusGpuPassMs: roundMs(stats.webgpuLastRunReadbackWaitMinusGpuPassMs),
-    lastRunTimestampReadbackWaitMs: roundMs(stats.webgpuLastRunTimestampReadbackWaitMs),
-    lastRunGpuPassMs: roundMs(stats.webgpuLastRunGpuPassMs),
-    lastRunGpuSections: stringStat(stats.webgpuLastRunGpuSections),
-    lastRunGpuTimingStatus: stringStat(stats.webgpuLastRunGpuTimingStatus),
-    lastRunReadbackBytes: numberStat(stats.webgpuLastRunReadbackBytes),
-    lastRunDispatchCount: numberStat(stats.webgpuLastRunDispatchCount),
-    lastRunSelectedTokenId: numberStat(stats.webgpuLastRunSelectedTokenId),
-    lastRunPipelineHit: numberStat(stats.webgpuLastRunComputePipelineHits),
-    lastRunPipelineMiss: numberStat(stats.webgpuLastRunComputePipelineMisses),
-    lastRunBindGroupHit: numberStat(stats.webgpuLastRunBindGroupHits),
-    lastRunBindGroupMiss: numberStat(stats.webgpuLastRunBindGroupMisses),
-    lastRunLayoutHit: numberStat(stats.webgpuLastRunBindGroupLayoutHits),
-    lastRunLayoutMiss: numberStat(stats.webgpuLastRunBindGroupLayoutMisses),
-  };
-  const global = webGpuTimingGlobal();
-  global.__heliopauseWebGpuTimings ??= [];
-  global.__heliopauseWebGpuTimings.push(row);
-  global.__heliopauseWebGpuTimingsTsv = () => webGpuTimingRowsToTsv(global.__heliopauseWebGpuTimings ?? []);
-  if (!global.__heliopauseWebGpuTimingCopyHintShown) {
-    global.__heliopauseWebGpuTimingCopyHintShown = true;
-    console.log(
-      "[heliopause] WebGPU timings are buffered for copying. " +
-        "Use copy(globalThis.__heliopauseWebGpuTimingsTsv()) or " +
-        "copy(JSON.stringify(globalThis.__heliopauseWebGpuTimings, null, 2)).",
-    );
-  }
-  if (global.__heliopauseWebGpuTimingFlush !== undefined) {
-    clearTimeout(global.__heliopauseWebGpuTimingFlush);
-  }
-  global.__heliopauseWebGpuTimingFlush = setTimeout(() => {
-    const rows = global.__heliopauseWebGpuTimings ?? [];
-    console.log(`[heliopause-webgpu-timings.tsv]\n${webGpuTimingRowsToTsv(rows)}`);
-  }, 1000);
-}
-
-type WebGpuRunnerTimingRow = {
-  phase: "prefill" | "decode";
-  runnerCreateMs: number;
-  runtimeInitMs: number;
-  firstRunTotalMs: number;
-  steadyRunMs: number;
-  runtimeResizeMs: number;
-  submitCount: number;
-  blockingWaitCount: number;
-  readbackCount: number;
-  pipelineHit: number;
-  pipelineMiss: number;
-  bindGroupHit: number;
-  bindGroupMiss: number;
-  lastRunDurationMs: number;
-  lastRunSubmitCount: number;
-  lastRunReadbackCount: number;
-  lastRunBindGroupCreates: number;
-  lastRunBindGroupCreateMs: number;
-  lastRunBufferCreates: number;
-  lastRunBufferCreateMs: number;
-  lastRunBufferCreateLabels: string;
-  lastRunEncodeMs: number;
-  lastRunSubmitMs: number;
-  lastRunReadbackWaitMs: number;
-  lastRunReadbackWaitMinusGpuPassMs: number;
-  lastRunTimestampReadbackWaitMs: number;
-  lastRunGpuPassMs: number;
-  lastRunGpuSections: string;
-  lastRunGpuTimingStatus: string;
-  lastRunReadbackBytes: number;
-  lastRunDispatchCount: number;
-  lastRunSelectedTokenId: number;
-  lastRunPipelineHit: number;
-  lastRunPipelineMiss: number;
-  lastRunBindGroupHit: number;
-  lastRunBindGroupMiss: number;
-  lastRunLayoutHit: number;
-  lastRunLayoutMiss: number;
-};
-
-type WebGpuTimingGlobal = typeof globalThis & {
-  __heliopauseWebGpuTimings?: WebGpuRunnerTimingRow[];
-  __heliopauseWebGpuTimingsTsv?: () => string;
-  __heliopauseWebGpuTimingFlush?: ReturnType<typeof setTimeout>;
-  __heliopauseWebGpuTimingCopyHintShown?: boolean;
-};
-
-function webGpuTimingGlobal(): WebGpuTimingGlobal {
-  return globalThis as WebGpuTimingGlobal;
-}
-
-function webGpuTimingRowsToTsv(rows: readonly WebGpuRunnerTimingRow[]): string {
-  const headers: Array<keyof WebGpuRunnerTimingRow> = [
-    "phase",
-    "runnerCreateMs",
-    "runtimeInitMs",
-    "firstRunTotalMs",
-    "steadyRunMs",
-    "runtimeResizeMs",
-    "submitCount",
-    "blockingWaitCount",
-    "readbackCount",
-    "pipelineHit",
-    "pipelineMiss",
-    "bindGroupHit",
-    "bindGroupMiss",
-    "lastRunDurationMs",
-    "lastRunSubmitCount",
-    "lastRunReadbackCount",
-    "lastRunBindGroupCreates",
-    "lastRunBindGroupCreateMs",
-    "lastRunBufferCreates",
-    "lastRunBufferCreateMs",
-    "lastRunBufferCreateLabels",
-    "lastRunEncodeMs",
-    "lastRunSubmitMs",
-    "lastRunReadbackWaitMs",
-    "lastRunReadbackWaitMinusGpuPassMs",
-    "lastRunTimestampReadbackWaitMs",
-    "lastRunGpuPassMs",
-    "lastRunGpuSections",
-    "lastRunGpuTimingStatus",
-    "lastRunReadbackBytes",
-    "lastRunDispatchCount",
-    "lastRunSelectedTokenId",
-    "lastRunPipelineHit",
-    "lastRunPipelineMiss",
-    "lastRunBindGroupHit",
-    "lastRunBindGroupMiss",
-    "lastRunLayoutHit",
-    "lastRunLayoutMiss",
-  ];
-  return [
-    headers.join("\t"),
-    ...rows.map((row) => headers.map((header) => String(row[header])).join("\t")),
-  ].join("\n");
-}
-
-function numberStat(value: unknown): number {
-  return typeof value === "number" ? value : 0;
-}
-
-function stringStat(value: unknown): string {
-  return typeof value === "string" ? value : "";
-}
-
-function roundMs(value: unknown): number {
-  return Math.round(numberStat(value) * 1000) / 1000;
 }

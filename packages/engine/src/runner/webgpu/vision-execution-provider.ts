@@ -5,6 +5,9 @@ import {
   type VisionPixelValues,
   type VisionSession,
 } from "../../vision";
+import type {
+  VisionEncoderRunner,
+} from "../vision-runner";
 import {
   GpuMemoryArena,
   scratchQ8_0,
@@ -50,6 +53,11 @@ type VisionRunBuffers = {
 
 const runners = new WeakMap<VisionSession, Promise<WebGpuVisionRunner | undefined>>();
 const statsBySession = new WeakMap<VisionSession, VisionStats>();
+
+export const webGpuVisionEncoderRunner: VisionEncoderRunner = {
+  provider: "webgpu",
+  run: (session, pixels) => runWebGpuVisionEncoder(session, pixels),
+};
 
 export async function runWebGpuVisionEncoder(
   session: VisionSession,

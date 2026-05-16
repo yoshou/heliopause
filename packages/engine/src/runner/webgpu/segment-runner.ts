@@ -68,6 +68,7 @@ import {
   type WebGpuRuntimeResourceCache,
 } from "./runtime-resources";
 import type { WebGpuBufferLike, WebGpuCommandEncoderLike, WebGpuComputePassLike, WebGpuQuerySetLike, WebGpuTopToken } from "./gpu-types";
+import type { SegmentRunner } from "../segment-runner";
 
 export type WebGpuSegmentRunnerOptions = {
   tensorReader: GgufTensorReader;
@@ -193,10 +194,13 @@ type GpuInputResources = {
 };
 
 type PreparedGpuInput = {
+  tokenCount: number;
   hidden: WebGpuBufferLike;
   perLayerInputs?: WebGpuBufferLike;
   destroy: () => void;
 };
+
+export type WebGpuPreparedInput = PreparedGpuInput;
 
 type TimestampProfiler = {
   querySet: WebGpuQuerySetLike;
@@ -222,7 +226,8 @@ const TIMESTAMP_QUERY_PAIR_BYTES = 2 * BigUint64Array.BYTES_PER_ELEMENT;
 const TIMESTAMP_RESOLVE_STRIDE_BYTES = 256;
 const TIMESTAMP_MAX_PASSES = 256;
 
-export class WebGpuSegmentRunner {
+export class WebGpuSegmentRunner implements SegmentRunner {
+  readonly provider = "webgpu" as const;
   readonly segmentStartLayer: number;
   readonly segmentEndLayerExclusive: number;
 
@@ -800,6 +805,98 @@ export class WebGpuSegmentRunner {
 
   supportsGpuInputPreparation(): boolean {
     return this.gpuInputPreparationSupport().supported;
+  }
+
+  supportsTokenIdInput(): boolean {
+    return this.supportsGpuInputPreparation();
+  }
+
+  async prepareTokenIds(tokenIds: readonly number[]): Promise<WebGpuPreparedInput> {
+    this.ensureRuntimeResources();
+    const runtimeRun = this.beginRuntimeRun();
+    try {
+      return await this.prepareGpuInput(tokenIds, false);
+    } finally {
+      this.endRuntimeRun(runtimeRun);
+    }
+  }
+
+  async readPreparedInputHidden(input: WebGpuPreparedInput): Promise<Float32Array> {
+    const byteLength = input.tokenCount * this.manifest.embeddingLength * Float32Array.BYTES_PER_ELEMENT;
+    const readback = this.arena.device.createBuffer({
+      label: "input.hidden.readback",
+      size: byteLength,
+      usage: GPU_COPY_DST | GPU_MAP_READ,
+    });
+    try {
+      const encoder = this.arena.device.createCommandEncoder();
+      encoder.copyBufferToBuffer(input.hidden, 0, readback, 0, byteLength);
+      this.submitCommandBuffer(encoder.finish());
+      this.readbackCount += 1;
+      await this.mapReadback(readback);
+      const hidden = new Float32Array(readback.getMappedRange()).slice();
+      readback.unmap();
+      this.readbackBytes += byteLength;
+      return hidden;
+    } finally {
+      readback.destroy?.();
+    }
+  }
+
+  async runPreparedInputHidden(
+    input: WebGpuPreparedInput,
+    positions: Int32Array,
+    state: WebGpuStateLike,
+    options: WebGpuRunOptions = {},
+  ): Promise<WebGpuHiddenResult> {
+    this.ensureRuntimeResources();
+    const runtimeRun = this.beginRuntimeRun();
+    try {
+      if (input.tokenCount > 1) {
+        return await this.runBatchedPrefillFromBoundary(input.hidden, positions, state, {
+          ...options,
+          perLayerInputsBuffer: input.perLayerInputs,
+          sourceTokenCount: input.tokenCount,
+          sourceTokenIndex: 0,
+        }, true);
+      }
+      return await this.runTokenFromBoundaryHidden(input.hidden, 0, tokenPositionsFromBatch(positions, 0, 1), state, {
+        ...options,
+        perLayerInputsBuffer: input.perLayerInputs,
+        sourceTokenCount: 1,
+        sourceTokenIndex: 0,
+      });
+    } finally {
+      this.endRuntimeRun(runtimeRun);
+    }
+  }
+
+  async runPreparedInput(
+    input: WebGpuPreparedInput,
+    positions: Int32Array,
+    state: WebGpuStateLike,
+    options: WebGpuRunOptions = {},
+  ): Promise<WebGpuTokenResult> {
+    this.ensureRuntimeResources();
+    const runtimeRun = this.beginRuntimeRun();
+    try {
+      if (input.tokenCount > 1) {
+        return await this.runBatchedPrefillFromBoundary(input.hidden, positions, state, {
+          ...options,
+          perLayerInputsBuffer: input.perLayerInputs,
+          sourceTokenCount: input.tokenCount,
+          sourceTokenIndex: 0,
+        }, false);
+      }
+      return await this.runTokenFromBoundary(input.hidden, 0, tokenPositionsFromBatch(positions, 0, 1), state, {
+        ...options,
+        perLayerInputsBuffer: input.perLayerInputs,
+        sourceTokenCount: 1,
+        sourceTokenIndex: 0,
+      });
+    } finally {
+      this.endRuntimeRun(runtimeRun);
+    }
   }
 
   private gpuInputPreparationSupport(): { supported: boolean; reason: string } {
@@ -1671,6 +1768,7 @@ export class WebGpuSegmentRunner {
     this.deferResourceCleanup(resources);
 
     return {
+      tokenCount,
       hidden,
       perLayerInputs,
       destroy: () => {

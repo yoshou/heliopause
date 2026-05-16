@@ -5,6 +5,7 @@ import {
   auditTensorCoverage,
   buildModelManifest,
   cloneInferenceState,
+  createReferenceProvider,
   createModelSession,
   createInferenceState,
   decode,
@@ -148,7 +149,7 @@ test("prefill advances nextPosition from default and explicit positions", async 
   const reader = tensorReaderFromTensors([
     f32Tensor("token_embd.weight", [4, 8], sequence(32)),
   ]);
-  const session = createModelSession(reader);
+  const session = createModelSession(reader, { runnerProviders: [createReferenceProvider()] });
 
   const defaultResult = await prefill(session, [1, 2, 3]);
   assert.equal(defaultResult.state.nextPosition, 3);
@@ -174,7 +175,7 @@ test("decode uses state position, explicit position, and returns fixed logits", 
       0.3, -0.2, 0.4, -0.3,
     ])),
   ]);
-  const session = createModelSession(reader);
+  const session = createModelSession(reader, { runnerProviders: [createReferenceProvider()] });
   const state = session.createInferenceState();
   state.nextPosition = 4;
 
@@ -212,7 +213,7 @@ test("model session caches F32 tensors and embedding rows", async () => {
     f32Tensor("token_embd.weight", [4, 8], sequence(32)),
     f32Tensor("output_norm.weight", [4], new Float32Array([1, 2, 3, 4])),
   ]);
-  const session = createModelSession(reader);
+  const session = createModelSession(reader, { runnerProviders: [createReferenceProvider()] });
 
   await session.readF32Tensor("output_norm.weight");
   await session.readF32Tensor("output_norm.weight");
@@ -285,7 +286,7 @@ test("full-attention decode rejects positions outside context", async () => {
       truncated: false,
     },
   });
-  const session = createModelSession(reader);
+  const session = createModelSession(reader, { runnerProviders: [createReferenceProvider()] });
 
   await assert.rejects(
     decode(session, 1, { position: 1 }),

@@ -13,6 +13,9 @@ import {
   type LayerKind,
   type ModelManifest,
 } from "./model";
+import type {
+  RunnerProvider,
+} from "./runner/provider";
 
 export type FullAttentionCache = {
   key: Float32Array;
@@ -36,9 +39,8 @@ export type ModelSessionOptions = {
   maxContextLength?: number;
   maxWeightCacheBytes?: number;
   executionProviders?: readonly ExecutionProviderConfig[];
+  runnerProviders?: readonly RunnerProvider[];
 };
-
-export type ExecutionProviderName = "reference" | "wasm" | "webgpu";
 
 export type ExecutionProviderConfig = {
   name: string;
@@ -53,10 +55,13 @@ export function resolvePreprocessProviders(
     return preprocessProviders.map(copyExecutionProviderConfig);
   }
 
-  const providers = executionProviders
-    .filter((provider) => isKnownExecutionProvider(provider.name))
-    .map(copyExecutionProviderConfig);
-  return providers.length > 0 ? providers : [{ name: "reference" }];
+  return executionProviders.map(copyExecutionProviderConfig);
+}
+
+export function resolveSessionExecutionProviders(
+  options: Pick<ModelSessionOptions, "executionProviders">,
+): readonly ExecutionProviderConfig[] {
+  return (options.executionProviders ?? [{ name: "reference" }]).map(copyExecutionProviderConfig);
 }
 
 function copyExecutionProviderConfig(provider: ExecutionProviderConfig): ExecutionProviderConfig {
@@ -107,6 +112,7 @@ export class ModelSession {
   private readonly maxContextLength?: number;
   private readonly maxWeightCacheBytes: number;
   readonly executionProviders: readonly ExecutionProviderConfig[];
+  readonly runnerProviders: readonly RunnerProvider[];
   private readonly f32TensorCache = new Map<string, Float32Array>();
   private readonly weightBytesCache = new Map<string, Uint8Array>();
   private readonly embeddingRowCache = new Map<number, Float32Array>();
@@ -128,11 +134,8 @@ export class ModelSession {
     );
     this.maxContextLength = options.maxContextLength;
     this.maxWeightCacheBytes = options.maxWeightCacheBytes ?? 256 * 1024 * 1024;
-    const executionProviders = options.executionProviders ?? [{ name: "reference" }];
-    this.executionProviders = executionProviders.map((provider) => ({
-      name: provider.name,
-      options: provider.options ? { ...provider.options } : undefined,
-    }));
+    this.executionProviders = resolveSessionExecutionProviders(options);
+    this.runnerProviders = options.runnerProviders ?? [];
   }
 
   createInferenceState(): InferenceState {
@@ -238,10 +241,6 @@ export class ModelSession {
     return this.executionProviders.find((provider) => provider.name === name);
   }
 
-  executionProviderEnabled(name: ExecutionProviderName): boolean {
-    return this.executionProvider(name) !== undefined;
-  }
-
   private executionProviderStats(): ExecutionProviderStats {
     const stats: ExecutionProviderStats = {};
     for (const provider of this.executionProviderStatsProviders.values()) {
@@ -262,17 +261,6 @@ export class ModelSession {
       this.weightCacheEvictions += 1;
     }
   }
-}
-
-export function isKnownExecutionProvider(name: string): name is ExecutionProviderName {
-  return name === "reference" || name === "wasm" || name === "webgpu";
-}
-
-export function hasExecutionProvider(
-  providers: readonly ExecutionProviderConfig[],
-  name: ExecutionProviderName,
-): boolean {
-  return providers.some((provider) => provider.name === name);
 }
 
 export function estimateWeightCacheBytes(tensorReader: GgufTensorReader): number {

@@ -1,19 +1,4 @@
 export {
-  checkWebGpuSupport,
-  planRunnerPlacement,
-  webGpuPlanningProvider,
-  WebGpuSegmentRunner,
-  type WebGpuSupport,
-  type WebGpuRuntimeStats,
-  type WebGpuSegmentRunnerOptions,
-} from "./runner/webgpu/index";
-
-export {
-  checkWasmSupport,
-  type WasmSupport,
-} from "./runner/cpu/wasm-kernels";
-
-export {
   parseGguf,
   serializeGgufMetadata,
   type GgufArraySummary,
@@ -31,84 +16,21 @@ export {
   buildVisionManifest,
   isAudioGguf,
   isVisionGguf,
-  type ExpectedTensor,
   type AudioManifest,
+  type ExpectedTensor,
   type LayerKind,
   type ModelManifest,
-  type VisionManifest,
   type TensorCoverageAudit,
+  type VisionManifest,
 } from "./model";
-
-export {
-  decode,
-  prefill,
-  prefillPreparedHidden,
-  type DecodeOptions,
-  type DecodeResult,
-  type PreparedHiddenPrefillOptions,
-  type PrefillOptions,
-  type PrefillResult,
-} from "./forward";
-
-export {
-  calculateVisionResize,
-  createVisionSession,
-  preprocessVisionImageFile,
-  runVisionPreprocessor,
-  runVisionEncoder,
-  VisionSession,
-  type VisionEncodeResult,
-  type VisionPixelValues,
-  type VisionPreprocessOptions,
-  type VisionResize,
-  type VisionSessionOptions,
-} from "./vision";
-
-export {
-  createAudioSession,
-  preprocessAudioPcm,
-  runAudioPreprocessor,
-  runAudioEncoder,
-  AudioSession,
-  type AudioEncodeResult,
-  type AudioFeatures,
-  type AudioPcmInput,
-  type AudioPreprocessOptions,
-  type AudioSessionOptions,
-} from "./audio";
-
-export {
-  createInferenceState,
-  createModelSession,
-  cloneInferenceState,
-  estimateWeightCacheBytes,
-  resolvePreprocessProviders,
-  ModelSession,
-  type CacheStats,
-  type ExecutionProviderConfig,
-  type ForwardTrace,
-  type FullAttentionCache,
-  type InferenceState,
-  type ModelInput,
-  type ModelSessionOptions,
-  type TimingEvent,
-  type TimingPhase,
-  type TimingSink,
-} from "./runtime";
-
-export { CpuSegmentRunner } from "./runner/cpu/index";
-export type {
-  CpuHiddenResult,
-  CpuSegmentRunnerOptions,
-} from "./runner/cpu/index";
 
 export {
   GgufTensorReader,
   ggmlTypeStorage,
   tensorByteLength,
   type GgufTensorRangeCoalesceOptions,
-  type GgufTensorReaderOptions,
   type GgufTensorReaderIoStats,
+  type GgufTensorReaderOptions,
   type GgufTensorReadKind,
   type GgufTensorReadSource,
   type GgufTensorReadTrace,
@@ -124,15 +46,15 @@ export {
   dequantizeQ6_K,
   dequantizeQ8_0,
   dequantizeRow,
-  float32ToFloat16,
   float16ToFloat32,
+  float32ToFloat16,
   quantizeQ8_0,
   quantizeQ8_K,
+  vecDotIQ4_XS_Q8_K,
   vecDotQ4_K_Q8_K,
   vecDotQ5_K_Q8_K,
   vecDotQ6_K_Q8_K,
   vecDotQ8_0_Q8_0,
-  vecDotIQ4_XS_Q8_K,
   type QuantizedQ8_0,
   type QuantizedQ8K,
 } from "./quant";
@@ -143,29 +65,143 @@ export {
 } from "./tokenizer";
 
 export {
-  applyChatTemplate,
+  cloneInferenceState,
+  createInferenceState,
+  createModelSession,
+  estimateWeightCacheBytes,
+  ModelSession,
+  resolvePreprocessProviders,
+  type CacheStats,
+  type ExecutionProviderConfig,
+  type ForwardTrace,
+  type FullAttentionCache,
+  type InferenceState,
+  type ModelInput,
+  type ModelSessionOptions,
+  type TimingEvent,
+  type TimingPhase,
+  type TimingSink,
+} from "./runtime";
+
+export {
+  decode,
+  prefill,
+  prefillPreparedHidden,
+  type DecodeOptions,
+  type DecodeResult,
+  type PrefillOptions,
+  type PrefillResult,
+  type PreparedHiddenPrefillOptions,
+} from "./forward";
+
+export {
   applyChatGenerationPrompt,
-  createFileGgufTensorReader,
+  applyChatTemplate,
   createChatSession,
+  createFileGgufTensorReader,
   DEFAULT_SYSTEM_PROMPT,
+  generateChatCompletion,
+  generateChatTurn,
   generatePreparedAudioChatTurn,
   generatePreparedImageChatTurn,
-  generateChatTurn,
-  generateChatCompletion,
   getGgufModelName,
   prefillChatMessages,
   stripThinking,
-  type ChatMessage,
-  type FileGgufTensorReaderOptions,
   type ChatCompletionChunk,
   type ChatCompletionOptions,
+  type ChatMessage,
   type ChatPrefillOptions,
   type ChatTemplateOptions,
   type ChatTurnOptions,
   type ChatTurnResult,
+  type FileGgufTensorReaderOptions,
   type PreparedAudioInput,
   type PreparedImageInput,
 } from "./chat";
+
+export {
+  AudioSession,
+  createAudioSession,
+  preprocessAudioPcm,
+  runAudioEncoder,
+  runAudioPreprocessor,
+  type AudioEncodeResult,
+  type AudioFeatures,
+  type AudioPcmInput,
+  type AudioPreprocessOptions,
+  type AudioSessionOptions,
+} from "./audio";
+
+export {
+  calculateVisionResize,
+  createVisionSession,
+  preprocessVisionImageFile,
+  runVisionEncoder,
+  runVisionPreprocessor,
+  VisionSession,
+  type VisionEncodeResult,
+  type VisionPixelValues,
+  type VisionPreprocessOptions,
+  type VisionResize,
+  type VisionSessionOptions,
+} from "./vision";
+
+export {
+  createReferenceProvider,
+  ReferenceSegmentRunner,
+  type ReferenceHiddenResult,
+  type ReferenceSegmentRunnerOptions,
+} from "./runner/reference/index";
+
+export {
+  createWasmProvider,
+  WasmSegmentRunner,
+  type WasmHiddenResult,
+  type WasmSegmentRunnerOptions,
+} from "./runner/wasm/index";
+
+export {
+  checkWasmSupport,
+  type WasmSupport,
+} from "./runner/wasm/wasm-kernels";
+
+export {
+  checkWebGpuSupport,
+  createWebGpuProvider,
+  WebGpuSegmentRunner,
+  type WebGpuRuntimeStats,
+  type WebGpuSegmentRunnerOptions,
+  type WebGpuSupport,
+} from "./runner/webgpu/index";
+
+export type {
+  RunnerProvider,
+} from "./runner/provider";
+
+export type {
+  SegmentHiddenResult,
+  SegmentRunner,
+  SegmentRunnerProvider,
+  SegmentRunOptions,
+} from "./runner/segment-runner";
+
+export {
+  planRunnerPlacement,
+} from "./runner/webgpu/planning";
+
+export {
+  auditRunnerPlacementCopies,
+  planProviderPlacement,
+  type RunnerCopyAuditObservation,
+  type RunnerCopyAuditResult,
+  type RunnerLayerPlacement,
+  type RunnerNodePlacement,
+  type RunnerPlacementPlan,
+  type RunnerPlanningOptions,
+  type RunnerPlanningProvider,
+  type RunnerSegmentPlacement,
+  type RunnerSegmentProvider,
+} from "./runner/planning";
 
 export {
   ForwardGraphExecutor,
@@ -178,31 +214,29 @@ export {
 } from "./runner/graph";
 
 export {
-  buildCpuOnlyForwardGraph,
-  buildManualSegmentForwardGraph,
-} from "./runner/nodes";
+  cpuRunnerBuffer,
+  destroyRunnerBuffer,
+  providerRunnerBuffer,
+  runnerBufferOwner,
+  runnerBufferToCpu,
+  type RunnerBuffer,
+  type RunnerBufferOwner,
+  type RunnerBufferStorage,
+} from "./runner/buffer";
 
 export {
-  auditRunnerPlacementCopies,
-  planProviderPlacement,
-  type RunnerCopyAuditObservation,
-  type RunnerCopyAuditResult,
-  type RunnerLayerPlacement,
-  type RunnerPlacementPlan,
-  type RunnerPlanningOptions,
-  type RunnerPlanningProvider,
-} from "./runner/planning";
-
-export {
-  l2NormRows,
   gqaAttention,
+  l2NormRows,
   matMulRows,
   maxTensorDiff,
-  ropeMultiMropeNeox,
   rmsNorm,
+  ropeMultiMropeNeox,
   sigmoid,
   silu,
   softplus,
-  type GqaAttentionOptions,
   type RopeMultiOptions,
-} from "./ops";
+} from "./runner/reference/kernels";
+
+export type {
+  GqaAttentionOptions,
+} from "./runner/types";

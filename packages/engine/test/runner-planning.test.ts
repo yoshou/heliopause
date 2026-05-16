@@ -14,6 +14,7 @@ test("runner placement planning handles off, blocked, and planned WebGPU placeme
   const off = planRunnerPlacement(gguf, manifest);
   assert.equal(off.status, "off");
   assert.equal(off.selectedLayerCount, 0);
+  assert.deepEqual(off.segments.map((segment) => segment.provider), ["wasm"]);
 
   const blocked = planRunnerPlacement(gguf, manifest, {
     mode: "enabled",
@@ -21,6 +22,7 @@ test("runner placement planning handles off, blocked, and planned WebGPU placeme
   });
   assert.equal(blocked.status, "blocked");
   assert.equal(blocked.selectedLayerCount, 0);
+  assert.deepEqual(blocked.segments.map((segment) => segment.provider), ["wasm"]);
 
   const planned = planRunnerPlacement(gguf, manifest, {
     mode: "enabled",
@@ -28,9 +30,43 @@ test("runner placement planning handles off, blocked, and planned WebGPU placeme
   });
   assert.equal(planned.status, "planned");
   assert.equal(planned.selectedLayerCount, 2);
-  assert.equal(planned.segmentStartLayer, 0);
+  assert.equal(planned.webGpuSegmentStartLayer, 0);
+  assert.deepEqual(planned.segments.map((segment) => segment.provider), ["webgpu"]);
+  assert.deepEqual(planned.segments.map((segment) => [segment.startLayer, segment.endLayerExclusive]), [[0, 2]]);
+  assert.deepEqual(planned.nodes.map((node) => node.kind), ["embedding", "segment", "output"]);
+  assert.deepEqual(planned.nodes.map((node) => "provider" in node ? node.provider : `${node.from}->${node.to}`), [
+    "webgpu",
+    "webgpu",
+    "webgpu",
+  ]);
+  assert.equal(planned.wasmSegmentLayerCount, 0);
+  assert.equal(planned.webGpuSegmentLayerCount, 2);
   assert.equal(planned.copyAuditExpectations.expectedTokenReadbacks, 0);
+  assert.equal(planned.copyAuditExpectations.expectedBoundaryUploads, 0);
   assert.equal(planned.copyAuditExpectations.expectedSelectedTokenReadbacks, 1);
+});
+
+test("runner placement planning exposes wasm prefix plus WebGPU suffix", () => {
+  const gguf = minimalGguf();
+  const manifest = buildModelManifest(gguf);
+  const baseline = planRunnerPlacement(gguf, manifest);
+  const planned = planRunnerPlacement(gguf, manifest, {
+    mode: "enabled",
+    memoryLimitBytes: baseline.fixedBytes + baseline.scratchBytes + baseline.outputBytes + 300,
+  });
+
+  assert.equal(planned.status, "planned");
+  assert.deepEqual(planned.segments.map((segment) => segment.provider), ["wasm", "webgpu"]);
+  assert.deepEqual(planned.nodes.map((node) => node.kind), ["embedding", "segment", "transfer", "segment", "output"]);
+  assert.deepEqual(planned.nodes.filter((node) => node.kind === "transfer"), [{
+    kind: "transfer",
+    from: "wasm",
+    to: "webgpu",
+    via: "cpu",
+    value: "hidden",
+  }]);
+  assert.equal(planned.segments[0]?.endLayerExclusive, planned.segments[1]?.startLayer);
+  assert.equal(planned.copyAuditExpectations.expectedBoundaryUploads, 1);
 });
 
 test("runner placement copy audit reports unexpected copies", () => {
@@ -66,7 +102,7 @@ test("runner placement copy audit treats selected token readback as the only nor
     decodeTensorReads: 0,
     segmentIntermediateReadbacks: 0,
     logitsReadbacks: 0,
-    boundaryUploads: 1,
+    boundaryUploads: 0,
     tokenReadbacks: 0,
     selectedTokenReadbacks: 1,
   }).ok, true);
@@ -75,7 +111,7 @@ test("runner placement copy audit treats selected token readback as the only nor
     decodeTensorReads: 0,
     segmentIntermediateReadbacks: 0,
     logitsReadbacks: 0,
-    boundaryUploads: 1,
+    boundaryUploads: 0,
     tokenReadbacks: 1,
     selectedTokenReadbacks: 1,
   });

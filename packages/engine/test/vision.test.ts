@@ -14,12 +14,17 @@ import {
   GgufTensorReader,
 } from "../src/tensor-reader.ts";
 import {
+  createReferenceProvider,
+  createWasmProvider,
+  createWebGpuProvider,
+} from "../src/index.ts";
+import {
   resetPrefillWasmForTesting,
   visionPreprocessRgbaWasm,
-} from "../src/runner/cpu/wasm-kernels.ts";
+} from "../src/runner/wasm/wasm-kernels.ts";
 import {
   runVisionPreprocessProviders,
-} from "../src/runner/cpu/vision-preprocess-runner.ts";
+} from "../src/runner/wasm/vision-preprocess-runner.ts";
 import {
   runWebGpuVisionPreprocessor,
 } from "../src/runner/webgpu/vision-preprocess-runner.ts";
@@ -61,6 +66,7 @@ test("Vision session exposes provider config, caches weights, and disposes resou
       name: "wasm",
       options: { residentWeightCache: true },
     }],
+    runnerProviders: [createWasmProvider()],
   });
 
   assert.equal(session.executionProvider("wasm")?.options?.residentWeightCache, true);
@@ -90,6 +96,7 @@ test("Vision encoder errors instead of falling back when WebGPU is unavailable",
       { name: "webgpu", options: { memoryLimitBytes: 1 } },
       { name: "reference" },
     ],
+    runnerProviders: [createWebGpuProvider(), createReferenceProvider()],
   });
 
   resetPrefillWasmForTesting("");
@@ -104,6 +111,26 @@ test("Vision encoder errors instead of falling back when WebGPU is unavailable",
   } finally {
     resetPrefillWasmForTesting();
   }
+});
+
+test("Vision reference encoder projects hidden to model embedding size", async () => {
+  const reader = visionTensorReader([
+    f32Tensor("v.patch_embd.weight", [1, 1, 3, 2], new Float32Array([0.1, -0.1, 0.2, -0.2, 0.3, -0.3])),
+    f32Tensor("v.position_embd.weight", [2, 1, 2], new Float32Array([0.01, 0.02, 0.03, 0.04])),
+    f32Tensor("mm.input_projection.weight", [2, 2], new Float32Array([1, 0, 0, 1])),
+  ], {
+    "clip.vision.projector.scale_factor": 1,
+  });
+  const session = createVisionSession(reader, { runnerProviders: [createReferenceProvider()] });
+
+  const encoded = await runVisionEncoder(session, {
+    values: new Float32Array([0.25, 0.5, 0.75]),
+    width: 1,
+    height: 1,
+  });
+
+  assert.equal(encoded.tokenCount, 1);
+  assert.equal(encoded.hidden.length, 2);
 });
 
 test("Vision WASM preprocessing matches CPU resize and normalization", async () => {
@@ -160,6 +187,7 @@ test("Vision preprocessor errors instead of falling back when WASM is unavailabl
       { name: "wasm" },
       { name: "reference" },
     ],
+    runnerProviders: [createWasmProvider(), createReferenceProvider()],
   });
 
   resetPrefillWasmForTesting("");
@@ -177,7 +205,7 @@ test("Vision preprocessor errors instead of falling back when WASM is unavailabl
 
     const stats = session.cacheStats().executionProviderStats;
     assert.equal(stats.wasmVisionPreprocessAttempts, 1);
-    assert.equal(stats.referenceVisionPreprocessRuns, 0);
+    assert.equal(stats.referenceVisionPreprocessRuns, undefined);
   } finally {
     resetPrefillWasmForTesting();
   }
@@ -191,6 +219,7 @@ test("Vision WebGPU preprocessor errors when unavailable", async () => {
   });
   const session = createVisionSession(reader, {
     executionProviders: [{ name: "webgpu" }, { name: "reference" }],
+    runnerProviders: [createWebGpuProvider(), createReferenceProvider()],
   });
 
   await assert.rejects(() => runWebGpuVisionPreprocessor(session, {

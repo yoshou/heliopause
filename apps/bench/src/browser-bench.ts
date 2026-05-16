@@ -29,8 +29,10 @@ import {
   gqaAttention,
   sigmoid,
   silu,
-  type GqaAttentionOptions,
-} from "../../../packages/engine/src/ops";
+} from "../../../packages/engine/src/runner/reference/kernels";
+import type {
+  GqaAttentionOptions,
+} from "../../../packages/engine/src/runner/types";
 import {
   createWasmQuantizedWeightHandle,
   gqaAttentionWasm,
@@ -39,7 +41,7 @@ import {
   prefillWasmBackend,
   releaseWasmQuantizedWeightHandle,
   type WasmQuantizedWeightHandle,
-} from "../../../packages/engine/src/runner/cpu/wasm-kernels";
+} from "../../../packages/engine/src/runner/wasm/wasm-kernels";
 import {
   quantizeQ8_0,
   quantizeQ8_K,

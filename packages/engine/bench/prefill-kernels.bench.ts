@@ -1,11 +1,11 @@
 import { performance } from "node:perf_hooks";
 
-import { gqaAttention } from "../src/ops.ts";
+import { gqaAttention } from "../src/runner/reference/kernels.ts";
 import {
   gqaAttentionWasm,
   matMulQuantizedWasm,
   prefillWasmBackend,
-} from "../src/runner/cpu/wasm-kernels.ts";
+} from "../src/runner/wasm/wasm-kernels.ts";
 import {
   quantizeQ8_0,
   quantizeQ8_K,

@@ -6,7 +6,7 @@ import { spawn } from "node:child_process";
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const crateDir = resolve(root, "wasm-kernels");
 const wasmPath = resolve(crateDir, "target/wasm32-unknown-unknown/release/heliopause_engine_wasm_kernels.wasm");
-const outputPath = resolve(root, "src/runner/cpu/wasm-kernels.generated.ts");
+const outputPath = resolve(root, "src/runner/wasm/wasm-kernels.generated.ts");
 
 await run("cargo", ["build", "--release", "--target", "wasm32-unknown-unknown"], {
   cwd: crateDir,

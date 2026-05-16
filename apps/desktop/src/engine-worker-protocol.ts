@@ -1,18 +1,16 @@
 export type MemoryProfile = "auto" | "low" | "full";
 
-export type ResolvedMemoryProfile = {
+export type ResolvedRuntimeProfile = {
   requested: MemoryProfile;
   resolved: "low" | "full";
   maxWeightCacheBytes: number;
   estimatedWeightCacheBytes: number;
   wasmResidentWeightCache: boolean;
-  webGpuStatus: "suffix-enabled" | "memory-profile-disabled" | "blocked";
+  webGpuStatus: "enabled" | "blocked";
   executionProviders: string[];
   wasmStatus: "enabled" | "unavailable";
   wasmUnavailableReason?: string;
   webGpuUnavailableReason?: string;
-  webGpuSegmentStartLayer?: number;
-  webGpuSegmentLayerCount?: number;
   availableMemoryBytes?: number;
 };
 
@@ -26,7 +24,7 @@ export type WorkerModelInfo = {
   modelName: string;
   contextLength: number;
   originalContextLength: number;
-  memoryProfile: ResolvedMemoryProfile;
+  runtimeProfile: ResolvedRuntimeProfile;
   visionFileName?: string;
   supportsImages: boolean;
   visionImageTokens?: {

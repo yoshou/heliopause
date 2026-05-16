@@ -1,4 +1,4 @@
-import type { GqaAttentionOptions } from "../../ops";
+import type { GqaAttentionOptions } from "../types";
 import { PREFILL_WASM_SIMD_BASE64 } from "./wasm-kernels.generated";
 
 type KernelExports = WebAssembly.Exports & {

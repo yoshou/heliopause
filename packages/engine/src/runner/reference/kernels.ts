@@ -1,7 +1,10 @@
 import {
   float16ToFloat32,
   float32ToFloat16,
-} from "./quant";
+} from "../../quant";
+import type {
+  GqaAttentionOptions,
+} from "../types";
 
 export function rmsNorm(input: Float32Array, weight: Float32Array, epsilon: number): Float32Array {
   if (input.length !== weight.length) {
@@ -206,19 +209,6 @@ export function ropeMultiMropeNeox(
 
   return output;
 }
-
-export type GqaAttentionOptions = {
-  headSize: number;
-  queryHeadCount: number;
-  keyValueHeadCount: number;
-  tokenCount: number;
-  keyValueTokenCount?: number;
-  scale: number;
-  causal?: boolean;
-  mask?: Float32Array;
-  valueLayout?: "token-head-dim" | "dim-head-token";
-  quantizeQueryForScore?: "f16";
-};
 
 export function gqaAttention(
   query: Float32Array,

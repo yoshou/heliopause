@@ -9,6 +9,9 @@ import type {
 import type {
   ExecutionProviderStats,
 } from "../../runtime";
+import type {
+  AudioPreprocessRunner,
+} from "../audio-runner";
 import { GpuMemoryArena, type F32Handle, type GpuResource } from "./arena";
 import { GPU_COPY_DST, GPU_COPY_SRC, GPU_MAP_READ, GPU_STORAGE, WEBGPU_MEMORY_LIMIT_BYTES } from "./gpu-constants";
 import { webGpuDevice } from "./gpu-device";
@@ -42,6 +45,12 @@ type AudioPreprocessRunBuffers = {
 
 const runners = new WeakMap<AudioPreprocessSession, Promise<WebGpuAudioPreprocessRunner>>();
 const statsBySession = new WeakMap<AudioPreprocessSession, AudioPreprocessStats>();
+
+export const webGpuAudioPreprocessRunner: AudioPreprocessRunner = {
+  provider: "webgpu",
+  run: (session, audio, _referencePreprocess, options) =>
+    runWebGpuAudioPreprocessor(session, audio, options),
+};
 
 export async function runWebGpuAudioPreprocessor(
   session: AudioPreprocessSession,

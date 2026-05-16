@@ -6,6 +6,9 @@ import type {
   VisionResize,
   VisionSession,
 } from "../../vision";
+import type {
+  VisionPreprocessRunner,
+} from "../vision-runner";
 import { GpuMemoryArena, type GpuResource } from "./arena";
 import { GPU_COPY_DST, GPU_COPY_SRC, GPU_MAP_READ, GPU_STORAGE, WEBGPU_MEMORY_LIMIT_BYTES } from "./gpu-constants";
 import { webGpuDevice } from "./gpu-device";
@@ -38,6 +41,12 @@ type VisionRgbaPreprocessInput = {
 
 const runners = new WeakMap<VisionPreprocessSession, Promise<WebGpuVisionPreprocessRunner>>();
 const statsBySession = new WeakMap<VisionPreprocessSession, VisionPreprocessStats>();
+
+export const webGpuVisionPreprocessRunner: VisionPreprocessRunner = {
+  provider: "webgpu",
+  run: (session, input, _referencePreprocess, options) =>
+    runWebGpuVisionPreprocessor(session, input, options),
+};
 
 export async function runWebGpuVisionPreprocessor(
   session: VisionPreprocessSession,

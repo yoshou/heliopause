@@ -4,6 +4,9 @@ import type {
   AudioFeatures,
   AudioSession,
 } from "../../audio";
+import type {
+  AudioEncoderRunner,
+} from "../audio-runner";
 import {
   dequantizeRow,
 } from "../../quant";
@@ -52,6 +55,11 @@ type ConvResult = {
 
 const runners = new WeakMap<AudioSession, Promise<WebGpuAudioRunner | undefined>>();
 const statsBySession = new WeakMap<AudioSession, AudioStats>();
+
+export const webGpuAudioEncoderRunner: AudioEncoderRunner = {
+  provider: "webgpu",
+  run: (session, features, options) => runWebGpuAudioEncoder(session, features, options),
+};
 
 export async function runWebGpuAudioEncoder(
   session: AudioSession,

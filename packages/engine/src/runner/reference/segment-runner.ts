@@ -7,13 +7,12 @@ import type { ModelManifest } from "../../model";
 import {
   forwardAttentionLayer,
 } from "./layers";
-import {
-  prefetchWasmShardedLayerWeights,
-  prefetchWasmShardedOutputWeight,
-  registerCpuExecutionProvider,
-} from "./acceleration";
+import type {
+  SegmentHiddenResult,
+  SegmentRunner,
+} from "../segment-runner";
 
-export type CpuSegmentRunnerOptions = {
+export type ReferenceSegmentRunnerOptions = {
   session: ModelSession;
   manifest?: ModelManifest;
   epsilon?: number;
@@ -21,11 +20,10 @@ export type CpuSegmentRunnerOptions = {
   segmentEndLayerExclusive?: number;
 };
 
-export type CpuHiddenResult = {
-  hidden: Float32Array;
-};
+export type ReferenceHiddenResult = SegmentHiddenResult;
 
-export class CpuSegmentRunner {
+export class ReferenceSegmentRunner implements SegmentRunner {
+  readonly provider = "reference" as const;
   readonly segmentStartLayer: number;
   readonly segmentEndLayerExclusive: number;
 
@@ -33,9 +31,8 @@ export class CpuSegmentRunner {
   private readonly manifest: ModelManifest;
   private readonly epsilon: number;
 
-  constructor(options: CpuSegmentRunnerOptions) {
+  constructor(options: ReferenceSegmentRunnerOptions) {
     this.session = options.session;
-    registerCpuExecutionProvider(this.session);
     this.manifest = options.manifest ?? options.session.manifest;
     this.epsilon = options.epsilon ?? options.session.epsilon;
     this.segmentStartLayer = options.segmentStartLayer ?? 0;
@@ -47,14 +44,13 @@ export class CpuSegmentRunner {
       this.segmentEndLayerExclusive < this.segmentStartLayer ||
       this.segmentEndLayerExclusive > this.manifest.blockCount
     ) {
-      throw new Error(`Invalid CPU layer segment: ${this.segmentStartLayer}..${this.segmentEndLayerExclusive}`);
+      throw new Error(`Invalid reference layer segment: ${this.segmentStartLayer}..${this.segmentEndLayerExclusive}`);
     }
     if (
       this.segmentEndLayerExclusive > this.segmentStartLayer &&
-      !this.session.executionProvider("wasm") &&
-      !this.session.executionProvider("reference")
+      !options.session.executionProvider("reference")
     ) {
-      throw new Error("CPU segment execution requires an enabled wasm or reference provider.");
+      throw new Error("Reference segment execution requires an enabled reference provider.");
     }
   }
 
@@ -63,15 +59,9 @@ export class CpuSegmentRunner {
     positions: Int32Array,
     state: InferenceState,
     options: { trace?: ForwardTrace; perLayerInputs?: Float32Array; attentionCausal?: boolean } = {},
-  ): Promise<CpuHiddenResult> {
+  ): Promise<ReferenceHiddenResult> {
     let hidden = inputHidden;
     for (let layer = this.segmentStartLayer; layer < this.segmentEndLayerExclusive; layer += 1) {
-      const lookaheadLayer = layer + 1;
-      if (lookaheadLayer < this.segmentEndLayerExclusive) {
-        prefetchWasmShardedLayerWeights(this.session, lookaheadLayer);
-      } else if (this.segmentEndLayerExclusive === this.manifest.blockCount) {
-        prefetchWasmShardedOutputWeight(this.session);
-      }
       hidden = await forwardAttentionLayer(
         this.session,
         this.manifest,
@@ -93,7 +83,7 @@ export class CpuSegmentRunner {
     positions: Int32Array,
     state: InferenceState,
     options: { trace?: ForwardTrace; perLayerInputs?: Float32Array; attentionCausal?: boolean } = {},
-  ): Promise<CpuHiddenResult> {
+  ): Promise<ReferenceHiddenResult> {
     return this.runTokensHidden(inputHidden, positions, state, options);
   }
 }

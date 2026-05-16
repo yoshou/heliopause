@@ -9,13 +9,15 @@ import type {
   VisionResize,
   VisionSession,
 } from "../../vision";
+import type {
+  VisionPreprocessRunner,
+} from "../vision-runner";
 import {
   visionPreprocessRgbaWasm,
 } from "./wasm-kernels";
 
 type VisionPreprocessStats = {
   wasm: ProviderStats;
-  reference: ProviderStats;
 };
 
 type ProviderStats = {
@@ -31,6 +33,12 @@ type VisionPreprocessSession = Pick<
 
 const statsBySession = new WeakMap<VisionPreprocessSession, VisionPreprocessStats>();
 
+export const wasmVisionPreprocessRunner: VisionPreprocessRunner = {
+  provider: "wasm",
+  run: (session, input, visionPreprocess, options) =>
+    tryVisionPreprocessProviders(session, input, visionPreprocess, [{ name: "wasm" }], options),
+};
+
 export type VisionRgbaPreprocessInput = {
   rgba: Uint8ClampedArray;
   sourceWidth: number;
@@ -45,7 +53,7 @@ export type VisionPreprocessOptions = {
 export async function runVisionPreprocessProviders(
   session: VisionPreprocessSession,
   input: VisionRgbaPreprocessInput,
-  cpuPreprocess: (
+  _cpuPreprocess: (
     rgba: Uint8ClampedArray,
     sourceWidth: number,
     sourceHeight: number,
@@ -56,7 +64,7 @@ export async function runVisionPreprocessProviders(
   const result = await tryVisionPreprocessProviders(
     session,
     input,
-    cpuPreprocess,
+    _cpuPreprocess,
     session.preprocessProviders,
     options,
   );
@@ -70,7 +78,7 @@ export async function runVisionPreprocessProviders(
 export async function tryVisionPreprocessProviders(
   session: VisionPreprocessSession,
   input: VisionRgbaPreprocessInput,
-  cpuPreprocess: (
+  _cpuPreprocess: (
     rgba: Uint8ClampedArray,
     sourceWidth: number,
     sourceHeight: number,
@@ -89,31 +97,10 @@ export async function tryVisionPreprocessProviders(
       }
       continue;
     }
-    if (provider.name === "reference") {
-      return runVisionReferencePreprocess(session, input, cpuPreprocess);
-    }
     throw new Error(`Unsupported vision preprocess provider: ${provider.name}`);
   }
 
   return undefined;
-}
-
-function runVisionReferencePreprocess(
-  session: VisionPreprocessSession,
-  input: VisionRgbaPreprocessInput,
-  cpuPreprocess: (
-    rgba: Uint8ClampedArray,
-    sourceWidth: number,
-    sourceHeight: number,
-    manifest: VisionManifest,
-  ) => VisionPixelValues,
-): VisionPixelValues {
-  const stats = visionPreprocessStats(session);
-  stats.reference.attempts += 1;
-  const result = cpuPreprocess(input.rgba, input.sourceWidth, input.sourceHeight, session.manifest);
-  stats.reference.runs += 1;
-  stats.reference.lastFallbackReason = "";
-  return result;
 }
 
 async function tryVisionWasmProvider(
@@ -152,7 +139,6 @@ function visionPreprocessStats(session: VisionPreprocessSession): VisionPreproce
   if (!stats) {
     stats = {
       wasm: createProviderStats(),
-      reference: createProviderStats(),
     };
     statsBySession.set(session, stats);
     const captured = stats;
@@ -165,8 +151,6 @@ function visionPreprocessStatsSnapshot(stats: VisionPreprocessStats): ExecutionP
   return {
     wasmVisionPreprocessAttempts: stats.wasm.attempts,
     wasmVisionPreprocessRuns: stats.wasm.runs,
-    referenceVisionPreprocessAttempts: stats.reference.attempts,
-    referenceVisionPreprocessRuns: stats.reference.runs,
   };
 }
 

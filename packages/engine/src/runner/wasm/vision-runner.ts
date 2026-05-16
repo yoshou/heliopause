@@ -2,10 +2,6 @@ import type {
   GgmlTypeName,
 } from "../../gguf";
 import {
-  gqaAttention,
-  rmsNorm,
-} from "../../ops";
-import {
   dequantizeRow,
 } from "../../quant";
 import {
@@ -16,6 +12,9 @@ import type {
   VisionPixelValues,
   VisionSession,
 } from "../../vision";
+import type {
+  VisionEncoderRunner,
+} from "../vision-runner";
 import {
   createWasmQuantizedWeightHandle,
   gqaAttentionWasm,
@@ -46,11 +45,16 @@ type VisionWasmWeightCache = {
 
 const residentWeightCaches = new WeakMap<VisionSession, VisionWasmWeightCache>();
 
-export async function runCpuVisionEncoder(
+export const wasmVisionEncoderRunner: VisionEncoderRunner = {
+  provider: "wasm",
+  run: (session, pixels) => runWasmVisionEncoder(session, pixels),
+};
+
+export async function runWasmVisionEncoder(
   session: VisionSession,
   pixels: VisionPixelValues,
 ): Promise<VisionEncodeResult> {
-  requireCpuLikeProvider(session);
+  requireWasmProvider(session);
   const manifest = session.manifest;
   const patchGridX = pixels.width / manifest.patchSize;
   const patchGridY = pixels.height / manifest.patchSize;
@@ -95,13 +99,13 @@ export async function runCpuVisionEncoder(
   };
 }
 
-function requireCpuLikeProvider(session: VisionSession): void {
-  if (!session.executionProvider("wasm") && !session.executionProvider("reference")) {
-    throw new Error("Vision CPU execution requires an enabled wasm or reference provider.");
+function requireWasmProvider(session: VisionSession): void {
+  if (!session.executionProvider("wasm")) {
+    throw new Error("Vision WASM execution requires an enabled wasm provider.");
   }
 }
 
-export function releaseCpuVisionEncoder(session: VisionSession): void {
+export function releaseWasmVisionEncoder(session: VisionSession): void {
   const cache = residentWeightCaches.get(session);
   if (!cache) {
     return;
@@ -136,7 +140,7 @@ function residentWeightCache(session: VisionSession): VisionWasmWeightCache {
       misses: 0,
     };
     residentWeightCaches.set(session, cache);
-    session.addDisposeCallback(() => releaseCpuVisionEncoder(session));
+    session.addDisposeCallback(() => releaseWasmVisionEncoder(session));
     const statsCache = cache;
     session.setExecutionProviderStatsProvider(() => ({
       wasmVisionResidentWeightCacheEnabled: visionResidentWeightCacheEnabled(session),
@@ -300,9 +304,7 @@ async function forwardVisionLayer(
     scale: 1,
     causal: false,
   };
-  const attention = visionWasmKernelsEnabled(session)
-    ? requireWasmResult(await gqaAttentionWasm(q, k, v, attentionOptions), "vision GQA attention")
-    : gqaAttention(q, k, v, attentionOptions);
+  const attention = requireWasmResult(await gqaAttentionWasm(q, k, v, attentionOptions), "vision GQA attention");
   const attentionOutput = await matMulVisionWeight(session, `v.blk.${layer}.attn_out.weight`, attention);
   const attentionNorm = await rmsNormRows(
     attentionOutput,
@@ -676,7 +678,23 @@ async function rmsNormRows(
   const output = new Float32Array(input.length);
   for (let row = 0; row < input.length / weight.length; row += 1) {
     const offset = row * weight.length;
-    output.set(rmsNorm(input.slice(offset, offset + weight.length), weight, epsilon), offset);
+    output.set(rmsNormVector(input.slice(offset, offset + weight.length), weight, epsilon), offset);
+  }
+  return output;
+}
+
+function rmsNormVector(input: Float32Array, weight: Float32Array, epsilon: number): Float32Array {
+  if (input.length !== weight.length) {
+    throw new Error(`RMSNorm shape mismatch: input=${input.length} weight=${weight.length}`);
+  }
+  let sumSquares = 0;
+  for (const value of input) {
+    sumSquares += value * value;
+  }
+  const scale = 1 / Math.sqrt(sumSquares / input.length + epsilon);
+  const output = new Float32Array(input.length);
+  for (let index = 0; index < input.length; index += 1) {
+    output[index] = (input[index] ?? 0) * scale * (weight[index] ?? 0);
   }
   return output;
 }

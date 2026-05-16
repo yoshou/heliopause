@@ -15,6 +15,9 @@ import {
 import {
   tensorByteLength,
 } from "../../tensor-reader";
+import type {
+  AudioEncoderRunner,
+} from "../audio-runner";
 import {
   audioAddBiasRowsWasm,
   audioClampWasm,
@@ -45,7 +48,12 @@ type AudioWasmWeightCache = {
 
 const residentWeightCaches = new WeakMap<AudioSession, AudioWasmWeightCache>();
 
-export function releaseCpuAudioEncoder(session: AudioSession): void {
+export const wasmAudioEncoderRunner: AudioEncoderRunner = {
+  provider: "wasm",
+  run: (session, features, options) => runWasmAudioEncoder(session, features, options),
+};
+
+export function releaseWasmAudioEncoder(session: AudioSession): void {
   const cache = residentWeightCaches.get(session);
   if (!cache) {
     return;
@@ -80,7 +88,7 @@ function residentWeightCache(session: AudioSession): AudioWasmWeightCache {
       misses: 0,
     };
     residentWeightCaches.set(session, cache);
-    session.addDisposeCallback(() => releaseCpuAudioEncoder(session));
+    session.addDisposeCallback(() => releaseWasmAudioEncoder(session));
     const statsCache = cache;
     session.setExecutionProviderStatsProvider(() => ({
       wasmAudioResidentWeightCacheEnabled: audioResidentWeightCacheEnabled(session),
@@ -117,12 +125,12 @@ async function readWasmWeightHandle(
   return handle;
 }
 
-export async function runCpuAudioEncoder(
+export async function runWasmAudioEncoder(
   session: AudioSession,
   features: AudioFeatures,
   options: { signal?: AbortSignal } = {},
 ): Promise<AudioEncodeResult> {
-  requireCpuLikeProvider(session);
+  requireWasmProvider(session);
   throwIfAborted(options.signal);
   const manifest = session.manifest;
   if (features.featureSize !== manifest.featureSize) {
@@ -154,9 +162,9 @@ export async function runCpuAudioEncoder(
   };
 }
 
-function requireCpuLikeProvider(session: AudioSession): void {
-  if (!session.executionProvider("wasm") && !session.executionProvider("reference")) {
-    throw new Error("Audio CPU execution requires an enabled wasm or reference provider.");
+function requireWasmProvider(session: AudioSession): void {
+  if (!session.executionProvider("wasm")) {
+    throw new Error("Audio WASM execution requires an enabled wasm provider.");
   }
 }
 

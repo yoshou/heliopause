@@ -5,6 +5,7 @@ import {
   applyChatTemplate,
   buildTokenizer,
   createFileGgufTensorReader,
+  createReferenceProvider,
   createModelSession,
   generateChatTurn,
   generateChatCompletion,
@@ -139,7 +140,7 @@ test("chat generation stops on turn token", async () => {
       0, 0, 0, 0,
       0, 0, 0, 0,
     ])),
-  ]));
+  ]), { runnerProviders: [createReferenceProvider()] });
 
   const chunks = [];
   for await (const chunk of generateChatCompletion(
@@ -200,7 +201,7 @@ test("stateful chat turn pre-fills only the new turn suffix", async () => {
       0, 0, 0, 0,
       1, 0, 0, 0,
     ])),
-  ]));
+  ]), { runnerProviders: [createReferenceProvider()] });
   const state = session.createInferenceState();
 
   await prefillChatMessages(

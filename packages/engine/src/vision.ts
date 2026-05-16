@@ -8,29 +8,27 @@ import type {
   ExecutionProviderStats,
 } from "./runtime";
 import {
+  resolveSessionExecutionProviders,
   resolvePreprocessProviders,
 } from "./runtime";
 import {
-  runCpuVisionEncoder,
-} from "./runner/cpu/vision-runner";
-import {
-  runVisionPreprocessProviders,
-  tryVisionPreprocessProviders,
-  type VisionPreprocessOptions,
-} from "./runner/cpu/vision-preprocess-runner";
-import {
-  runWebGpuVisionEncoder,
-} from "./runner/webgpu/vision-execution-provider";
-import {
-  runWebGpuVisionPreprocessor,
-} from "./runner/webgpu/vision-preprocess-runner";
+  dispatchVisionEncoder,
+  dispatchVisionPreprocessor,
+} from "./runner/vision";
+import type {
+  VisionRunners,
+  VisionPreprocessOptions,
+} from "./runner/vision-runner";
+import type {
+  RunnerProvider,
+} from "./runner/provider";
 import {
   GgufTensorReader,
 } from "./tensor-reader";
 
 export type {
   VisionPreprocessOptions,
-} from "./runner/cpu/vision-preprocess-runner";
+} from "./runner/vision-runner";
 
 export type VisionPixelValues = {
   values: Float32Array;
@@ -55,6 +53,8 @@ export type VisionSessionOptions = {
   maxWeightCacheBytes?: number;
   executionProviders?: readonly ExecutionProviderConfig[];
   preprocessProviders?: readonly ExecutionProviderConfig[];
+  runnerProviders?: readonly RunnerProvider[];
+  visionRunners?: readonly VisionRunners[];
 };
 
 export class VisionSession {
@@ -63,6 +63,7 @@ export class VisionSession {
   readonly epsilon: number;
   readonly executionProviders: readonly ExecutionProviderConfig[];
   readonly preprocessProviders: readonly ExecutionProviderConfig[];
+  readonly visionRunners: readonly VisionRunners[];
 
   private readonly maxWeightCacheBytes: number;
   private readonly f32TensorCache = new Map<string, Float32Array>();
@@ -79,11 +80,9 @@ export class VisionSession {
     this.manifest = buildVisionManifest(tensorReader.metadata);
     this.epsilon = this.manifest.layerNormEpsilon;
     this.maxWeightCacheBytes = options.maxWeightCacheBytes ?? 256 * 1024 * 1024;
-    this.executionProviders = (options.executionProviders ?? [{ name: "reference" }]).map((provider) => ({
-      name: provider.name,
-      options: provider.options ? { ...provider.options } : undefined,
-    }));
+    this.executionProviders = resolveSessionExecutionProviders(options);
     this.preprocessProviders = resolvePreprocessProviders(this.executionProviders, options.preprocessProviders);
+    this.visionRunners = options.visionRunners ?? createVisionRunners(options.runnerProviders ?? []);
   }
 
   getTensor(name: string) {
@@ -258,27 +257,7 @@ export async function runVisionPreprocessor(
       sourceHeight: bitmap.height,
       resize,
     };
-    for (const provider of session.preprocessProviders) {
-      throwIfAborted(options.signal);
-      if (provider.name === "webgpu") {
-        const webgpu = await runWebGpuVisionPreprocessor(session, input, options);
-        if (!webgpu) {
-          throw new Error("WebGPU vision preprocessor is unavailable.");
-        }
-        return webgpu;
-      }
-      const result = await tryVisionPreprocessProviders(
-        session,
-        input,
-        preprocessVisionRgbaCpu,
-        [provider],
-        options,
-      );
-      if (result) {
-        return result;
-      }
-    }
-    throw new Error("No vision preprocessor provider was selected.");
+    return dispatchVisionPreprocessor(session.visionRunners, session, input, preprocessVisionRgbaCpu, options);
   } finally {
     bitmap.close();
   }
@@ -307,14 +286,13 @@ export async function runVisionEncoder(
   session: VisionSession,
   pixels: VisionPixelValues,
 ): Promise<VisionEncodeResult> {
-  if (session.executionProvider("webgpu")) {
-    const webgpu = await runWebGpuVisionEncoder(session, pixels);
-    if (!webgpu) {
-      throw new Error("WebGPU vision encoder is unavailable.");
-    }
-    return webgpu;
-  }
-  return runCpuVisionEncoder(session, pixels);
+  return dispatchVisionEncoder(session.visionRunners, session, pixels);
+}
+
+function createVisionRunners(providers: readonly RunnerProvider[]): readonly VisionRunners[] {
+  return providers
+    .map((provider) => provider.createVisionRunners?.())
+    .filter((runner): runner is VisionRunners => runner !== undefined);
 }
 
 function imageBitmapToRgba(bitmap: ImageBitmap): Uint8ClampedArray {
@@ -323,7 +301,10 @@ function imageBitmapToRgba(bitmap: ImageBitmap): Uint8ClampedArray {
     : document.createElement("canvas");
   canvas.width = bitmap.width;
   canvas.height = bitmap.height;
-  const context = canvas.getContext("2d", { willReadFrequently: true });
+  const context = canvas.getContext("2d", { willReadFrequently: true }) as
+    | CanvasRenderingContext2D
+    | OffscreenCanvasRenderingContext2D
+    | null;
   if (!context) {
     throw new Error("Could not create image decode canvas.");
   }
@@ -385,10 +366,4 @@ function floorByFactor(value: number, factor: number): number {
 
 function lerp(left: number, right: number, amount: number): number {
   return left + (right - left) * amount;
-}
-
-function throwIfAborted(signal: AbortSignal | undefined): void {
-  if (signal?.aborted) {
-    throw new DOMException("Vision preprocessing was aborted.", "AbortError");
-  }
 }
