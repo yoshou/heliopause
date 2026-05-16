@@ -48,7 +48,6 @@ import {
   dispatchScale,
   dispatchSelectTop1Candidate,
   dispatchTokenSlice,
-  dispatchTokenWrite,
   dispatchTop1Chunks,
   dispatchTopK,
   dispatchValueCacheWrite,
@@ -845,9 +844,9 @@ export class WebGpuSegmentRunner {
       const prepared = await this.prepareGpuInput(tokenIds, profileGpuPasses);
       this.tokenIdInputBatches += 1;
       this.tokenIdInputTokens += tokenCount;
-      if (tokenCount > 1 && options.attentionCausal !== false) {
+      if (tokenCount > 1) {
         try {
-          return await this.runCausalPrefillFromBoundary(prepared.hidden, positions, state, {
+          return await this.runBatchedPrefillFromBoundary(prepared.hidden, positions, state, {
             ...options,
             perLayerInputsBuffer: prepared.perLayerInputs,
             sourceTokenCount: tokenCount,
@@ -871,10 +870,6 @@ export class WebGpuSegmentRunner {
             sourceTokenCount: 1,
             sourceTokenIndex: 0,
           });
-          selectedTokenId = result.selectedTokenId;
-          topTokens = result.topTokens;
-        } else {
-          const result = await this.runTokenIdsNonCausalLoop(prepared, positions, state, options, tokenCount);
           selectedTokenId = result.selectedTokenId;
           topTokens = result.topTokens;
         }
@@ -978,9 +973,9 @@ export class WebGpuSegmentRunner {
       );
       this.arena.device.queue.writeBuffer(boundary, 0, inputHidden);
       this.boundaryUploads += 1;
-      if (tokenCount > 1 && options.attentionCausal !== false) {
+      if (tokenCount > 1) {
         try {
-          return await this.runCausalPrefillFromBoundary(boundary, positions, state, {
+          return await this.runBatchedPrefillFromBoundary(boundary, positions, state, {
             ...options,
             sourceTokenCount: tokenCount,
             sourceTokenIndex: 0,
@@ -1002,10 +997,6 @@ export class WebGpuSegmentRunner {
             sourceTokenCount: 1,
             sourceTokenIndex: 0,
           });
-          selectedTokenId = result.selectedTokenId;
-          topTokens = result.topTokens;
-        } else {
-          const result = await this.runTokensNonCausalLoop(boundary, positions, state, options, tokenCount);
           selectedTokenId = result.selectedTokenId;
           topTokens = result.topTokens;
         }
@@ -1032,9 +1023,6 @@ export class WebGpuSegmentRunner {
     const runtimeRun = this.beginRuntimeRun();
     try {
       const tokenCount = this.assertBatchedHidden(inputHidden, positions);
-      if (options.attentionCausal === false && tokenCount > 1) {
-        return await this.runTokensHiddenNonCausal(inputHidden, positions, state, options, tokenCount);
-      }
       const boundary = this.arena.createBuffer(
         "segment boundary hidden batch",
         inputHidden.byteLength,
@@ -1044,7 +1032,7 @@ export class WebGpuSegmentRunner {
       this.boundaryUploads += 1;
       if (tokenCount > 1) {
         try {
-          return await this.runCausalPrefillFromBoundary(boundary, positions, state, {
+          return await this.runBatchedPrefillFromBoundary(boundary, positions, state, {
             ...options,
             sourceTokenCount: tokenCount,
             sourceTokenIndex: 0,
@@ -1067,197 +1055,7 @@ export class WebGpuSegmentRunner {
     }
   }
 
-  private async runTokenIdsNonCausalLoop(
-    prepared: PreparedGpuInput,
-    positions: Int32Array,
-    state: WebGpuStateLike,
-    options: WebGpuRunOptions,
-    tokenCount: number,
-  ): Promise<WebGpuTokenResult> {
-    if (options.attentionCausal !== false) {
-      throw new Error("Multi-token causal prefill must use the batched WebGPU path.");
-    }
-    let topTokens: WebGpuTopToken[] | undefined;
-    let selectedTokenId: number | undefined;
-    for (let tokenIndex = 0; tokenIndex < tokenCount; tokenIndex += 1) {
-      const tokenPositions = tokenPositionsFromBatch(positions, tokenIndex, tokenCount);
-      const computeTopK = options.computeTopK === true && tokenIndex === tokenCount - 1;
-      const computeSelectedToken = options.computeSelectedToken === true && tokenIndex === tokenCount - 1;
-      const result = await this.runTokenFromBoundary(prepared.hidden, tokenIndex, tokenPositions, state, {
-        ...options,
-        computeTopK,
-        computeSelectedToken,
-        perLayerInputsBuffer: prepared.perLayerInputs,
-        sourceTokenCount: tokenCount,
-        sourceTokenIndex: tokenIndex,
-      });
-      if (computeSelectedToken) {
-        selectedTokenId = result.selectedTokenId;
-      }
-      if (computeTopK) {
-        topTokens = result.topTokens;
-      }
-    }
-    return { selectedTokenId, topTokens };
-  }
-
-  private async runTokensNonCausalLoop(
-    boundary: WebGpuBufferLike,
-    positions: Int32Array,
-    state: WebGpuStateLike,
-    options: WebGpuRunOptions,
-    tokenCount: number,
-  ): Promise<WebGpuTokenResult> {
-    if (options.attentionCausal !== false) {
-      throw new Error("Multi-token causal prefill must use the batched WebGPU path.");
-    }
-    let topTokens: WebGpuTopToken[] | undefined;
-    let selectedTokenId: number | undefined;
-    for (let tokenIndex = 0; tokenIndex < tokenCount; tokenIndex += 1) {
-      const tokenPositions = tokenPositionsFromBatch(positions, tokenIndex, tokenCount);
-      const computeTopK = options.computeTopK === true && tokenIndex === tokenCount - 1;
-      const computeSelectedToken = options.computeSelectedToken === true && tokenIndex === tokenCount - 1;
-      const result = await this.runTokenFromBoundary(boundary, tokenIndex, tokenPositions, state, {
-        ...options,
-        computeTopK,
-        computeSelectedToken,
-        sourceTokenCount: tokenCount,
-        sourceTokenIndex: tokenIndex,
-      });
-      if (computeSelectedToken) {
-        selectedTokenId = result.selectedTokenId;
-      }
-      if (computeTopK) {
-        topTokens = result.topTokens;
-      }
-    }
-    return { selectedTokenId, topTokens };
-  }
-
-  private async runTokensHiddenNonCausal(
-    inputHidden: Float32Array,
-    positions: Int32Array,
-    state: WebGpuStateLike,
-    options: WebGpuRunOptions,
-    tokenCount: number,
-  ): Promise<WebGpuHiddenResult> {
-    const tokenPositions = tokenPositionsFromBatchedMrope(positions, tokenCount);
-    for (const position of tokenPositions) {
-      if (position < 0 || position >= state.contextLength) {
-        throw new Error(`Position ${position} is outside context length ${state.contextLength}`);
-      }
-    }
-    const keyValueTokenCount = Math.min(state.contextLength, maxInt32(tokenPositions) + 1);
-    const gpuState = this.ensureGpuState(state);
-    const cleanup: GpuResource[] = [];
-    const resources: Array<{ destroy: () => void }> = [];
-    const byteLength = tokenCount * this.manifest.embeddingLength * Float32Array.BYTES_PER_ELEMENT;
-    let readback: WebGpuBufferLike | undefined;
-    const boundary = this.arena.createBuffer(
-      "segment boundary hidden noncausal batch",
-      inputHidden.byteLength,
-      GPU_STORAGE | GPU_COPY_DST | GPU_COPY_SRC,
-    );
-    this.arena.device.queue.writeBuffer(boundary, 0, inputHidden);
-    this.boundaryUploads += 1;
-    cleanup.push(boundary);
-
-    const encodeStartMs = nowMs();
-    const encoder = this.arena.device.createCommandEncoder();
-    let compute = this.beginComputePass(encoder, false, "prefill.noncausal");
-    let currentBatch = boundary;
-
-    try {
-      for (const layer of this.layers) {
-        for (let tokenIndex = 0; tokenIndex < tokenCount; tokenIndex += 1) {
-          const current = scratchF32(this.arena, this.manifest.embeddingLength, cleanup, `blk.${layer.layer}.kv.token`);
-          dispatchTokenSlice(this.arena.device, compute.pass, resources, currentBatch, current, {
-            rowSize: this.manifest.embeddingLength,
-            rowIndex: tokenIndex,
-          });
-          this.dispatchLayerKvUpdate(
-            compute.pass,
-            layer,
-            gpuState,
-            current,
-            tokenPositionsFromBatch(positions, tokenIndex, tokenCount),
-            tokenPositions[tokenIndex] ?? 0,
-            state.contextLength,
-            cleanup,
-            resources,
-          );
-        }
-
-        const nextBatch = this.arena.createScratchBuffer(
-          `blk.${layer.layer}.noncausal.output_batch`,
-          byteLength,
-          GPU_STORAGE | GPU_COPY_SRC,
-        );
-        cleanup.push(nextBatch);
-        for (let tokenIndex = 0; tokenIndex < tokenCount; tokenIndex += 1) {
-          const current = scratchF32(this.arena, this.manifest.embeddingLength, cleanup, `blk.${layer.layer}.token`);
-          dispatchTokenSlice(this.arena.device, compute.pass, resources, currentBatch, current, {
-            rowSize: this.manifest.embeddingLength,
-            rowIndex: tokenIndex,
-          });
-          const result = this.dispatchLayer(
-            encoder,
-            compute,
-            layer,
-            gpuState,
-            current,
-            tokenPositionsFromBatch(positions, tokenIndex, tokenCount),
-            tokenPositions[tokenIndex] ?? 0,
-            state.contextLength,
-            {
-              ...options,
-              attentionCausal: false,
-              keyValueTokenCount,
-              skipKvUpdate: true,
-              sourceTokenCount: tokenCount,
-              sourceTokenIndex: tokenIndex,
-            },
-            cleanup,
-            resources,
-          );
-          compute = result.compute;
-          dispatchTokenWrite(this.arena.device, compute.pass, resources, result.output, nextBatch, {
-            rowSize: this.manifest.embeddingLength,
-            rowIndex: tokenIndex,
-          });
-        }
-        currentBatch = nextBatch;
-      }
-
-      readback = this.arena.device.createBuffer({
-        size: byteLength,
-        usage: GPU_MAP_READ | GPU_COPY_DST,
-      });
-      this.endComputePass(encoder, compute);
-      encoder.copyBufferToBuffer(currentBatch, 0, readback, 0, byteLength);
-      this.activeRunEncodeMs += nowMs() - encodeStartMs;
-      this.submitCommandBuffer(encoder.finish());
-      this.readbackCount += 1;
-      await this.mapReadback(readback);
-      const hidden = new Float32Array(readback.getMappedRange()).slice();
-      readback.unmap();
-      readback.destroy?.();
-      readback = undefined;
-      this.readbackBytes += byteLength;
-      this.activeRunReadbackBytes += byteLength;
-      return { hidden };
-    } finally {
-      readback?.destroy?.();
-      for (const resource of resources) {
-        resource.destroy();
-      }
-      for (const item of cleanup.reverse()) {
-        item.destroy?.();
-      }
-    }
-  }
-
-  private async runCausalPrefillFromBoundary(
+  private async runBatchedPrefillFromBoundary(
     boundary: WebGpuBufferLike,
     positions: Int32Array,
     state: WebGpuStateLike,
@@ -1308,8 +1106,10 @@ export class WebGpuSegmentRunner {
     let candidateByteLength = 0;
 
     try {
-      for (let chunkStart = 0; chunkStart < tokenCount; chunkStart += this.prefillChunkSize) {
-        const chunkTokenCount = Math.min(this.prefillChunkSize, tokenCount - chunkStart);
+      // Match llama.cpp: non-causal attention is evaluated as one physical batch.
+      const prefillChunkSize = options.attentionCausal === false ? tokenCount : this.prefillChunkSize;
+      for (let chunkStart = 0; chunkStart < tokenCount; chunkStart += prefillChunkSize) {
+        const chunkTokenCount = Math.min(prefillChunkSize, tokenCount - chunkStart);
         const chunkByteLength = chunkTokenCount * hiddenByteLength;
         const chunkPositions = tokenPositions.slice(chunkStart, chunkStart + chunkTokenCount);
         const positionsBuffer = this.createPositionsBuffer(chunkPositions, cleanup, `prefill.positions.${chunkStart}`);
@@ -1565,7 +1365,9 @@ export class WebGpuSegmentRunner {
       `blk.${layer.layer}.prefill.attention_probabilities`,
     );
     const attention = scratchF32(this.arena, tokenCount * valueDim, cleanup, `blk.${layer.layer}.prefill.attention`);
-    const slidingWindow = layer.kind === "sliding-attention" ? this.manifest.slidingWindow : undefined;
+    const slidingWindow = options.attentionCausal === false
+      ? undefined
+      : layer.kind === "sliding-attention" ? this.manifest.slidingWindow : undefined;
     const attentionOptions = {
       headSize: layer.headSize,
       valueSize: layer.valueSize,
@@ -1577,7 +1379,7 @@ export class WebGpuSegmentRunner {
       slidingWindow,
       tokenCount,
       scale: 1,
-      causal: true,
+      causal: options.attentionCausal !== false,
     };
     dispatchBatchedFullAttentionScore(this.arena.device, pass, resources, query, state.key, positionsBuffer, probabilities, attentionOptions);
     dispatchBatchedFullAttentionApply(this.arena.device, pass, resources, state.value, probabilities, positionsBuffer, attention, attentionOptions);
