@@ -212,7 +212,7 @@ test("prefill follows planned provider graph instead of a full primary segment",
     ],
   });
 
-  await prefill(session, [1], { computeLogits: true });
+  await prefill(session, session.createInferenceState(), [1]);
 
   assert.deepEqual(executed, [
     "wasm.embedding",
@@ -241,7 +241,7 @@ test("prefill keeps WebGPU-only planned graph on WebGPU", async () => {
     ],
   });
 
-  await prefill(session, [1], { computeLogits: true });
+  await prefill(session, session.createInferenceState(), [1]);
 
   assert.deepEqual(executed, [
     "webgpu.embedding",

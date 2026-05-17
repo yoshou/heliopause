@@ -33,19 +33,10 @@ export type ForwardOutputValue = {
   result: OutputResult;
 };
 
-export type ForwardDecodeValue = {
-  kind: "decode";
-  hidden: Float32Array;
-  logits?: Float32Array;
-  selectedTokenId?: number;
-  topTokens?: Array<{ id: number; value: number }>;
-};
-
 export type ForwardValue =
   | ForwardCpuHiddenValue
   | ForwardProviderHiddenValue
-  | ForwardOutputValue
-  | ForwardDecodeValue;
+  | ForwardOutputValue;
 
 export type ForwardGraphContext = {
   session: ModelSession;

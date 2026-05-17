@@ -2,6 +2,7 @@ import {
   createForwardTrace,
   type InferenceState,
   type ModelSession,
+  type OutputResult,
   type TimingSink,
 } from "./runtime";
 import type {
@@ -36,109 +37,122 @@ import type {
 
 export type PrefillOptions = {
   positions?: Int32Array | number[];
-  state?: InferenceState;
   computeLogits?: boolean;
   logitsTopK?: number;
   onTiming?: TimingSink;
 };
 
-export type PreparedHiddenPrefillOptions = PrefillOptions & {
+export type PrefillStateOptions = {
+  positions?: Int32Array | number[];
+  onTiming?: TimingSink;
+};
+
+export type PreparedHiddenPrefillStateOptions = PrefillStateOptions & {
   attentionCausal?: boolean;
 };
 
-export type PrefillResult = {
-  hidden: Float32Array;
-  state: InferenceState;
+export type NextTokenResult = {
+  nextTokenId: number;
   logits?: Float32Array;
-  selectedTokenId?: number;
-  topTokens?: Array<{ id: number; value: number }>;
 };
 
 export type DecodeOptions = {
   position?: number;
-  state?: InferenceState;
+  computeLogits?: boolean;
   logitsTopK?: number;
   onTiming?: TimingSink;
 };
 
-export type DecodeResult = {
-  hidden: Float32Array;
-  state: InferenceState;
-  logits?: Float32Array;
-  selectedTokenId?: number;
-  topTokens?: Array<{ id: number; value: number }>;
-};
-
 export type { OutputResult } from "./runtime";
 
-export async function prefillPreparedHidden(
+export async function prefillPreparedHiddenState(
   session: ModelSession,
+  state: InferenceState,
   hiddenInput: Float32Array,
-  options: PreparedHiddenPrefillOptions = {},
-): Promise<PrefillResult> {
+  options: PreparedHiddenPrefillStateOptions = {},
+): Promise<void> {
   const tokenCount = hiddenInput.length / session.manifest.embeddingLength;
   if (!Number.isInteger(tokenCount)) {
     throw new Error(`Prepared hidden shape mismatch: ${hiddenInput.length}`);
   }
-  const state = options.state ?? session.createInferenceState();
   const runtime = modelRuntimeForForward(session, state);
   const positions = normalizePositions(options.positions, tokenCount);
   const trace = createForwardTrace("prefill", options.onTiming);
 
   if (tokenCount === 0) {
-    return { hidden: new Float32Array(), state };
+    return;
   }
 
   const input = new PreparedHiddenInputNode(runtime.primary.runner, hiddenInput);
   const built = buildForwardGraphFromPlan(runtime, {
     input,
-    computeLogits: options.computeLogits === true,
-    logitsTopK: options.logitsTopK ?? 10,
+    produceOutput: false,
+    logitsTopK: 1,
     segmentOptions: {
       attentionCausal: options.attentionCausal ?? true,
     },
   });
   const graph = new ForwardGraphExecutor(built.nodes);
-  const graphResult = await graph.run({
+  await graph.run({
     session,
     manifest: session.manifest,
     state,
     positions,
     phase: "prefill",
-    outputTopK: options.computeLogits ? options.logitsTopK ?? 10 : undefined,
     trace,
   });
-  const hidden = graphHiddenForResult(graphResult.values, built.hiddenId);
   updateNextPosition(state, positions, tokenCount);
-
-  const result: PrefillResult = { hidden, state };
-  if (options.computeLogits) {
-    const output = requireGraphOutput(graphResult.values, built.outputId ?? "output").result;
-    result.logits = output.logits;
-    result.selectedTokenId = output.topTokens[0]?.id;
-    result.topTokens = output.topTokens;
-  }
-  return result;
 }
 
-export async function prefill(
+export async function prefillState(
   session: ModelSession,
+  state: InferenceState,
   tokenIds: readonly number[],
-  options: PrefillOptions = {},
-): Promise<PrefillResult> {
-  const state = options.state ?? session.createInferenceState();
+  options: PrefillStateOptions = {},
+): Promise<void> {
   const runtime = modelRuntimeForForward(session, state);
   const positions = normalizePositions(options.positions, tokenIds.length);
   const trace = createForwardTrace("prefill", options.onTiming);
 
   if (tokenIds.length === 0) {
-    return { hidden: new Float32Array(), state };
+    return;
   }
 
   const built = buildForwardGraphFromPlan(runtime, {
     tokenIds,
-    computeLogits: options.computeLogits === true,
-    logitsTopK: options.logitsTopK ?? 10,
+    produceOutput: false,
+    logitsTopK: 1,
+  });
+  const graph = new ForwardGraphExecutor(built.nodes);
+  await graph.run({
+    session,
+    manifest: session.manifest,
+    state,
+    positions,
+    phase: "prefill",
+    trace,
+  });
+  updateNextPosition(state, positions, tokenIds.length);
+}
+
+export async function prefill(
+  session: ModelSession,
+  state: InferenceState,
+  tokenIds: readonly number[],
+  options: PrefillOptions = {},
+): Promise<NextTokenResult> {
+  const runtime = modelRuntimeForForward(session, state);
+  const positions = normalizePositions(options.positions, tokenIds.length);
+  const trace = createForwardTrace("prefill", options.onTiming);
+
+  if (tokenIds.length === 0) {
+    throw new Error("Cannot prefill next token from an empty token sequence.");
+  }
+
+  const built = buildForwardGraphFromPlan(runtime, {
+    tokenIds,
+    produceOutput: true,
+    logitsTopK: options.logitsTopK ?? 1,
   });
   const graph = new ForwardGraphExecutor(built.nodes);
   const graphResult = await graph.run({
@@ -147,36 +161,29 @@ export async function prefill(
     state,
     positions,
     phase: "prefill",
-    outputTopK: options.computeLogits ? options.logitsTopK ?? 10 : undefined,
+    outputTopK: options.logitsTopK ?? 1,
     trace,
   });
-  const hidden = graphHiddenForResult(graphResult.values, built.hiddenId);
   updateNextPosition(state, positions, tokenIds.length);
 
-  const result: PrefillResult = { hidden, state };
-  if (options.computeLogits) {
-    const output = requireGraphOutput(graphResult.values, built.outputId ?? "output").result;
-    result.logits = output.logits;
-    result.selectedTokenId = output.topTokens[0]?.id;
-    result.topTokens = output.topTokens;
-  }
-  return result;
+  const output = requireGraphOutput(graphResult.values, built.outputId ?? "output").result;
+  return nextTokenResultFromOutput(output, { computeLogits: options.computeLogits === true });
 }
 
 export async function decode(
   session: ModelSession,
+  state: InferenceState,
   tokenId: number,
   options: DecodeOptions = {},
-): Promise<DecodeResult> {
-  const state = options.state ?? session.createInferenceState();
+): Promise<NextTokenResult> {
   const runtime = modelRuntimeForForward(session, state);
   const position = options.position ?? state.nextPosition;
   const positions = new Int32Array([position]);
   const trace = createForwardTrace("decode", options.onTiming);
   const built = buildForwardGraphFromPlan(runtime, {
     tokenIds: [tokenId],
-    computeLogits: true,
-    logitsTopK: options.logitsTopK ?? 10,
+    produceOutput: true,
+    logitsTopK: options.logitsTopK ?? 1,
   });
   const graph = new ForwardGraphExecutor(built.nodes);
   const graphResult = await graph.run({
@@ -185,19 +192,12 @@ export async function decode(
     state,
     positions,
     phase: "decode",
-    outputTopK: options.logitsTopK ?? 10,
+    outputTopK: options.logitsTopK ?? 1,
     trace,
   });
-  const hidden = graphHiddenForResult(graphResult.values, built.hiddenId);
   state.nextPosition = Math.max(state.nextPosition, position + 1);
   const output = requireGraphOutput(graphResult.values, built.outputId ?? "output").result;
-  return {
-    hidden,
-    state,
-    logits: output.logits,
-    selectedTokenId: output.topTokens[0]?.id,
-    topTokens: output.topTokens,
-  };
+  return nextTokenResultFromOutput(output, { computeLogits: options.computeLogits === true });
 }
 
 class PreparedHiddenInputNode implements ForwardRunnerNode {
@@ -333,22 +333,6 @@ class ModelOutputNode implements ForwardRunnerNode {
   }
 }
 
-function requireGraphCpuHidden(values: ReadonlyMap<string, ForwardValue>, id: string): ForwardCpuHiddenValue {
-  const value = values.get(id);
-  if (!value || value.kind !== "cpu-hidden") {
-    throw new Error(`Expected CPU hidden graph value from ${id}`);
-  }
-  return value;
-}
-
-function graphHiddenForResult(values: ReadonlyMap<string, ForwardValue>, id: string): Float32Array {
-  const value = values.get(id);
-  if (!value || (value.kind !== "cpu-hidden" && value.kind !== "provider-hidden")) {
-    throw new Error(`Expected hidden graph value from ${id}`);
-  }
-  return value.kind === "cpu-hidden" ? value.hidden : new Float32Array();
-}
-
 function requireGraphOutput(values: ReadonlyMap<string, ForwardValue>, id: string): ForwardOutputValue {
   const value = values.get(id);
   if (!value || value.kind !== "output") {
@@ -357,7 +341,41 @@ function requireGraphOutput(values: ReadonlyMap<string, ForwardValue>, id: strin
   return value;
 }
 
-function normalizePositions(positions: PrefillOptions["positions"], tokenCount: number): Int32Array {
+function nextTokenResultFromOutput(
+  output: OutputResult,
+  options: { computeLogits: boolean },
+): NextTokenResult {
+  const nextTokenId = output.topTokens[0]?.id ?? nextTokenFromLogits(output.logits);
+  if (nextTokenId === undefined) {
+    throw new Error("Forward output did not produce a next token.");
+  }
+  const result: NextTokenResult = { nextTokenId };
+  if (options.computeLogits) {
+    if (output.logits.length === 0) {
+      throw new Error("Full logits were requested but the selected provider did not return them.");
+    }
+    result.logits = output.logits;
+  }
+  return result;
+}
+
+function nextTokenFromLogits(logits: Float32Array): number | undefined {
+  if (logits.length === 0) {
+    return undefined;
+  }
+  let bestId = 0;
+  let bestValue = Number.NEGATIVE_INFINITY;
+  for (let id = 0; id < logits.length; id += 1) {
+    const value = logits[id] ?? Number.NEGATIVE_INFINITY;
+    if (value > bestValue) {
+      bestId = id;
+      bestValue = value;
+    }
+  }
+  return bestId;
+}
+
+function normalizePositions(positions: PrefillStateOptions["positions"], tokenCount: number): Int32Array {
   if (!positions) {
     return Int32Array.from({ length: tokenCount }, (_, index) => index);
   }
@@ -382,7 +400,6 @@ type PlannedModelForward = {
 
 type BuiltForwardGraph = {
   nodes: ForwardRunnerNode[];
-  hiddenId: string;
   outputId?: string;
 };
 
@@ -436,7 +453,7 @@ function buildForwardGraphFromPlan(
   options: {
     tokenIds?: readonly number[];
     input?: ForwardRunnerNode;
-    computeLogits: boolean;
+    produceOutput: boolean;
     logitsTopK: number;
     segmentOptions?: { attentionCausal?: boolean };
   },
@@ -444,7 +461,6 @@ function buildForwardGraphFromPlan(
   const nodes: ForwardRunnerNode[] = [];
   let currentId: string | undefined;
   let currentProvider: SegmentRunnerProvider | undefined;
-  let hiddenId: string | undefined;
   let outputId: string | undefined;
 
   if (options.input) {
@@ -511,8 +527,7 @@ function buildForwardGraphFromPlan(
         nodes.push(exported);
         currentId = exported.id;
       }
-      hiddenId = currentId;
-      if (options.computeLogits) {
+      if (options.produceOutput) {
         const output = outputNode(outputRuntime, currentId, options.logitsTopK);
         nodes.push(output);
         outputId = output.id;
@@ -523,10 +538,7 @@ function buildForwardGraphFromPlan(
   if (!currentId) {
     throw new Error("Forward graph plan produced no hidden value.");
   }
-  if (!hiddenId) {
-    hiddenId = currentId;
-  }
-  return { nodes, hiddenId, outputId };
+  return { nodes, outputId };
 }
 
 function segmentNode(

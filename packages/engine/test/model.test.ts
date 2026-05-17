@@ -11,7 +11,7 @@ import {
   decode,
   estimateWeightCacheBytes,
   GgufTensorReader,
-  prefill,
+  prefillState,
   type ModelRunnerProvider,
 } from "../src/index.ts";
 
@@ -176,18 +176,21 @@ test("prefill advances nextPosition from default and explicit positions", async 
   ]);
   const session = createModelSession(reader, { providers: [createReferenceProvider()] });
 
-  const defaultResult = await prefill(session, [1, 2, 3]);
-  assert.equal(defaultResult.state.nextPosition, 3);
+  const defaultState = session.createInferenceState();
+  await prefillState(session, defaultState, [1, 2, 3]);
+  assert.equal(defaultState.nextPosition, 3);
 
-  const explicitResult = await prefill(session, [1, 2], {
+  const explicitState = session.createInferenceState();
+  await prefillState(session, explicitState, [1, 2], {
     positions: new Int32Array([4, 7]),
   });
-  assert.equal(explicitResult.state.nextPosition, 8);
+  assert.equal(explicitState.nextPosition, 8);
 
-  const mropeResult = await prefill(session, [1, 2], {
+  const mropeState = session.createInferenceState();
+  await prefillState(session, mropeState, [1, 2], {
     positions: new Int32Array([5, 6, 50, 60, 70, 80, 90, 100]),
   });
-  assert.equal(mropeResult.state.nextPosition, 7);
+  assert.equal(mropeState.nextPosition, 7);
 });
 
 test("decode uses state position, explicit position, and returns fixed logits", async () => {
@@ -204,33 +207,25 @@ test("decode uses state position, explicit position, and returns fixed logits", 
   const state = session.createInferenceState();
   state.nextPosition = 4;
 
-  const first = await decode(session, 2, { state, logitsTopK: 2 });
-  assert.equal(first.state.nextPosition, 5);
+  const first = await decode(session, state, 2, { computeLogits: true, logitsTopK: 2 });
+  assert.equal(state.nextPosition, 5);
+  assert.equal(first.nextTokenId, 1);
+  assert.ok(first.logits);
   assertFloatArrayClose(first.logits, new Float32Array([
     -0.16329793632030487,
     0.5715428590774536,
     -0.5715428590774536,
   ]), 2e-5);
-  assert.deepEqual(first.topTokens.map((token) => token.id), [1, 0]);
-  assertFloatArrayClose(
-    Float32Array.from(first.topTokens.map((token) => token.value)),
-    new Float32Array([0.5715428590774536, -0.16329793632030487]),
-    2e-5,
-  );
 
-  const second = await decode(session, 3, { state, position: 9, logitsTopK: 2 });
-  assert.equal(second.state.nextPosition, 10);
+  const second = await decode(session, state, 3, { position: 9, computeLogits: true, logitsTopK: 2 });
+  assert.equal(state.nextPosition, 10);
+  assert.equal(second.nextTokenId, 0);
+  assert.ok(second.logits);
   assertFloatArrayClose(second.logits, new Float32Array([
     0.1568925976753235,
     -0.7452399134635925,
     -0.23533886671066284,
   ]), 2e-5);
-  assert.deepEqual(second.topTokens.map((token) => token.id), [0, 2]);
-  assertFloatArrayClose(
-    Float32Array.from(second.topTokens.map((token) => token.value)),
-    new Float32Array([0.1568925976753235, -0.23533886671066284]),
-    2e-5,
-  );
 });
 
 test("model session caches F32 tensors and embedding rows", async () => {
@@ -315,9 +310,10 @@ test("full-attention decode rejects positions outside context", async () => {
     },
   });
   const session = createModelSession(reader, { providers: [createReferenceProvider()] });
+  const state = session.createInferenceState();
 
   await assert.rejects(
-    decode(session, 1, { position: 1 }),
+    decode(session, state, 1, { position: 1 }),
     /outside context length/,
   );
 });

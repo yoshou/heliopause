@@ -83,12 +83,13 @@ export {
 export {
   decode,
   prefill,
-  prefillPreparedHidden,
+  prefillPreparedHiddenState,
+  prefillState,
   type DecodeOptions,
-  type DecodeResult,
+  type NextTokenResult,
   type PrefillOptions,
-  type PrefillResult,
-  type PreparedHiddenPrefillOptions,
+  type PrefillStateOptions,
+  type PreparedHiddenPrefillStateOptions,
 } from "./forward";
 
 export {

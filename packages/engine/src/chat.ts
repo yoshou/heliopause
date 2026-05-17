@@ -12,7 +12,9 @@ import {
 import {
   decode as decodeToken,
   prefill as prefillTokens,
-  prefillPreparedHidden,
+  prefillPreparedHiddenState,
+  prefillState as prefillStateTokens,
+  type NextTokenResult,
 } from "./forward";
 import {
   GgufTensorReader,
@@ -172,15 +174,11 @@ export async function generateChatTurn(
     applyChatGenerationPrompt(),
     {
       signal: options.signal,
-      computeLogits: true,
+      returnNextToken: true,
       requireGenerationSlot: true,
     },
   );
-  let logits = promptPrefill.logits;
-  let nextTokenId = nextTokenFrom(logits, promptPrefill.topTokens, promptPrefill.selectedTokenId);
-  if (nextTokenId === undefined) {
-    return { content: "", finishReason: "stop", state };
-  }
+  let nextTokenId = promptPrefill.nextTokenId;
 
   const stopTokenIds = new Set([
     tokenizer.eosTokenId,
@@ -206,16 +204,10 @@ export async function generateChatTurn(
       break;
     }
 
-    const decodeResult = await decodeToken(session, tokenId, {
-      state,
+    const decodeResult = await decodeToken(session, state, tokenId, {
       logitsTopK: 1,
     });
-    logits = decodeResult.logits;
-    nextTokenId = nextTokenFrom(logits, decodeResult.topTokens, decodeResult.selectedTokenId);
-    if (nextTokenId === undefined) {
-      finishReason = "stop";
-      break;
-    }
+    nextTokenId = decodeResult.nextTokenId;
 
     const token = tokenizer.idToToken(tokenId) ?? "";
     const text = tokenizer.detokenize([tokenId]);
@@ -256,8 +248,7 @@ export async function generatePreparedImageChatTurn(
     signal: options.signal,
     requireGenerationSlot: true,
   });
-  await prefillPreparedHidden(session, image.hidden, {
-    state,
+  await prefillPreparedHiddenState(session, state, image.hidden, {
     positions: Int32Array.from(
       { length: image.tokenCount },
       (_, index) => state.nextPosition + index,
@@ -276,15 +267,11 @@ export async function generatePreparedImageChatTurn(
     applyChatGenerationPrompt(),
     {
       signal: options.signal,
-      computeLogits: true,
+      returnNextToken: true,
       requireGenerationSlot: true,
     },
   );
-  let logits = promptPrefill.logits;
-  let nextTokenId = nextTokenFrom(logits, promptPrefill.topTokens, promptPrefill.selectedTokenId);
-  if (nextTokenId === undefined) {
-    return { content: "", finishReason: "stop", state };
-  }
+  let nextTokenId = promptPrefill.nextTokenId;
 
   const stopTokenIds = new Set([
     tokenizer.eosTokenId,
@@ -310,16 +297,10 @@ export async function generatePreparedImageChatTurn(
       break;
     }
 
-    const decodeResult = await decodeToken(session, tokenId, {
-      state,
+    const decodeResult = await decodeToken(session, state, tokenId, {
       logitsTopK: 1,
     });
-    logits = decodeResult.logits;
-    nextTokenId = nextTokenFrom(logits, decodeResult.topTokens, decodeResult.selectedTokenId);
-    if (nextTokenId === undefined) {
-      finishReason = "stop";
-      break;
-    }
+    nextTokenId = decodeResult.nextTokenId;
 
     const token = tokenizer.idToToken(tokenId) ?? "";
     const text = tokenizer.detokenize([tokenId]);
@@ -360,8 +341,7 @@ export async function generatePreparedAudioChatTurn(
     signal: options.signal,
     requireGenerationSlot: true,
   });
-  await prefillPreparedHidden(session, audio.hidden, {
-    state,
+  await prefillPreparedHiddenState(session, state, audio.hidden, {
     positions: Int32Array.from(
       { length: audio.tokenCount },
       (_, index) => state.nextPosition + index,
@@ -388,15 +368,11 @@ async function generateAssistantFromState(
     applyChatGenerationPrompt(),
     {
       signal: options.signal,
-      computeLogits: true,
+      returnNextToken: true,
       requireGenerationSlot: true,
     },
   );
-  let logits = promptPrefill.logits;
-  let nextTokenId = nextTokenFrom(logits, promptPrefill.topTokens, promptPrefill.selectedTokenId);
-  if (nextTokenId === undefined) {
-    return { content: "", finishReason: "stop", state };
-  }
+  let nextTokenId = promptPrefill.nextTokenId;
 
   const stopTokenIds = new Set([
     tokenizer.eosTokenId,
@@ -422,16 +398,10 @@ async function generateAssistantFromState(
       break;
     }
 
-    const decodeResult = await decodeToken(session, tokenId, {
-      state,
+    const decodeResult = await decodeToken(session, state, tokenId, {
       logitsTopK: 1,
     });
-    logits = decodeResult.logits;
-    nextTokenId = nextTokenFrom(logits, decodeResult.topTokens, decodeResult.selectedTokenId);
-    if (nextTokenId === undefined) {
-      finishReason = "stop";
-      break;
-    }
+    nextTokenId = decodeResult.nextTokenId;
 
     const token = tokenizer.idToToken(tokenId) ?? "";
     const text = tokenizer.detokenize([tokenId]);
@@ -481,16 +451,10 @@ export async function* generateChatCompletion(
     );
   }
 
-  const prefillResult = await prefillTokens(session, promptTokenIds, {
-    state,
-    computeLogits: true,
+  const prefillResult = await prefillTokens(session, state, promptTokenIds, {
     logitsTopK: 1,
   });
-  let logits = prefillResult.logits;
-  let nextTokenId = nextTokenFrom(logits, prefillResult.topTokens, prefillResult.selectedTokenId);
-  if (nextTokenId === undefined) {
-    return "";
-  }
+  let nextTokenId = prefillResult.nextTokenId;
 
   let content = "";
   for (let index = 0; index < maxNewTokens; index += 1) {
@@ -514,15 +478,10 @@ export async function* generateChatCompletion(
     options.onToken?.(chunk);
     yield chunk;
 
-    const decodeResult = await decodeToken(session, tokenId, {
-      state,
+    const decodeResult = await decodeToken(session, state, tokenId, {
       logitsTopK: 1,
     });
-    logits = decodeResult.logits;
-    nextTokenId = nextTokenFrom(logits, decodeResult.topTokens, decodeResult.selectedTokenId);
-    if (nextTokenId === undefined) {
-      break;
-    }
+    nextTokenId = decodeResult.nextTokenId;
   }
 
   return content;
@@ -536,19 +495,41 @@ async function prefillChatText(
   options: {
     signal?: AbortSignal;
     computeLogits?: boolean;
+    returnNextToken: true;
+    requireGenerationSlot?: boolean;
+  },
+): Promise<NextTokenResult>;
+async function prefillChatText(
+  session: ModelSession,
+  tokenizer: Tokenizer,
+  state: InferenceState,
+  text: string,
+  options?: {
+    signal?: AbortSignal;
+    returnNextToken?: false;
+    requireGenerationSlot?: boolean;
+  },
+): Promise<void>;
+async function prefillChatText(
+  session: ModelSession,
+  tokenizer: Tokenizer,
+  state: InferenceState,
+  text: string,
+  options: {
+    signal?: AbortSignal;
+    computeLogits?: boolean;
+    returnNextToken?: boolean;
     requireGenerationSlot?: boolean;
   } = {},
-): Promise<{
-  state: InferenceState;
-  logits?: Float32Array;
-  selectedTokenId?: number;
-  topTokens?: Array<{ id: number; value: number }>;
-}> {
+): Promise<NextTokenResult | void> {
   throwIfAborted(options.signal);
 
   const tokenIds = tokenizer.tokenize(text, { addBos: state.nextPosition === 0 });
   if (tokenIds.length === 0) {
-    return { state };
+    if (options.returnNextToken) {
+      throw new Error("Cannot produce a next token from empty chat prefill text.");
+    }
+    return;
   }
 
   const requiredPositions = state.nextPosition + tokenIds.length;
@@ -559,15 +540,18 @@ async function prefillChatText(
     );
   }
 
-  return prefillTokens(session, tokenIds, {
-    state,
-    positions: Int32Array.from(
-      { length: tokenIds.length },
-      (_, index) => state.nextPosition + index,
-    ),
-    computeLogits: options.computeLogits,
-    logitsTopK: options.computeLogits ? 1 : undefined,
-  });
+  const positions = Int32Array.from(
+    { length: tokenIds.length },
+    (_, index) => state.nextPosition + index,
+  );
+  if (options.returnNextToken) {
+    return prefillTokens(session, state, tokenIds, {
+      positions,
+      computeLogits: options.computeLogits,
+      logitsTopK: 1,
+    });
+  }
+  await prefillStateTokens(session, state, tokenIds, { positions });
 }
 
 export function stripThinking(content: string): string {
@@ -658,34 +642,6 @@ class BufferedGgufByteReader implements GgufByteReader {
     }
     return this.buffer.subarray(0, length);
   }
-}
-
-function argmax(values: Float32Array): number {
-  let bestId = 0;
-  let bestValue = Number.NEGATIVE_INFINITY;
-  for (let id = 0; id < values.length; id += 1) {
-    const value = values[id] ?? Number.NEGATIVE_INFINITY;
-    if (value > bestValue) {
-      bestValue = value;
-      bestId = id;
-    }
-  }
-  return bestId;
-}
-
-function nextTokenFrom(
-  logits: Float32Array | undefined,
-  topTokens: Array<{ id: number; value: number }> | undefined,
-  selectedTokenId: number | undefined,
-): number | undefined {
-  if (selectedTokenId !== undefined) {
-    return selectedTokenId;
-  }
-  const topToken = topTokens?.[0]?.id;
-  if (topToken !== undefined) {
-    return topToken;
-  }
-  return logits ? argmax(logits) : undefined;
 }
 
 function throwIfAborted(signal: AbortSignal | undefined): void {
