@@ -35,7 +35,8 @@ import type {
   ModelGraphRunner,
 } from "../src/runner/model-runner.ts";
 import type {
-  RunnerNodePlacement,
+  LayerResourceRequirement,
+  ProviderResourceRequirements,
 } from "../src/runner/planning.ts";
 
 test("forward graph topologically sorts dependency order", () => {
@@ -206,29 +207,7 @@ test("prefill follows planned provider graph instead of a full primary segment",
   });
   const session = createModelSession(reader, {
     providers: [
-      fakeProvider("webgpu", executed, [
-        { kind: "embedding", provider: "wasm" },
-        {
-          kind: "segment",
-          provider: "wasm",
-          startLayer: 0,
-          endLayerExclusive: 1,
-          layerCount: 1,
-          weightBytes: 0,
-          cacheBytes: 0,
-        },
-        { kind: "transfer", from: "wasm", to: "webgpu", via: "cpu", value: "hidden" },
-        {
-          kind: "segment",
-          provider: "webgpu",
-          startLayer: 1,
-          endLayerExclusive: 3,
-          layerCount: 2,
-          weightBytes: 0,
-          cacheBytes: 0,
-        },
-        { kind: "output", provider: "webgpu" },
-      ]),
+      fakeProvider("webgpu", executed, 20),
       fakeProvider("wasm", executed),
     ],
   });
@@ -257,19 +236,7 @@ test("prefill keeps WebGPU-only planned graph on WebGPU", async () => {
   });
   const session = createModelSession(reader, {
     providers: [
-      fakeProvider("webgpu", executed, [
-        { kind: "embedding", provider: "webgpu" },
-        {
-          kind: "segment",
-          provider: "webgpu",
-          startLayer: 0,
-          endLayerExclusive: 3,
-          layerCount: 3,
-          weightBytes: 0,
-          cacheBytes: 0,
-        },
-        { kind: "output", provider: "webgpu" },
-      ]),
+      fakeProvider("webgpu", executed, 30),
       fakeProvider("wasm", executed),
     ],
   });
@@ -298,7 +265,7 @@ function node(id: string, deps: string[] = []): ForwardRunnerNode {
 function fakeProvider(
   name: "wasm" | "webgpu",
   executed: string[],
-  planNodes?: RunnerNodePlacement[],
+  memoryLimitBytes = 1_000,
 ): ModelRunnerProvider {
   const hidden = () => new Float32Array([1, 0, 0, 0]);
   const hiddenNode = (id: string, deps: string[] = []): ForwardRunnerNode => ({
@@ -357,35 +324,41 @@ function fakeProvider(
         },
       }),
     }),
-    planModelPlacement: planNodes
-      ? () => ({
-        status: "planned",
-        mode: "enabled",
-        memoryLimitBytes: 0,
-        enabled: false,
-        outputBytes: 0,
-        fixedBytes: 0,
-        scratchBytes: 0,
-        selectedLayerCount: 0,
-        wasmSegmentLayerCount: 1,
-        webGpuSegmentLayerCount: 2,
-        webGpuWeightBytes: 0,
-        webGpuCacheBytes: 0,
-        estimatedResidentBytes: 0,
-        remainingBytes: 0,
-        webGpuSelectedLayers: [],
-        segments: [],
-        nodes: planNodes,
-        copyAuditExpectations: {
-          decodeTensorReads: 0,
-          segmentIntermediateReadbacks: 0,
-          logitsReadbacks: 0,
-          expectedBoundaryUploads: 1,
-          expectedTokenReadbacks: 0,
-          expectedSelectedTokenReadbacks: 1,
-        },
-      })
-      : undefined,
+    modelResourceRequirements: () => fakeRequirements(name, memoryLimitBytes),
+  };
+}
+
+function fakeRequirements(
+  provider: "wasm" | "webgpu",
+  memoryLimitBytes: number,
+): ProviderResourceRequirements {
+  const constrained = provider === "webgpu";
+  const layers = [0, 1, 2].map((layer): LayerResourceRequirement => ({
+    provider,
+    layer,
+    layerKind: "sliding-attention",
+    weightBytes: 0,
+    cacheBytes: 0,
+    scratchBytes: 0,
+    residentBytes: constrained ? 10 : 0,
+    estimatedComputeCost: layer + 1,
+    requiredSourceLayers: [],
+    supportedValueTransfers: ["hidden"],
+  }));
+  return {
+    provider,
+    mode: "enabled",
+    support: { available: true },
+    memoryLimitBytes,
+    fixedBytes: 0,
+    outputBytes: 0,
+    scratchBytes: 0,
+    targetResourceConstrained: constrained,
+    canRunFullModel: !constrained,
+    offReason: `${provider} off`,
+    blockedReason: `${provider} blocked`,
+    plannedReason: `${provider} planned`,
+    layers,
   };
 }
 

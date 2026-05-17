@@ -1,6 +1,5 @@
-import type { GgufMetadata, GgufTensorInfo } from "../gguf";
-import type { LayerKind, ModelManifest } from "../model";
-import { tensorByteLength } from "../tensor-reader";
+import type { LayerKind } from "../model";
+import type { SegmentRunnerProvider } from "./segment-runner";
 
 export type RunnerExecutionMode = "off" | "verify" | "enabled";
 
@@ -21,33 +20,87 @@ export type RunnerProviderSupport =
       error?: string;
     };
 
-export type RunnerLayerPlacement = {
+export type RunnerCopyExpectations = {
+  decodeTensorReads: 0;
+  segmentIntermediateReadbacks: 0;
+  logitsReadbacks: 0;
+  expectedBoundaryUploads: number;
+  expectedTokenReadbacks: number;
+  expectedSelectedTokenReadbacks: number;
+};
+
+export type LayerResourceRequirement = {
+  provider: SegmentRunnerProvider;
   layer: number;
   layerKind: LayerKind;
   weightBytes: number;
   cacheBytes: number;
-  totalBytes: number;
+  scratchBytes: number;
+  residentBytes: number;
+  estimatedComputeCost: number;
+  requiredSourceLayers: readonly number[];
+  supportedValueTransfers: readonly "hidden"[];
 };
 
-export type RunnerSegmentProvider = "reference" | "wasm" | "webgpu";
+export type RunnerLayerPlacement = LayerResourceRequirement;
+
+export type ProviderResourceRequirements = {
+  provider: SegmentRunnerProvider;
+  mode: RunnerExecutionMode;
+  support: RunnerProviderSupport;
+  memoryLimitBytes: number;
+  fixedBytes: number;
+  outputBytes: number;
+  scratchBytes: number;
+  targetResourceConstrained: boolean;
+  canRunFullModel: boolean;
+  offReason: string;
+  blockedReason: string;
+  plannedReason: string;
+  layers: readonly LayerResourceRequirement[];
+  copyExpectations?: (params: {
+    selectedLayers: readonly LayerResourceRequirement[];
+    nodes: readonly RunnerNodePlacement[];
+  }) => RunnerCopyExpectations;
+};
+
+export type ResourceBudget = {
+  mode?: RunnerExecutionMode;
+  memoryLimitBytes?: number;
+  providerPriority?: readonly SegmentRunnerProvider[];
+};
+
+export type RunnerResourceUsage = {
+  provider: SegmentRunnerProvider;
+  memoryLimitBytes: number;
+  fixedBytes: number;
+  outputBytes: number;
+  scratchBytes: number;
+  selectedLayerCount: number;
+  selectedResidentBytes: number;
+  totalResidentBytes: number;
+  remainingBytes: number;
+};
 
 export type RunnerSegmentPlacement = {
-  provider: RunnerSegmentProvider;
+  provider: SegmentRunnerProvider;
   startLayer: number;
   endLayerExclusive: number;
   layerCount: number;
   weightBytes: number;
   cacheBytes: number;
+  residentBytes: number;
+  estimatedComputeCost: number;
 };
 
 export type RunnerNodePlacement =
   | {
       kind: "embedding";
-      provider: RunnerSegmentProvider;
+      provider: SegmentRunnerProvider;
     }
   | {
       kind: "segment";
-      provider: RunnerSegmentProvider;
+      provider: SegmentRunnerProvider;
       startLayer: number;
       endLayerExclusive: number;
       layerCount: number;
@@ -56,44 +109,25 @@ export type RunnerNodePlacement =
     }
   | {
       kind: "transfer";
-      from: RunnerSegmentProvider;
-      to: RunnerSegmentProvider;
+      from: SegmentRunnerProvider;
+      to: SegmentRunnerProvider;
       via: "cpu";
       value: "hidden";
     }
   | {
       kind: "output";
-      provider: RunnerSegmentProvider;
+      provider: SegmentRunnerProvider;
     };
 
 export type RunnerPlacementPlan = {
   status: RunnerPlanStatus;
   mode: RunnerExecutionMode;
-  memoryLimitBytes: number;
-  enabled: false;
   reason?: string;
-  outputBytes: number;
-  fixedBytes: number;
-  scratchBytes: number;
-  selectedLayerCount: number;
-  webGpuSegmentStartLayer?: number;
-  wasmSegmentLayerCount: number;
-  webGpuSegmentLayerCount: number;
-  webGpuWeightBytes: number;
-  webGpuCacheBytes: number;
-  estimatedResidentBytes: number;
-  remainingBytes: number;
-  webGpuSelectedLayers: RunnerLayerPlacement[];
   segments: RunnerSegmentPlacement[];
   nodes: RunnerNodePlacement[];
-  copyAuditExpectations: {
-    decodeTensorReads: 0;
-    segmentIntermediateReadbacks: 0;
-    logitsReadbacks: 0;
-    expectedBoundaryUploads: number;
-    expectedTokenReadbacks: number;
-    expectedSelectedTokenReadbacks: number;
-  };
+  selectedLayers: RunnerLayerPlacement[];
+  resourceUsage: RunnerResourceUsage[];
+  copyExpectations: RunnerCopyExpectations;
 };
 
 export type RunnerCopyAuditObservation = {
@@ -108,170 +142,85 @@ export type RunnerCopyAuditObservation = {
 export type RunnerCopyAuditResult = {
   ok: boolean;
   errors: string[];
-  expected: RunnerPlacementPlan["copyAuditExpectations"];
+  expected: RunnerCopyExpectations;
   observed: RunnerCopyAuditObservation;
 };
 
-export type RunnerPlanningOptions = {
-  mode?: RunnerExecutionMode;
-  memoryLimitBytes?: number;
-  contextLength?: number;
-  support?: RunnerProviderSupport;
+const EMPTY_COPY_EXPECTATIONS: RunnerCopyExpectations = {
+  decodeTensorReads: 0,
+  segmentIntermediateReadbacks: 0,
+  logitsReadbacks: 0,
+  expectedBoundaryUploads: 0,
+  expectedTokenReadbacks: 0,
+  expectedSelectedTokenReadbacks: 0,
 };
 
-export type RunnerPlanningProvider = {
-  name: string;
-  defaultMemoryLimitBytes: number;
-  fixedBytes: number;
-  scratchBytes: number;
-  outputTensorNames: readonly string[];
-  offReason: string;
-  blockedByMemoryReason: string;
-  unavailableReason: (support: RunnerProviderSupport) => string;
-  plannedReason: string;
-  requiredSegmentStart?: (params: {
-    manifest: ModelManifest;
-    selectedLayers: readonly RunnerLayerPlacement[];
-  }) => number | undefined;
-  layerPlacement: (params: {
-    tensorsByName: ReadonlyMap<string, GgufTensorInfo>;
-    manifest: ModelManifest;
-    layer: number;
-    contextLength: number;
-  }) => RunnerLayerPlacement;
-  copyAuditExpectations: (selectedLayerCount: number) => RunnerPlacementPlan["copyAuditExpectations"];
-};
-
-export function planProviderPlacement(
-  provider: RunnerPlanningProvider,
-  gguf: GgufMetadata,
-  manifest: ModelManifest,
-  options: RunnerPlanningOptions = {},
+export function planModelPlacement(
+  requirements: readonly ProviderResourceRequirements[],
+  budget: ResourceBudget = {},
 ): RunnerPlacementPlan {
-  const mode = options.mode ?? "off";
-  const memoryLimitBytes = options.memoryLimitBytes ?? provider.defaultMemoryLimitBytes;
-  const contextLength = Math.min(
-    options.contextLength ?? manifest.contextLength,
-    manifest.contextLength,
+  const ordered = orderRequirements(requirements, budget.providerPriority);
+  const mode = budget.mode ?? "enabled";
+  const unavailable = ordered.find((item) => item.support.available === false);
+  const off = ordered.find((item) => effectiveMode(item, mode) === "off");
+  const fallback = ordered.find((item) =>
+    effectiveMode(item, mode) !== "off" &&
+    item.support.available &&
+    item.canRunFullModel &&
+    !item.targetResourceConstrained
   );
-  const support = options.support;
-  const tensorsByName = new Map(gguf.tensors.map((tensor) => [tensor.name, tensor]));
-  const outputBytes = provider.outputTensorNames.reduce(
-    (sum, name) => sum + tensorBytes(tensorsByName, name),
-    0,
+  const accelerated = ordered.find((item) =>
+    effectiveMode(item, mode) !== "off" &&
+    item.support.available &&
+    item.targetResourceConstrained
   );
-  const layerPlans = buildLayerPlans(provider, tensorsByName, manifest, contextLength);
 
-  if (mode === "off") {
-    return emptyPlan(provider, {
-      status: "off",
-      mode,
-      memoryLimitBytes,
-      reason: provider.offReason,
-      outputBytes,
-      blockCount: manifest.blockCount,
-    });
-  }
-
-  if (support && !support.available) {
-    return emptyPlan(provider, {
-      status: "unavailable",
-      mode,
-      memoryLimitBytes,
-      reason: provider.unavailableReason(support),
-      outputBytes,
-      blockCount: manifest.blockCount,
-    });
-  }
-
-  let selectedBytes = outputBytes + provider.fixedBytes + provider.scratchBytes;
-  const selectedLayers: RunnerLayerPlacement[] = [];
-
-  if (selectedBytes > memoryLimitBytes) {
-    return emptyPlan(provider, {
-      status: "blocked",
-      mode,
-      memoryLimitBytes,
-      reason: provider.blockedByMemoryReason,
-      outputBytes,
-      blockCount: manifest.blockCount,
-    });
-  }
-
-  for (let layer = manifest.blockCount - 1; layer >= 0; layer -= 1) {
-    const candidate = layerPlans.get(layer);
-    if (!candidate) {
-      continue;
+  if (!accelerated) {
+    if (fallback) {
+      return fullProviderPlan(fallback, mode, budget);
     }
-    if (selectedBytes + candidate.totalBytes > memoryLimitBytes) {
-      break;
+    if (off) {
+      return emptyPlan("off", mode, off.offReason);
     }
-    selectedLayers.unshift(candidate);
-    selectedBytes += candidate.totalBytes;
+    if (unavailable && !unavailable.support.available) {
+      return emptyPlan("unavailable", mode, unavailable.support.reason);
+    }
+    return emptyPlan("blocked", mode, "No executable model provider is available.");
   }
 
-  const requiredStart = provider.requiredSegmentStart?.({ manifest, selectedLayers });
-  if (requiredStart !== undefined && selectedLayers.length > 0) {
-    const currentStart = selectedLayers[0]?.layer ?? manifest.blockCount;
-    for (let layer = currentStart - 1; layer >= requiredStart; layer -= 1) {
-      const candidate = layerPlans.get(layer);
-      if (!candidate) {
-        continue;
-      }
-      if (selectedBytes + candidate.totalBytes > memoryLimitBytes) {
-        return emptyPlan(provider, {
-          status: "blocked",
-          mode,
-          memoryLimitBytes,
-          reason: provider.blockedByMemoryReason,
-          outputBytes,
-          blockCount: manifest.blockCount,
-        });
-      }
-      selectedLayers.unshift(candidate);
-      selectedBytes += candidate.totalBytes;
-    }
+  const selected = selectConnectedLayers(accelerated, budget);
+  if (selected.length === 0) {
+    return emptyPlan("blocked", mode, accelerated.blockedReason);
   }
 
-  const webGpuSegmentStartLayer = selectedLayers[0]?.layer;
-  const webGpuWeightBytes = outputBytes +
-    selectedLayers.reduce((sum, layer) => sum + layer.weightBytes, 0);
-  const webGpuCacheBytes = selectedLayers.reduce((sum, layer) => sum + layer.cacheBytes, 0);
-  const segments = buildHybridSegments({
-    blockCount: manifest.blockCount,
-    webGpuSegmentStartLayer,
-    webGpuSegmentEndLayer: selectedLayers.length > 0 ? manifest.blockCount : undefined,
-    webGpuWeightBytes,
-    webGpuCacheBytes,
-  });
-  const nodes = buildHybridNodes(segments);
+  const blockCount = accelerated.layers.length;
+  const startLayer = selected[0]?.layer ?? blockCount;
+  if (startLayer > 0 && !fallback) {
+    return emptyPlan("blocked", mode, "No fallback provider can execute unselected layers.");
+  }
+
+  const segments: RunnerSegmentPlacement[] = [];
+  if (startLayer > 0 && fallback) {
+    segments.push(segmentFromLayers(fallback.provider, fallback.layers.slice(0, startLayer)));
+  }
+  segments.push(segmentFromLayers(accelerated.provider, selected));
+  const nodes = buildNodes(segments);
+  const resourceUsage = [
+    resourceUsageFor(accelerated, selected, budget),
+  ];
+  if (fallback && startLayer > 0) {
+    resourceUsage.unshift(resourceUsageFor(fallback, fallback.layers.slice(0, startLayer), budget));
+  }
 
   return {
     status: "planned",
     mode,
-    memoryLimitBytes,
-    enabled: false,
-    reason: provider.plannedReason,
-    outputBytes,
-    fixedBytes: provider.fixedBytes,
-    scratchBytes: provider.scratchBytes,
-    selectedLayerCount: selectedLayers.length,
-    webGpuSegmentStartLayer,
-    wasmSegmentLayerCount: webGpuSegmentStartLayer === undefined ? manifest.blockCount : webGpuSegmentStartLayer,
-    webGpuSegmentLayerCount: selectedLayers.length,
-    webGpuWeightBytes,
-    webGpuCacheBytes,
-    estimatedResidentBytes: selectedBytes,
-    remainingBytes: Math.max(0, memoryLimitBytes - selectedBytes),
-    webGpuSelectedLayers: selectedLayers,
+    reason: accelerated.plannedReason,
     segments,
     nodes,
-    copyAuditExpectations: {
-      ...provider.copyAuditExpectations(selectedLayers.length),
-      expectedBoundaryUploads: nodes.some((node) =>
-        node.kind === "transfer" && node.to === "webgpu"
-      ) ? 1 : 0,
-    },
+    selectedLayers: selected,
+    resourceUsage,
+    copyExpectations: copyExpectationsFor(accelerated, selected, nodes),
   };
 }
 
@@ -279,7 +228,7 @@ export function auditRunnerPlacementCopies(
   plan: RunnerPlacementPlan,
   observed: RunnerCopyAuditObservation,
 ): RunnerCopyAuditResult {
-  const expected = plan.copyAuditExpectations;
+  const expected = plan.copyExpectations;
   const errors: string[] = [];
 
   if (observed.decodeTensorReads !== expected.decodeTensorReads) {
@@ -320,71 +269,163 @@ export function auditRunnerPlacementCopies(
   };
 }
 
-function buildLayerPlans(
-  provider: RunnerPlanningProvider,
-  tensorsByName: ReadonlyMap<string, GgufTensorInfo>,
-  manifest: ModelManifest,
-  contextLength: number,
-): Map<number, RunnerLayerPlacement> {
-  const plans = new Map<number, RunnerLayerPlacement>();
-  for (let layer = 0; layer < manifest.blockCount; layer += 1) {
-    plans.set(layer, provider.layerPlacement({
-      tensorsByName,
-      manifest,
-      layer,
-      contextLength,
-    }));
+function orderRequirements(
+  requirements: readonly ProviderResourceRequirements[],
+  priority: readonly SegmentRunnerProvider[] | undefined,
+): ProviderResourceRequirements[] {
+  if (!priority) {
+    return requirements.slice();
   }
-  return plans;
-}
-
-function tensorBytes(tensorsByName: ReadonlyMap<string, GgufTensorInfo>, name: string): number {
-  const tensor = tensorsByName.get(name);
-  return tensor ? tensorByteLength(tensor) : 0;
-}
-
-function buildHybridSegments(params: {
-  blockCount: number;
-  webGpuSegmentStartLayer?: number;
-  webGpuSegmentEndLayer?: number;
-  webGpuWeightBytes: number;
-  webGpuCacheBytes: number;
-}): RunnerSegmentPlacement[] {
-  const webGpuStart = params.webGpuSegmentStartLayer;
-  if (webGpuStart === undefined || params.webGpuSegmentEndLayer === undefined) {
-    return [{
-      provider: "wasm",
-      startLayer: 0,
-      endLayerExclusive: params.blockCount,
-      layerCount: params.blockCount,
-      weightBytes: 0,
-      cacheBytes: 0,
-    }];
-  }
-
-  const segments: RunnerSegmentPlacement[] = [];
-  if (webGpuStart > 0) {
-    segments.push({
-      provider: "wasm",
-      startLayer: 0,
-      endLayerExclusive: webGpuStart,
-      layerCount: webGpuStart,
-      weightBytes: 0,
-      cacheBytes: 0,
-    });
-  }
-  segments.push({
-    provider: "webgpu",
-    startLayer: webGpuStart,
-    endLayerExclusive: params.webGpuSegmentEndLayer,
-    layerCount: params.webGpuSegmentEndLayer - webGpuStart,
-    weightBytes: params.webGpuWeightBytes,
-    cacheBytes: params.webGpuCacheBytes,
+  const byProvider = new Map(requirements.map((item) => [item.provider, item]));
+  const ordered = priority.flatMap((provider) => {
+    const item = byProvider.get(provider);
+    return item ? [item] : [];
   });
-  return segments;
+  for (const item of requirements) {
+    if (!priority.includes(item.provider)) {
+      ordered.push(item);
+    }
+  }
+  return ordered;
 }
 
-function buildHybridNodes(segments: readonly RunnerSegmentPlacement[]): RunnerNodePlacement[] {
+function effectiveMode(
+  requirements: ProviderResourceRequirements,
+  mode: RunnerExecutionMode,
+): RunnerExecutionMode {
+  return mode === "off" ? "off" : requirements.mode;
+}
+
+function fullProviderPlan(
+  provider: ProviderResourceRequirements,
+  mode: RunnerExecutionMode,
+  budget: ResourceBudget,
+): RunnerPlacementPlan {
+  const segments = provider.layers.length > 0 ? [segmentFromLayers(provider.provider, provider.layers)] : [];
+  const nodes = provider.layers.length > 0
+    ? buildNodes(segments)
+    : [
+      { kind: "embedding", provider: provider.provider },
+      { kind: "output", provider: provider.provider },
+    ] satisfies RunnerNodePlacement[];
+  return {
+    status: "planned",
+    mode,
+    reason: provider.plannedReason,
+    segments,
+    nodes,
+    selectedLayers: provider.layers.slice(),
+    resourceUsage: [resourceUsageFor(provider, provider.layers, budget)],
+    copyExpectations: copyExpectationsFor(provider, provider.layers, nodes),
+  };
+}
+
+function selectConnectedLayers(
+  provider: ProviderResourceRequirements,
+  budget: ResourceBudget,
+): LayerResourceRequirement[] {
+  const layers = provider.layers.slice().sort((left, right) => left.layer - right.layer);
+  const limit = budget.memoryLimitBytes ?? provider.memoryLimitBytes;
+  let selectedStart = layers.length;
+  let selectedResidentBytes = 0;
+  const selected = new Map<number, LayerResourceRequirement>();
+  const rejected = new Set<number>();
+
+  for (;;) {
+    const candidates = layers
+      .filter((layer) => !selected.has(layer.layer) && !rejected.has(layer.layer))
+      .map((layer) => candidateGroup(layers, layer.layer, selectedStart))
+      .filter((candidate): candidate is LayerResourceRequirement[] => candidate !== undefined)
+      .sort(compareCandidateGroups);
+    const candidate = candidates[0];
+    if (!candidate) {
+      break;
+    }
+
+    const additionalResidentBytes = candidate.reduce((sum, layer) => sum + layer.residentBytes, 0);
+    const totalResidentBytes = provider.fixedBytes + provider.outputBytes + provider.scratchBytes +
+      selectedResidentBytes + additionalResidentBytes;
+    if (totalResidentBytes > limit) {
+      for (const layer of candidate) {
+        rejected.add(layer.layer);
+      }
+      continue;
+    }
+
+    for (const layer of candidate) {
+      selected.set(layer.layer, layer);
+      selectedStart = Math.min(selectedStart, layer.layer);
+    }
+    selectedResidentBytes += additionalResidentBytes;
+  }
+
+  return [...selected.values()].sort((left, right) => left.layer - right.layer);
+}
+
+function candidateGroup(
+  layers: readonly LayerResourceRequirement[],
+  layer: number,
+  selectedStart: number,
+): LayerResourceRequirement[] | undefined {
+  if (layer !== selectedStart - 1) {
+    return undefined;
+  }
+  const layerByIndex = new Map(layers.map((item) => [item.layer, item]));
+  const current = layerByIndex.get(layer);
+  if (!current) {
+    return undefined;
+  }
+  const requiredStart = Math.min(layer, ...current.requiredSourceLayers.filter((source) => source < selectedStart));
+  const group: LayerResourceRequirement[] = [];
+  for (let index = requiredStart; index < selectedStart; index += 1) {
+    const item = layerByIndex.get(index);
+    if (!item) {
+      return undefined;
+    }
+    group.push(item);
+  }
+  return group;
+}
+
+function compareCandidateGroups(
+  left: readonly LayerResourceRequirement[],
+  right: readonly LayerResourceRequirement[],
+): number {
+  const leftCost = sum(left, (item) => item.estimatedComputeCost);
+  const rightCost = sum(right, (item) => item.estimatedComputeCost);
+  if (leftCost !== rightCost) {
+    return leftCost - rightCost;
+  }
+  const leftResident = sum(left, (item) => item.residentBytes);
+  const rightResident = sum(right, (item) => item.residentBytes);
+  if (leftResident !== rightResident) {
+    return leftResident - rightResident;
+  }
+  return Math.max(...right.map((item) => item.layer)) - Math.max(...left.map((item) => item.layer));
+}
+
+function segmentFromLayers(
+  provider: SegmentRunnerProvider,
+  layers: readonly LayerResourceRequirement[],
+): RunnerSegmentPlacement {
+  const first = layers[0];
+  const last = layers[layers.length - 1];
+  if (!first || !last) {
+    throw new Error(`Cannot build empty segment for ${provider}.`);
+  }
+  return {
+    provider,
+    startLayer: first.layer,
+    endLayerExclusive: last.layer + 1,
+    layerCount: layers.length,
+    weightBytes: sum(layers, (layer) => layer.weightBytes),
+    cacheBytes: sum(layers, (layer) => layer.cacheBytes),
+    residentBytes: sum(layers, (layer) => layer.residentBytes),
+    estimatedComputeCost: sum(layers, (layer) => layer.estimatedComputeCost),
+  };
+}
+
+function buildNodes(segments: readonly RunnerSegmentPlacement[]): RunnerNodePlacement[] {
   const first = segments[0];
   if (!first) {
     return [];
@@ -427,45 +468,52 @@ function buildHybridNodes(segments: readonly RunnerSegmentPlacement[]): RunnerNo
   return nodes;
 }
 
-function emptyPlan(
-  provider: RunnerPlanningProvider,
-  params: {
-    status: RunnerPlanStatus;
-    mode: RunnerExecutionMode;
-    memoryLimitBytes: number;
-    reason: string;
-    outputBytes: number;
-    blockCount: number;
-  },
-): RunnerPlacementPlan {
-  const estimatedResidentBytes = params.outputBytes + provider.fixedBytes + provider.scratchBytes;
-  const segments: RunnerSegmentPlacement[] = [{
-    provider: "wasm",
-    startLayer: 0,
-    endLayerExclusive: params.blockCount,
-    layerCount: params.blockCount,
-    weightBytes: 0,
-    cacheBytes: 0,
-  }];
+function resourceUsageFor(
+  provider: ProviderResourceRequirements,
+  layers: readonly LayerResourceRequirement[],
+  budget: ResourceBudget,
+): RunnerResourceUsage {
+  const memoryLimitBytes = budget.memoryLimitBytes ?? provider.memoryLimitBytes;
+  const selectedResidentBytes = sum(layers, (layer) => layer.residentBytes);
+  const totalResidentBytes = provider.fixedBytes + provider.outputBytes + provider.scratchBytes + selectedResidentBytes;
   return {
-    status: params.status,
-    mode: params.mode,
-    memoryLimitBytes: params.memoryLimitBytes,
-    enabled: false,
-    reason: params.reason,
-    outputBytes: params.outputBytes,
+    provider: provider.provider,
+    memoryLimitBytes,
     fixedBytes: provider.fixedBytes,
+    outputBytes: provider.outputBytes,
     scratchBytes: provider.scratchBytes,
-    selectedLayerCount: 0,
-    wasmSegmentLayerCount: params.blockCount,
-    webGpuSegmentLayerCount: 0,
-    webGpuWeightBytes: params.outputBytes,
-    webGpuCacheBytes: 0,
-    estimatedResidentBytes,
-    remainingBytes: Math.max(0, params.memoryLimitBytes - estimatedResidentBytes),
-    webGpuSelectedLayers: [],
-    segments,
-    nodes: buildHybridNodes(segments),
-    copyAuditExpectations: provider.copyAuditExpectations(0),
+    selectedLayerCount: layers.length,
+    selectedResidentBytes,
+    totalResidentBytes,
+    remainingBytes: Math.max(0, memoryLimitBytes - totalResidentBytes),
   };
+}
+
+function copyExpectationsFor(
+  provider: ProviderResourceRequirements,
+  selectedLayers: readonly LayerResourceRequirement[],
+  nodes: readonly RunnerNodePlacement[],
+): RunnerCopyExpectations {
+  return provider.copyExpectations?.({ selectedLayers, nodes }) ?? EMPTY_COPY_EXPECTATIONS;
+}
+
+function emptyPlan(
+  status: Exclude<RunnerPlanStatus, "planned">,
+  mode: RunnerExecutionMode,
+  reason: string,
+): RunnerPlacementPlan {
+  return {
+    status,
+    mode,
+    reason,
+    segments: [],
+    nodes: [],
+    selectedLayers: [],
+    resourceUsage: [],
+    copyExpectations: EMPTY_COPY_EXPECTATIONS,
+  };
+}
+
+function sum<T>(items: readonly T[], value: (item: T) => number): number {
+  return items.reduce((total, item) => total + value(item), 0);
 }

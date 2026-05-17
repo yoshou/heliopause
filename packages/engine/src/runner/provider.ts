@@ -6,7 +6,7 @@ import type {
   ModelRunner,
 } from "./model-runner";
 import type {
-  RunnerPlacementPlan,
+  ProviderResourceRequirements,
 } from "./planning";
 import type {
   ModelSession,
@@ -25,7 +25,7 @@ export type RunnerProvider = {
 export type ModelRunnerProvider = RunnerProvider & {
   createModelRunner(): ModelRunner;
   createModelGraphRunner?(): ModelGraphRunner;
-  planModelPlacement?(session: ModelSession, options: { contextLength: number }): RunnerPlacementPlan;
+  modelResourceRequirements(session: ModelSession, options: { contextLength: number }): ProviderResourceRequirements;
 };
 
 export type AudioRunnerProvider = RunnerProvider & {

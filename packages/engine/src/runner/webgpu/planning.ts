@@ -1,10 +1,17 @@
-import type { GgufMetadata, GgufTensorInfo } from "../../gguf";
-import type { LayerKind, ModelManifest } from "../../model";
-import { tensorByteLength } from "../../tensor-reader";
+import type { GgufMetadata } from "../../gguf";
+import type { ModelManifest } from "../../model";
 import {
-  planProviderPlacement,
-  type RunnerPlacementPlan,
-  type RunnerPlanningOptions,
+  createModelResourceRequirements,
+} from "../model-resources";
+import type {
+  ProviderResourceRequirements,
+  ResourceBudget,
+  RunnerCopyExpectations,
+  RunnerExecutionMode,
+  RunnerProviderSupport,
+} from "../planning";
+import {
+  planModelPlacement,
 } from "../planning";
 import {
   DEFAULT_GPU_FIXED_BYTES,
@@ -12,108 +19,77 @@ import {
   WEBGPU_MEMORY_LIMIT_BYTES,
 } from "./gpu-constants";
 
-type WebGpuPlanningSupport =
-  | { available: true }
-  | { available: false; reason: string };
-
-type WebGpuLayerPlacementParams = {
-  tensorsByName: ReadonlyMap<string, GgufTensorInfo>;
-  manifest: ModelManifest;
-  layer: number;
-  contextLength: number;
+export type WebGpuResourceOptions = {
+  mode?: RunnerExecutionMode;
+  memoryLimitBytes?: number;
+  contextLength?: number;
+  support?: RunnerProviderSupport;
 };
 
-type WebGpuCopyAuditExpectations = {
-  decodeTensorReads: 0;
-  segmentIntermediateReadbacks: 0;
-  logitsReadbacks: 0;
-  expectedBoundaryUploads: number;
-  expectedTokenReadbacks: number;
-  expectedSelectedTokenReadbacks: number;
-};
+export function webGpuResourceRequirements(
+  gguf: GgufMetadata,
+  manifest: ModelManifest,
+  options: WebGpuResourceOptions = {},
+): ProviderResourceRequirements {
+  const contextLength = Math.min(
+    options.contextLength ?? manifest.contextLength,
+    manifest.contextLength,
+  );
+  return createModelResourceRequirements({
+    provider: "webgpu",
+    gguf,
+    manifest,
+    contextLength,
+    mode: options.mode ?? "enabled",
+    support: options.support,
+    memoryLimitBytes: options.memoryLimitBytes ?? WEBGPU_MEMORY_LIMIT_BYTES,
+    fixedBytes: DEFAULT_GPU_FIXED_BYTES,
+    scratchBytes: DEFAULT_GPU_SCRATCH_BYTES,
+    outputTensorNames: ["token_embd.weight", "output_norm.weight"],
+    targetResourceConstrained: true,
+    canRunFullModel: false,
+    offReason: "WebGPU execution is off; this is a placement plan only.",
+    blockedReason: "No WebGPU layer placement fits the configured memory budget.",
+    plannedReason: "Cost-based layer placement is planned.",
+    residentBytes: ({ weightBytes, cacheBytes }) => weightBytes + cacheBytes,
+    estimatedComputeCost: ({ layerKind, weightBytes, cacheBytes }) => {
+      const attentionFactor = layerKind === "full-attention" ? 2 : 1;
+      return (weightBytes + cacheBytes) * attentionFactor;
+    },
+    requiredSourceLayers: ({ layer, manifest: modelManifest }) => {
+      const source = modelManifest.kvSourceLayers[layer] ?? layer;
+      return source < layer ? [source] : [];
+    },
+    copyExpectations: webGpuCopyExpectations,
+  });
+}
 
-export const webGpuPlanningProvider = {
-  name: "webgpu",
-  defaultMemoryLimitBytes: WEBGPU_MEMORY_LIMIT_BYTES,
-  fixedBytes: DEFAULT_GPU_FIXED_BYTES,
-  scratchBytes: DEFAULT_GPU_SCRATCH_BYTES,
-  outputTensorNames: ["token_embd.weight", "output_norm.weight"],
-  offReason: "WebGPU execution is off; this is a placement plan only.",
-  blockedByMemoryReason: "WebGPU layer suffix plus required KV source layers exceed the configured WebGPU memory cap.",
-  unavailableReason: (support: WebGpuPlanningSupport) => `WebGPU unavailable: ${support.available ? "unknown" : support.reason}`,
-  plannedReason: "WebGPU layer suffix placement is planned.",
-  layerPlacement: ({ tensorsByName, manifest, layer, contextLength }: WebGpuLayerPlacementParams) => {
-    const layerKind: LayerKind = manifest.layerKinds[layer] ?? "sliding-attention";
-    const weightBytes = manifest.expectedTensors.reduce((sum, expected) => {
-      if (expected.layer !== layer) {
-        return sum;
-      }
-      return sum + tensorBytes(tensorsByName, expected.name);
-    }, 0);
-    const cacheBytes = manifest.layerHasKv[layer]
-      ? attentionCacheBytes(manifest, layer, contextLength)
-      : 0;
-    return {
-      layer,
-      layerKind,
-      weightBytes,
-      cacheBytes,
-      totalBytes: weightBytes + cacheBytes,
-    };
-  },
-  copyAuditExpectations: (selectedLayerCount: number): WebGpuCopyAuditExpectations => ({
+export function planWebGpuResourcePlacement(
+  gguf: GgufMetadata,
+  manifest: ModelManifest,
+  options: WebGpuResourceOptions = {},
+  budget: ResourceBudget = {},
+) {
+  const requirements = webGpuResourceRequirements(gguf, manifest, options);
+  return planModelPlacement([requirements], {
+    mode: options.mode,
+    memoryLimitBytes: options.memoryLimitBytes,
+    ...budget,
+  });
+}
+
+function webGpuCopyExpectations({
+  selectedLayers,
+  nodes,
+}: Parameters<NonNullable<ProviderResourceRequirements["copyExpectations"]>>[0]): RunnerCopyExpectations {
+  return {
     decodeTensorReads: 0,
     segmentIntermediateReadbacks: 0,
     logitsReadbacks: 0,
-    expectedBoundaryUploads: selectedLayerCount > 0 ? 1 : 0,
+    expectedBoundaryUploads: nodes.some((node) =>
+      node.kind === "transfer" && node.to === "webgpu"
+    ) ? 1 : 0,
     expectedTokenReadbacks: 0,
-    expectedSelectedTokenReadbacks: selectedLayerCount > 0 ? 1 : 0,
-  }),
-  requiredSegmentStart: ({
-    manifest,
-    selectedLayers,
-  }: {
-    manifest: ModelManifest;
-    selectedLayers: readonly { layer: number }[];
-  }): number | undefined => {
-    if (selectedLayers.length === 0) {
-      return undefined;
-    }
-    let requiredStart = selectedLayers[0]?.layer;
-    for (const layer of selectedLayers) {
-      const source = manifest.kvSourceLayers[layer.layer] ?? layer.layer;
-      if (manifest.layerHasKv[layer.layer] !== true && requiredStart !== undefined) {
-        requiredStart = Math.min(requiredStart, source);
-      }
-    }
-    return requiredStart;
-  },
-};
-
-export function planRunnerPlacement(
-  gguf: GgufMetadata,
-  manifest: ModelManifest,
-  options: RunnerPlanningOptions = {},
-): RunnerPlacementPlan {
-  return planProviderPlacement(
-    webGpuPlanningProvider,
-    gguf,
-    manifest,
-    options,
-  );
-}
-
-function tensorBytes(tensorsByName: ReadonlyMap<string, GgufTensorInfo>, name: string): number {
-  const tensor = tensorsByName.get(name);
-  return tensor ? tensorByteLength(tensor) : 0;
-}
-
-function attentionCacheBytes(
-  manifest: ModelManifest,
-  layer: number,
-  contextLength: number,
-): number {
-  const keyLength = manifest.layerKeyLengths[layer] ?? manifest.keyLength;
-  const valueLength = manifest.layerValueLengths[layer] ?? manifest.valueLength;
-  return contextLength * manifest.headCountKv * (keyLength + valueLength) * Float32Array.BYTES_PER_ELEMENT;
+    expectedSelectedTokenReadbacks: selectedLayers.length > 0 ? 1 : 0,
+  };
 }

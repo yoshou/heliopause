@@ -25,8 +25,8 @@ import {
   wasmSegmentRunner,
 } from "../wasm/execution-provider";
 import {
-  planRunnerPlacement,
-} from "./planning";
+  planModelPlacement,
+} from "../planning";
 import {
   webGpuExecutionProviderOptions,
   webGpuSegmentRunner,
@@ -108,15 +108,7 @@ async function webGpuSegmentRunnerForForward(
     throw new Error("WebGPU segment runner is not enabled for this session.");
   }
   const webGpuStartLayer = providerOptions.segmentStartLayer ??
-    planRunnerPlacement(
-      session.tensorReader.metadata,
-      session.manifest,
-      {
-        mode: "enabled",
-        contextLength: state.contextLength,
-        memoryLimitBytes: providerOptions.memoryLimitBytes,
-      },
-    ).segments.find((segment) => segment.provider === "webgpu")?.startLayer;
+    plannedWebGpuStartLayer(session, state.contextLength, providerOptions.memoryLimitBytes);
   return webGpuSegmentRunner(session, state, { segmentStartLayer: webGpuStartLayer });
 }
 
@@ -128,15 +120,7 @@ async function webGpuModelSegmentRunner(
     throw new Error("WebGPU model runner is not enabled for this session.");
   }
   const webGpuStartLayer = providerOptions.segmentStartLayer ??
-    planRunnerPlacement(
-      options.session.tensorReader.metadata,
-      options.manifest,
-      {
-        mode: "enabled",
-        contextLength: options.state.contextLength,
-        memoryLimitBytes: providerOptions.memoryLimitBytes,
-      },
-    ).segments.find((segment) => segment.provider === "webgpu")?.startLayer;
+    plannedWebGpuStartLayer(options.session, options.state.contextLength, providerOptions.memoryLimitBytes);
 
   if (webGpuStartLayer === undefined || webGpuStartLayer >= options.segmentEndLayerExclusive) {
     return wasmSegmentRunner(options);
@@ -154,6 +138,27 @@ async function webGpuModelSegmentRunner(
     segmentEndLayerExclusive: gpu.segmentStartLayer,
   });
   return new WasmPrefixWebGpuSegmentRunner(prefix, gpu, options.segmentStartLayer);
+}
+
+function plannedWebGpuStartLayer(
+  session: ModelSession,
+  contextLength: number,
+  memoryLimitBytes: number,
+): number | undefined {
+  const plan = planModelPlacement(
+    session.providers.map((provider) =>
+      provider.modelResourceRequirements(session, { contextLength })
+    ),
+    {
+      mode: "enabled",
+      memoryLimitBytes,
+      providerPriority: session.providers.map((provider) => provider.name),
+    },
+  );
+  if (plan.status !== "planned") {
+    throw new Error(plan.reason ?? "WebGPU model placement could not be planned.");
+  }
+  return plan.segments.find((segment) => segment.provider === "webgpu")?.startLayer;
 }
 
 class WasmPrefixWebGpuSegmentRunner implements SegmentRunner {

@@ -24,6 +24,9 @@ import {
   CpuHiddenTransferNode,
 } from "../buffer-nodes";
 import {
+  createModelResourceRequirements,
+} from "../model-resources";
+import {
   wasmAudioPreprocessRunner,
 } from "./audio-preprocess-runner";
 import {
@@ -63,6 +66,16 @@ export function createWasmProvider(options: WasmProviderOptions = {}): Multimoda
     options: { ...options },
     createModelRunner: createWasmModelRunner,
     createModelGraphRunner: () => createWasmModelRunner().graph as NonNullable<ModelRunner["graph"]>,
+    modelResourceRequirements: (session, resourceOptions) => createModelResourceRequirements({
+      provider: "wasm",
+      gguf: session.tensorReader.metadata,
+      manifest: session.manifest,
+      contextLength: resourceOptions.contextLength,
+      memoryLimitBytes: Number.POSITIVE_INFINITY,
+      targetResourceConstrained: false,
+      canRunFullModel: true,
+      plannedReason: "WASM full-model placement is planned.",
+    }),
     createAudioRunners: createWasmAudioRunners,
     createVisionRunners: createWasmVisionRunners,
   };

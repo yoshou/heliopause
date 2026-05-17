@@ -28,7 +28,7 @@ import {
   webGpuExecutionProviderOptions,
 } from "./execution-provider";
 import {
-  planRunnerPlacement,
+  webGpuResourceRequirements,
 } from "./planning";
 
 export { createWebGpuModelRunner } from "./model-runner";
@@ -67,11 +67,11 @@ export function createWebGpuProvider(options: WebGpuProviderOptions = {}): Multi
     options: { ...options },
     createModelRunner: createWebGpuModelRunner,
     createModelGraphRunner: createWebGpuGraphRunner,
-    planModelPlacement: (session, options) => {
+    modelResourceRequirements: (session, resourceOptions) => {
       const providerOptions = webGpuExecutionProviderOptions(session);
-      return planRunnerPlacement(session.tensorReader.metadata, session.manifest, {
+      return webGpuResourceRequirements(session.tensorReader.metadata, session.manifest, {
         mode: "enabled",
-        contextLength: options.contextLength,
+        contextLength: resourceOptions.contextLength,
         memoryLimitBytes: providerOptions?.memoryLimitBytes,
       });
     },

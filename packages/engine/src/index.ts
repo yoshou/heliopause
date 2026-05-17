@@ -189,21 +189,19 @@ export type {
 } from "./runner/segment-runner";
 
 export {
-  planRunnerPlacement,
-} from "./runner/webgpu/planning";
-
-export {
   auditRunnerPlacementCopies,
-  planProviderPlacement,
+  planModelPlacement,
+  type LayerResourceRequirement,
+  type ProviderResourceRequirements,
+  type ResourceBudget,
   type RunnerCopyAuditObservation,
   type RunnerCopyAuditResult,
+  type RunnerCopyExpectations,
   type RunnerLayerPlacement,
   type RunnerNodePlacement,
   type RunnerPlacementPlan,
-  type RunnerPlanningOptions,
-  type RunnerPlanningProvider,
+  type RunnerResourceUsage,
   type RunnerSegmentPlacement,
-  type RunnerSegmentProvider,
 } from "./runner/planning";
 
 export {

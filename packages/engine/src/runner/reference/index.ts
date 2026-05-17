@@ -28,6 +28,9 @@ import {
 import {
   CpuHiddenTransferNode,
 } from "../buffer-nodes";
+import {
+  createModelResourceRequirements,
+} from "../model-resources";
 
 export function createReferenceModelRunner(): ModelRunner {
   return {
@@ -51,6 +54,16 @@ export function createReferenceProvider(): MultimodalRunnerProvider {
   return {
     name: "reference",
     createModelRunner: createReferenceModelRunner,
+    modelResourceRequirements: (session, options) => createModelResourceRequirements({
+      provider: "reference",
+      gguf: session.tensorReader.metadata,
+      manifest: session.manifest,
+      contextLength: options.contextLength,
+      memoryLimitBytes: Number.POSITIVE_INFINITY,
+      targetResourceConstrained: false,
+      canRunFullModel: true,
+      plannedReason: "Reference full-model placement is planned.",
+    }),
     createAudioRunners: createReferenceAudioRunners,
     createVisionRunners: createReferenceVisionRunners,
   };

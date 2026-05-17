@@ -27,6 +27,9 @@ import {
 import type {
   RunnerNodePlacement,
 } from "./runner/planning";
+import {
+  planModelPlacement,
+} from "./runner/planning";
 import type {
   SegmentRunnerProvider,
 } from "./runner/segment-runner";
@@ -385,20 +388,30 @@ type BuiltForwardGraph = {
 
 function modelRuntimeForForward(session: ModelSession, state: InferenceState): PlannedModelForward {
   const providers = modelRuntimesForForward(session);
-  for (const provider of session.providers) {
-    const runtime = providers.get(provider.name);
-    if (runtime) {
-      const plan = runtime.provider.planModelPlacement?.(session, {
-        contextLength: state.contextLength,
-      });
-      return {
-        primary: runtime,
-        providers,
-        nodes: plan?.nodes ?? fullModelNodes(runtime.runner.provider, session.manifest.blockCount),
-      };
-    }
+  const firstRuntime = providers.get(session.providers[0]?.name ?? "reference");
+  if (!firstRuntime) {
+    throw new Error("No model runner was selected.");
   }
-  throw new Error("No model runner was selected.");
+  const plan = planModelPlacement(
+    session.providers.map((provider) =>
+      provider.modelResourceRequirements(session, {
+        contextLength: state.contextLength,
+      })
+    ),
+    {
+      mode: "enabled",
+      providerPriority: session.providers.map((provider) => provider.name),
+    },
+  );
+  if (plan.status !== "planned" || plan.nodes.length === 0) {
+    throw new Error(plan.reason ?? "No model placement was planned.");
+  }
+  const primaryProvider = "provider" in plan.nodes[0] ? plan.nodes[0].provider : firstRuntime.provider.name;
+  return {
+    primary: providers.get(primaryProvider) ?? firstRuntime,
+    providers,
+    nodes: plan.nodes,
+  };
 }
 
 function modelRuntimesForForward(session: ModelSession): ReadonlyMap<SegmentRunnerProvider, ModelRuntimeForForward> {
@@ -416,28 +429,6 @@ function modelRuntimesForForward(session: ModelSession): ReadonlyMap<SegmentRunn
     });
   }
   return providers;
-}
-
-function fullModelNodes(provider: SegmentRunnerProvider, blockCount: number): RunnerNodePlacement[] {
-  return [
-    {
-      kind: "embedding",
-      provider,
-    },
-    {
-      kind: "segment",
-      provider,
-      startLayer: 0,
-      endLayerExclusive: blockCount,
-      layerCount: blockCount,
-      weightBytes: 0,
-      cacheBytes: 0,
-    },
-    {
-      kind: "output",
-      provider,
-    },
-  ];
 }
 
 function buildForwardGraphFromPlan(
