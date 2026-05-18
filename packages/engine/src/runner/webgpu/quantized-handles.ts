@@ -23,15 +23,15 @@ export async function createWebGpuQuantizedWeightHandle(
   if (!device) {
     return undefined;
   }
-  const packedWeight = packBytesToU32(weightBytes);
-  await assertStorageBindingFits(`${type} weight`, packedWeight.byteLength);
-  const weightBuffer = storageBuffer(device, packedWeight.byteLength, GPU_COPY_DST);
-  device.queue.writeBuffer(weightBuffer, 0, packedWeight);
+  const uploadWeight = quantizedWeightUploadBytes(weightBytes);
+  await assertStorageBindingFits(`${type} weight`, uploadWeight.byteLength);
+  const weightBuffer = storageBuffer(device, uploadWeight.byteLength, GPU_COPY_DST);
+  device.queue.writeBuffer(weightBuffer, 0, uploadWeight);
   const handle: WebGpuQuantizedWeightHandleInternal = {
     type,
     inputSize,
     rowCount,
-    byteLength: packedWeight.byteLength,
+    byteLength: uploadWeight.byteLength,
     device,
     weightBuffer,
     blockCount: layout.blockCount,
@@ -153,12 +153,14 @@ export function quantizeQ8_KColumns(
   return { scales, qs, bsums };
 }
 
-export function packBytesToU32(bytes: Uint8Array): Uint32Array {
-  const packed = new Uint32Array(Math.ceil(bytes.byteLength / 4));
-  for (let index = 0; index < bytes.byteLength; index += 1) {
-    packed[index >> 2] |= (bytes[index] ?? 0) << ((index & 3) * 8);
+export function quantizedWeightUploadBytes(bytes: Uint8Array): Uint8Array {
+  const remainder = bytes.byteLength % 4;
+  if (remainder === 0) {
+    return bytes;
   }
-  return packed;
+  const padded = new Uint8Array(bytes.byteLength + 4 - remainder);
+  padded.set(bytes);
+  return padded;
 }
 
 export function float16ToFloat32(value: number): number {
@@ -222,9 +224,9 @@ export function createQuantizedHandleFromBytes(
   if (bytes.byteLength !== expected) {
     throw new Error(`WebGPU ${label} weight shape mismatch: ${bytes.byteLength} !== ${expected}`);
   }
-  const packed = packBytesToU32(bytes);
-  const weightBuffer = arena.createBuffer(label, packed.byteLength, GPU_STORAGE | GPU_COPY_DST);
-  arena.device.queue.writeBuffer(weightBuffer, 0, packed);
+  const uploadBytes = quantizedWeightUploadBytes(bytes);
+  const weightBuffer = arena.createBuffer(label, uploadBytes.byteLength, GPU_STORAGE | GPU_COPY_DST);
+  arena.device.queue.writeBuffer(weightBuffer, 0, uploadBytes);
   return {
     type,
     inputSize,

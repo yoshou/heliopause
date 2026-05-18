@@ -13,7 +13,7 @@ import {
   createSwiGluResources,
   createTop1Resources,
 } from "./kernel-resources";
-import { packBytesToU32, quantizeQ8_0Columns, quantizeQ8_KColumns, webGpuQuantizedWeightLayout } from "./quantized-handles";
+import { quantizedWeightUploadBytes, quantizeQ8_0Columns, quantizeQ8_KColumns, webGpuQuantizedWeightLayout } from "./quantized-handles";
 import { Q4_K_MATMUL_WGSL, Q5_K_MATMUL_WGSL, Q6_K_MATMUL_WGSL, Q8_0_MATMUL_WGSL } from "./shaders";
 import type { WebGpuBufferLike, WebGpuComputePassLike, WebGpuDeviceLike, WebGpuQuantizedWeightHandle, WebGpuQuantizedWeightHandleInternal, WebGpuTopToken } from "./gpu-types";
 
@@ -42,12 +42,12 @@ export async function matMulQ8_0WebGpu(
   }
 
   const q8 = quantizeQ8_0Columns(inputColumns, inputSize, columnCount);
-  const packedWeight = packBytesToU32(weightBytes);
-  await assertStorageBindingFits("Q8_0 weight", packedWeight.byteLength);
+  const uploadWeight = quantizedWeightUploadBytes(weightBytes);
+  await assertStorageBindingFits("Q8_0 weight", uploadWeight.byteLength);
   const outputLength = rowCount * columnCount;
   const params = new Uint32Array([inputSize, rowCount, columnCount, blockCount, rowByteLength, 0, 0, 0]);
 
-  const weightBuffer = storageBuffer(device, packedWeight.byteLength, GPU_COPY_DST);
+  const weightBuffer = storageBuffer(device, uploadWeight.byteLength, GPU_COPY_DST);
   const inputScaleBuffer = storageBuffer(device, q8.scales.byteLength, GPU_COPY_DST);
   const inputQsBuffer = storageBuffer(device, q8.qs.byteLength, GPU_COPY_DST);
   const paramsBuffer = device.createBuffer({
@@ -61,7 +61,7 @@ export async function matMulQ8_0WebGpu(
   });
 
   try {
-    device.queue.writeBuffer(weightBuffer, 0, packedWeight);
+    device.queue.writeBuffer(weightBuffer, 0, uploadWeight);
     device.queue.writeBuffer(inputScaleBuffer, 0, q8.scales);
     device.queue.writeBuffer(inputQsBuffer, 0, q8.qs);
     device.queue.writeBuffer(paramsBuffer, 0, params);
@@ -148,12 +148,12 @@ export async function matMulQ4_KWebGpu(
   }
 
   const q8 = quantizeQ8_KColumns(inputColumns, inputSize, columnCount);
-  const packedWeight = packBytesToU32(weightBytes);
-  await assertStorageBindingFits("Q4_K weight", packedWeight.byteLength);
+  const uploadWeight = quantizedWeightUploadBytes(weightBytes);
+  await assertStorageBindingFits("Q4_K weight", uploadWeight.byteLength);
   const outputLength = rowCount * columnCount;
   const params = new Uint32Array([inputSize, rowCount, columnCount, blockCount, rowByteLength, 0, 0, 0]);
 
-  const weightBuffer = storageBuffer(device, packedWeight.byteLength, GPU_COPY_DST);
+  const weightBuffer = storageBuffer(device, uploadWeight.byteLength, GPU_COPY_DST);
   const inputScaleBuffer = storageBuffer(device, q8.scales.byteLength, GPU_COPY_DST);
   const inputQsBuffer = storageBuffer(device, q8.qs.byteLength, GPU_COPY_DST);
   const inputBsumsBuffer = storageBuffer(device, q8.bsums.byteLength, GPU_COPY_DST);
@@ -168,7 +168,7 @@ export async function matMulQ4_KWebGpu(
   });
 
   try {
-    device.queue.writeBuffer(weightBuffer, 0, packedWeight);
+    device.queue.writeBuffer(weightBuffer, 0, uploadWeight);
     device.queue.writeBuffer(inputScaleBuffer, 0, q8.scales);
     device.queue.writeBuffer(inputQsBuffer, 0, q8.qs);
     device.queue.writeBuffer(inputBsumsBuffer, 0, q8.bsums);
@@ -259,12 +259,12 @@ export async function matMulQ5_KWebGpu(
   }
 
   const q8 = quantizeQ8_KColumns(inputColumns, inputSize, columnCount);
-  const packedWeight = packBytesToU32(weightBytes);
-  await assertStorageBindingFits("Q5_K weight", packedWeight.byteLength);
+  const uploadWeight = quantizedWeightUploadBytes(weightBytes);
+  await assertStorageBindingFits("Q5_K weight", uploadWeight.byteLength);
   const outputLength = rowCount * columnCount;
   const params = new Uint32Array([inputSize, rowCount, columnCount, blockCount, rowByteLength, 0, 0, 0]);
 
-  const weightBuffer = storageBuffer(device, packedWeight.byteLength, GPU_COPY_DST);
+  const weightBuffer = storageBuffer(device, uploadWeight.byteLength, GPU_COPY_DST);
   const inputScaleBuffer = storageBuffer(device, q8.scales.byteLength, GPU_COPY_DST);
   const inputQsBuffer = storageBuffer(device, q8.qs.byteLength, GPU_COPY_DST);
   const inputBsumsBuffer = storageBuffer(device, q8.bsums.byteLength, GPU_COPY_DST);
@@ -279,7 +279,7 @@ export async function matMulQ5_KWebGpu(
   });
 
   try {
-    device.queue.writeBuffer(weightBuffer, 0, packedWeight);
+    device.queue.writeBuffer(weightBuffer, 0, uploadWeight);
     device.queue.writeBuffer(inputScaleBuffer, 0, q8.scales);
     device.queue.writeBuffer(inputQsBuffer, 0, q8.qs);
     device.queue.writeBuffer(inputBsumsBuffer, 0, q8.bsums);
@@ -370,12 +370,12 @@ export async function matMulQ6_KWebGpu(
   }
 
   const q8 = quantizeQ8_KColumns(inputColumns, inputSize, columnCount);
-  const packedWeight = packBytesToU32(weightBytes);
-  await assertStorageBindingFits("Q6_K weight", packedWeight.byteLength);
+  const uploadWeight = quantizedWeightUploadBytes(weightBytes);
+  await assertStorageBindingFits("Q6_K weight", uploadWeight.byteLength);
   const outputLength = rowCount * columnCount;
   const params = new Uint32Array([inputSize, rowCount, columnCount, blockCount, rowByteLength, 0, 0, 0]);
 
-  const weightBuffer = storageBuffer(device, packedWeight.byteLength, GPU_COPY_DST);
+  const weightBuffer = storageBuffer(device, uploadWeight.byteLength, GPU_COPY_DST);
   const inputScaleBuffer = storageBuffer(device, q8.scales.byteLength, GPU_COPY_DST);
   const inputQsBuffer = storageBuffer(device, q8.qs.byteLength, GPU_COPY_DST);
   const paramsBuffer = device.createBuffer({
@@ -389,7 +389,7 @@ export async function matMulQ6_KWebGpu(
   });
 
   try {
-    device.queue.writeBuffer(weightBuffer, 0, packedWeight);
+    device.queue.writeBuffer(weightBuffer, 0, uploadWeight);
     device.queue.writeBuffer(inputScaleBuffer, 0, q8.scales);
     device.queue.writeBuffer(inputQsBuffer, 0, q8.qs);
     device.queue.writeBuffer(paramsBuffer, 0, params);
