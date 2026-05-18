@@ -13,6 +13,7 @@ import {
 import {
   forwardOutput,
   prepareInput,
+  preparePreparedHiddenInput,
 } from "./layers";
 import {
   ReferenceSegmentRunner,
@@ -35,6 +36,29 @@ export class ReferenceEmbeddingNode implements ForwardRunnerNode {
     return {
       kind: "cpu-hidden",
       buffer: cpuRunnerBuffer(prepared.hidden, [this.tokenIds.length, context.manifest.embeddingLength]),
+      hidden: prepared.hidden,
+      perLayerInputs: prepared.perLayerInputs,
+    };
+  }
+}
+
+export class ReferencePreparedHiddenInputNode implements ForwardRunnerNode {
+  readonly id: string;
+  readonly deps: readonly string[] = [];
+  readonly backend = "reference" as const;
+
+  private readonly hidden: Float32Array;
+
+  constructor(hidden: Float32Array, id = "input") {
+    this.hidden = hidden;
+    this.id = id;
+  }
+
+  async run(context: ForwardGraphContext): Promise<ForwardCpuHiddenValue> {
+    const prepared = await preparePreparedHiddenInput(context.session, this.hidden, context.trace);
+    return {
+      kind: "cpu-hidden",
+      buffer: cpuRunnerBuffer(prepared.hidden, [prepared.hidden.length / context.manifest.embeddingLength, context.manifest.embeddingLength]),
       hidden: prepared.hidden,
       perLayerInputs: prepared.perLayerInputs,
     };

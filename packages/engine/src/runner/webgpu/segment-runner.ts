@@ -225,6 +225,7 @@ type ActiveComputePass = {
 const TIMESTAMP_QUERY_PAIR_BYTES = 2 * BigUint64Array.BYTES_PER_ELEMENT;
 const TIMESTAMP_RESOLVE_STRIDE_BYTES = 256;
 const TIMESTAMP_MAX_PASSES = 256;
+const WEBGPU_LAYER_LOAD_CONCURRENCY = 2;
 
 export class WebGpuSegmentRunner implements SegmentRunner {
   readonly provider = "webgpu" as const;
@@ -350,10 +351,15 @@ export class WebGpuSegmentRunner implements SegmentRunner {
     }
 
     const arena = new GpuMemoryArena(device, options.memoryLimitBytes ?? WEBGPU_MEMORY_LIMIT_BYTES);
-    const layers: GpuLayer[] = [];
-    for (let layer = segmentStartLayer; layer < segmentEndLayerExclusive; layer += 1) {
-      layers.push(await loadGpuLayer(arena, options.tensorReader, options.manifest, layer));
-    }
+    const layerIndexes = Array.from(
+      { length: segmentEndLayerExclusive - segmentStartLayer },
+      (_, index) => segmentStartLayer + index,
+    );
+    const layers = await mapWithConcurrency(
+      layerIndexes,
+      WEBGPU_LAYER_LOAD_CONCURRENCY,
+      (layer) => loadGpuLayer(arena, options.tensorReader, options.manifest, layer),
+    );
     const { handle: ropeFreqFactors, present: hasRopeFreqFactors } = await loadRopeFreqFactors(arena, options.tensorReader);
     const loadOutput = options.loadOutput ?? true;
     const outputNorm = loadOutput
@@ -2862,6 +2868,27 @@ function mergeTopCandidates(
 
 function nowMs(): number {
   return typeof performance !== "undefined" ? performance.now() : Date.now();
+}
+
+async function mapWithConcurrency<TInput, TOutput>(
+  values: readonly TInput[],
+  concurrency: number,
+  mapper: (value: TInput, index: number) => Promise<TOutput>,
+): Promise<TOutput[]> {
+  const outputs = new Array<TOutput>(values.length);
+  let nextIndex = 0;
+  const workerCount = Math.min(values.length, Math.max(1, Math.floor(concurrency)));
+  await Promise.all(Array.from({ length: workerCount }, async () => {
+    for (;;) {
+      const index = nextIndex;
+      nextIndex += 1;
+      if (index >= values.length) {
+        return;
+      }
+      outputs[index] = await mapper(values[index]!, index);
+    }
+  }));
+  return outputs;
 }
 
 function formatGpuSectionMs(sectionMs: ReadonlyMap<string, number>): string {

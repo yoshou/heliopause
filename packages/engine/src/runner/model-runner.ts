@@ -46,6 +46,7 @@ export type ModelDecodeTokenResult = {
 
 export type ModelGraphNodeFactory = {
   createEmbeddingNode(tokenIds: readonly number[]): ForwardRunnerNode;
+  createPreparedHiddenInputNode(hidden: Float32Array): ForwardRunnerNode;
   createLayerSegmentNode(startLayer: number, endLayerExclusive: number, inputId: string): ForwardRunnerNode;
   createOutputNode(inputId: string, topK?: number): ForwardRunnerNode;
   createImportHiddenNode(inputId: string): ForwardRunnerNode;

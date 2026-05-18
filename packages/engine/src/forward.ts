@@ -10,22 +10,11 @@ import type {
   ModelRunner,
 } from "./runner/model-runner";
 import {
-  cpuRunnerBuffer,
-  providerRunnerBuffer,
-} from "./runner/buffer";
-import {
   ForwardGraphExecutor,
-  type ForwardCpuHiddenValue,
-  type ForwardGraphContext,
   type ForwardOutputValue,
-  type ForwardProviderHiddenValue,
   type ForwardRunnerNode,
   type ForwardValue,
 } from "./runner/graph";
-import {
-  prepareWebGpuPreparedHiddenInput,
-  prepareWebGpuPreparedHiddenInputHandle,
-} from "./runner/webgpu/model-io";
 import {
   type ModelRunnerProvider,
 } from "./runner/provider";
@@ -87,7 +76,7 @@ export async function prefillPreparedHiddenState(
     return;
   }
 
-  const input = new PreparedHiddenInputNode(runtime.primary.runner, hiddenInput);
+  const input = createPreparedHiddenInputNode(runtime.primary, hiddenInput);
   const built = buildForwardGraphFromPlan(runtime, {
     input,
     produceOutput: false,
@@ -201,48 +190,13 @@ export async function decode(
   return nextTokenResultFromOutput(output, { computeLogits: options.computeLogits === true });
 }
 
-class PreparedHiddenInputNode implements ForwardRunnerNode {
-  readonly id = "input";
-  readonly deps: readonly string[] = [];
-  readonly backend = "transfer" as const;
-  private readonly runner: ModelRunner;
-  private readonly hidden: Float32Array;
-
-  constructor(
-    runner: ModelRunner,
-    hidden: Float32Array,
-  ) {
-    this.runner = runner;
-    this.hidden = hidden;
-  }
-
-  async run(context: ForwardGraphContext): Promise<ForwardCpuHiddenValue | ForwardProviderHiddenValue> {
-    if (
-      this.runner.provider === "webgpu" &&
-      this.runner.preparePreparedHiddenInput === prepareWebGpuPreparedHiddenInput
-    ) {
-      const prepared = await prepareWebGpuPreparedHiddenInputHandle(context.session, this.hidden, context.trace);
-      return {
-        kind: "provider-hidden",
-        provider: "webgpu",
-        buffer: providerRunnerBuffer(
-          "webgpu",
-          prepared,
-          [prepared.tokenCount, context.manifest.embeddingLength],
-          () => this.hidden.slice(),
-          prepared.destroy,
-        ),
-      };
-    }
-
-    const prepared = await this.runner.preparePreparedHiddenInput(context.session, this.hidden, context.trace);
-    return {
-      kind: "cpu-hidden",
-      buffer: cpuRunnerBuffer(prepared.hidden, [prepared.hidden.length / context.manifest.embeddingLength, context.manifest.embeddingLength]),
-      hidden: prepared.hidden,
-      perLayerInputs: prepared.perLayerInputs,
-    };
-  }
+function createPreparedHiddenInputNode(runtime: ModelRuntimeForForward, hidden: Float32Array): ForwardRunnerNode {
+  const create = graphFactory(
+    runtime,
+    "createPreparedHiddenInputNode",
+    `Planned ${runtime.provider.name} prepared hidden input`,
+  );
+  return create(hidden);
 }
 
 function requireGraphOutput(values: ReadonlyMap<string, ForwardOutputValue>, id: string): ForwardOutputValue {

@@ -24,6 +24,7 @@ import {
   ReferenceEmbeddingNode,
   ReferenceLayerSegmentNode,
   ReferenceOutputNode,
+  ReferencePreparedHiddenInputNode,
 } from "./nodes";
 import {
   CpuHiddenTransferNode,
@@ -41,6 +42,7 @@ export function createReferenceModelRunner(): ModelRunner {
     output: referenceOutput,
     graphNodes: {
       createEmbeddingNode: (tokenIds) => new ReferenceEmbeddingNode(tokenIds),
+      createPreparedHiddenInputNode: (hidden) => new ReferencePreparedHiddenInputNode(hidden),
       createLayerSegmentNode: (startLayer, endLayerExclusive, inputId) =>
         new ReferenceLayerSegmentNode(startLayer, endLayerExclusive, inputId),
       createOutputNode: (inputId, topK) => new ReferenceOutputNode(inputId, topK),

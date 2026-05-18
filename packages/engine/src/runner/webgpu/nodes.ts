@@ -22,6 +22,37 @@ import type {
 import {
   webGpuSegmentRunner,
 } from "./execution-provider";
+import {
+  prepareWebGpuPreparedHiddenInputHandle,
+} from "./model-io";
+
+export class WebGpuPreparedHiddenInputNode implements ForwardRunnerNode {
+  readonly id: string;
+  readonly deps: readonly string[] = [];
+  readonly backend = "webgpu" as const;
+
+  private readonly hidden: Float32Array;
+
+  constructor(hidden: Float32Array, id = "input") {
+    this.hidden = hidden;
+    this.id = id;
+  }
+
+  async run(context: ForwardGraphContext): Promise<ForwardProviderHiddenValue> {
+    const prepared = await prepareWebGpuPreparedHiddenInputHandle(context.session, this.hidden, context.trace);
+    return {
+      kind: "provider-hidden",
+      provider: "webgpu",
+      buffer: providerRunnerBuffer(
+        "webgpu",
+        prepared,
+        [prepared.tokenCount, context.manifest.embeddingLength],
+        () => this.hidden.slice(),
+        prepared.destroy,
+      ),
+    };
+  }
+}
 
 export class WebGpuEmbeddingNode implements ForwardRunnerNode {
   readonly id: string;

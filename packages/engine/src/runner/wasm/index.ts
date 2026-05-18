@@ -19,6 +19,7 @@ import {
   WasmEmbeddingNode,
   WasmLayerSegmentNode,
   WasmOutputNode,
+  WasmPreparedHiddenInputNode,
 } from "./nodes";
 import {
   CpuHiddenTransferNode,
@@ -48,6 +49,7 @@ export function createWasmModelRunner(): ModelRunner {
     output: wasmOutput,
     graphNodes: {
       createEmbeddingNode: (tokenIds) => new WasmEmbeddingNode(tokenIds),
+      createPreparedHiddenInputNode: (hidden) => new WasmPreparedHiddenInputNode(hidden),
       createLayerSegmentNode: (startLayer, endLayerExclusive, inputId) =>
         new WasmLayerSegmentNode(startLayer, endLayerExclusive, inputId),
       createOutputNode: (inputId, topK) => new WasmOutputNode(inputId, topK),

@@ -27,9 +27,9 @@ import {
   WebGpuEmbeddingNode,
   WebGpuLayerSegmentNode,
   WebGpuOutputNode,
+  WebGpuPreparedHiddenInputNode,
 } from "./nodes";
 import {
-  prepareWebGpuPreparedHiddenInput,
   prepareWebGpuInput,
   webGpuOutput,
 } from "./model-io";
@@ -39,7 +39,7 @@ export function createWebGpuModelRunner(): ModelRunner {
     provider: "webgpu",
     graphNodes: createWebGpuGraphNodes(),
     prepareInput: prepareWebGpuInput,
-    preparePreparedHiddenInput: prepareWebGpuPreparedHiddenInput,
+    preparePreparedHiddenInput: rejectWebGpuPreparedHiddenInput,
     segmentRunner: webGpuModelSegmentRunner,
     output: webGpuOutput,
     decodeToken: decodeWebGpuToken,
@@ -49,12 +49,19 @@ export function createWebGpuModelRunner(): ModelRunner {
 function createWebGpuGraphNodes() {
   return {
     createEmbeddingNode: (tokenIds: readonly number[]) => new WebGpuEmbeddingNode(tokenIds),
+    createPreparedHiddenInputNode: (hidden: Float32Array) => new WebGpuPreparedHiddenInputNode(hidden),
     createLayerSegmentNode: (startLayer: number, endLayerExclusive: number, inputId: string) =>
       new WebGpuLayerSegmentNode(startLayer, endLayerExclusive, inputId),
     createOutputNode: (inputId: string, topK?: number) => new WebGpuOutputNode(inputId, topK),
     createImportHiddenNode: (inputId: string) => new CpuToGpuHiddenTransferNode(inputId),
     createExportHiddenNode: (inputId: string) => new GpuToCpuHiddenTransferNode(inputId),
   };
+}
+
+async function rejectWebGpuPreparedHiddenInput(): Promise<never> {
+  throw new Error(
+    "WebGPU prepared hidden input must be created through graphNodes.createPreparedHiddenInputNode.",
+  );
 }
 
 async function decodeWebGpuToken(

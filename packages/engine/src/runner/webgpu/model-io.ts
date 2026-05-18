@@ -73,24 +73,7 @@ export async function prepareWebGpuInput(
     return { hidden: new Float32Array() };
   }
   return timedAsync(trace, "WebGPU input preparation", () =>
-    runWebGpuInputPreparation(session, tokenIds, undefined)
-  );
-}
-
-export async function prepareWebGpuPreparedHiddenInput(
-  session: ModelSession,
-  hidden: Float32Array,
-  trace?: ForwardTrace,
-): Promise<ModelPreparedInput> {
-  const tokenCount = hidden.length / session.manifest.embeddingLength;
-  if (!Number.isInteger(tokenCount)) {
-    throw new Error(`Prepared hidden shape mismatch: ${hidden.length}`);
-  }
-  if (tokenCount === 0 || session.manifest.perLayerEmbeddingLength <= 0) {
-    return { hidden };
-  }
-  return timedAsync(trace, "WebGPU prepared hidden input preparation", () =>
-    runWebGpuInputPreparation(session, undefined, hidden)
+    runWebGpuInputPreparation(session, tokenIds)
   );
 }
 
@@ -226,8 +209,7 @@ export async function webGpuOutput(
 
 async function runWebGpuInputPreparation(
   session: ModelSession,
-  tokenIds: readonly number[] | undefined,
-  preparedHidden: Float32Array | undefined,
+  tokenIds: readonly number[],
 ): Promise<ModelPreparedInput> {
   const device = await requireDevice();
   const arena = new GpuMemoryArena(device, webGpuMemoryLimitBytes(session));
@@ -236,7 +218,7 @@ async function runWebGpuInputPreparation(
   try {
     const manifest = session.manifest;
     const hiddenSize = manifest.embeddingLength;
-    const tokenCount = tokenIds?.length ?? (preparedHidden ? preparedHidden.length / hiddenSize : 0);
+    const tokenCount = tokenIds.length;
     if (!Number.isInteger(tokenCount) || tokenCount <= 0) {
       throw new Error(`WebGPU input token count mismatch: ${tokenCount}`);
     }
@@ -247,16 +229,10 @@ async function runWebGpuInputPreparation(
       GPU_STORAGE | GPU_COPY_SRC | GPU_COPY_DST,
     );
     cleanup.push(hidden);
-    let tokenIdBuffer: WebGpuBufferLike | undefined;
-    let inputTokenIds: Uint32Array | undefined;
-    if (tokenIds) {
-      inputTokenIds = Uint32Array.from(tokenIds);
-      tokenIdBuffer = arena.createScratchBuffer("model-input.token_ids", inputTokenIds.byteLength, GPU_STORAGE | GPU_COPY_DST);
-      cleanup.push(tokenIdBuffer);
-      device.queue.writeBuffer(tokenIdBuffer, 0, inputTokenIds);
-    } else if (preparedHidden) {
-      device.queue.writeBuffer(hidden, 0, preparedHidden);
-    }
+    const inputTokenIds = Uint32Array.from(tokenIds);
+    const tokenIdBuffer = arena.createScratchBuffer("model-input.token_ids", inputTokenIds.byteLength, GPU_STORAGE | GPU_COPY_DST);
+    cleanup.push(tokenIdBuffer);
+    device.queue.writeBuffer(tokenIdBuffer, 0, inputTokenIds);
 
     const hiddenReadback = device.createBuffer({
       label: "model-input.hidden.readback",
@@ -270,29 +246,17 @@ async function runWebGpuInputPreparation(
     const encoder = device.createCommandEncoder();
     const pass = encoder.beginComputePass();
 
-    if (tokenIds && tokenIdBuffer) {
-      const tokenEmbedding = await loadEmbeddingGatherHandle(arena, session, "token_embd.weight");
-      cleanup.push(tokenEmbedding);
-      dispatchGatherRowsScale(device, pass, resources, tokenEmbedding, tokenIdBuffer, hidden, {
-        rowSize: hiddenSize,
-        tokenCount,
-        scale: Math.sqrt(hiddenSize),
-      });
-    }
+    const tokenEmbedding = await loadEmbeddingGatherHandle(arena, session, "token_embd.weight");
+    cleanup.push(tokenEmbedding);
+    dispatchGatherRowsScale(device, pass, resources, tokenEmbedding, tokenIdBuffer, hidden, {
+      rowSize: hiddenSize,
+      tokenCount,
+      scale: Math.sqrt(hiddenSize),
+    });
 
     if (manifest.perLayerEmbeddingLength > 0) {
       const perLayerLength = manifest.perLayerEmbeddingLength;
       const totalPerLayerLength = perLayerLength * manifest.blockCount;
-      const perLayerTokenIds = tokenIdBuffer ?? arena.createScratchBuffer(
-        "model-input.padding_token_ids",
-        tokenCount * Uint32Array.BYTES_PER_ELEMENT,
-        GPU_STORAGE | GPU_COPY_DST,
-      );
-      if (!tokenIdBuffer) {
-        cleanup.push(perLayerTokenIds);
-        device.queue.writeBuffer(perLayerTokenIds, 0, new Uint32Array(tokenCount));
-      }
-
       const perLayerTokenEmbedding = await loadEmbeddingGatherHandle(arena, session, "per_layer_token_embd.weight");
       const modelProjection = await loadProjectionHandle(arena, session, "per_layer_model_proj.weight");
       const projectionNorm = await loadF32Handle(arena, session.tensorReader, "per_layer_proj_norm.weight");
@@ -314,7 +278,7 @@ async function runWebGpuInputPreparation(
         GPU_STORAGE | GPU_COPY_SRC,
       );
       cleanup.push(tokenRows, projected, perLayerInputs);
-      dispatchGatherRowsScale(device, pass, resources, perLayerTokenEmbedding, perLayerTokenIds, tokenRows, {
+      dispatchGatherRowsScale(device, pass, resources, perLayerTokenEmbedding, tokenIdBuffer, tokenRows, {
         rowSize: totalPerLayerLength,
         tokenCount,
         scale: Math.sqrt(perLayerLength),
@@ -352,9 +316,7 @@ async function runWebGpuInputPreparation(
     }
     device.queue.submit([encoder.finish()]);
 
-    const hiddenValues = tokenIds
-      ? await readMappedF32(hiddenReadback, tokenCount * hiddenSize)
-      : preparedHidden?.slice() ?? await readMappedF32(hiddenReadback, tokenCount * hiddenSize);
+    const hiddenValues = await readMappedF32(hiddenReadback, tokenCount * hiddenSize);
     const perLayerValues = perLayerReadback
       ? await readMappedF32(perLayerReadback, tokenCount * manifest.blockCount * manifest.perLayerEmbeddingLength)
       : undefined;

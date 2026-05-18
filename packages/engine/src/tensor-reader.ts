@@ -30,6 +30,7 @@ export type GgufTensorReaderOptions = {
 export type GgufTensorRangeCoalesceOptions = {
   maxGapBytes?: number;
   maxReadBytes?: number;
+  copyResults?: boolean;
 };
 
 export type GgufTensorReaderIoStats = {
@@ -161,6 +162,7 @@ export class GgufTensorReader {
     if (ranges.length === 0) {
       return [];
     }
+    const copyResults = options.copyResults ?? true;
     const maxGapBytes = BigInt(Math.max(0, Math.floor(options.maxGapBytes ?? 1024 * 1024)));
     const maxReadBytes = Math.max(1, Math.floor(options.maxReadBytes ?? 256 * 1024 * 1024));
     const entries = ranges.map((range, index) => ({
@@ -187,7 +189,9 @@ export class GgufTensorReader {
       }
       for (const item of group) {
         const relativeStart = Number(item.absoluteOffset - groupStart);
-        const result = bytes.slice(relativeStart, relativeStart + item.range.length);
+        const result = copyResults
+          ? bytes.slice(relativeStart, relativeStart + item.range.length)
+          : bytes.subarray(relativeStart, relativeStart + item.range.length);
         output[item.index] = result;
         this.onRead?.({
           kind: "range",

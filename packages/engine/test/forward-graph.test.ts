@@ -481,6 +481,30 @@ test("prepared hidden state does not create unplanned provider imports", async (
   ]);
 });
 
+test("prepared hidden state requires planned provider input graph capability", async () => {
+  const executed: string[] = [];
+  const reader = tensorReaderFromGguf({
+    ...minimalGguf(),
+    metadata: {
+      ...minimalGguf().metadata,
+      "gemma4.block_count": 3,
+    },
+  });
+  const session = createModelSession(reader, {
+    providers: [fakeProvider("wasm", executed, 1_000, { missingGraphNode: "createPreparedHiddenInputNode" })],
+  });
+
+  await assert.rejects(
+    prefillPreparedHiddenState(
+      session,
+      session.createInferenceState(),
+      new Float32Array([1, 0, 0, 0]),
+    ),
+    /Planned wasm prepared hidden input requires graphNodes\.createPreparedHiddenInputNode\./,
+  );
+  assert.deepEqual(executed, []);
+});
+
 test("planned provider requires a matching model runtime", async () => {
   const executed: string[] = [];
   const reader = tensorReaderFromGguf({
@@ -658,6 +682,18 @@ function fakeProvider(
   function graphNodes(): ModelGraphNodeFactory {
     const graph: Partial<ModelGraphNodeFactory> = {
       createEmbeddingNode: () => hiddenNode(`${name}.embedding`),
+      createPreparedHiddenInputNode: (value) => ({
+        id: "input",
+        deps: [],
+        backend: name,
+        run() {
+          return {
+            kind: "cpu-hidden",
+            buffer: cpuRunnerBuffer(value, [value.length / 4, 4]),
+            hidden: value,
+          };
+        },
+      }),
       createLayerSegmentNode: (startLayer, endLayerExclusive, inputId) =>
         hiddenNode(`${name}.segment:${startLayer}:${endLayerExclusive}`, [inputId]),
       createImportHiddenNode: (inputId) => hiddenNode(`${name}.import`, [inputId]),
