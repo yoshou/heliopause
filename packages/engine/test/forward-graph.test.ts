@@ -15,6 +15,7 @@ import {
 } from "../src/index.ts";
 import {
   cpuRunnerBuffer,
+  destroyRunnerBuffer,
   providerRunnerBuffer,
 } from "../src/runner/buffer.ts";
 import {
@@ -101,6 +102,142 @@ test("forward graph cleans produced WebGPU values when execution fails", async (
   assert.equal(destroyed, true);
 });
 
+test("forward graph cleans provider values after successful output consumption", async () => {
+  let destroyed = false;
+  const graph = new ForwardGraphExecutor([
+    {
+      id: "gpu",
+      deps: [],
+      backend: "webgpu",
+      run() {
+        const hidden = new Float32Array([1]);
+        return {
+          kind: "provider-hidden",
+          provider: "webgpu",
+          buffer: providerRunnerBuffer("webgpu", hidden, [1, 1], () => hidden, () => {
+            destroyed = true;
+          }),
+        };
+      },
+    },
+    {
+      id: "output",
+      deps: ["gpu"],
+      backend: "webgpu",
+      run(_context, inputs) {
+        assert.equal(inputs.get("gpu")?.kind, "provider-hidden");
+        return {
+          kind: "output",
+          result: {
+            logits: new Float32Array(),
+            topTokens: [{ id: 1, value: 1 }],
+          },
+        };
+      },
+    },
+  ]);
+
+  const result = await graph.run(emptyContext());
+
+  assert.equal(destroyed, true);
+  assert.equal(result.outputs.get("output")?.kind, "output");
+});
+
+test("forward graph cleans shared provider values after the last consumer", async () => {
+  let destroyCount = 0;
+  const graph = new ForwardGraphExecutor([
+    {
+      id: "gpu",
+      deps: [],
+      backend: "webgpu",
+      run() {
+        const hidden = new Float32Array([1]);
+        return {
+          kind: "provider-hidden",
+          provider: "webgpu",
+          buffer: providerRunnerBuffer("webgpu", hidden, [1, 1], () => hidden, () => {
+            destroyCount += 1;
+          }),
+        };
+      },
+    },
+    {
+      id: "left-output",
+      deps: ["gpu"],
+      backend: "webgpu",
+      run() {
+        assert.equal(destroyCount, 0);
+        return {
+          kind: "output",
+          result: {
+            logits: new Float32Array(),
+            topTokens: [{ id: 1, value: 1 }],
+          },
+        };
+      },
+    },
+    {
+      id: "right-output",
+      deps: ["gpu"],
+      backend: "webgpu",
+      run() {
+        assert.equal(destroyCount, 0);
+        return {
+          kind: "output",
+          result: {
+            logits: new Float32Array(),
+            topTokens: [{ id: 2, value: 1 }],
+          },
+        };
+      },
+    },
+  ]);
+
+  const result = await graph.run(emptyContext());
+
+  assert.equal(destroyCount, 1);
+  assert.deepEqual([...result.outputs.keys()], ["left-output", "right-output"]);
+});
+
+test("forward graph cleans final provider values for state-only graphs", async () => {
+  let destroyed = false;
+  const graph = new ForwardGraphExecutor([
+    {
+      id: "gpu",
+      deps: [],
+      backend: "webgpu",
+      run() {
+        const hidden = new Float32Array([1]);
+        return {
+          kind: "provider-hidden",
+          provider: "webgpu",
+          buffer: providerRunnerBuffer("webgpu", hidden, [1, 1], () => hidden, () => {
+            destroyed = true;
+          }),
+        };
+      },
+    },
+  ]);
+
+  const result = await graph.run(emptyContext());
+
+  assert.equal(destroyed, true);
+  assert.equal(result.outputs.size, 0);
+});
+
+test("runner buffer destroy is idempotent", () => {
+  let destroyCount = 0;
+  const hidden = new Float32Array([1]);
+  const buffer = providerRunnerBuffer("webgpu", hidden, [1, 1], () => hidden, () => {
+    destroyCount += 1;
+  });
+
+  destroyRunnerBuffer(buffer);
+  destroyRunnerBuffer(buffer);
+
+  assert.equal(destroyCount, 1);
+});
+
 test("hidden transfers preserve per-layer inputs across provider buffers", async () => {
   const hidden = new Float32Array([1, 2, 3, 4]);
   const perLayerInputs = new Float32Array([5, 6, 7, 8]);
@@ -121,13 +258,28 @@ test("hidden transfers preserve per-layer inputs across provider buffers", async
     new CpuToGpuHiddenTransferNode("source", "gpu-import"),
     new GpuToCpuHiddenTransferNode("gpu-import", "gpu-export"),
     new CpuHiddenTransferNode("gpu-export", "cpu-copy"),
+    {
+      id: "output",
+      deps: ["cpu-copy"],
+      backend: "wasm",
+      run(_context, inputs) {
+        const value = inputs.get("cpu-copy");
+        assert.equal(value?.kind, "cpu-hidden");
+        assert.equal(value.perLayerInputs, perLayerInputs);
+        return {
+          kind: "output",
+          result: {
+            logits: new Float32Array(),
+            topTokens: [{ id: 0, value: 0 }],
+          },
+        };
+      },
+    },
   ]);
 
   const result = await graph.run(emptyContext());
-  const value = result.values.get("cpu-copy");
 
-  assert.equal(value?.kind, "cpu-hidden");
-  assert.equal(value.perLayerInputs, perLayerInputs);
+  assert.equal(result.outputs.get("output")?.kind, "output");
 });
 
 test("WASM-only forward graph produces fixed logits for synthetic tensors", async () => {
@@ -156,7 +308,7 @@ test("WASM-only forward graph produces fixed logits for synthetic tensors", asyn
     positions,
     phase: "prefill",
   });
-  const output = result.values.get("output");
+  const output = result.outputs.get("output");
 
   assert.equal(output?.kind, "output");
   assertFloatArrayClose(output.result.logits, new Float32Array([

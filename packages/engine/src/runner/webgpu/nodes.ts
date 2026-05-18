@@ -108,13 +108,9 @@ export class WebGpuLayerSegmentNode implements ForwardRunnerNode {
     context: ForwardGraphContext,
     outputOptions: WebGpuOutputOptions,
   ): Promise<WebGpuSegmentNodeResult> {
-    try {
-      return outputOptions.computeSelectedToken
-        ? await runner.runPreparedInput(prepared, context.positions, context.state, outputOptions)
-        : await runner.runPreparedInputHidden(prepared, context.positions, context.state);
-    } finally {
-      prepared.destroy();
-    }
+    return outputOptions.computeSelectedToken
+      ? await runner.runPreparedInput(prepared, context.positions, context.state, outputOptions)
+      : await runner.runPreparedInputHidden(prepared, context.positions, context.state);
   }
 
   private async runCpuHidden(

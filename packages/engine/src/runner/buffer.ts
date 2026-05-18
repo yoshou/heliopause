@@ -15,6 +15,7 @@ export type RunnerBufferStorage =
       handle: unknown;
       exportToCpu: () => Float32Array | Promise<Float32Array>;
       destroy?: () => void;
+      destroyed?: boolean;
     };
 
 export type RunnerBuffer = {
@@ -66,6 +67,10 @@ export async function runnerBufferToCpu(buffer: RunnerBuffer): Promise<Float32Ar
 
 export function destroyRunnerBuffer(buffer: RunnerBuffer): void {
   if (buffer.storage.kind === "provider") {
+    if (buffer.storage.destroyed) {
+      return;
+    }
+    buffer.storage.destroyed = true;
     buffer.storage.destroy?.();
   }
 }

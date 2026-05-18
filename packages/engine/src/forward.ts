@@ -161,7 +161,7 @@ export async function prefill(
   });
   updateNextPosition(state, positions, tokenIds.length);
 
-  const output = requireGraphOutput(graphResult.values, built.outputId ?? "output").result;
+  const output = requireGraphOutput(graphResult.outputs, built.outputId ?? "output").result;
   return nextTokenResultFromOutput(output, { computeLogits: options.computeLogits === true });
 }
 
@@ -191,7 +191,7 @@ export async function decode(
     trace,
   });
   state.nextPosition = Math.max(state.nextPosition, position + 1);
-  const output = requireGraphOutput(graphResult.values, built.outputId ?? "output").result;
+  const output = requireGraphOutput(graphResult.outputs, built.outputId ?? "output").result;
   return nextTokenResultFromOutput(output, { computeLogits: options.computeLogits === true });
 }
 
@@ -221,9 +221,9 @@ class PreparedHiddenInputNode implements ForwardRunnerNode {
   }
 }
 
-function requireGraphOutput(values: ReadonlyMap<string, ForwardValue>, id: string): ForwardOutputValue {
+function requireGraphOutput(values: ReadonlyMap<string, ForwardOutputValue>, id: string): ForwardOutputValue {
   const value = values.get(id);
-  if (!value || value.kind !== "output") {
+  if (!value) {
     throw new Error(`Expected output graph value from ${id}`);
   }
   return value;

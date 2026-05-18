@@ -60,16 +60,18 @@ export type ForwardRunnerNode = {
 
 export type ForwardGraphExecutionResult = {
   order: string[];
-  values: Map<string, ForwardValue>;
+  outputs: ReadonlyMap<string, ForwardOutputValue>;
 };
 
 export class ForwardGraphExecutor {
   private readonly nodes: Map<string, ForwardRunnerNode>;
   private readonly order: ForwardRunnerNode[];
+  private readonly consumerCounts: ReadonlyMap<string, number>;
 
   constructor(nodes: readonly ForwardRunnerNode[]) {
     this.nodes = validateForwardGraph(nodes);
     this.order = topologicalSortForwardGraph(this.nodes);
+    this.consumerCounts = countForwardGraphConsumers(this.nodes);
   }
 
   executionOrder(): string[] {
@@ -78,25 +80,58 @@ export class ForwardGraphExecutor {
 
   async run(context: ForwardGraphContext): Promise<ForwardGraphExecutionResult> {
     const values = new Map<string, ForwardValue>();
-    const cleanup: ForwardValue[] = [];
+    const outputs = new Map<string, ForwardOutputValue>();
+    const remainingConsumers = new Map(this.consumerCounts);
+    const producedIds: string[] = [];
     try {
       for (const node of this.order) {
         const output = await node.run(context, values);
         values.set(node.id, output);
-        cleanup.push(output);
+        producedIds.push(node.id);
+        if (output.kind === "output") {
+          outputs.set(node.id, output);
+        }
+        for (const dep of node.deps) {
+          const remaining = (remainingConsumers.get(dep) ?? 0) - 1;
+          if (remaining > 0) {
+            remainingConsumers.set(dep, remaining);
+            continue;
+          }
+          remainingConsumers.delete(dep);
+          const value = values.get(dep);
+          if (value) {
+            destroyForwardValue(value);
+            values.delete(dep);
+          }
+        }
+      }
+      for (const id of [...producedIds].reverse()) {
+        const value = values.get(id);
+        if (value) {
+          destroyForwardValue(value);
+          values.delete(id);
+        }
       }
       return {
         order: this.executionOrder(),
-        values,
+        outputs,
       };
     } catch (error) {
-      for (const value of cleanup.reverse()) {
-        if (value.kind === "cpu-hidden" || value.kind === "provider-hidden") {
-          destroyRunnerBuffer(value.buffer);
+      for (const id of producedIds.reverse()) {
+        const value = values.get(id);
+        if (value) {
+          destroyForwardValue(value);
+          values.delete(id);
         }
       }
       throw error;
     }
+  }
+}
+
+function destroyForwardValue(value: ForwardValue): void {
+  if (value.kind === "cpu-hidden" || value.kind === "provider-hidden") {
+    destroyRunnerBuffer(value.buffer);
   }
 }
 
@@ -139,6 +174,16 @@ function validateForwardGraph(nodes: readonly ForwardRunnerNode[]): Map<string, 
     }
   }
   return byId;
+}
+
+function countForwardGraphConsumers(nodes: ReadonlyMap<string, ForwardRunnerNode>): ReadonlyMap<string, number> {
+  const counts = new Map<string, number>();
+  for (const node of nodes.values()) {
+    for (const dep of node.deps) {
+      counts.set(dep, (counts.get(dep) ?? 0) + 1);
+    }
+  }
+  return counts;
 }
 
 function topologicalSortForwardGraph(nodes: ReadonlyMap<string, ForwardRunnerNode>): ForwardRunnerNode[] {
