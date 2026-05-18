@@ -1,0 +1,4 @@
+interface:
+  display_name: "Commit Changes"
+  short_description: "Create clean Conventional Commits"
+  default_prompt: "Use $commit to review, stage, validate, and commit the completed changes."
