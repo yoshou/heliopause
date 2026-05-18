@@ -46,10 +46,10 @@ export type ModelDecodeTokenResult = {
 
 export type ModelGraphRunner = {
   embeddingNode(tokenIds: readonly number[]): ForwardRunnerNode;
-  layerSegmentNode?(startLayer: number, endLayerExclusive: number, inputId: string): ForwardRunnerNode;
-  outputNode?(inputId: string, topK?: number): ForwardRunnerNode;
-  importHiddenNode?(inputId: string): ForwardRunnerNode;
-  exportHiddenNode?(inputId: string): ForwardRunnerNode;
+  layerSegmentNode(startLayer: number, endLayerExclusive: number, inputId: string): ForwardRunnerNode;
+  outputNode(inputId: string, topK?: number): ForwardRunnerNode;
+  importHiddenNode(inputId: string): ForwardRunnerNode;
+  exportHiddenNode(inputId: string): ForwardRunnerNode;
 };
 
 export type ModelRunner = {

@@ -9,6 +9,8 @@ import {
   createWebGpuProvider,
   GgufTensorReader,
   prefill,
+  prefillPreparedHiddenState,
+  prefillState,
   type ModelRunnerProvider,
 } from "../src/index.ts";
 import {
@@ -250,6 +252,175 @@ test("prefill keeps WebGPU-only planned graph on WebGPU", async () => {
   ]);
 });
 
+test("prefillState does not require output capability or create output nodes", async () => {
+  const executed: string[] = [];
+  const reader = tensorReaderFromGguf({
+    ...minimalGguf(),
+    metadata: {
+      ...minimalGguf().metadata,
+      "gemma4.block_count": 3,
+      "gemma4.full_attention_interval": 2,
+    },
+  });
+  const session = createModelSession(reader, {
+    providers: [
+      fakeProvider("webgpu", executed, 30, { missingGraphNode: "outputNode" }),
+      fakeProvider("wasm", executed),
+    ],
+  });
+
+  await prefillState(session, session.createInferenceState(), [1]);
+
+  assert.deepEqual(executed, [
+    "webgpu.embedding",
+    "webgpu.segment:0:3",
+  ]);
+});
+
+test("prepared hidden state uses CPU hidden directly for CPU providers", async () => {
+  const executed: string[] = [];
+  const reader = tensorReaderFromGguf({
+    ...minimalGguf(),
+    metadata: {
+      ...minimalGguf().metadata,
+      "gemma4.block_count": 3,
+    },
+  });
+  const session = createModelSession(reader, {
+    providers: [fakeProvider("wasm", executed)],
+  });
+
+  await prefillPreparedHiddenState(
+    session,
+    session.createInferenceState(),
+    new Float32Array([1, 0, 0, 0]),
+  );
+
+  assert.deepEqual(executed, [
+    "wasm.segment:0:3",
+  ]);
+});
+
+test("prepared hidden state does not create unplanned provider imports", async () => {
+  const executed: string[] = [];
+  const reader = tensorReaderFromGguf({
+    ...minimalGguf(),
+    metadata: {
+      ...minimalGguf().metadata,
+      "gemma4.block_count": 3,
+      "gemma4.full_attention_interval": 2,
+    },
+  });
+  const session = createModelSession(reader, {
+    providers: [
+      fakeProvider("webgpu", executed, 30),
+      fakeProvider("wasm", executed),
+    ],
+  });
+
+  await prefillPreparedHiddenState(
+    session,
+    session.createInferenceState(),
+    new Float32Array([1, 0, 0, 0]),
+  );
+
+  assert.deepEqual(executed, [
+    "webgpu.segment:0:3",
+  ]);
+});
+
+test("planned segments require segment graph capability", async () => {
+  const executed: string[] = [];
+  const reader = tensorReaderFromGguf({
+    ...minimalGguf(),
+    metadata: {
+      ...minimalGguf().metadata,
+      "gemma4.block_count": 3,
+    },
+  });
+  const session = createModelSession(reader, {
+    providers: [fakeProvider("wasm", executed, 1_000, { missingGraphNode: "layerSegmentNode" })],
+  });
+
+  await assert.rejects(
+    prefill(session, session.createInferenceState(), [1]),
+    /Planned wasm segment requires graph\.layerSegmentNode\./,
+  );
+  assert.deepEqual(executed, []);
+});
+
+test("planned transfers require source export graph capability", async () => {
+  const executed: string[] = [];
+  const reader = tensorReaderFromGguf({
+    ...minimalGguf(),
+    metadata: {
+      ...minimalGguf().metadata,
+      "gemma4.block_count": 3,
+      "gemma4.full_attention_interval": 2,
+    },
+  });
+  const session = createModelSession(reader, {
+    providers: [
+      fakeProvider("webgpu", executed, 20),
+      fakeProvider("wasm", executed, 1_000, { missingGraphNode: "exportHiddenNode" }),
+    ],
+  });
+
+  await assert.rejects(
+    prefill(session, session.createInferenceState(), [1]),
+    /Planned wasm hidden export requires graph\.exportHiddenNode\./,
+  );
+  assert.deepEqual(executed, []);
+});
+
+test("planned transfers require target import graph capability", async () => {
+  const executed: string[] = [];
+  const reader = tensorReaderFromGguf({
+    ...minimalGguf(),
+    metadata: {
+      ...minimalGguf().metadata,
+      "gemma4.block_count": 3,
+      "gemma4.full_attention_interval": 2,
+    },
+  });
+  const session = createModelSession(reader, {
+    providers: [
+      fakeProvider("webgpu", executed, 20, { missingGraphNode: "importHiddenNode" }),
+      fakeProvider("wasm", executed),
+    ],
+  });
+
+  await assert.rejects(
+    prefill(session, session.createInferenceState(), [1]),
+    /Planned webgpu hidden import requires graph\.importHiddenNode\./,
+  );
+  assert.deepEqual(executed, []);
+});
+
+test("planned outputs require output graph capability", async () => {
+  const executed: string[] = [];
+  const reader = tensorReaderFromGguf({
+    ...minimalGguf(),
+    metadata: {
+      ...minimalGguf().metadata,
+      "gemma4.block_count": 3,
+      "gemma4.full_attention_interval": 2,
+    },
+  });
+  const session = createModelSession(reader, {
+    providers: [
+      fakeProvider("webgpu", executed, 30, { missingGraphNode: "outputNode" }),
+      fakeProvider("wasm", executed),
+    ],
+  });
+
+  await assert.rejects(
+    prefill(session, session.createInferenceState(), [1]),
+    /Planned webgpu output requires graph\.outputNode\./,
+  );
+  assert.deepEqual(executed, []);
+});
+
 function node(id: string, deps: string[] = []): ForwardRunnerNode {
   return {
     id,
@@ -266,6 +437,7 @@ function fakeProvider(
   name: "wasm" | "webgpu",
   executed: string[],
   memoryLimitBytes = 1_000,
+  options: { missingGraphNode?: keyof ModelGraphRunner } = {},
 ): ModelRunnerProvider {
   const hidden = () => new Float32Array([1, 0, 0, 0]);
   const hiddenNode = (id: string, deps: string[] = []): ForwardRunnerNode => ({
@@ -302,28 +474,34 @@ function fakeProvider(
         };
       },
     }),
-    createModelGraphRunner: () => ({
-      embeddingNode: () => hiddenNode(`${name}.embedding`),
-      layerSegmentNode: (startLayer, endLayerExclusive, inputId) =>
-        hiddenNode(`${name}.segment:${startLayer}:${endLayerExclusive}`, [inputId]),
-      importHiddenNode: (inputId) => hiddenNode(`${name}.import`, [inputId]),
-      exportHiddenNode: (inputId) => hiddenNode(`${name}.export`, [inputId]),
-      outputNode: (inputId) => ({
-        id: `${name}.output`,
-        deps: [inputId],
-        backend: name,
-        run() {
-          executed.push(`${name}.output`);
-          return {
-            kind: "output",
-            result: {
-              logits: new Float32Array([1]),
-              topTokens: [{ id: 0, value: 1 }],
-            },
-          };
-        },
-      }),
-    }),
+    createModelGraphRunner: () => {
+      const graph: Partial<ModelGraphRunner> = {
+        embeddingNode: () => hiddenNode(`${name}.embedding`),
+        layerSegmentNode: (startLayer, endLayerExclusive, inputId) =>
+          hiddenNode(`${name}.segment:${startLayer}:${endLayerExclusive}`, [inputId]),
+        importHiddenNode: (inputId) => hiddenNode(`${name}.import`, [inputId]),
+        exportHiddenNode: (inputId) => hiddenNode(`${name}.export`, [inputId]),
+        outputNode: (inputId) => ({
+          id: `${name}.output`,
+          deps: [inputId],
+          backend: name,
+          run() {
+            executed.push(`${name}.output`);
+            return {
+              kind: "output",
+              result: {
+                logits: new Float32Array([1]),
+                topTokens: [{ id: 0, value: 1 }],
+              },
+            };
+          },
+        }),
+      };
+      if (options.missingGraphNode) {
+        delete graph[options.missingGraphNode];
+      }
+      return graph as ModelGraphRunner;
+    },
     modelResourceRequirements: () => fakeRequirements(name, memoryLimitBytes),
   };
 }

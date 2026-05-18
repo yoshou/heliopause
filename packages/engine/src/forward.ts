@@ -11,11 +11,9 @@ import type {
 } from "./runner/model-runner";
 import {
   cpuRunnerBuffer,
-  runnerBufferToCpu,
 } from "./runner/buffer";
 import {
   ForwardGraphExecutor,
-  requireCpuHidden,
   type ForwardCpuHiddenValue,
   type ForwardGraphContext,
   type ForwardOutputValue,
@@ -88,9 +86,6 @@ export async function prefillPreparedHiddenState(
     input,
     produceOutput: false,
     logitsTopK: 1,
-    segmentOptions: {
-      attentionCausal: options.attentionCausal ?? true,
-    },
   });
   const graph = new ForwardGraphExecutor(built.nodes);
   await graph.run({
@@ -226,113 +221,6 @@ class PreparedHiddenInputNode implements ForwardRunnerNode {
   }
 }
 
-class CpuHiddenAliasNode implements ForwardRunnerNode {
-  readonly id: string;
-  readonly deps: readonly string[];
-  readonly backend = "transfer" as const;
-
-  constructor(inputId: string, id = "hidden") {
-    this.id = id;
-    this.deps = [inputId];
-  }
-
-  run(_context: ForwardGraphContext, inputs: ReadonlyMap<string, ForwardValue>): ForwardCpuHiddenValue {
-    return requireCpuHidden(inputs, this.deps[0] ?? "");
-  }
-}
-
-class ModelSegmentNode implements ForwardRunnerNode {
-  readonly id = "segment";
-  readonly deps: readonly string[];
-  readonly backend: ForwardRunnerNode["backend"];
-  private readonly runner: ModelRunner;
-  private readonly options: {
-    attentionCausal?: boolean;
-    segmentStartLayer: number;
-    segmentEndLayerExclusive: number;
-  };
-
-  constructor(
-    runner: ModelRunner,
-    inputId: string,
-    options: {
-      attentionCausal?: boolean;
-      segmentStartLayer?: number;
-      segmentEndLayerExclusive?: number;
-    } = {},
-  ) {
-    this.runner = runner;
-    this.options = {
-      ...options,
-      segmentStartLayer: options.segmentStartLayer ?? 0,
-      segmentEndLayerExclusive: options.segmentEndLayerExclusive ?? Number.POSITIVE_INFINITY,
-    };
-    this.deps = [inputId];
-    this.backend = runner.provider;
-  }
-
-  async run(context: ForwardGraphContext, inputs: ReadonlyMap<string, ForwardValue>): Promise<ForwardCpuHiddenValue> {
-    const input = requireCpuHidden(inputs, this.deps[0] ?? "");
-    const segment = await this.runner.segmentRunner({
-      session: context.session,
-      state: context.state,
-      manifest: context.manifest,
-      epsilon: context.session.epsilon,
-      segmentStartLayer: this.options.segmentStartLayer,
-      segmentEndLayerExclusive: Math.min(this.options.segmentEndLayerExclusive, context.manifest.blockCount),
-    });
-    const inputHidden = await runnerBufferToCpu(input.buffer);
-    const hidden = inputHidden.length === context.manifest.embeddingLength
-      ? (await segment.runTokenHidden(inputHidden, context.positions, context.state, {
-        trace: context.trace,
-        perLayerInputs: input.perLayerInputs,
-        attentionCausal: this.options.attentionCausal,
-      })).hidden
-      : (await segment.runTokensHidden(inputHidden, context.positions, context.state, {
-        trace: context.trace,
-        perLayerInputs: input.perLayerInputs,
-        attentionCausal: this.options.attentionCausal,
-      })).hidden;
-    return {
-      kind: "cpu-hidden",
-      buffer: cpuRunnerBuffer(hidden, [hidden.length / context.manifest.embeddingLength, context.manifest.embeddingLength]),
-      hidden,
-      perLayerInputs: input.perLayerInputs,
-    };
-  }
-}
-
-class ModelOutputNode implements ForwardRunnerNode {
-  readonly id = "output";
-  readonly deps: readonly string[];
-  readonly backend: ForwardRunnerNode["backend"];
-  private readonly runner: ModelRunner;
-  private readonly topK: number;
-
-  constructor(
-    runner: ModelRunner,
-    inputId: string,
-    topK: number,
-  ) {
-    this.runner = runner;
-    this.topK = topK;
-    this.deps = [inputId];
-    this.backend = runner.provider;
-  }
-
-  async run(context: ForwardGraphContext, inputs: ReadonlyMap<string, ForwardValue>): Promise<ForwardOutputValue> {
-    const input = requireCpuHidden(inputs, this.deps[0] ?? "");
-    const hidden = await runnerBufferToCpu(input.buffer);
-    return {
-      kind: "output",
-      result: await this.runner.output(context.session, hidden, {
-        topK: this.topK,
-        trace: context.trace,
-      }),
-    };
-  }
-}
-
 function requireGraphOutput(values: ReadonlyMap<string, ForwardValue>, id: string): ForwardOutputValue {
   const value = values.get(id);
   if (!value || value.kind !== "output") {
@@ -455,7 +343,6 @@ function buildForwardGraphFromPlan(
     input?: ForwardRunnerNode;
     produceOutput: boolean;
     logitsTopK: number;
-    segmentOptions?: { attentionCausal?: boolean };
   },
 ): BuiltForwardGraph {
   const nodes: ForwardRunnerNode[] = [];
@@ -474,7 +361,7 @@ function buildForwardGraphFromPlan(
         continue;
       }
       const runtime = requirePlannedProvider(planned, planNode.provider);
-      const embedding = runtime.graph.embeddingNode(options.tokenIds);
+      const embedding = createEmbeddingNode(runtime, options.tokenIds);
       nodes.push(embedding);
       currentId = embedding.id;
       currentProvider = planNode.provider;
@@ -485,18 +372,12 @@ function buildForwardGraphFromPlan(
       if (!currentId) {
         throw new Error(`Cannot run ${planNode.provider} segment without an input node.`);
       }
-      if (!currentProvider && planNode.provider !== "reference" && planNode.provider !== "wasm") {
-        const imported = importHiddenNode(requirePlannedProvider(planned, planNode.provider), currentId);
-        nodes.push(imported);
-        currentId = imported.id;
-      }
       const runtime = requirePlannedProvider(planned, planNode.provider);
-      const segment = segmentNode(
+      const segment = createSegmentNode(
         runtime,
         currentId,
         planNode.startLayer,
         planNode.endLayerExclusive,
-        options.segmentOptions,
       );
       nodes.push(segment);
       currentId = segment.id;
@@ -508,9 +389,14 @@ function buildForwardGraphFromPlan(
       if (!currentId) {
         throw new Error(`Cannot transfer ${planNode.from} hidden without an input node.`);
       }
-      const exported = exportHiddenNode(requirePlannedProvider(planned, planNode.from), currentId);
+      if (currentProvider !== undefined && currentProvider !== planNode.from) {
+        throw new Error(
+          `Planned transfer ${planNode.from} -> ${planNode.to} cannot consume ${currentProvider} hidden without a matching plan.`,
+        );
+      }
+      const exported = createExportHiddenNode(requirePlannedProvider(planned, planNode.from), currentId);
       nodes.push(exported);
-      const imported = importHiddenNode(requirePlannedProvider(planned, planNode.to), exported.id);
+      const imported = createImportHiddenNode(requirePlannedProvider(planned, planNode.to), exported.id);
       nodes.push(imported);
       currentId = imported.id;
       currentProvider = planNode.to;
@@ -521,17 +407,17 @@ function buildForwardGraphFromPlan(
       if (!currentId) {
         throw new Error(`Cannot produce ${planNode.provider} output without hidden input.`);
       }
-      const outputRuntime = requirePlannedProvider(planned, planNode.provider);
-      if (currentProvider !== planNode.provider || !outputRuntime.graph.outputNode) {
-        const exported = exportHiddenNode(requirePlannedProvider(planned, currentProvider ?? planNode.provider), currentId);
-        nodes.push(exported);
-        currentId = exported.id;
+      if (!options.produceOutput) {
+        continue;
       }
-      if (options.produceOutput) {
-        const output = outputNode(outputRuntime, currentId, options.logitsTopK);
-        nodes.push(output);
-        outputId = output.id;
+      if (currentProvider !== planNode.provider) {
+        throw new Error(
+          `Planned ${planNode.provider} output cannot consume ${currentProvider ?? "CPU"} hidden without a planned transfer.`,
+        );
       }
+      const output = createOutputNode(requirePlannedProvider(planned, planNode.provider), currentId, options.logitsTopK);
+      nodes.push(output);
+      outputId = output.id;
     }
   }
 
@@ -541,31 +427,46 @@ function buildForwardGraphFromPlan(
   return { nodes, outputId };
 }
 
-function segmentNode(
+function createEmbeddingNode(runtime: ModelRuntimeForForward, tokenIds: readonly number[]): ForwardRunnerNode {
+  const create = graphFactory(runtime, "embeddingNode", `Planned ${runtime.provider.name} embedding`);
+  return create(tokenIds);
+}
+
+function createSegmentNode(
   runtime: ModelRuntimeForForward,
   inputId: string,
   startLayer: number,
   endLayerExclusive: number,
-  options: { attentionCausal?: boolean } = {},
 ): ForwardRunnerNode {
-  return runtime.graph.layerSegmentNode?.(startLayer, endLayerExclusive, inputId) ??
-    new ModelSegmentNode(runtime.runner, inputId, {
-      ...options,
-      segmentStartLayer: startLayer,
-      segmentEndLayerExclusive: endLayerExclusive,
-    });
+  const create = graphFactory(runtime, "layerSegmentNode", `Planned ${runtime.provider.name} segment`);
+  return create(startLayer, endLayerExclusive, inputId);
 }
 
-function importHiddenNode(runtime: ModelRuntimeForForward, inputId: string): ForwardRunnerNode {
-  return runtime.graph.importHiddenNode?.(inputId) ?? new CpuHiddenAliasNode(inputId, `${runtime.runner.provider}-import-hidden`);
+function createImportHiddenNode(runtime: ModelRuntimeForForward, inputId: string): ForwardRunnerNode {
+  const create = graphFactory(runtime, "importHiddenNode", `Planned ${runtime.provider.name} hidden import`);
+  return create(inputId);
 }
 
-function exportHiddenNode(runtime: ModelRuntimeForForward, inputId: string): ForwardRunnerNode {
-  return runtime.graph.exportHiddenNode?.(inputId) ?? new CpuHiddenAliasNode(inputId, "hidden");
+function createExportHiddenNode(runtime: ModelRuntimeForForward, inputId: string): ForwardRunnerNode {
+  const create = graphFactory(runtime, "exportHiddenNode", `Planned ${runtime.provider.name} hidden export`);
+  return create(inputId);
 }
 
-function outputNode(runtime: ModelRuntimeForForward, inputId: string, topK: number): ForwardRunnerNode {
-  return runtime.graph.outputNode?.(inputId, topK) ?? new ModelOutputNode(runtime.runner, inputId, topK);
+function createOutputNode(runtime: ModelRuntimeForForward, inputId: string, topK: number): ForwardRunnerNode {
+  const create = graphFactory(runtime, "outputNode", `Planned ${runtime.provider.name} output`);
+  return create(inputId, topK);
+}
+
+function graphFactory<TKey extends keyof ModelGraphRunner>(
+  runtime: ModelRuntimeForForward,
+  key: TKey,
+  label: string,
+): ModelGraphRunner[TKey] {
+  const create = runtime.graph[key];
+  if (typeof create !== "function") {
+    throw new Error(`${label} requires graph.${String(key)}.`);
+  }
+  return create;
 }
 
 function requirePlannedProvider(
