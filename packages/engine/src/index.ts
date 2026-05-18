@@ -175,6 +175,11 @@ export {
 } from "./runner/webgpu/index";
 
 export type {
+  ModelGraphNodeFactory,
+  ModelRunner,
+} from "./runner/model-runner";
+
+export type {
   AudioRunnerProvider,
   ModelRunnerProvider,
   MultimodalRunnerProvider,

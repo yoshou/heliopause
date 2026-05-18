@@ -6,7 +6,7 @@ import {
   type TimingSink,
 } from "./runtime";
 import type {
-  ModelGraphRunner,
+  ModelGraphNodeFactory,
   ModelRunner,
 } from "./runner/model-runner";
 import {
@@ -277,7 +277,6 @@ function normalizePositions(positions: PrefillStateOptions["positions"], tokenCo
 type ModelRuntimeForForward = {
   provider: ModelRunnerProvider;
   runner: ModelRunner;
-  graph: ModelGraphRunner;
 };
 
 type PlannedModelForward = {
@@ -327,14 +326,9 @@ function modelRuntimesForForward(session: ModelSession): ReadonlyMap<SegmentRunn
   const providers = new Map<SegmentRunnerProvider, ModelRuntimeForForward>();
   for (const provider of session.providers) {
     const runner = provider.createModelRunner();
-    const graph = provider.createModelGraphRunner?.() ?? runner.graph;
-    if (!graph) {
-      throw new Error(`Model graph runner is not available for ${provider.name}.`);
-    }
     providers.set(provider.name, {
       provider,
       runner,
-      graph,
     });
   }
   return providers;
@@ -432,7 +426,7 @@ function buildForwardGraphFromPlan(
 }
 
 function createEmbeddingNode(runtime: ModelRuntimeForForward, tokenIds: readonly number[]): ForwardRunnerNode {
-  const create = graphFactory(runtime, "embeddingNode", `Planned ${runtime.provider.name} embedding`);
+  const create = graphFactory(runtime, "createEmbeddingNode", `Planned ${runtime.provider.name} embedding`);
   return create(tokenIds);
 }
 
@@ -442,33 +436,33 @@ function createSegmentNode(
   startLayer: number,
   endLayerExclusive: number,
 ): ForwardRunnerNode {
-  const create = graphFactory(runtime, "layerSegmentNode", `Planned ${runtime.provider.name} segment`);
+  const create = graphFactory(runtime, "createLayerSegmentNode", `Planned ${runtime.provider.name} segment`);
   return create(startLayer, endLayerExclusive, inputId);
 }
 
 function createImportHiddenNode(runtime: ModelRuntimeForForward, inputId: string): ForwardRunnerNode {
-  const create = graphFactory(runtime, "importHiddenNode", `Planned ${runtime.provider.name} hidden import`);
+  const create = graphFactory(runtime, "createImportHiddenNode", `Planned ${runtime.provider.name} hidden import`);
   return create(inputId);
 }
 
 function createExportHiddenNode(runtime: ModelRuntimeForForward, inputId: string): ForwardRunnerNode {
-  const create = graphFactory(runtime, "exportHiddenNode", `Planned ${runtime.provider.name} hidden export`);
+  const create = graphFactory(runtime, "createExportHiddenNode", `Planned ${runtime.provider.name} hidden export`);
   return create(inputId);
 }
 
 function createOutputNode(runtime: ModelRuntimeForForward, inputId: string, topK: number): ForwardRunnerNode {
-  const create = graphFactory(runtime, "outputNode", `Planned ${runtime.provider.name} output`);
+  const create = graphFactory(runtime, "createOutputNode", `Planned ${runtime.provider.name} output`);
   return create(inputId, topK);
 }
 
-function graphFactory<TKey extends keyof ModelGraphRunner>(
+function graphFactory<TKey extends keyof ModelGraphNodeFactory>(
   runtime: ModelRuntimeForForward,
   key: TKey,
   label: string,
-): ModelGraphRunner[TKey] {
-  const create = runtime.graph[key];
+): ModelGraphNodeFactory[TKey] {
+  const create = runtime.runner.graphNodes[key];
   if (typeof create !== "function") {
-    throw new Error(`${label} requires graph.${String(key)}.`);
+    throw new Error(`${label} requires graphNodes.${String(key)}.`);
   }
   return create;
 }

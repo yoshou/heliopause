@@ -10,13 +10,6 @@ import {
 import {
   webGpuVisionPreprocessRunner,
 } from "./vision-preprocess-runner";
-import {
-  CpuToGpuHiddenTransferNode,
-  GpuToCpuHiddenTransferNode,
-  WebGpuEmbeddingNode,
-  WebGpuLayerSegmentNode,
-  WebGpuOutputNode,
-} from "./nodes";
 import type {
   MultimodalRunnerProvider,
 } from "../provider";
@@ -32,17 +25,6 @@ import {
 } from "./planning";
 
 export { createWebGpuModelRunner } from "./model-runner";
-
-export function createWebGpuGraphRunner() {
-  return {
-    embeddingNode: (tokenIds: readonly number[]) => new WebGpuEmbeddingNode(tokenIds),
-    layerSegmentNode: (startLayer: number, endLayerExclusive: number, inputId: string) =>
-      new WebGpuLayerSegmentNode(startLayer, endLayerExclusive, inputId),
-    outputNode: (inputId: string, topK?: number) => new WebGpuOutputNode(inputId, topK),
-    importHiddenNode: (inputId: string) => new CpuToGpuHiddenTransferNode(inputId),
-    exportHiddenNode: (inputId: string) => new GpuToCpuHiddenTransferNode(inputId),
-  };
-}
 
 export function createWebGpuAudioRunners() {
   return {
@@ -66,7 +48,6 @@ export function createWebGpuProvider(options: WebGpuProviderOptions = {}): Multi
     name: "webgpu",
     options: { ...options },
     createModelRunner: createWebGpuModelRunner,
-    createModelGraphRunner: createWebGpuGraphRunner,
     modelResourceRequirements: (session, resourceOptions) => {
       const providerOptions = webGpuExecutionProviderOptions(session);
       return webGpuResourceRequirements(session.tensorReader.metadata, session.manifest, {

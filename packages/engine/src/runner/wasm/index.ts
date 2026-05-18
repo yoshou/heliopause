@@ -46,13 +46,13 @@ export function createWasmModelRunner(): ModelRunner {
     preparePreparedHiddenInput,
     segmentRunner: wasmSegmentRunner,
     output: wasmOutput,
-    graph: {
-      embeddingNode: (tokenIds) => new WasmEmbeddingNode(tokenIds),
-      layerSegmentNode: (startLayer, endLayerExclusive, inputId) =>
+    graphNodes: {
+      createEmbeddingNode: (tokenIds) => new WasmEmbeddingNode(tokenIds),
+      createLayerSegmentNode: (startLayer, endLayerExclusive, inputId) =>
         new WasmLayerSegmentNode(startLayer, endLayerExclusive, inputId),
-      outputNode: (inputId, topK) => new WasmOutputNode(inputId, topK),
-      importHiddenNode: (inputId) => new CpuHiddenTransferNode(inputId, "wasm-import-hidden"),
-      exportHiddenNode: (inputId) => new CpuHiddenTransferNode(inputId, "wasm-export-hidden"),
+      createOutputNode: (inputId, topK) => new WasmOutputNode(inputId, topK),
+      createImportHiddenNode: (inputId) => new CpuHiddenTransferNode(inputId, "wasm-import-hidden"),
+      createExportHiddenNode: (inputId) => new CpuHiddenTransferNode(inputId, "wasm-export-hidden"),
     },
   };
 }
@@ -65,7 +65,6 @@ export function createWasmProvider(options: WasmProviderOptions = {}): Multimoda
     name: "wasm",
     options: { ...options },
     createModelRunner: createWasmModelRunner,
-    createModelGraphRunner: () => createWasmModelRunner().graph as NonNullable<ModelRunner["graph"]>,
     modelResourceRequirements: (session, resourceOptions) => createModelResourceRequirements({
       provider: "wasm",
       gguf: session.tensorReader.metadata,

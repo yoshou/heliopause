@@ -31,15 +31,34 @@ import {
   webGpuExecutionProviderOptions,
   webGpuSegmentRunner,
 } from "./execution-provider";
+import {
+  CpuToGpuHiddenTransferNode,
+  GpuToCpuHiddenTransferNode,
+  WebGpuEmbeddingNode,
+  WebGpuLayerSegmentNode,
+  WebGpuOutputNode,
+} from "./nodes";
 
 export function createWebGpuModelRunner(): ModelRunner {
   return {
     provider: "webgpu",
+    graphNodes: createWebGpuGraphNodes(),
     prepareInput: prepareWasmInput,
     preparePreparedHiddenInput: prepareWasmPreparedHiddenInput,
     segmentRunner: webGpuModelSegmentRunner,
     output: wasmOutput,
     decodeToken: decodeWebGpuToken,
+  };
+}
+
+function createWebGpuGraphNodes() {
+  return {
+    createEmbeddingNode: (tokenIds: readonly number[]) => new WebGpuEmbeddingNode(tokenIds),
+    createLayerSegmentNode: (startLayer: number, endLayerExclusive: number, inputId: string) =>
+      new WebGpuLayerSegmentNode(startLayer, endLayerExclusive, inputId),
+    createOutputNode: (inputId: string, topK?: number) => new WebGpuOutputNode(inputId, topK),
+    createImportHiddenNode: (inputId: string) => new CpuToGpuHiddenTransferNode(inputId),
+    createExportHiddenNode: (inputId: string) => new GpuToCpuHiddenTransferNode(inputId),
   };
 }
 

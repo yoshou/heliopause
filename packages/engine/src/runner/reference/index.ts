@@ -39,13 +39,13 @@ export function createReferenceModelRunner(): ModelRunner {
     preparePreparedHiddenInput,
     segmentRunner: referenceSegmentRunner,
     output: referenceOutput,
-    graph: {
-      embeddingNode: (tokenIds) => new ReferenceEmbeddingNode(tokenIds),
-      layerSegmentNode: (startLayer, endLayerExclusive, inputId) =>
+    graphNodes: {
+      createEmbeddingNode: (tokenIds) => new ReferenceEmbeddingNode(tokenIds),
+      createLayerSegmentNode: (startLayer, endLayerExclusive, inputId) =>
         new ReferenceLayerSegmentNode(startLayer, endLayerExclusive, inputId),
-      outputNode: (inputId, topK) => new ReferenceOutputNode(inputId, topK),
-      importHiddenNode: (inputId) => new CpuHiddenTransferNode(inputId, "reference-import-hidden"),
-      exportHiddenNode: (inputId) => new CpuHiddenTransferNode(inputId, "reference-export-hidden"),
+      createOutputNode: (inputId, topK) => new ReferenceOutputNode(inputId, topK),
+      createImportHiddenNode: (inputId) => new CpuHiddenTransferNode(inputId, "reference-import-hidden"),
+      createExportHiddenNode: (inputId) => new CpuHiddenTransferNode(inputId, "reference-export-hidden"),
     },
   };
 }

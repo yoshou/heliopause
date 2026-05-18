@@ -2,7 +2,6 @@ import type {
   AudioRunners,
 } from "./audio-runner";
 import type {
-  ModelGraphRunner,
   ModelRunner,
 } from "./model-runner";
 import type {
@@ -24,7 +23,6 @@ export type RunnerProvider = {
 
 export type ModelRunnerProvider = RunnerProvider & {
   createModelRunner(): ModelRunner;
-  createModelGraphRunner?(): ModelGraphRunner;
   modelResourceRequirements(session: ModelSession, options: { contextLength: number }): ProviderResourceRequirements;
 };
 

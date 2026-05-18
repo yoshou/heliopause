@@ -44,16 +44,17 @@ export type ModelDecodeTokenResult = {
   topTokens?: Array<{ id: number; value: number }>;
 };
 
-export type ModelGraphRunner = {
-  embeddingNode(tokenIds: readonly number[]): ForwardRunnerNode;
-  layerSegmentNode(startLayer: number, endLayerExclusive: number, inputId: string): ForwardRunnerNode;
-  outputNode(inputId: string, topK?: number): ForwardRunnerNode;
-  importHiddenNode(inputId: string): ForwardRunnerNode;
-  exportHiddenNode(inputId: string): ForwardRunnerNode;
+export type ModelGraphNodeFactory = {
+  createEmbeddingNode(tokenIds: readonly number[]): ForwardRunnerNode;
+  createLayerSegmentNode(startLayer: number, endLayerExclusive: number, inputId: string): ForwardRunnerNode;
+  createOutputNode(inputId: string, topK?: number): ForwardRunnerNode;
+  createImportHiddenNode(inputId: string): ForwardRunnerNode;
+  createExportHiddenNode(inputId: string): ForwardRunnerNode;
 };
 
 export type ModelRunner = {
   readonly provider: SegmentRunnerProvider;
+  readonly graphNodes: ModelGraphNodeFactory;
   prepareInput(
     session: ModelSession,
     tokenIds: readonly number[],
@@ -75,5 +76,4 @@ export type ModelRunner = {
     tokenId: number,
     options: ModelDecodeTokenOptions,
   ): Promise<ModelDecodeTokenResult>;
-  readonly graph?: ModelGraphRunner;
 };

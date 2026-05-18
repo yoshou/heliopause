@@ -35,7 +35,7 @@ import type {
   ModelManifest,
 } from "../src/model.ts";
 import type {
-  ModelGraphRunner,
+  ModelGraphNodeFactory,
 } from "../src/runner/model-runner.ts";
 import type {
   LayerResourceRequirement,
@@ -416,7 +416,7 @@ test("prefillState does not require output capability or create output nodes", a
   });
   const session = createModelSession(reader, {
     providers: [
-      fakeProvider("webgpu", executed, 30, { missingGraphNode: "outputNode" }),
+      fakeProvider("webgpu", executed, 30, { missingGraphNode: "createOutputNode" }),
       fakeProvider("wasm", executed),
     ],
   });
@@ -513,12 +513,12 @@ test("planned segments require segment graph capability", async () => {
     },
   });
   const session = createModelSession(reader, {
-    providers: [fakeProvider("wasm", executed, 1_000, { missingGraphNode: "layerSegmentNode" })],
+    providers: [fakeProvider("wasm", executed, 1_000, { missingGraphNode: "createLayerSegmentNode" })],
   });
 
   await assert.rejects(
     prefill(session, session.createInferenceState(), [1]),
-    /Planned wasm segment requires graph\.layerSegmentNode\./,
+    /Planned wasm segment requires graphNodes\.createLayerSegmentNode\./,
   );
   assert.deepEqual(executed, []);
 });
@@ -536,13 +536,13 @@ test("planned transfers require source export graph capability", async () => {
   const session = createModelSession(reader, {
     providers: [
       fakeProvider("webgpu", executed, 20),
-      fakeProvider("wasm", executed, 1_000, { missingGraphNode: "exportHiddenNode" }),
+      fakeProvider("wasm", executed, 1_000, { missingGraphNode: "createExportHiddenNode" }),
     ],
   });
 
   await assert.rejects(
     prefill(session, session.createInferenceState(), [1]),
-    /Planned wasm hidden export requires graph\.exportHiddenNode\./,
+    /Planned wasm hidden export requires graphNodes\.createExportHiddenNode\./,
   );
   assert.deepEqual(executed, []);
 });
@@ -559,14 +559,14 @@ test("planned transfers require target import graph capability", async () => {
   });
   const session = createModelSession(reader, {
     providers: [
-      fakeProvider("webgpu", executed, 20, { missingGraphNode: "importHiddenNode" }),
+      fakeProvider("webgpu", executed, 20, { missingGraphNode: "createImportHiddenNode" }),
       fakeProvider("wasm", executed),
     ],
   });
 
   await assert.rejects(
     prefill(session, session.createInferenceState(), [1]),
-    /Planned webgpu hidden import requires graph\.importHiddenNode\./,
+    /Planned webgpu hidden import requires graphNodes\.createImportHiddenNode\./,
   );
   assert.deepEqual(executed, []);
 });
@@ -583,14 +583,14 @@ test("planned outputs require output graph capability", async () => {
   });
   const session = createModelSession(reader, {
     providers: [
-      fakeProvider("webgpu", executed, 30, { missingGraphNode: "outputNode" }),
+      fakeProvider("webgpu", executed, 30, { missingGraphNode: "createOutputNode" }),
       fakeProvider("wasm", executed),
     ],
   });
 
   await assert.rejects(
     prefill(session, session.createInferenceState(), [1]),
-    /Planned webgpu output requires graph\.outputNode\./,
+    /Planned webgpu output requires graphNodes\.createOutputNode\./,
   );
   assert.deepEqual(executed, []);
 });
@@ -612,7 +612,7 @@ function fakeProvider(
   executed: string[],
   memoryLimitBytes = 1_000,
   options: {
-    missingGraphNode?: keyof ModelGraphRunner;
+    missingGraphNode?: keyof ModelGraphNodeFactory;
     requirementsProvider?: "wasm" | "webgpu";
   } = {},
 ): ModelRunnerProvider {
@@ -635,6 +635,7 @@ function fakeProvider(
     name,
     createModelRunner: () => ({
       provider: name,
+      graphNodes: graphNodes(),
       async prepareInput() {
         return { hidden: hidden() };
       },
@@ -651,36 +652,37 @@ function fakeProvider(
         };
       },
     }),
-    createModelGraphRunner: () => {
-      const graph: Partial<ModelGraphRunner> = {
-        embeddingNode: () => hiddenNode(`${name}.embedding`),
-        layerSegmentNode: (startLayer, endLayerExclusive, inputId) =>
-          hiddenNode(`${name}.segment:${startLayer}:${endLayerExclusive}`, [inputId]),
-        importHiddenNode: (inputId) => hiddenNode(`${name}.import`, [inputId]),
-        exportHiddenNode: (inputId) => hiddenNode(`${name}.export`, [inputId]),
-        outputNode: (inputId) => ({
-          id: `${name}.output`,
-          deps: [inputId],
-          backend: name,
-          run() {
-            executed.push(`${name}.output`);
-            return {
-              kind: "output",
-              result: {
-                logits: new Float32Array([1]),
-                topTokens: [{ id: 0, value: 1 }],
-              },
-            };
-          },
-        }),
-      };
-      if (options.missingGraphNode) {
-        delete graph[options.missingGraphNode];
-      }
-      return graph as ModelGraphRunner;
-    },
     modelResourceRequirements: () => fakeRequirements(options.requirementsProvider ?? name, memoryLimitBytes),
   };
+
+  function graphNodes(): ModelGraphNodeFactory {
+    const graph: Partial<ModelGraphNodeFactory> = {
+      createEmbeddingNode: () => hiddenNode(`${name}.embedding`),
+      createLayerSegmentNode: (startLayer, endLayerExclusive, inputId) =>
+        hiddenNode(`${name}.segment:${startLayer}:${endLayerExclusive}`, [inputId]),
+      createImportHiddenNode: (inputId) => hiddenNode(`${name}.import`, [inputId]),
+      createExportHiddenNode: (inputId) => hiddenNode(`${name}.export`, [inputId]),
+      createOutputNode: (inputId) => ({
+        id: `${name}.output`,
+        deps: [inputId],
+        backend: name,
+        run() {
+          executed.push(`${name}.output`);
+          return {
+            kind: "output",
+            result: {
+              logits: new Float32Array([1]),
+              topTokens: [{ id: 0, value: 1 }],
+            },
+          };
+        },
+      }),
+    };
+    if (options.missingGraphNode) {
+      delete graph[options.missingGraphNode];
+    }
+    return graph as ModelGraphNodeFactory;
+  }
 }
 
 function fakeRequirements(
@@ -742,8 +744,8 @@ function buildWasmOnlyForwardGraph(
   tokenIds: readonly number[],
   options: { includeOutput?: boolean; outputTopK?: number } = {},
 ): ForwardRunnerNode[] {
-  const wasm = requireModelGraphRunner(createWasmProvider(), "wasm");
-  const nodes: ForwardRunnerNode[] = [requireNode(wasm.embeddingNode, "wasm embedding")(tokenIds)];
+  const wasm = requireModelGraphNodeFactory(createWasmProvider(), "wasm");
+  const nodes: ForwardRunnerNode[] = [requireNode(wasm.createEmbeddingNode, "wasm embedding")(tokenIds)];
   let currentId = "embedding";
   const segment = maybeLayerSegmentNode(wasm, 0, manifest.blockCount, currentId);
   if (segment) {
@@ -751,7 +753,7 @@ function buildWasmOnlyForwardGraph(
     currentId = segment.id;
   }
   if (options.includeOutput ?? true) {
-    nodes.push(requireNode(wasm.outputNode, "wasm output")(currentId, options.outputTopK));
+    nodes.push(requireNode(wasm.createOutputNode, "wasm output")(currentId, options.outputTopK));
   }
   return nodes;
 }
@@ -763,23 +765,23 @@ function buildManualSegmentForwardGraph(
   options: { includeOutput?: boolean; outputTopK?: number } = {},
 ): ForwardRunnerNode[] {
   validateLayerSegment(manifest, segment);
-  const wasm = requireModelGraphRunner(createWasmProvider(), "wasm");
-  const webgpu = requireModelGraphRunner(createWebGpuProvider(), "webgpu");
-  const nodes: ForwardRunnerNode[] = [requireNode(wasm.embeddingNode, "wasm embedding")(tokenIds)];
+  const wasm = requireModelGraphNodeFactory(createWasmProvider(), "wasm");
+  const webgpu = requireModelGraphNodeFactory(createWebGpuProvider(), "webgpu");
+  const nodes: ForwardRunnerNode[] = [requireNode(wasm.createEmbeddingNode, "wasm embedding")(tokenIds)];
   let currentId = "embedding";
   const prefix = maybeLayerSegmentNode(wasm, 0, segment.startLayer, currentId);
   if (prefix) {
     nodes.push(prefix);
     currentId = prefix.id;
   }
-  const gpu = requireNode(webgpu.layerSegmentNode, "webgpu segment")(
+  const gpu = requireNode(webgpu.createLayerSegmentNode, "webgpu segment")(
     segment.startLayer,
     segment.endLayerExclusive,
     currentId,
   );
   nodes.push(gpu);
   currentId = gpu.id;
-  const transfer = requireNode(webgpu.exportHiddenNode, "provider hidden export")(currentId);
+  const transfer = requireNode(webgpu.createExportHiddenNode, "provider hidden export")(currentId);
   nodes.push(transfer);
   currentId = transfer.id;
   const suffix = maybeLayerSegmentNode(wasm, segment.endLayerExclusive, manifest.blockCount, currentId);
@@ -788,31 +790,27 @@ function buildManualSegmentForwardGraph(
     currentId = suffix.id;
   }
   if (options.includeOutput ?? true) {
-    nodes.push(requireNode(wasm.outputNode, "wasm output")(currentId, options.outputTopK));
+    nodes.push(requireNode(wasm.createOutputNode, "wasm output")(currentId, options.outputTopK));
   }
   return nodes;
 }
 
 function maybeLayerSegmentNode(
-  provider: ModelGraphRunner,
+  provider: ModelGraphNodeFactory,
   start: number,
   end: number,
   inputId: string,
 ): ForwardRunnerNode | undefined {
   return end > start
-    ? requireNode(provider.layerSegmentNode, "provider segment")(start, end, inputId)
+    ? requireNode(provider.createLayerSegmentNode, "provider segment")(start, end, inputId)
     : undefined;
 }
 
-function requireModelGraphRunner(
+function requireModelGraphNodeFactory(
   provider: ModelRunnerProvider,
   name: string,
-): ModelGraphRunner {
-  const graph = provider.createModelGraphRunner?.();
-  if (!graph) {
-    throw new Error(`Model graph provider is not available for ${name}.`);
-  }
-  return graph;
+): ModelGraphNodeFactory {
+  return provider.createModelRunner().graphNodes;
 }
 
 function requireNode<T extends (...args: never[]) => ForwardRunnerNode>(
