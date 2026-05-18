@@ -11,15 +11,21 @@ import type {
 } from "./runner/model-runner";
 import {
   cpuRunnerBuffer,
+  providerRunnerBuffer,
 } from "./runner/buffer";
 import {
   ForwardGraphExecutor,
   type ForwardCpuHiddenValue,
   type ForwardGraphContext,
   type ForwardOutputValue,
+  type ForwardProviderHiddenValue,
   type ForwardRunnerNode,
   type ForwardValue,
 } from "./runner/graph";
+import {
+  prepareWebGpuPreparedHiddenInput,
+  prepareWebGpuPreparedHiddenInputHandle,
+} from "./runner/webgpu/model-io";
 import {
   type ModelRunnerProvider,
 } from "./runner/provider";
@@ -210,7 +216,25 @@ class PreparedHiddenInputNode implements ForwardRunnerNode {
     this.hidden = hidden;
   }
 
-  async run(context: ForwardGraphContext): Promise<ForwardCpuHiddenValue> {
+  async run(context: ForwardGraphContext): Promise<ForwardCpuHiddenValue | ForwardProviderHiddenValue> {
+    if (
+      this.runner.provider === "webgpu" &&
+      this.runner.preparePreparedHiddenInput === prepareWebGpuPreparedHiddenInput
+    ) {
+      const prepared = await prepareWebGpuPreparedHiddenInputHandle(context.session, this.hidden, context.trace);
+      return {
+        kind: "provider-hidden",
+        provider: "webgpu",
+        buffer: providerRunnerBuffer(
+          "webgpu",
+          prepared,
+          [prepared.tokenCount, context.manifest.embeddingLength],
+          () => this.hidden.slice(),
+          prepared.destroy,
+        ),
+      };
+    }
+
     const prepared = await this.runner.preparePreparedHiddenInput(context.session, this.hidden, context.trace);
     return {
       kind: "cpu-hidden",

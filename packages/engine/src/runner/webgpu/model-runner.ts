@@ -5,8 +5,6 @@ import type {
   ModelSegmentRunnerOptions,
 } from "../model-runner";
 import type {
-  SegmentHiddenResult,
-  SegmentRunOptions,
   SegmentRunner,
 } from "../segment-runner";
 import type {
@@ -16,14 +14,6 @@ import type {
 import {
   timedAsync,
 } from "../../runtime";
-import {
-  prepareInput as prepareWasmInput,
-  preparePreparedHiddenInput as prepareWasmPreparedHiddenInput,
-} from "../wasm/layers";
-import {
-  wasmOutput,
-  wasmSegmentRunner,
-} from "../wasm/execution-provider";
 import {
   planModelPlacement,
 } from "../planning";
@@ -38,15 +28,20 @@ import {
   WebGpuLayerSegmentNode,
   WebGpuOutputNode,
 } from "./nodes";
+import {
+  prepareWebGpuPreparedHiddenInput,
+  prepareWebGpuInput,
+  webGpuOutput,
+} from "./model-io";
 
 export function createWebGpuModelRunner(): ModelRunner {
   return {
     provider: "webgpu",
     graphNodes: createWebGpuGraphNodes(),
-    prepareInput: prepareWasmInput,
-    preparePreparedHiddenInput: prepareWasmPreparedHiddenInput,
+    prepareInput: prepareWebGpuInput,
+    preparePreparedHiddenInput: prepareWebGpuPreparedHiddenInput,
     segmentRunner: webGpuModelSegmentRunner,
-    output: wasmOutput,
+    output: webGpuOutput,
     decodeToken: decodeWebGpuToken,
   };
 }
@@ -70,43 +65,19 @@ async function decodeWebGpuToken(
   const positions = new Int32Array([options.position]);
   const gpu = await webGpuSegmentRunnerForForward(session, options.state);
 
-  if (gpu.supportsGpuInputPreparation()) {
-    const result = await timedAsync(
-      options.trace,
-      "WebGPU token-id input segment",
-      () => gpu.runTokenIds([tokenId], positions, options.state, {
-        computeSelectedToken: true,
-        topK: options.logitsTopK,
-      }),
+  if (!gpu.supportsGpuInputPreparation()) {
+    throw new Error(
+      "WebGPU direct token decode requires GPU input preparation. " +
+        "Use graph-planned forward.decode() for mixed WASM/WebGPU placement.",
     );
-    options.state.nextPosition = Math.max(options.state.nextPosition, options.position + 1);
-    return {
-      hidden: new Float32Array(),
-      state: options.state,
-      selectedTokenId: result.selectedTokenId,
-      topTokens: result.topTokens ?? [],
-    };
   }
 
-  const prepared = await prepareWasmInput(session, [tokenId], options.trace);
-  const prefix = wasmSegmentRunner({
-    session,
-    manifest: session.manifest,
-    epsilon: session.epsilon,
-    segmentStartLayer: 0,
-    segmentEndLayerExclusive: gpu.segmentStartLayer,
-  });
-  const segmentInputHidden = (await prefix.runTokenHidden(prepared.hidden, positions, options.state, {
-    trace: options.trace,
-    perLayerInputs: prepared.perLayerInputs,
-  })).hidden;
   const result = await timedAsync(
     options.trace,
-    "WebGPU segment",
-    () => gpu.runToken(segmentInputHidden, positions, options.state, {
+    "WebGPU token-id input segment",
+    () => gpu.runTokenIds([tokenId], positions, options.state, {
       computeSelectedToken: true,
       topK: options.logitsTopK,
-      perLayerInputs: prepared.perLayerInputs,
     }),
   );
   options.state.nextPosition = Math.max(options.state.nextPosition, options.position + 1);
@@ -142,21 +113,25 @@ async function webGpuModelSegmentRunner(
     plannedWebGpuStartLayer(options.session, options.state.contextLength, providerOptions.memoryLimitBytes);
 
   if (webGpuStartLayer === undefined || webGpuStartLayer >= options.segmentEndLayerExclusive) {
-    return wasmSegmentRunner(options);
+    throw new Error(
+      "WebGPU model segment runner cannot execute this segment. " +
+        "Use graph-planned execution for mixed WASM/WebGPU placement.",
+    );
+  }
+
+  const segmentStartLayer = Math.max(options.segmentStartLayer, webGpuStartLayer);
+  if (segmentStartLayer > options.segmentStartLayer) {
+    throw new Error(
+      "WebGPU model segment runner cannot execute a WASM prefix inside the WebGPU runner. " +
+        "Use graph-planned execution for mixed WASM/WebGPU placement.",
+    );
   }
 
   const gpu = await webGpuSegmentRunner(options.session, options.state, {
-    segmentStartLayer: Math.max(options.segmentStartLayer, webGpuStartLayer),
+    segmentStartLayer,
+    segmentEndLayerExclusive: options.segmentEndLayerExclusive,
   });
-  if (gpu.segmentStartLayer <= options.segmentStartLayer) {
-    return gpu;
-  }
-
-  const prefix = wasmSegmentRunner({
-    ...options,
-    segmentEndLayerExclusive: gpu.segmentStartLayer,
-  });
-  return new WasmPrefixWebGpuSegmentRunner(prefix, gpu, options.segmentStartLayer);
+  return gpu;
 }
 
 function plannedWebGpuStartLayer(
@@ -178,43 +153,4 @@ function plannedWebGpuStartLayer(
     throw new Error(plan.reason ?? "WebGPU model placement could not be planned.");
   }
   return plan.segments.find((segment) => segment.provider === "webgpu")?.startLayer;
-}
-
-class WasmPrefixWebGpuSegmentRunner implements SegmentRunner {
-  readonly provider = "webgpu" as const;
-  readonly segmentEndLayerExclusive: number;
-  readonly segmentStartLayer: number;
-  private readonly prefix: SegmentRunner;
-  private readonly gpu: SegmentRunner;
-
-  constructor(
-    prefix: SegmentRunner,
-    gpu: SegmentRunner,
-    segmentStartLayer: number,
-  ) {
-    this.prefix = prefix;
-    this.gpu = gpu;
-    this.segmentStartLayer = segmentStartLayer;
-    this.segmentEndLayerExclusive = gpu.segmentEndLayerExclusive;
-  }
-
-  async runTokensHidden(
-    inputHidden: Float32Array,
-    positions: Int32Array,
-    state: InferenceState,
-    options: SegmentRunOptions = {},
-  ): Promise<SegmentHiddenResult> {
-    const prefix = await this.prefix.runTokensHidden(inputHidden, positions, state, options);
-    return this.gpu.runTokensHidden(prefix.hidden, positions, state, options);
-  }
-
-  async runTokenHidden(
-    inputHidden: Float32Array,
-    positions: Int32Array,
-    state: InferenceState,
-    options: SegmentRunOptions = {},
-  ): Promise<SegmentHiddenResult> {
-    const prefix = await this.prefix.runTokenHidden(inputHidden, positions, state, options);
-    return this.gpu.runTokenHidden(prefix.hidden, positions, state, options);
-  }
 }
