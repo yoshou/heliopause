@@ -1,0 +1,4 @@
+interface:
+  display_name: "Build Windows Exe"
+  short_description: "Build the Heliopause Windows executable with Tauri"
+  default_prompt: "Build the Windows exe for Heliopause using the canonical Tauri build workflow."
