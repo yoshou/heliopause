@@ -175,16 +175,21 @@ textarea:disabled {
 }
 
 .form-actions {
-  display: flex;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
   align-items: center;
-  justify-content: space-between;
   gap: 12px;
 }
 
 .form-actions p {
   margin: 0;
+  min-width: 0;
   color: #647064;
   font-size: 0.82rem;
+  overflow: hidden;
+  text-align: center;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .input-actions {
@@ -192,6 +197,17 @@ textarea:disabled {
   align-items: center;
   gap: 8px;
   min-width: 0;
+}
+
+.submit-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.attachment-menu-wrap {
+  position: relative;
+  flex: 0 0 auto;
 }
 
 .generation-error {
@@ -340,8 +356,6 @@ textarea:disabled {
   white-space: nowrap;
 }
 
-.attachment-preview button,
-.image-button,
 .message-audio a {
   min-height: 36px;
   padding: 0 12px;
@@ -354,60 +368,64 @@ textarea:disabled {
   cursor: pointer;
 }
 
-.attachment-preview button:disabled,
-.image-button:has(input:disabled),
-.image-button:disabled {
-  cursor: not-allowed;
-  opacity: 0.5;
-}
-
-.image-button,
 .message-audio a {
   display: inline-grid;
   place-items: center;
   text-decoration: none;
 }
 
-.image-button input {
-  position: absolute;
-  width: 1px;
-  height: 1px;
-  opacity: 0;
-  pointer-events: none;
-}
-
-.form-actions button {
-  min-width: 104px;
-  min-height: 42px;
-  border: 0;
+.icon-button {
+  display: inline-grid;
+  flex: 0 0 auto;
+  place-items: center;
+  width: 42px;
+  height: 42px;
+  padding: 0;
+  border: 1px solid #c9d2cb;
   border-radius: 8px;
-  color: #ffffff;
-  background: #9f4636;
-  font-weight: 850;
+  color: #172026;
+  background: #ffffff;
   cursor: pointer;
 }
 
-.form-actions button:hover:not(:disabled) {
-  background: #85392d;
+.icon-button:hover:not(:disabled) {
+  background: #eef4f1;
 }
 
-.form-actions button:disabled {
+.icon-button:disabled {
   cursor: not-allowed;
   opacity: 0.45;
 }
 
-.form-actions .secondary-button {
+.icon-button--primary {
+  border-color: #9f4636;
+  color: #ffffff;
+  background: #9f4636;
+}
+
+.icon-button--primary:hover:not(:disabled) {
+  border-color: #85392d;
+  background: #85392d;
+}
+
+.icon-button--secondary,
+.icon-button--ghost {
   color: #172026;
   background: #e6ebe6;
 }
 
-.form-actions .secondary-button:hover {
+.icon-button--secondary:hover:not(:disabled),
+.icon-button--ghost:hover:not(:disabled) {
   background: #d6ded7;
 }
 
+.attachment-preview .icon-button {
+  width: 36px;
+  height: 36px;
+}
+
 .form-actions .record-button {
-  min-width: 132px;
-  border: 1px solid #c9d2cb;
+  border-color: #c9d2cb;
   color: #172026;
   background: #ffffff;
 }
@@ -421,6 +439,59 @@ textarea:disabled {
   border-color: #9f4636;
   color: #ffffff;
   background: #9f4636;
+}
+
+.icon-button svg {
+  width: 20px;
+  height: 20px;
+  pointer-events: none;
+}
+
+.icon-button--secondary svg,
+.attachment-preview .icon-button svg {
+  width: 18px;
+  height: 18px;
+}
+
+.attachment-menu {
+  position: absolute;
+  bottom: calc(100% + 8px);
+  left: 0;
+  z-index: 10;
+  display: grid;
+  min-width: 152px;
+  padding: 6px;
+  border: 1px solid #c9d2cb;
+  border-radius: 8px;
+  background: #ffffff;
+  box-shadow: 0 12px 28px rgba(23, 32, 38, 0.16);
+}
+
+.attachment-menu-item {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr);
+  align-items: center;
+  gap: 9px;
+  min-height: 38px;
+  padding: 0 10px;
+  border: 0;
+  border-radius: 6px;
+  color: #172026;
+  background: transparent;
+  font-weight: 800;
+  text-align: left;
+  cursor: pointer;
+}
+
+.attachment-menu-item:hover,
+.attachment-menu-item:focus-visible {
+  background: #eef4f1;
+}
+
+.attachment-menu-item span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .message-audio audio {
@@ -451,19 +522,12 @@ textarea:disabled {
     padding-left: 18px;
   }
 
-  .form-actions {
-    align-items: stretch;
-    flex-direction: column;
-  }
-
   .input-actions {
-    align-items: stretch;
-    flex-direction: column;
+    flex-wrap: wrap;
   }
 
-  .form-actions .record-button,
-  .image-button {
-    width: 100%;
+  .icon-button {
+    width: 42px;
   }
 
   .message-audio {

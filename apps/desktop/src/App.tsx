@@ -1,4 +1,5 @@
 import { ChangeEvent, ClipboardEvent, DragEvent, FormEvent, KeyboardEvent, PointerEvent, useEffect, useMemo, useRef, useState } from "react";
+import { FileArchive, Image, Mic, Plus, SendHorizontal, Square, X } from "lucide-react";
 import {
   DEFAULT_SYSTEM_PROMPT,
   stripThinking,
@@ -107,6 +108,7 @@ function App() {
   const [isDraggingFiles, setIsDraggingFiles] = useState(false);
   const [imageAttachment, setImageAttachment] = useState<UiImageAttachment | undefined>();
   const [recordingState, setRecordingState] = useState<RecordingState>("idle");
+  const [isAttachmentMenuOpen, setIsAttachmentMenuOpen] = useState(false);
   const [messages, setMessages] = useState<UiMessage[]>(() => [
     createAssistantMessage(INITIAL_ASSISTANT_CONTENT),
   ]);
@@ -114,6 +116,8 @@ function App() {
   const [generationError, setGenerationError] = useState<string | undefined>();
   const workerRef = useRef<Worker | null>(null);
   const modelFilesInputRef = useRef<HTMLInputElement | null>(null);
+  const imageInputRef = useRef<HTMLInputElement | null>(null);
+  const attachmentMenuRef = useRef<HTMLDivElement | null>(null);
   const nextRequestIdRef = useRef(1);
   const pendingRequestsRef = useRef(new Map<number, PendingRequest>());
   const generationRequestRef = useRef<{ requestId: number; worker: Worker } | null>(null);
@@ -155,6 +159,12 @@ function App() {
       : recordingState === "processing"
         ? "Preparing audio..."
         : "Hold to record";
+  const addAttachmentLabel = model.status === "ready"
+    ? model.supportsImages ? "Add image" : "Images unavailable for this model"
+    : model.status === "loading" ? "Loading model..." : "Choose model files";
+  const canAddAttachment = model.status === "ready"
+    ? model.supportsImages && !isGenerating
+    : model.status !== "loading" && !isGenerating;
 
   useEffect(() => {
     imageAttachmentRef.current = imageAttachment;
@@ -181,6 +191,7 @@ function App() {
   useEffect(() => {
     function handleWindowBlur() {
       void stopRecording();
+      setIsAttachmentMenuOpen(false);
     }
     window.addEventListener("blur", handleWindowBlur);
     return () => {
@@ -188,8 +199,35 @@ function App() {
     };
   }, []);
 
+  useEffect(() => {
+    function handlePointerDown(event: globalThis.PointerEvent) {
+      if (!attachmentMenuRef.current?.contains(event.target as Node | null)) {
+        setIsAttachmentMenuOpen(false);
+      }
+    }
+
+    function handleKeyDown(event: globalThis.KeyboardEvent) {
+      if (event.key === "Escape") {
+        setIsAttachmentMenuOpen(false);
+      }
+    }
+
+    document.addEventListener("pointerdown", handlePointerDown);
+    document.addEventListener("keydown", handleKeyDown);
+    return () => {
+      document.removeEventListener("pointerdown", handlePointerDown);
+      document.removeEventListener("keydown", handleKeyDown);
+    };
+  }, []);
+
   function handleModelFilesChange(event: ChangeEvent<HTMLInputElement>) {
     const files = Array.from(event.target.files ?? []);
+    setIsAttachmentMenuOpen(false);
+    if (model.status === "ready") {
+      event.target.value = "";
+      setGenerationError("Model selection is locked after loading.");
+      return;
+    }
     if (files.length === 0) {
       return;
     }
@@ -198,10 +236,15 @@ function App() {
   }
 
   function addGgufFiles(files: File[]) {
+    if (model.status === "ready") {
+      setGenerationError("Model selection is locked after loading.");
+      return;
+    }
+
     const ggufs = files.filter(isGgufFile);
     const rejectedImages = files.some((file) => file.type.startsWith("image/"));
     if (ggufs.length === 0) {
-      const message = rejectedImages && model.status !== "ready"
+      const message = rejectedImages
         ? "Load a GGUF model before attaching images."
         : "Add GGUF files to load a model.";
       setGgufError(message);
@@ -350,8 +393,38 @@ function App() {
     } satisfies EngineWorkerRequest);
   }
 
+  function handleAddAttachmentClick() {
+    if (!canAddAttachment) {
+      return;
+    }
+    setIsAttachmentMenuOpen((isOpen) => !isOpen);
+  }
+
+  function handleModelMenuSelect() {
+    if (model.status === "ready") {
+      setIsAttachmentMenuOpen(false);
+      setGenerationError("Model selection is locked after loading.");
+      return;
+    }
+    setIsAttachmentMenuOpen(false);
+    modelFilesInputRef.current?.click();
+  }
+
+  function handleImageMenuSelect() {
+    if (model.status === "ready") {
+      setIsAttachmentMenuOpen(false);
+      imageInputRef.current?.click();
+      return;
+    }
+    setIsAttachmentMenuOpen(false);
+    const message = "Load a GGUF model before attaching images.";
+    setGgufError(message);
+    appendAssistantMessage(message);
+  }
+
   function handleImageFileChange(event: ChangeEvent<HTMLInputElement>) {
     const file = event.target.files?.[0];
+    setIsAttachmentMenuOpen(false);
     if (file) {
       setNextImageAttachment(file);
     }
@@ -393,7 +466,12 @@ function App() {
     setIsDraggingFiles(false);
 
     const ggufs = files.filter(isGgufFile);
-    if (ggufs.length > 0 || model.status !== "ready") {
+    if (model.status === "ready" && ggufs.length > 0) {
+      setGenerationError("Model selection is locked after loading.");
+      return;
+    }
+
+    if (model.status !== "ready") {
       addGgufFiles(files);
       return;
     }
@@ -458,6 +536,16 @@ function App() {
   }
 
   function setNextImageAttachment(file: File) {
+    if (model.status !== "ready") {
+      const message = "Load a GGUF model before attaching images.";
+      setGgufError(message);
+      appendAssistantMessage(message);
+      return;
+    }
+    if (!model.supportsImages) {
+      setGenerationError("This model does not support images.");
+      return;
+    }
     if (imageAttachment) {
       URL.revokeObjectURL(imageAttachment.url);
     }
@@ -868,7 +956,15 @@ function App() {
             accept=".gguf"
             multiple
             onChange={handleModelFilesChange}
-            disabled={model.status === "loading" || isGenerating}
+            disabled={model.status === "ready" || model.status === "loading" || isGenerating}
+          />
+          <input
+            ref={imageInputRef}
+            className="visually-hidden-input"
+            type="file"
+            accept="image/*"
+            onChange={handleImageFileChange}
+            disabled={model.status !== "ready" || isGenerating || !model.supportsImages}
           />
           {isGgufComposerActive ? (
             <GgufComposer
@@ -900,8 +996,15 @@ function App() {
                 <div className="attachment-preview">
                   <img src={imageAttachment.url} alt="" />
                   <span>{imageAttachment.fileName}</span>
-                  <button type="button" onClick={clearImageAttachment} disabled={isGenerating}>
-                    Remove
+                  <button
+                    type="button"
+                    className="icon-button icon-button--ghost"
+                    aria-label="Remove image"
+                    title="Remove image"
+                    onClick={clearImageAttachment}
+                    disabled={isGenerating}
+                  >
+                    <X aria-hidden="true" size={18} />
                   </button>
                 </div>
               ) : null}
@@ -912,52 +1015,92 @@ function App() {
           )}
           <div className="form-actions">
             <div className="input-actions">
-              <button
-                type="button"
-                className="image-button"
-                onClick={() => modelFilesInputRef.current?.click()}
-                disabled={model.status === "loading" || isGenerating}
-              >
-                Models
-              </button>
-              {!isGgufComposerActive ? (
-                <>
-                  <label className="image-button">
-                    Image
-                    <input
-                      type="file"
-                      accept="image/*"
-                      onChange={handleImageFileChange}
-                      disabled={isGenerating || (model.status === "ready" && !model.supportsImages)}
-                    />
-                  </label>
-                  <button
-                    type="button"
-                    className={`record-button${recordingState === "recording" ? " record-button--active" : ""}`}
-                    onPointerDown={handleRecordPointerDown}
-                    onPointerUp={handleRecordPointerUp}
-                    onPointerCancel={handleRecordPointerCancel}
-                    onPointerLeave={handleRecordPointerCancel}
-                    onKeyDown={handleRecordKeyDown}
-                    onKeyUp={handleRecordKeyUp}
-                    disabled={!canRecordAudio}
-                    aria-pressed={recordingState === "recording"}
-                  >
-                    {recordingLabel}
-                  </button>
-                </>
-              ) : null}
+              <div className="attachment-menu-wrap" ref={attachmentMenuRef}>
+                <button
+                  type="button"
+                  className="icon-button"
+                  aria-label={addAttachmentLabel}
+                  aria-haspopup="menu"
+                  aria-expanded={isAttachmentMenuOpen}
+                  title={addAttachmentLabel}
+                  onClick={handleAddAttachmentClick}
+                  disabled={!canAddAttachment}
+                >
+                  <Plus aria-hidden="true" size={20} />
+                </button>
+                {isAttachmentMenuOpen ? (
+                  <div className="attachment-menu" role="menu">
+                    {model.status === "ready" ? (
+                      <button
+                        type="button"
+                        className="attachment-menu-item"
+                        role="menuitem"
+                        onClick={handleImageMenuSelect}
+                      >
+                        <Image aria-hidden="true" size={18} />
+                        <span>Image</span>
+                      </button>
+                    ) : (
+                      <button
+                        type="button"
+                        className="attachment-menu-item"
+                        role="menuitem"
+                        onClick={handleModelMenuSelect}
+                      >
+                        <FileArchive aria-hidden="true" size={18} />
+                        <span>Model</span>
+                      </button>
+                    )}
+                  </div>
+                ) : null}
+              </div>
             </div>
             <p>{composerStatusLabel(model, prompt, ggufFiles.length)}</p>
-            {isGenerating ? (
-              <button type="button" className="secondary-button" onClick={handleStop}>
-                Stop
-              </button>
-            ) : (
-              <button type="submit" disabled={!canSubmit}>
-                {model.status === "loading" ? "Loading..." : ggufConfirmation ? "Load" : "Send"}
-              </button>
-            )}
+            <div className="submit-actions">
+              {!isGgufComposerActive ? (
+                <button
+                  type="button"
+                  className={`icon-button record-button${recordingState === "recording" ? " record-button--active" : ""}`}
+                  onPointerDown={handleRecordPointerDown}
+                  onPointerUp={handleRecordPointerUp}
+                  onPointerCancel={handleRecordPointerCancel}
+                  onPointerLeave={handleRecordPointerCancel}
+                  onKeyDown={handleRecordKeyDown}
+                  onKeyUp={handleRecordKeyUp}
+                  disabled={!canRecordAudio}
+                  aria-label={recordingLabel}
+                  aria-pressed={recordingState === "recording"}
+                  title={recordingLabel}
+                >
+                  <Mic aria-hidden="true" size={20} />
+                </button>
+              ) : null}
+              {isGenerating ? (
+                <button
+                  type="button"
+                  className="icon-button icon-button--secondary"
+                  aria-label="Stop generation"
+                  title="Stop generation"
+                  onClick={handleStop}
+                >
+                  <Square aria-hidden="true" size={18} />
+                </button>
+              ) : (
+                <button
+                  type="submit"
+                  className="icon-button icon-button--primary"
+                  aria-label={model.status === "loading" ? "Loading..." : ggufConfirmation ? "Load model" : "Send"}
+                  title={model.status === "loading" ? "Loading..." : ggufConfirmation ? "Load model" : "Send"}
+                  disabled={!canSubmit}
+                >
+                  {isGgufComposerActive ? (
+                    <FileArchive aria-hidden="true" size={20} />
+                  ) : (
+                    <SendHorizontal aria-hidden="true" size={20} />
+                  )}
+                </button>
+              )}
+            </div>
           </div>
         </form>
       </section>
