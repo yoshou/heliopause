@@ -25,16 +25,17 @@ export async function dispatchVisionPreprocessor(
   ) => VisionPixelValues,
   options: VisionPreprocessOptions = {},
 ): Promise<VisionPixelValues> {
-  for (const provider of session.preprocessProviders) {
-    throwIfAborted(options.signal);
-    const runner = visionPreprocessRunner(runners, provider.name);
-    const result = await runner.run(session, input, visionPreprocess, options);
-    if (result) {
-      return result;
-    }
+  const provider = session.preprocessProviders[0];
+  if (!provider) {
+    throw new Error("No vision preprocessor provider was selected.");
+  }
+  throwIfAborted(options.signal);
+  const runner = visionPreprocessRunner(runners, provider.name);
+  const result = await runner.run(session, input, visionPreprocess, options);
+  if (!result) {
     throw new Error(`Vision preprocess provider ${provider.name} did not return a result.`);
   }
-  throw new Error("No vision preprocessor provider was selected.");
+  return result;
 }
 
 export async function dispatchVisionEncoder(
@@ -42,11 +43,12 @@ export async function dispatchVisionEncoder(
   session: VisionSession,
   pixels: VisionPixelValues,
 ): Promise<VisionEncodeResult> {
-  for (const provider of session.providers) {
-    const runner = visionEncoderRunner(runners, provider.name);
-    return runner.run(session, pixels);
+  const provider = session.providers[0];
+  if (!provider) {
+    throw new Error("No vision encoder provider was selected.");
   }
-  throw new Error("No vision encoder provider was selected.");
+  const runner = visionEncoderRunner(runners, provider.name);
+  return runner.run(session, pixels);
 }
 
 function visionPreprocessRunner(

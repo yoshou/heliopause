@@ -312,8 +312,12 @@ function modelRuntimeForForward(session: ModelSession, state: InferenceState): P
     throw new Error(plan.reason ?? "No model placement was planned.");
   }
   const primaryProvider = "provider" in plan.nodes[0] ? plan.nodes[0].provider : firstRuntime.provider.name;
+  const primary = providers.get(primaryProvider);
+  if (!primary) {
+    throw new Error(`No model runner was supplied for planned ${primaryProvider} provider.`);
+  }
   return {
-    primary: providers.get(primaryProvider) ?? firstRuntime,
+    primary,
     providers,
     nodes: plan.nodes,
   };

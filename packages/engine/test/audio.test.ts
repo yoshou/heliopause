@@ -89,6 +89,16 @@ test("audio session rejects unknown preprocess provider order", () => {
   );
 });
 
+test("audio session rejects empty preprocess provider order", () => {
+  assert.throws(
+    () => createAudioSession(audioTensorReader([]), {
+      providers: [createReferenceProvider()],
+      preprocessProviderOrder: [],
+    }),
+    /At least one preprocess provider is required/,
+  );
+});
+
 test("audio preprocessor errors instead of falling back when WebGPU is unavailable", async () => {
   const session = createAudioSession(audioTensorReader([]), {
     preprocessProviderOrder: [

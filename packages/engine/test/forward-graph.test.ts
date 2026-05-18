@@ -481,6 +481,28 @@ test("prepared hidden state does not create unplanned provider imports", async (
   ]);
 });
 
+test("planned provider requires a matching model runtime", async () => {
+  const executed: string[] = [];
+  const reader = tensorReaderFromGguf({
+    ...minimalGguf(),
+    metadata: {
+      ...minimalGguf().metadata,
+      "gemma4.block_count": 3,
+    },
+  });
+  const session = createModelSession(reader, {
+    providers: [
+      fakeProvider("wasm", executed, 30, { requirementsProvider: "webgpu" }),
+    ],
+  });
+
+  await assert.rejects(
+    prefill(session, session.createInferenceState(), [1]),
+    /No model runner was supplied for planned webgpu provider/,
+  );
+  assert.deepEqual(executed, []);
+});
+
 test("planned segments require segment graph capability", async () => {
   const executed: string[] = [];
   const reader = tensorReaderFromGguf({
@@ -589,7 +611,10 @@ function fakeProvider(
   name: "wasm" | "webgpu",
   executed: string[],
   memoryLimitBytes = 1_000,
-  options: { missingGraphNode?: keyof ModelGraphRunner } = {},
+  options: {
+    missingGraphNode?: keyof ModelGraphRunner;
+    requirementsProvider?: "wasm" | "webgpu";
+  } = {},
 ): ModelRunnerProvider {
   const hidden = () => new Float32Array([1, 0, 0, 0]);
   const hiddenNode = (id: string, deps: string[] = []): ForwardRunnerNode => ({
@@ -654,7 +679,7 @@ function fakeProvider(
       }
       return graph as ModelGraphRunner;
     },
-    modelResourceRequirements: () => fakeRequirements(name, memoryLimitBytes),
+    modelResourceRequirements: () => fakeRequirements(options.requirementsProvider ?? name, memoryLimitBytes),
   };
 }
 

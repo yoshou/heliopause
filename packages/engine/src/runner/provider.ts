@@ -67,6 +67,9 @@ export function resolveProviderOrder<TProvider extends RunnerProvider>(
   if (!order) {
     return providers;
   }
+  if (order.length === 0) {
+    throw new Error("At least one preprocess provider is required.");
+  }
 
   const providerByName = new Map(providers.map((provider) => [provider.name, provider]));
   return order.map((name) => {

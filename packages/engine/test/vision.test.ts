@@ -203,6 +203,22 @@ test("Vision preprocessor errors instead of falling back when WASM is unavailabl
   }
 });
 
+test("Vision session rejects empty preprocess provider order", () => {
+  const reader = visionTensorReader([
+    f32Tensor("v.patch_embd.weight", [1, 1, 3, 2], new Float32Array(6)),
+  ], {
+    "clip.vision.projector.scale_factor": 1,
+  });
+
+  assert.throws(
+    () => createVisionSession(reader, {
+      providers: [createReferenceProvider()],
+      preprocessProviderOrder: [],
+    }),
+    /At least one preprocess provider is required/,
+  );
+});
+
 test("Vision WebGPU preprocessor errors when unavailable", async () => {
   const reader = visionTensorReader([
     f32Tensor("v.patch_embd.weight", [1, 1, 3, 2], new Float32Array(6)),

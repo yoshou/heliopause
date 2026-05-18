@@ -21,16 +21,17 @@ export async function dispatchAudioPreprocessor(
   audioPreprocess: (audio: AudioPcmInput, manifest: AudioPreprocessConfig) => AudioFeatures,
   options: AudioPreprocessOptions = {},
 ): Promise<AudioFeatures> {
-  for (const provider of session.preprocessProviders) {
-    throwIfAborted(options.signal);
-    const runner = audioPreprocessRunner(runners, provider.name);
-    const result = await runner.run(session, audio, audioPreprocess, options);
-    if (result) {
-      return result;
-    }
+  const provider = session.preprocessProviders[0];
+  if (!provider) {
+    throw new Error("No audio preprocessor provider was selected.");
+  }
+  throwIfAborted(options.signal);
+  const runner = audioPreprocessRunner(runners, provider.name);
+  const result = await runner.run(session, audio, audioPreprocess, options);
+  if (!result) {
     throw new Error(`Audio preprocess provider ${provider.name} did not return a result.`);
   }
-  throw new Error("No audio preprocessor provider was selected.");
+  return result;
 }
 
 export async function dispatchAudioEncoder(
@@ -39,11 +40,12 @@ export async function dispatchAudioEncoder(
   features: AudioFeatures,
   options: { signal?: AbortSignal } = {},
 ): Promise<AudioEncodeResult> {
-  for (const provider of session.providers) {
-    const runner = audioEncoderRunner(runners, provider.name);
-    return runner.run(session, features, options);
+  const provider = session.providers[0];
+  if (!provider) {
+    throw new Error("No audio encoder provider was selected.");
   }
-  throw new Error("No audio encoder provider was selected.");
+  const runner = audioEncoderRunner(runners, provider.name);
+  return runner.run(session, features, options);
 }
 
 function audioPreprocessRunner(
