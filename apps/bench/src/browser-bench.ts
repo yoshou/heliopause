@@ -21,7 +21,7 @@ import { createKMatMulBindResources, createQ8_0MatMulBindResources } from "../..
 import {
   quantizeQ8_0Columns,
   quantizeQ8_KColumns,
-  packBytesToU32,
+  quantizedWeightUploadBytes,
   webGpuQuantizedWeightLayout,
 } from "../../../packages/engine/src/runner/webgpu/quantized-handles";
 import type { WebGpuBufferLike, WebGpuComputePassLike, WebGpuDeviceLike, WebGpuQuantizedWeightHandleInternal } from "../../../packages/engine/src/runner/webgpu/gpu-types";
@@ -858,7 +858,7 @@ function createTimestampQuantizedHandle(
   rowCount: number,
 ): WebGpuQuantizedWeightHandleInternal {
   const layout = webGpuQuantizedWeightLayout(type, inputSize);
-  const packedWeight = packBytesToU32(weightBytes);
+  const packedWeight = quantizedWeightUploadBytes(weightBytes);
   const weightBuffer = storageBuffer(device, packedWeight.byteLength, GPU_COPY_DST);
   device.queue.writeBuffer(weightBuffer, 0, packedWeight);
   return {
