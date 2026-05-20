@@ -120,6 +120,7 @@ function App() {
   const modelFilesInputRef = useRef<HTMLInputElement | null>(null);
   const imageInputRef = useRef<HTMLInputElement | null>(null);
   const attachmentMenuRef = useRef<HTMLDivElement | null>(null);
+  const messagePanelRef = useRef<HTMLDivElement | null>(null);
   const nextRequestIdRef = useRef(1);
   const pendingRequestsRef = useRef(new Map<number, PendingRequest>());
   const generationRequestRef = useRef<{ requestId: number; worker: Worker } | null>(null);
@@ -175,6 +176,17 @@ function App() {
   useEffect(() => {
     messagesRef.current = messages;
   }, [messages]);
+
+  useEffect(() => {
+    const messagePanel = messagePanelRef.current;
+    if (!messagePanel) {
+      return;
+    }
+    messagePanel.scrollTo({
+      top: messagePanel.scrollHeight,
+      behavior: isGenerating ? "auto" : "smooth",
+    });
+  }, [isGenerating, messages]);
 
   useEffect(() => () => {
     const worker = workerRef.current;
@@ -948,7 +960,7 @@ function App() {
   return (
     <main className="app-shell">
       <section className="chat-workspace" aria-label="Chat">
-        <div className="message-panel" aria-live="polite">
+        <div ref={messagePanelRef} className="message-panel" aria-live="polite">
           {messages.map((message) => (
             <MessageBubble
               isGenerating={isGenerating}
