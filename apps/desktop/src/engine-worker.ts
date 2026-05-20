@@ -1,4 +1,8 @@
 import {
+  DEFAULT_MAX_TOOL_STEPS,
+  generateAgentTurn,
+} from "@heliopause/agent";
+import {
   buildTokenizer,
   cloneInferenceState,
   createAudioSession,
@@ -13,7 +17,6 @@ import {
   estimateWeightCacheBytes,
   generatePreparedAudioChatTurn,
   generatePreparedImageChatTurn,
-  generateChatTurn,
   getGgufModelName,
   isAudioGguf,
   isVisionGguf,
@@ -29,6 +32,11 @@ import {
   type Tokenizer,
   type VisionSession,
 } from "@heliopause/engine";
+import { createVirtualFileSystem } from "@heliopause/sandbox";
+import {
+  executeSandboxAgentTool,
+  SANDBOX_AGENT_TOOLS,
+} from "./agent-sandbox-tools";
 import type {
   EngineWorkerRequest,
   EngineWorkerResponse,
@@ -37,7 +45,7 @@ import type {
   SystemMemoryInfo,
 } from "./engine-worker-protocol";
 
-const CHAT_CONTEXT_LENGTH = 4096;
+const CHAT_CONTEXT_LENGTH = 16_384;
 const LOW_WEIGHT_CACHE_BYTES = 768 * 1024 * 1024;
 const FULL_WEIGHT_CACHE_LIMIT_BYTES = 32 * 1024 * 1024 * 1024;
 const FULL_WEIGHT_CACHE_HEADROOM = 1.25;
@@ -48,6 +56,7 @@ let audioSession: AudioSession | undefined;
 let tokenizer: Tokenizer | undefined;
 let currentState: InferenceState | undefined;
 let currentSystemPrompt: string | undefined;
+const sandboxFs = createVirtualFileSystem();
 let activeGeneration:
   | {
       requestId: number;
@@ -94,6 +103,7 @@ async function handleLoadModel(
   tokenizer = undefined;
   currentState = undefined;
   currentSystemPrompt = undefined;
+  sandboxFs.reset();
 
   const tensorReader = await createFileGgufTensorReader(request.file);
   let nextVisionSession: VisionSession | undefined;
@@ -277,12 +287,27 @@ async function handleGenerateTurn(
         turnOptions,
       );
     } else {
-      await generateChatTurn(
+      await generateAgentTurn(
         session,
         tokenizer,
         workingState,
         request.userContent,
-        turnOptions,
+        {
+          ...turnOptions,
+          tools: SANDBOX_AGENT_TOOLS,
+          executeTool: (call, signal) => executeSandboxAgentTool(sandboxFs, call, signal),
+          maxToolSteps: DEFAULT_MAX_TOOL_STEPS,
+          onAgentEvent(event) {
+            if (event.type === "text") {
+              return;
+            }
+            workerScope.postMessage({
+              type: "agentEvent",
+              requestId: request.requestId,
+              event,
+            });
+          },
+        },
       );
     }
 

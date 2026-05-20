@@ -42,9 +42,15 @@ importers:
 
   apps/desktop:
     dependencies:
+      '@heliopause/agent':
+        specifier: workspace:*
+        version: link:../../packages/agent
       '@heliopause/engine':
         specifier: workspace:*
         version: link:../../packages/engine
+      '@heliopause/sandbox':
+        specifier: workspace:*
+        version: link:../../packages/sandbox
       '@tauri-apps/api':
         specifier: ^2.9.0
         version: 2.11.0

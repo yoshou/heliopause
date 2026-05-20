@@ -9,6 +9,7 @@ import type {
   EngineWorkerResponse,
   MemoryProfile,
   SystemMemoryInfo,
+  WorkerAgentEvent,
   WorkerModelInfo,
 } from "./engine-worker-protocol";
 
@@ -19,6 +20,7 @@ type UiMessage = {
   files?: UiFileAttachment[];
   image?: UiImageAttachment;
   audio?: UiAudioAttachment;
+  agentEvents?: WorkerAgentEvent[];
   inferenceDurationMs?: number;
 };
 
@@ -878,6 +880,20 @@ function App() {
     }
 
     if (pending.type !== "generate") {
+      return;
+    }
+
+    if (message.type === "agentEvent") {
+      setMessages((currentMessages) =>
+        currentMessages.map((uiMessage) =>
+          uiMessage.id === pending.assistantId
+            ? {
+                ...uiMessage,
+                agentEvents: [...(uiMessage.agentEvents ?? []), message.event],
+              }
+            : uiMessage,
+        ),
+      );
       return;
     }
 

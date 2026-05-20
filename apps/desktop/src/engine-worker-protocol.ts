@@ -1,4 +1,8 @@
+import type { AgentEvent } from "@heliopause/agent";
+
 export type MemoryProfile = "auto" | "low" | "full";
+
+export type WorkerAgentEvent = Exclude<AgentEvent, { type: "text" }>;
 
 export type ResolvedRuntimeProfile = {
   requested: MemoryProfile;
@@ -82,6 +86,11 @@ export type EngineWorkerResponse =
       type: "generationChunk";
       requestId: number;
       content: string;
+    }
+  | {
+      type: "agentEvent";
+      requestId: number;
+      event: WorkerAgentEvent;
     }
   | {
       type: "generationDone";

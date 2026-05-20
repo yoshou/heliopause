@@ -473,6 +473,7 @@ export class WebGpuSegmentRunner implements SegmentRunner {
     readbackCount: number;
     resourceStats?: ReturnType<WebGpuRuntimeResourceCache["stats"]>;
   } {
+    this.arena.destroyScratchBuffers();
     this.activeRunEncodeMs = 0;
     this.activeRunSubmitMs = 0;
     this.activeRunReadbackWaitMs = 0;
@@ -528,10 +529,12 @@ export class WebGpuSegmentRunner implements SegmentRunner {
       }
       this.firstRunTotalMs = durationMs;
       this.hasRecordedFirstRun = true;
+      this.arena.destroyScratchBuffers();
       return;
     }
     this.steadyRunMs = durationMs;
     this.steadyRunCount += 1;
+    this.arena.destroyScratchBuffers();
   }
 
   private submitCommandBuffer(commandBuffer: unknown): void {
@@ -541,6 +544,13 @@ export class WebGpuSegmentRunner implements SegmentRunner {
       this.submitCount += 1;
     } finally {
       this.activeRunSubmitMs += nowMs() - startMs;
+    }
+  }
+
+  private async waitForSubmittedWorkDone(): Promise<void> {
+    const done = this.arena.device.queue.onSubmittedWorkDone?.();
+    if (done) {
+      await done;
     }
   }
 
@@ -1174,8 +1184,7 @@ export class WebGpuSegmentRunner implements SegmentRunner {
     }
 
     const gpuState = this.ensureGpuState(state);
-    const cleanup: GpuResource[] = [];
-    const resources: Array<{ destroy: () => void }> = [];
+    const persistentCleanup: GpuResource[] = [];
     const hiddenSize = this.manifest.embeddingLength;
     const hiddenByteLength = hiddenSize * Float32Array.BYTES_PER_ELEMENT;
     const outputTokenCount = readHidden
@@ -1194,10 +1203,9 @@ export class WebGpuSegmentRunner implements SegmentRunner {
         webGpuGpuDetailedTimingEnabled()
       );
 
-    const perLayerInputsBuffer = this.prepareBatchedPerLayerInputBuffer(options, cleanup);
+    const perLayerInputsBuffer = this.prepareBatchedPerLayerInputBuffer(options, persistentCleanup);
 
     const encodeStartMs = nowMs();
-    const encoder = this.arena.device.createCommandEncoder();
     if (readHidden) {
       hiddenReadback = this.arena.device.createBuffer({
         size: outputByteLength,
@@ -1212,93 +1220,104 @@ export class WebGpuSegmentRunner implements SegmentRunner {
       // Match llama.cpp: non-causal attention is evaluated as one physical batch.
       const prefillChunkSize = options.attentionCausal === false ? tokenCount : this.prefillChunkSize;
       for (let chunkStart = 0; chunkStart < tokenCount; chunkStart += prefillChunkSize) {
+        const cleanup: GpuResource[] = [];
+        const resources: Array<{ destroy: () => void }> = [];
+        const encoder = this.arena.device.createCommandEncoder();
         const chunkTokenCount = Math.min(prefillChunkSize, tokenCount - chunkStart);
         const chunkByteLength = chunkTokenCount * hiddenByteLength;
-        const chunkPositions = tokenPositions.slice(chunkStart, chunkStart + chunkTokenCount);
-        const positionsBuffer = this.createPositionsBuffer(chunkPositions, cleanup, `prefill.positions.${chunkStart}`);
-        let currentBatch = this.arena.createScratchBuffer(
-          `prefill.chunk.${chunkStart}.input`,
-          chunkByteLength,
-          GPU_STORAGE | GPU_COPY_SRC | GPU_COPY_DST,
-        );
-        cleanup.push(currentBatch);
-        encoder.copyBufferToBuffer(boundary, chunkStart * hiddenByteLength, currentBatch, 0, chunkByteLength);
-
-        let compute = this.beginComputePass(encoder, profileGpuPass, `prefill.chunk.${chunkStart}`);
-        for (const layer of this.layers) {
-          currentBatch = this.dispatchBatchedLayer(
-            compute.pass,
-            layer,
-            gpuState,
-            currentBatch,
-            positionsBuffer,
-            chunkPositions,
-            state.contextLength,
-            {
-              ...options,
-              perLayerInputsBuffer,
-              sourceTokenIndex: chunkStart,
-              sourceTokenCount: tokenCount,
-            },
-            cleanup,
-            resources,
+        try {
+          const chunkPositions = tokenPositions.slice(chunkStart, chunkStart + chunkTokenCount);
+          const positionsBuffer = this.createPositionsBuffer(chunkPositions, cleanup, `prefill.positions.${chunkStart}`);
+          let currentBatch = this.arena.createScratchBuffer(
+            `prefill.chunk.${chunkStart}.input`,
+            chunkByteLength,
+            GPU_STORAGE | GPU_COPY_SRC | GPU_COPY_DST,
           );
-        }
+          cleanup.push(currentBatch);
+          encoder.copyBufferToBuffer(boundary, chunkStart * hiddenByteLength, currentBatch, 0, chunkByteLength);
 
-        const isLastChunk = chunkStart + chunkTokenCount >= tokenCount;
-        let topBuffer: WebGpuBufferLike | undefined;
-        let selectedTokenBuffer: WebGpuBufferLike | undefined;
-        const lastHiddenOffset = (chunkTokenCount - 1) * hiddenByteLength;
-        const selectedHidden = isLastChunk &&
-            this.segmentEndLayerExclusive === this.manifest.blockCount &&
-            chunkTokenCount > 1 &&
-            (options.computeTopK === true || options.computeSelectedToken === true)
-          ? this.createLastTokenView(compute.pass, resources, currentBatch, cleanup, chunkTokenCount)
-          : currentBatch;
-
-        if (isLastChunk && options.computeTopK === true) {
-          candidateCount = Math.max(1, options.topK ?? 1);
-          const outputStripes = this.requireOutputStripes();
-          candidateByteLength = outputStripes.length * candidateCount * 2 * Float32Array.BYTES_PER_ELEMENT;
-          topBuffer = this.dispatchOutputTopK(compute.pass, selectedHidden, candidateCount, cleanup, resources);
-          topReadback = this.arena.device.createBuffer({
-            size: candidateByteLength,
-            usage: GPU_MAP_READ | GPU_COPY_DST,
-          });
-        }
-        if (isLastChunk && options.computeSelectedToken === true) {
-          selectedTokenBuffer = this.dispatchOutputSelectedToken(compute.pass, selectedHidden, cleanup, resources);
-          selectedTokenReadback = this.arena.device.createBuffer({
-            size: Uint32Array.BYTES_PER_ELEMENT,
-            usage: GPU_MAP_READ | GPU_COPY_DST,
-          });
-        }
-
-        this.endComputePass(encoder, compute);
-        if (hiddenReadback) {
-          if (this.segmentEndLayerExclusive === this.manifest.blockCount) {
-            if (isLastChunk) {
-              encoder.copyBufferToBuffer(currentBatch, lastHiddenOffset, hiddenReadback, 0, hiddenByteLength);
-            }
-          } else {
-            encoder.copyBufferToBuffer(currentBatch, 0, hiddenReadback, chunkStart * hiddenByteLength, chunkByteLength);
+          let compute = this.beginComputePass(encoder, profileGpuPass, `prefill.chunk.${chunkStart}`);
+          for (const layer of this.layers) {
+            currentBatch = this.dispatchBatchedLayer(
+              compute.pass,
+              layer,
+              gpuState,
+              currentBatch,
+              positionsBuffer,
+              chunkPositions,
+              state.contextLength,
+              {
+                ...options,
+                perLayerInputsBuffer,
+                sourceTokenIndex: chunkStart,
+                sourceTokenCount: tokenCount,
+              },
+              cleanup,
+              resources,
+            );
           }
-        }
-        if (topReadback && topBuffer) {
-          encoder.copyBufferToBuffer(topBuffer, 0, topReadback, 0, candidateByteLength);
-        }
-        if (selectedTokenReadback && selectedTokenBuffer) {
-          encoder.copyBufferToBuffer(selectedTokenBuffer, 0, selectedTokenReadback, 0, Uint32Array.BYTES_PER_ELEMENT);
+
+          const isLastChunk = chunkStart + chunkTokenCount >= tokenCount;
+          let topBuffer: WebGpuBufferLike | undefined;
+          let selectedTokenBuffer: WebGpuBufferLike | undefined;
+          const lastHiddenOffset = (chunkTokenCount - 1) * hiddenByteLength;
+          const selectedHidden = isLastChunk &&
+              this.segmentEndLayerExclusive === this.manifest.blockCount &&
+              chunkTokenCount > 1 &&
+              (options.computeTopK === true || options.computeSelectedToken === true)
+            ? this.createLastTokenView(compute.pass, resources, currentBatch, cleanup, chunkTokenCount)
+            : currentBatch;
+
+          if (isLastChunk && options.computeTopK === true) {
+            candidateCount = Math.max(1, options.topK ?? 1);
+            const outputStripes = this.requireOutputStripes();
+            candidateByteLength = outputStripes.length * candidateCount * 2 * Float32Array.BYTES_PER_ELEMENT;
+            topBuffer = this.dispatchOutputTopK(compute.pass, selectedHidden, candidateCount, cleanup, resources);
+            topReadback = this.arena.device.createBuffer({
+              size: candidateByteLength,
+              usage: GPU_MAP_READ | GPU_COPY_DST,
+            });
+          }
+          if (isLastChunk && options.computeSelectedToken === true) {
+            selectedTokenBuffer = this.dispatchOutputSelectedToken(compute.pass, selectedHidden, cleanup, resources);
+            selectedTokenReadback = this.arena.device.createBuffer({
+              size: Uint32Array.BYTES_PER_ELEMENT,
+              usage: GPU_MAP_READ | GPU_COPY_DST,
+            });
+          }
+
+          this.endComputePass(encoder, compute);
+          if (hiddenReadback) {
+            if (this.segmentEndLayerExclusive === this.manifest.blockCount) {
+              if (isLastChunk) {
+                encoder.copyBufferToBuffer(currentBatch, lastHiddenOffset, hiddenReadback, 0, hiddenByteLength);
+              }
+            } else {
+              encoder.copyBufferToBuffer(currentBatch, 0, hiddenReadback, chunkStart * hiddenByteLength, chunkByteLength);
+            }
+          }
+          if (topReadback && topBuffer) {
+            encoder.copyBufferToBuffer(topBuffer, 0, topReadback, 0, candidateByteLength);
+          }
+          if (selectedTokenReadback && selectedTokenBuffer) {
+            encoder.copyBufferToBuffer(selectedTokenBuffer, 0, selectedTokenReadback, 0, Uint32Array.BYTES_PER_ELEMENT);
+          }
+
+          this.submitCommandBuffer(encoder.finish());
+          await this.waitForSubmittedWorkDone();
+        } finally {
+          for (const resource of resources) {
+            resource.destroy();
+          }
+          for (const item of cleanup.reverse()) {
+            item.destroy?.();
+          }
         }
       }
 
       this.activeRunEncodeMs += nowMs() - encodeStartMs;
-      this.submitCommandBuffer(encoder.finish());
 
       if (!hiddenReadback && !topReadback && !selectedTokenReadback) {
-        this.deferResourceCleanup(resources, cleanup);
-        resources.length = 0;
-        cleanup.length = 0;
         return {
           hidden: new Float32Array(),
           selectedTokenId: undefined,
@@ -1351,10 +1370,7 @@ export class WebGpuSegmentRunner implements SegmentRunner {
       hiddenReadback?.destroy?.();
       topReadback?.destroy?.();
       selectedTokenReadback?.destroy?.();
-      for (const resource of resources) {
-        resource.destroy();
-      }
-      for (const item of cleanup.reverse()) {
+      for (const item of persistentCleanup.reverse()) {
         item.destroy?.();
       }
     }
