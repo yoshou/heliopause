@@ -1,0 +1,24 @@
+{
+  "name": "@heliopause/agent",
+  "version": "0.1.0",
+  "description": "A model tool-call parser and agent loop for Heliopause.",
+  "type": "module",
+  "private": false,
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "import": "./src/index.ts"
+    }
+  },
+  "scripts": {
+    "build": "tsc --noEmit",
+    "typecheck": "tsc --noEmit",
+    "test": "node --experimental-strip-types --loader ./test/ts-extension-loader.mjs --test test/*.test.ts"
+  },
+  "dependencies": {
+    "@heliopause/engine": "workspace:*"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3"
+  }
+}

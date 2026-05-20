@@ -77,6 +77,16 @@ importers:
         specifier: ^7.2.7
         version: 7.3.2
 
+  packages/agent:
+    dependencies:
+      '@heliopause/engine':
+        specifier: workspace:*
+        version: link:../engine
+    devDependencies:
+      typescript:
+        specifier: ^5.9.3
+        version: 5.9.3
+
   packages/engine:
     devDependencies:
       typescript:
