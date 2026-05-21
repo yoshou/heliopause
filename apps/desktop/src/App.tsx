@@ -1,5 +1,5 @@
 import { ChangeEvent, ClipboardEvent, DragEvent, FormEvent, KeyboardEvent, PointerEvent, useEffect, useMemo, useRef, useState } from "react";
-import { FileArchive, Image, Mic, Plus, SendHorizontal, Square, X } from "lucide-react";
+import { ChevronRight, FileArchive, Image, Mic, Plus, SendHorizontal, Square, X } from "lucide-react";
 import {
   DEFAULT_SYSTEM_PROMPT,
   stripThinking,
@@ -43,6 +43,52 @@ type UiAudioAttachment = {
   wavFileName?: string;
   pcm: Float32Array;
   durationMs: number;
+};
+
+type ToolCardStatus = "running" | "success" | "failed" | "refused";
+
+type ToolCardView = {
+  id: string;
+  step: number;
+  actionLabel: string;
+  status: ToolCardStatus;
+  statusLabel: string;
+  call?: Extract<WorkerAgentEvent, { type: "toolCall" }>["call"];
+  result?: Extract<WorkerAgentEvent, { type: "toolResult" }>["result"];
+  stepError?: Extract<WorkerAgentEvent, { type: "stepError" }>["error"];
+};
+
+type SandboxListFilesContent = {
+  kind: "sandbox_list_files";
+  entries: SandboxFileEntry[];
+};
+
+type SandboxReadFileContent = {
+  kind: "sandbox_read_file";
+  path: string;
+  content: string;
+  truncated?: boolean;
+};
+
+type SandboxWriteFileContent = {
+  kind: "sandbox_write_file";
+  path: string;
+  bytesWritten: number;
+};
+
+type SandboxCommandContent = {
+  kind: "sandbox_command";
+  exitCode: number;
+  stdout: string;
+  stderr: string;
+  truncated: boolean;
+};
+
+type SandboxFileEntry = {
+  path: string;
+  name: string;
+  kind: "file" | "directory";
+  sizeBytes: number;
 };
 
 type RecordingState = "idle" | "requesting" | "recording" | "processing";
@@ -1139,9 +1185,14 @@ function App() {
 function MessageBubble(
   { isGenerating, message }: { isGenerating: boolean; message: UiMessage },
 ) {
-  const visibleContent = stripThinking(message.content);
+  const toolCards = message.role === "assistant"
+    ? buildToolCardViews(message.agentEvents ?? [])
+    : [];
+  const visibleContent = stripAgentArtifacts(stripThinking(message.content)).trim();
   const textContent = message.files && message.files.length > 0 ? "" : visibleContent;
-  const placeholder = message.role === "assistant" && isGenerating ? "Generating..." : "";
+  const placeholder = message.role === "assistant" && isGenerating && toolCards.length === 0
+    ? "Generating..."
+    : "";
   return (
     <article className={`message message--${message.role}`}>
       <span>{message.role === "user" ? "You" : "Assistant"}</span>
@@ -1161,6 +1212,7 @@ function MessageBubble(
         <AudioMessage audio={message.audio} />
       ) : null}
       {textContent || placeholder ? <p>{textContent || placeholder}</p> : null}
+      {toolCards.length > 0 ? <ToolIndicators tools={toolCards} /> : null}
       {message.role === "assistant" && message.inferenceDurationMs !== undefined ? (
         <footer className="message-meta">
           {formatDuration(message.inferenceDurationMs)}
@@ -1168,6 +1220,382 @@ function MessageBubble(
       ) : null}
     </article>
   );
+}
+
+function ToolIndicators({ tools }: { tools: ToolCardView[] }) {
+  return (
+    <div className="tool-indicators" aria-label="Tool activity">
+      {tools.map((tool) => (
+        <details
+          className={`tool-indicator tool-indicator--${tool.status}`}
+          key={tool.id}
+        >
+          <summary>
+            <span className="tool-status-dot" aria-hidden="true" />
+            <span className="tool-action-label">{tool.actionLabel}</span>
+            <span className="tool-status-label">{tool.statusLabel}</span>
+            <ChevronRight className="tool-details-icon" aria-hidden="true" size={15} />
+          </summary>
+          <ToolIndicatorDetails tool={tool} />
+        </details>
+      ))}
+    </div>
+  );
+}
+
+function ToolIndicatorDetails({ tool }: { tool: ToolCardView }) {
+  const args = tool.call?.arguments;
+  return (
+    <div className="tool-detail">
+      <dl className="tool-detail-grid">
+        <dt>Step</dt>
+        <dd>{tool.step}</dd>
+        <dt>Call ID</dt>
+        <dd>{tool.id}</dd>
+        <dt>Tool</dt>
+        <dd>{tool.call?.name ?? "Tool call"}</dd>
+      </dl>
+      {args !== undefined ? (
+        <ToolPreBlock label="Arguments" value={formatJson(args)} />
+      ) : null}
+      {tool.stepError ? (
+        <ToolErrorDetail code={tool.stepError.code} message={tool.stepError.message} />
+      ) : null}
+      {tool.result ? <ToolResultDetail result={tool.result} args={args} /> : null}
+    </div>
+  );
+}
+
+function ToolResultDetail(
+  {
+    args,
+    result,
+  }: {
+    args: unknown;
+    result: Extract<WorkerAgentEvent, { type: "toolResult" }>["result"];
+  },
+) {
+  if (!result.ok) {
+    return (
+      <ToolErrorDetail
+        code={result.error.code}
+        message={result.error.message}
+      />
+    );
+  }
+
+  const content = result.content;
+  if (isSandboxListFilesContent(content)) {
+    return (
+      <div className="tool-result">
+        <div className="tool-result-heading">Result</div>
+        {content.entries.length > 0 ? (
+          <ul className="tool-entry-list">
+            {content.entries.map((entry) => (
+              <li key={entry.path}>
+                <span>{entry.name}</span>
+                <small>{entry.kind} | {formatBytes(entry.sizeBytes)}</small>
+              </li>
+            ))}
+          </ul>
+        ) : (
+          <p className="tool-empty">No entries</p>
+        )}
+      </div>
+    );
+  }
+
+  if (isSandboxReadFileContent(content)) {
+    return (
+      <div className="tool-result">
+        <dl className="tool-detail-grid">
+          <dt>Path</dt>
+          <dd>{content.path}</dd>
+          <dt>Size</dt>
+          <dd>{formatBytes(byteLength(content.content))}</dd>
+          <dt>Truncated</dt>
+          <dd>{content.truncated ? "Yes" : "No"}</dd>
+        </dl>
+        <ToolPreBlock label="Preview" value={previewText(content.content)} />
+      </div>
+    );
+  }
+
+  if (isSandboxWriteFileContent(content)) {
+    const writtenContent = isRecord(args) && typeof args.content === "string"
+      ? args.content
+      : undefined;
+    return (
+      <div className="tool-result">
+        <dl className="tool-detail-grid">
+          <dt>Path</dt>
+          <dd>{content.path}</dd>
+          <dt>Written</dt>
+          <dd>{formatBytes(content.bytesWritten)}</dd>
+        </dl>
+        {writtenContent !== undefined ? (
+          <ToolPreBlock label="Preview" value={previewText(writtenContent)} />
+        ) : null}
+      </div>
+    );
+  }
+
+  if (isSandboxCommandContent(content)) {
+    return (
+      <div className="tool-result">
+        <dl className="tool-detail-grid">
+          <dt>Exit code</dt>
+          <dd>{content.exitCode}</dd>
+          <dt>Truncated</dt>
+          <dd>{content.truncated ? "Yes" : "No"}</dd>
+        </dl>
+        <ToolPreBlock label="stdout" value={previewText(content.stdout)} />
+        <ToolPreBlock label="stderr" value={previewText(content.stderr)} />
+      </div>
+    );
+  }
+
+  return <ToolPreBlock label="Result" value={formatJson(content)} />;
+}
+
+function ToolErrorDetail({ code, message }: { code: string; message: string }) {
+  return (
+    <div className="tool-error-detail">
+      <dl className="tool-detail-grid">
+        <dt>Error</dt>
+        <dd>{code}</dd>
+        <dt>Message</dt>
+        <dd>{message}</dd>
+      </dl>
+    </div>
+  );
+}
+
+function ToolPreBlock({ label, value }: { label: string; value: string }) {
+  const isLong = isLongToolPreview(value);
+  if (isLong) {
+    return (
+      <details className="tool-pre-block tool-pre-block--collapsible">
+        <summary>
+          <span>{label}</span>
+          <ChevronRight className="tool-pre-icon" aria-hidden="true" size={14} />
+        </summary>
+        <pre>{value}</pre>
+      </details>
+    );
+  }
+
+  return (
+    <div className="tool-pre-block">
+      <div>{label}</div>
+      <pre>{value}</pre>
+    </div>
+  );
+}
+
+function buildToolCardViews(events: WorkerAgentEvent[]): ToolCardView[] {
+  const tools = new Map<string, ToolCardView>();
+  const orderedIds: string[] = [];
+
+  function upsert(id: string, next: ToolCardView) {
+    if (!tools.has(id)) {
+      orderedIds.push(id);
+    }
+    tools.set(id, next);
+  }
+
+  for (const event of events) {
+    if (event.type === "toolCall") {
+      const id = event.call.id;
+      upsert(id, {
+        id,
+        step: event.step,
+        actionLabel: describeToolAction(event.call),
+        status: "running",
+        statusLabel: "Running",
+        call: event.call,
+      });
+      continue;
+    }
+
+    if (event.type === "toolResult") {
+      const current = tools.get(event.result.callId);
+      const status = statusForToolResult(event.result);
+      upsert(event.result.callId, {
+        id: event.result.callId,
+        step: current?.step ?? event.step,
+        actionLabel: current?.call ? describeToolAction(current.call) : "Tool call",
+        status,
+        statusLabel: labelForStatus(status),
+        call: current?.call,
+        result: event.result,
+      });
+      continue;
+    }
+
+    if (event.type === "stepError") {
+      const current = tools.get(event.callId);
+      upsert(event.callId, {
+        id: event.callId,
+        step: current?.step ?? event.step,
+        actionLabel: current?.call ? describeToolAction(current.call) : "Tool call",
+        status: "failed",
+        statusLabel: "Failed",
+        call: current?.call,
+        stepError: event.error,
+      });
+    }
+  }
+
+  return orderedIds.map((id) => tools.get(id)).filter((tool): tool is ToolCardView => Boolean(tool));
+}
+
+function statusForToolResult(
+  result: Extract<WorkerAgentEvent, { type: "toolResult" }>["result"],
+): ToolCardStatus {
+  if (!result.ok) {
+    return result.error.code === "user_denied" ? "refused" : "failed";
+  }
+  if (isSandboxCommandContent(result.content) && result.content.exitCode !== 0) {
+    return "failed";
+  }
+  return "success";
+}
+
+function labelForStatus(status: ToolCardStatus): string {
+  switch (status) {
+    case "running":
+      return "Running";
+    case "success":
+      return "Done";
+    case "failed":
+      return "Failed";
+    case "refused":
+      return "Declined";
+  }
+}
+
+function describeToolAction(
+  call: Extract<WorkerAgentEvent, { type: "toolCall" }>["call"],
+): string {
+  const args = isRecord(call.arguments) ? call.arguments : {};
+  switch (call.name) {
+    case "sandbox_list_files":
+      return `List ${typeof args.path === "string" ? args.path : "/workspace"}`;
+    case "sandbox_read_file":
+      return `Read ${typeof args.path === "string" ? args.path : "file"}`;
+    case "sandbox_write_file":
+      return `Write ${typeof args.path === "string" ? args.path : "file"}`;
+    case "sandbox_command": {
+      const cmd = typeof args.cmd === "string" ? args.cmd : "command";
+      const commandArgs = Array.isArray(args.args)
+        ? args.args.filter((item): item is string => typeof item === "string")
+        : [];
+      return [cmd, ...commandArgs].join(" ");
+    }
+    case "web_search":
+      return "Web search";
+  }
+}
+
+function stripAgentArtifacts(content: string): string {
+  return content
+    .replace(/<tool_call>[\s\S]*?<\/tool_call>/g, "")
+    .replace(/<tool_response>[\s\S]*?<\/tool_response>/g, "")
+    .replace(/<tool_call>[\s\S]*$/g, "")
+    .replace(/<tool_response>[\s\S]*$/g, "");
+}
+
+function isSandboxListFilesContent(value: unknown): value is SandboxListFilesContent {
+  return (
+    isRecord(value) &&
+    value.kind === "sandbox_list_files" &&
+    Array.isArray(value.entries) &&
+    value.entries.every(isSandboxFileEntry)
+  );
+}
+
+function isSandboxReadFileContent(value: unknown): value is SandboxReadFileContent {
+  return (
+    isRecord(value) &&
+    value.kind === "sandbox_read_file" &&
+    typeof value.path === "string" &&
+    typeof value.content === "string"
+  );
+}
+
+function isSandboxWriteFileContent(value: unknown): value is SandboxWriteFileContent {
+  return (
+    isRecord(value) &&
+    value.kind === "sandbox_write_file" &&
+    typeof value.path === "string" &&
+    typeof value.bytesWritten === "number"
+  );
+}
+
+function isSandboxCommandContent(value: unknown): value is SandboxCommandContent {
+  return (
+    isRecord(value) &&
+    value.kind === "sandbox_command" &&
+    typeof value.exitCode === "number" &&
+    typeof value.stdout === "string" &&
+    typeof value.stderr === "string" &&
+    typeof value.truncated === "boolean"
+  );
+}
+
+function isSandboxFileEntry(value: unknown): value is SandboxFileEntry {
+  return (
+    isRecord(value) &&
+    typeof value.path === "string" &&
+    typeof value.name === "string" &&
+    (value.kind === "file" || value.kind === "directory") &&
+    typeof value.sizeBytes === "number"
+  );
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function formatJson(value: unknown): string {
+  try {
+    return previewText(JSON.stringify(value, null, 2));
+  } catch {
+    return "Unable to format value";
+  }
+}
+
+function previewText(value: string): string {
+  const maxLength = 1800;
+  if (value.length === 0) {
+    return "(empty)";
+  }
+  if (value.length <= maxLength) {
+    return value;
+  }
+  return `${value.slice(0, maxLength)}\n... truncated`;
+}
+
+function isLongToolPreview(value: string): boolean {
+  return value.length > 360 || value.split("\n").length > 8;
+}
+
+function formatBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes < 0) {
+    return "unknown size";
+  }
+  if (bytes < 1024) {
+    return `${bytes} B`;
+  }
+  if (bytes < 1024 * 1024) {
+    return `${(bytes / 1024).toFixed(1)} KB`;
+  }
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function byteLength(value: string): number {
+  return new TextEncoder().encode(value).byteLength;
 }
 
 function GgufComposer(
