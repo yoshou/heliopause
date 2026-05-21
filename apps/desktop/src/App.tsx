@@ -1,5 +1,5 @@
-import { ChangeEvent, ClipboardEvent, DragEvent, FormEvent, KeyboardEvent, PointerEvent, useEffect, useMemo, useRef, useState } from "react";
-import { ChevronRight, FileArchive, Image, Mic, Plus, SendHorizontal, Square, X } from "lucide-react";
+import { ChangeEvent, ClipboardEvent, DragEvent, FormEvent, KeyboardEvent, PointerEvent, RefObject, useEffect, useMemo, useRef, useState } from "react";
+import { ChevronRight, FileArchive, Image, KeyRound, Mic, Plus, SendHorizontal, Square, X } from "lucide-react";
 import {
   DEFAULT_SYSTEM_PROMPT,
   stripThinking,
@@ -11,6 +11,8 @@ import type {
   SystemMemoryInfo,
   WorkerAgentEvent,
   WorkerModelInfo,
+  WorkerWebSearchResult,
+  WorkerWebSearchToolResult,
 } from "./engine-worker-protocol";
 
 type UiMessage = {
@@ -84,6 +86,12 @@ type SandboxCommandContent = {
   truncated: boolean;
 };
 
+type WebSearchContent = {
+  kind: "web_search";
+  query: string;
+  results: WorkerWebSearchResult[];
+};
+
 type SandboxFileEntry = {
   path: string;
   name: string;
@@ -117,6 +125,26 @@ type GgufValidation =
       projectorCandidates: File[];
     };
 
+type TavilyTokenStatus = {
+  available: boolean;
+  configured: boolean;
+  reason?: string;
+};
+
+type PendingWebSearchConfirmation = {
+  worker: Worker;
+  requestId: number;
+  callId: string;
+  query: string;
+  maxResults: number;
+};
+
+type TauriWebSearchResponse = {
+  results: WorkerWebSearchResult[];
+};
+
+type WebSearchToolError = Extract<WorkerWebSearchToolResult, { ok: false }>["error"];
+
 type PendingRequest =
   | {
       type: "load";
@@ -146,6 +174,7 @@ const INITIAL_ASSISTANT_CONTENT = [
 ].join("\n");
 
 function App() {
+  const [isTauriRuntime] = useState(detectTauriRuntime);
   const [model, setModel] = useState<ModelState>({ status: "empty" });
   const memoryProfile: MemoryProfile = "auto";
   const systemPrompt = DEFAULT_SYSTEM_PROMPT;
@@ -157,6 +186,10 @@ function App() {
   const [imageAttachment, setImageAttachment] = useState<UiImageAttachment | undefined>();
   const [recordingState, setRecordingState] = useState<RecordingState>("idle");
   const [isAttachmentMenuOpen, setIsAttachmentMenuOpen] = useState(false);
+  const [isTavilyMenuOpen, setIsTavilyMenuOpen] = useState(false);
+  const [tavilyStatus, setTavilyStatus] = useState<TavilyTokenStatus | undefined>();
+  const [tavilyError, setTavilyError] = useState<string | undefined>();
+  const [pendingWebSearch, setPendingWebSearch] = useState<PendingWebSearchConfirmation | undefined>();
   const [messages, setMessages] = useState<UiMessage[]>(() => [
     createAssistantMessage(INITIAL_ASSISTANT_CONTENT),
   ]);
@@ -166,6 +199,8 @@ function App() {
   const modelFilesInputRef = useRef<HTMLInputElement | null>(null);
   const imageInputRef = useRef<HTMLInputElement | null>(null);
   const attachmentMenuRef = useRef<HTMLDivElement | null>(null);
+  const tavilyMenuRef = useRef<HTMLDivElement | null>(null);
+  const tavilyTokenInputRef = useRef<HTMLInputElement | null>(null);
   const messagePanelRef = useRef<HTMLDivElement | null>(null);
   const nextRequestIdRef = useRef(1);
   const pendingRequestsRef = useRef(new Map<number, PendingRequest>());
@@ -252,6 +287,7 @@ function App() {
     function handleWindowBlur() {
       void stopRecording();
       setIsAttachmentMenuOpen(false);
+      setIsTavilyMenuOpen(false);
     }
     window.addEventListener("blur", handleWindowBlur);
     return () => {
@@ -264,11 +300,15 @@ function App() {
       if (!attachmentMenuRef.current?.contains(event.target as Node | null)) {
         setIsAttachmentMenuOpen(false);
       }
+      if (!tavilyMenuRef.current?.contains(event.target as Node | null)) {
+        setIsTavilyMenuOpen(false);
+      }
     }
 
     function handleKeyDown(event: globalThis.KeyboardEvent) {
       if (event.key === "Escape") {
         setIsAttachmentMenuOpen(false);
+        setIsTavilyMenuOpen(false);
       }
     }
 
@@ -279,6 +319,13 @@ function App() {
       document.removeEventListener("keydown", handleKeyDown);
     };
   }, []);
+
+  useEffect(() => {
+    if (!isTauriRuntime) {
+      return;
+    }
+    void refreshTavilyStatus();
+  }, [isTauriRuntime]);
 
   function handleModelFilesChange(event: ChangeEvent<HTMLInputElement>) {
     const files = Array.from(event.target.files ?? []);
@@ -426,6 +473,7 @@ function App() {
         imageAttachment,
         undefined,
         CHAT_MAX_NEW_TOKENS,
+        isTauriRuntime,
       );
     } catch (error) {
       setGenerationError(error instanceof Error ? error.message : String(error));
@@ -458,6 +506,124 @@ function App() {
       return;
     }
     setIsAttachmentMenuOpen((isOpen) => !isOpen);
+  }
+
+  function handleTavilyMenuClick() {
+    if (!isTauriRuntime) {
+      return;
+    }
+    setIsTavilyMenuOpen((isOpen) => {
+      const nextIsOpen = !isOpen;
+      if (nextIsOpen) {
+        void refreshTavilyStatus();
+      }
+      return nextIsOpen;
+    });
+  }
+
+  async function refreshTavilyStatus() {
+    if (!isTauriRuntime) {
+      return;
+    }
+    try {
+      const status = await invokeTauri<TavilyTokenStatus>("tavily_token_status");
+      setTavilyStatus(status);
+      setTavilyError(undefined);
+    } catch (error) {
+      setTavilyStatus({ available: false, configured: false });
+      setTavilyError(normalizeErrorMessage(error));
+    }
+  }
+
+  async function saveTavilyToken() {
+    const input = tavilyTokenInputRef.current;
+    const token = input?.value.trim() ?? "";
+    if (!token) {
+      setTavilyError("Enter a Tavily token before saving.");
+      return;
+    }
+    try {
+      await invokeTauri("save_tavily_token", { token });
+      if (input) {
+        input.value = "";
+      }
+      await refreshTavilyStatus();
+    } catch (error) {
+      if (input) {
+        input.value = "";
+      }
+      setTavilyError(normalizeErrorMessage(error));
+    }
+  }
+
+  async function deleteTavilyToken() {
+    try {
+      await invokeTauri("delete_tavily_token");
+      if (tavilyTokenInputRef.current) {
+        tavilyTokenInputRef.current.value = "";
+      }
+      await refreshTavilyStatus();
+    } catch (error) {
+      setTavilyError(normalizeErrorMessage(error));
+    }
+  }
+
+  async function approveWebSearch() {
+    const confirmation = pendingWebSearch;
+    if (!confirmation) {
+      return;
+    }
+    setPendingWebSearch(undefined);
+    const result = await runTavilyWebSearch(confirmation);
+    confirmation.worker.postMessage({
+      type: "resolveWebSearchConfirmation",
+      requestId: confirmation.requestId,
+      callId: confirmation.callId,
+      approved: true,
+      result,
+    } satisfies EngineWorkerRequest);
+  }
+
+  function declineWebSearch() {
+    const confirmation = pendingWebSearch;
+    if (!confirmation) {
+      return;
+    }
+    setPendingWebSearch(undefined);
+    confirmation.worker.postMessage({
+      type: "resolveWebSearchConfirmation",
+      requestId: confirmation.requestId,
+      callId: confirmation.callId,
+      approved: false,
+    } satisfies EngineWorkerRequest);
+  }
+
+  async function runTavilyWebSearch(
+    confirmation: PendingWebSearchConfirmation,
+  ): Promise<WorkerWebSearchToolResult> {
+    try {
+      const response = await invokeTauri<TauriWebSearchResponse>("web_search", {
+        request: {
+          query: confirmation.query,
+          max_results: confirmation.maxResults,
+        },
+      });
+      return {
+        callId: confirmation.callId,
+        ok: true,
+        content: {
+          kind: "web_search",
+          query: confirmation.query,
+          results: response.results,
+        },
+      };
+    } catch (error) {
+      return {
+        callId: confirmation.callId,
+        ok: false,
+        error: normalizeToolError(error, "tavily_error"),
+      };
+    }
   }
 
   function handleModelMenuSelect() {
@@ -792,6 +958,7 @@ function App() {
         undefined,
         audio,
         CHAT_MAX_NEW_TOKENS,
+        isTauriRuntime,
       );
     } catch (error) {
       setGenerationError(error instanceof Error ? error.message : String(error));
@@ -876,6 +1043,7 @@ function App() {
     image: UiImageAttachment | undefined,
     audio: UiAudioAttachment | undefined,
     maxNewTokens: number,
+    webSearchAvailable: boolean,
   ): Promise<void> {
     const requestId = nextRequestIdRef.current;
     nextRequestIdRef.current += 1;
@@ -912,6 +1080,7 @@ function App() {
             }
           : undefined,
         maxNewTokens,
+        webSearchAvailable,
       } satisfies EngineWorkerRequest);
     });
   }
@@ -941,6 +1110,34 @@ function App() {
       return;
     }
 
+    if (message.type === "webSearchConfirmationRequested") {
+      if (!isTauriRuntime) {
+        worker.postMessage({
+          type: "resolveWebSearchConfirmation",
+          requestId: message.requestId,
+          callId: message.callId,
+          approved: true,
+          result: {
+            callId: message.callId,
+            ok: false,
+            error: {
+              code: "web_search_unavailable",
+              message: "web_search is only available in the desktop app.",
+            },
+          },
+        } satisfies EngineWorkerRequest);
+        return;
+      }
+      setPendingWebSearch({
+        worker,
+        requestId: message.requestId,
+        callId: message.callId,
+        query: message.query,
+        maxResults: message.maxResults,
+      });
+      return;
+    }
+
     if (message.type === "agentEvent") {
       setMessages((currentMessages) =>
         currentMessages.map((uiMessage) =>
@@ -967,6 +1164,9 @@ function App() {
     }
 
     if (message.type === "generationCancelled") {
+      setPendingWebSearch((confirmation) =>
+        confirmation?.requestId === message.requestId ? undefined : confirmation
+      );
       setMessages((currentMessages) =>
         currentMessages.filter((uiMessage) =>
           uiMessage.id !== pending.userId && uiMessage.id !== pending.assistantId
@@ -980,6 +1180,9 @@ function App() {
     }
 
     if (message.type === "generationDone") {
+      setPendingWebSearch((confirmation) =>
+        confirmation?.requestId === message.requestId ? undefined : confirmation
+      );
       setMessages((currentMessages) =>
         currentMessages.map((uiMessage) =>
           uiMessage.id === pending.assistantId
@@ -994,6 +1197,9 @@ function App() {
   }
 
   function rejectWorkerRequests(worker: Worker, error: Error) {
+    setPendingWebSearch((confirmation) =>
+      confirmation?.worker === worker ? undefined : confirmation
+    );
     for (const [requestId, pending] of pendingRequestsRef.current) {
       if (pending.worker !== worker) {
         continue;
@@ -1085,6 +1291,13 @@ function App() {
               {generationError ? (
                 <p className="generation-error">{generationError}</p>
               ) : null}
+              {isTauriRuntime && pendingWebSearch ? (
+                <WebSearchConfirmationPanel
+                  confirmation={pendingWebSearch}
+                  onApprove={() => void approveWebSearch()}
+                  onDecline={declineWebSearch}
+                />
+              ) : null}
             </>
           )}
           <div className="form-actions">
@@ -1128,6 +1341,30 @@ function App() {
                   </div>
                 ) : null}
               </div>
+              {isTauriRuntime ? (
+                <div className="tavily-menu-wrap" ref={tavilyMenuRef}>
+                  <button
+                    type="button"
+                    className="icon-button"
+                    aria-label="Tavily search settings"
+                    aria-haspopup="dialog"
+                    aria-expanded={isTavilyMenuOpen}
+                    title="Tavily search settings"
+                    onClick={handleTavilyMenuClick}
+                  >
+                    <KeyRound aria-hidden="true" size={19} />
+                  </button>
+                  {isTavilyMenuOpen ? (
+                    <TavilyTokenPopover
+                      error={tavilyError}
+                      inputRef={tavilyTokenInputRef}
+                      onDelete={() => void deleteTavilyToken()}
+                      onSave={() => void saveTavilyToken()}
+                      status={tavilyStatus}
+                    />
+                  ) : null}
+                </div>
+              ) : null}
             </div>
             <p>{composerStatusLabel(model, prompt, ggufFiles.length)}</p>
             <div className="submit-actions">
@@ -1355,6 +1592,29 @@ function ToolResultDetail(
     );
   }
 
+  if (isWebSearchContent(content)) {
+    return (
+      <div className="tool-result">
+        <div className="tool-result-heading">Results</div>
+        {content.results.length > 0 ? (
+          <ul className="web-search-result-list">
+            {content.results.map((result) => (
+              <li key={result.url}>
+                <a href={result.url} target="_blank" rel="noreferrer">
+                  {result.title}
+                </a>
+                <small>{result.url}</small>
+                <p>{result.snippet}</p>
+              </li>
+            ))}
+          </ul>
+        ) : (
+          <p className="tool-empty">No results</p>
+        )}
+      </div>
+    );
+  }
+
   return <ToolPreBlock label="Result" value={formatJson(content)} />;
 }
 
@@ -1494,7 +1754,7 @@ function describeToolAction(
       return [cmd, ...commandArgs].join(" ");
     }
     case "web_search":
-      return "Web search";
+      return `Search: ${typeof args.query === "string" ? args.query : "web"}`;
   }
 }
 
@@ -1541,6 +1801,25 @@ function isSandboxCommandContent(value: unknown): value is SandboxCommandContent
     typeof value.stdout === "string" &&
     typeof value.stderr === "string" &&
     typeof value.truncated === "boolean"
+  );
+}
+
+function isWebSearchContent(value: unknown): value is WebSearchContent {
+  return (
+    isRecord(value) &&
+    value.kind === "web_search" &&
+    typeof value.query === "string" &&
+    Array.isArray(value.results) &&
+    value.results.every(isWebSearchResult)
+  );
+}
+
+function isWebSearchResult(value: unknown): value is WorkerWebSearchResult {
+  return (
+    isRecord(value) &&
+    typeof value.title === "string" &&
+    typeof value.url === "string" &&
+    typeof value.snippet === "string"
   );
 }
 
@@ -1706,6 +1985,87 @@ function AudioMessage({ audio }: { audio: UiAudioAttachment }) {
       {audio.wavUrl && audio.wavFileName ? (
         <a href={audio.wavUrl} download={audio.wavFileName}>WAV</a>
       ) : null}
+    </div>
+  );
+}
+
+function TavilyTokenPopover(
+  {
+    error,
+    inputRef,
+    onDelete,
+    onSave,
+    status,
+  }: {
+    error: string | undefined;
+    inputRef: RefObject<HTMLInputElement | null>;
+    onDelete: () => void;
+    onSave: () => void;
+    status: TavilyTokenStatus | undefined;
+  },
+) {
+  const statusLabel = !status
+    ? "Checking..."
+    : !status.available
+      ? "Unavailable"
+      : status.configured ? "Configured" : "Not configured";
+  return (
+    <div className="tavily-popover" role="dialog" aria-label="Tavily search settings">
+      <div className="tavily-popover-heading">
+        <strong>Tavily search</strong>
+        <span>{statusLabel}</span>
+      </div>
+      {status?.reason ? <p>{status.reason}</p> : null}
+      <label>
+        API token
+        <input
+          ref={inputRef}
+          type="password"
+          autoComplete="off"
+          spellCheck={false}
+          placeholder="tvly-..."
+          disabled={status?.available === false}
+        />
+      </label>
+      {error ? <p className="tavily-error">{error}</p> : null}
+      <div className="tavily-actions">
+        <button type="button" onClick={onSave} disabled={status?.available === false}>
+          Save
+        </button>
+        <button type="button" onClick={onDelete} disabled={status?.available === false || !status?.configured}>
+          Delete
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function WebSearchConfirmationPanel(
+  {
+    confirmation,
+    onApprove,
+    onDecline,
+  }: {
+    confirmation: PendingWebSearchConfirmation;
+    onApprove: () => void;
+    onDecline: () => void;
+  },
+) {
+  return (
+    <div className="web-search-confirmation" role="alert">
+      <div>
+        <strong>Web search</strong>
+        <p>{confirmation.query}</p>
+        <small>{confirmation.maxResults} results maximum</small>
+      </div>
+      <div className="web-search-confirmation-actions">
+        <button type="button" onClick={onDecline}>
+          Decline
+        </button>
+        <button type="button" onClick={onApprove}>
+          Approve
+        </button>
+      </div>
     </div>
   );
 }
@@ -1948,8 +2308,7 @@ function writeAscii(view: DataView, offset: number, text: string) {
 
 async function readSystemMemoryInfo(): Promise<SystemMemoryInfo | undefined> {
   try {
-    const { invoke } = await import("@tauri-apps/api/core");
-    const info = await invoke<SystemMemoryInfo>("system_memory_info");
+    const info = await invokeTauri<SystemMemoryInfo>("system_memory_info");
     if (info.total_bytes <= 0 && info.available_bytes <= 0) {
       return undefined;
     }
@@ -1957,6 +2316,44 @@ async function readSystemMemoryInfo(): Promise<SystemMemoryInfo | undefined> {
   } catch {
     return undefined;
   }
+}
+
+function detectTauriRuntime(): boolean {
+  return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+}
+
+async function invokeTauri<T = unknown>(command: string, args?: Record<string, unknown>): Promise<T> {
+  const { invoke } = await import("@tauri-apps/api/core");
+  return invoke<T>(command, args);
+}
+
+function normalizeErrorMessage(error: unknown): string {
+  if (isRecord(error) && typeof error.message === "string") {
+    return error.message;
+  }
+  if (error instanceof Error) {
+    return error.message;
+  }
+  return String(error);
+}
+
+function normalizeToolError(error: unknown, fallbackCode: string): WebSearchToolError {
+  if (isRecord(error)) {
+    const code = typeof error.code === "string" ? error.code : fallbackCode;
+    const message = typeof error.message === "string" ? error.message : "Web search failed.";
+    const retryable = typeof error.retryable === "boolean" ? error.retryable : undefined;
+    return retryable === undefined ? { code, message } : { code, message, retryable };
+  }
+  if (error instanceof Error) {
+    return {
+      code: fallbackCode,
+      message: error.message,
+    };
+  }
+  return {
+    code: fallbackCode,
+    message: "Web search failed.",
+  };
 }
 
 function formatDuration(durationMs: number): string {

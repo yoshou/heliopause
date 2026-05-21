@@ -1,6 +1,7 @@
 import {
   DEFAULT_MAX_TOOL_STEPS,
   generateAgentTurn,
+  type AgentToolCall,
 } from "@heliopause/agent";
 import {
   buildTokenizer,
@@ -35,8 +36,8 @@ import {
 } from "@heliopause/engine";
 import { createVirtualFileSystem } from "@heliopause/sandbox";
 import {
-  executeSandboxAgentTool,
-  SANDBOX_AGENT_TOOLS,
+  buildAgentTools,
+  executeDesktopAgentTool,
 } from "./agent-sandbox-tools";
 import type {
   EngineWorkerRequest,
@@ -44,6 +45,7 @@ import type {
   MemoryProfile,
   ResolvedRuntimeProfile,
   SystemMemoryInfo,
+  WorkerWebSearchToolResult,
 } from "./engine-worker-protocol";
 
 const CHAT_CONTEXT_LENGTH = 16_384;
@@ -63,6 +65,13 @@ let activeGeneration:
       requestId: number;
       abortController: AbortController;
       workingState?: InferenceState;
+      pendingWebSearches: Map<
+        string,
+        {
+          resolve: (result: WorkerWebSearchToolResult) => void;
+          reject: (error: unknown) => void;
+        }
+      >;
     }
   | undefined;
 
@@ -83,6 +92,10 @@ async function handleRequest(request: EngineWorkerRequest): Promise<void> {
     }
     if (request.type === "generateTurn") {
       await handleGenerateTurn(request);
+      return;
+    }
+    if (request.type === "resolveWebSearchConfirmation") {
+      handleResolveWebSearchConfirmation(request);
       return;
     }
     handleCancelGeneration(request.requestId);
@@ -219,7 +232,11 @@ async function handleGenerateTurn(
   }
 
   const abortController = new AbortController();
-  activeGeneration = { requestId: request.requestId, abortController };
+  activeGeneration = {
+    requestId: request.requestId,
+    abortController,
+    pendingWebSearches: new Map(),
+  };
   const inferenceStartedAt = performance.now();
 
   try {
@@ -244,6 +261,11 @@ async function handleGenerateTurn(
         });
       },
     };
+    const tools = buildAgentTools({ webSearchAvailable: request.webSearchAvailable });
+    const executeTool = (call: AgentToolCall, signal: AbortSignal) =>
+      executeDesktopAgentTool(sandboxFs, call, signal, {
+        executeWebSearch: executeWebSearchWithUserConfirmation,
+      });
     if (request.audio) {
       if (!audioSession) {
         throw new Error("No audio encoder loaded.");
@@ -265,8 +287,8 @@ async function handleGenerateTurn(
         request.userContent,
         {
           ...turnOptions,
-          tools: SANDBOX_AGENT_TOOLS,
-          executeTool: (call, signal) => executeSandboxAgentTool(sandboxFs, call, signal),
+          tools,
+          executeTool,
           maxToolSteps: DEFAULT_MAX_TOOL_STEPS,
           onAgentEvent(event) {
             if (event.type === "text") {
@@ -324,8 +346,8 @@ async function handleGenerateTurn(
         request.userContent,
         {
           ...turnOptions,
-          tools: SANDBOX_AGENT_TOOLS,
-          executeTool: (call, signal) => executeSandboxAgentTool(sandboxFs, call, signal),
+          tools,
+          executeTool,
           maxToolSteps: DEFAULT_MAX_TOOL_STEPS,
           onAgentEvent(event) {
             if (event.type === "text") {
@@ -400,6 +422,110 @@ function handleCancelGeneration(requestId: number): void {
     return;
   }
   activeGeneration.abortController.abort();
+}
+
+async function executeWebSearchWithUserConfirmation(
+  call: AgentToolCall,
+  signal: AbortSignal,
+): Promise<WorkerWebSearchToolResult> {
+  const args = requireWebSearchArguments(call.arguments);
+  const maxResults = normalizeWebSearchMaxResults(args.max_results);
+  const generation = activeGeneration;
+  if (!generation) {
+    return {
+      callId: call.id,
+      ok: false,
+      error: {
+        code: "web_search_unavailable",
+        message: "No active generation can confirm web_search.",
+      },
+    };
+  }
+
+  return new Promise((resolve, reject) => {
+    const abort = () => {
+      generation.pendingWebSearches.delete(call.id);
+      reject(new DOMException("web_search was aborted.", "AbortError"));
+    };
+    if (signal.aborted) {
+      abort();
+      return;
+    }
+
+    generation.pendingWebSearches.set(call.id, { resolve, reject });
+    signal.addEventListener("abort", abort, { once: true });
+    workerScope.postMessage({
+      type: "webSearchConfirmationRequested",
+      requestId: generation.requestId,
+      callId: call.id,
+      query: args.query,
+      maxResults,
+    });
+  });
+}
+
+function handleResolveWebSearchConfirmation(
+  request: Extract<EngineWorkerRequest, { type: "resolveWebSearchConfirmation" }>,
+): void {
+  if (!activeGeneration || activeGeneration.requestId !== request.requestId) {
+    return;
+  }
+  const pending = activeGeneration.pendingWebSearches.get(request.callId);
+  if (!pending) {
+    return;
+  }
+  activeGeneration.pendingWebSearches.delete(request.callId);
+
+  if (!request.approved) {
+    pending.resolve({
+      callId: request.callId,
+      ok: false,
+      error: {
+        code: "user_denied",
+        message: "The user declined the web search.",
+      },
+    });
+    return;
+  }
+
+  pending.resolve(request.result ?? {
+    callId: request.callId,
+    ok: false,
+    error: {
+      code: "web_search_unavailable",
+      message: "The approved web search did not return a result.",
+    },
+  });
+}
+
+function requireWebSearchArguments(value: unknown): { query: string; max_results?: unknown } {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw {
+      code: "invalid_arguments",
+      message: "web_search arguments must be an object.",
+    };
+  }
+  const args = value as Record<string, unknown>;
+  if (typeof args.query !== "string" || args.query.trim().length === 0) {
+    throw {
+      code: "invalid_arguments",
+      message: "web_search query must be a non-empty string.",
+    };
+  }
+  return {
+    query: args.query.trim(),
+    max_results: args.max_results,
+  };
+}
+
+function normalizeWebSearchMaxResults(value: unknown): number {
+  if (value === undefined) {
+    return 5;
+  }
+  if (typeof value !== "number" || !Number.isInteger(value)) {
+    return 5;
+  }
+  return Math.min(5, Math.max(1, value));
 }
 
 function resolveRuntimeProfile(

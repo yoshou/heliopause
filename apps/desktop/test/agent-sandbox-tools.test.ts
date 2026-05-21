@@ -3,8 +3,11 @@ import test from "node:test";
 import type { AgentToolCall } from "@heliopause/agent";
 import { createVirtualFileSystem } from "@heliopause/sandbox";
 import {
+  buildAgentTools,
+  executeDesktopAgentTool,
   executeSandboxAgentTool,
   SANDBOX_AGENT_TOOLS,
+  WEB_SEARCH_AGENT_TOOL,
 } from "../src/agent-sandbox-tools";
 
 test("SANDBOX_AGENT_TOOLS exposes only Phase 3 sandbox tools", () => {
@@ -17,6 +20,54 @@ test("SANDBOX_AGENT_TOOLS exposes only Phase 3 sandbox tools", () => {
       "sandbox_command",
     ],
   );
+});
+
+test("buildAgentTools hides web_search when the desktop runtime is unavailable", () => {
+  assert.deepEqual(
+    buildAgentTools({ webSearchAvailable: false }).map((tool) => tool.name),
+    [
+      "sandbox_list_files",
+      "sandbox_read_file",
+      "sandbox_write_file",
+      "sandbox_command",
+    ],
+  );
+});
+
+test("buildAgentTools exposes web_search only when enabled", () => {
+  assert.deepEqual(
+    buildAgentTools({ webSearchAvailable: true }).map((tool) => tool.name),
+    [
+      "sandbox_list_files",
+      "sandbox_read_file",
+      "sandbox_write_file",
+      "sandbox_command",
+      "web_search",
+    ],
+  );
+});
+
+test("WEB_SEARCH_AGENT_TOOL requires a query and limits max_results", () => {
+  assert.equal(WEB_SEARCH_AGENT_TOOL.requiresConfirmation, true);
+  assert.match(WEB_SEARCH_AGENT_TOOL.description, /app, not the assistant/i);
+  assert.match(WEB_SEARCH_AGENT_TOOL.description, /recent conversation/i);
+  assert.deepEqual(WEB_SEARCH_AGENT_TOOL.parametersJsonSchema, {
+    type: "object",
+    properties: {
+      query: {
+        type: "string",
+        minLength: 1,
+        maxLength: 500,
+      },
+      max_results: {
+        type: "integer",
+        minimum: 1,
+        maximum: 5,
+      },
+    },
+    required: ["query"],
+    additionalProperties: false,
+  });
 });
 
 test("sandbox_list_files lists the default workspace and explicit paths", async () => {
@@ -131,6 +182,58 @@ test("sandbox tool errors become failed tool results", async () => {
   );
   assert.equal(invalidArguments.ok, false);
   assert.equal(invalidArguments.error.code, "invalid_arguments");
+});
+
+test("desktop executor reports web_search unavailable without a host executor", async () => {
+  const fs = createVirtualFileSystem();
+
+  const result = await executeDesktopAgentTool(
+    fs,
+    call("web_search", { query: "OpenAI latest model release", max_results: 5 }),
+    new AbortController().signal,
+  );
+
+  assert.equal(result.ok, false);
+  assert.equal(result.error.code, "web_search_unavailable");
+});
+
+test("desktop executor delegates web_search to the host executor", async () => {
+  const fs = createVirtualFileSystem();
+
+  const result = await executeDesktopAgentTool(
+    fs,
+    call("web_search", { query: "OpenAI latest model release", max_results: 5 }),
+    new AbortController().signal,
+    {
+      executeWebSearch: async (toolCall) => ({
+        callId: toolCall.id,
+        ok: true,
+        content: {
+          kind: "web_search",
+          query: "OpenAI latest model release",
+          results: [{
+            title: "OpenAI",
+            url: "https://openai.com/",
+            snippet: "OpenAI news",
+          }],
+        },
+      }),
+    },
+  );
+
+  assert.deepEqual(result, {
+    callId: "tool_1",
+    ok: true,
+    content: {
+      kind: "web_search",
+      query: "OpenAI latest model release",
+      results: [{
+        title: "OpenAI",
+        url: "https://openai.com/",
+        snippet: "OpenAI news",
+      }],
+    },
+  });
 });
 
 test("pre-aborted sandbox commands reject instead of becoming tool results", async () => {

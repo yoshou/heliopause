@@ -84,6 +84,64 @@ export const SANDBOX_AGENT_TOOLS: readonly AgentToolDefinition[] = [
   },
 ];
 
+export const WEB_SEARCH_AGENT_TOOL: AgentToolDefinition = {
+  name: "web_search",
+  description:
+    'Request a public web search with Tavily. The app, not the assistant, will ask the user to confirm before running it. If the user asks you to search or confirms a previous search suggestion, call this tool with the best query from the current request or recent conversation. Results include title, url, and snippet only; raw page content, images, cookies, credentials, and private URLs are not available. Example: <tool_call>{"tool":"web_search","arguments":{"query":"OpenAI latest model release","max_results":5}}</tool_call>',
+  parametersJsonSchema: {
+    type: "object",
+    properties: {
+      query: {
+        type: "string",
+        minLength: 1,
+        maxLength: 500,
+      },
+      max_results: {
+        type: "integer",
+        minimum: 1,
+        maximum: 5,
+      },
+    },
+    required: ["query"],
+    additionalProperties: false,
+  },
+  requiresConfirmation: true,
+};
+
+export function buildAgentTools(
+  options: { webSearchAvailable: boolean },
+): readonly AgentToolDefinition[] {
+  return options.webSearchAvailable
+    ? [...SANDBOX_AGENT_TOOLS, WEB_SEARCH_AGENT_TOOL]
+    : SANDBOX_AGENT_TOOLS;
+}
+
+export type WebSearchToolExecutor = (
+  call: AgentToolCall,
+  signal: AbortSignal,
+) => Promise<AgentToolResult>;
+
+export async function executeDesktopAgentTool(
+  fs: VirtualFileSystem,
+  call: AgentToolCall,
+  signal: AbortSignal,
+  options?: {
+    executeWebSearch?: WebSearchToolExecutor;
+  },
+): Promise<AgentToolResult> {
+  if (call.name === "web_search") {
+    if (!options?.executeWebSearch) {
+      return toolError(call.id, {
+        code: "web_search_unavailable",
+        message: "web_search is not available in this runtime.",
+      });
+    }
+    return options.executeWebSearch(call, signal);
+  }
+
+  return executeSandboxAgentTool(fs, call, signal);
+}
+
 export async function executeSandboxAgentTool(
   fs: VirtualFileSystem,
   call: AgentToolCall,
@@ -154,8 +212,8 @@ export async function executeSandboxAgentTool(
 
       case "web_search":
         return toolError(call.id, {
-          code: "unknown_tool",
-          message: "web_search is not available in Phase 3.",
+          code: "web_search_unavailable",
+          message: "web_search is not available in the sandbox executor.",
         });
     }
   } catch (error) {

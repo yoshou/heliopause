@@ -248,6 +248,8 @@ test("generateAgentTurn executes a valid tool call and then emits final text", a
   assert.deepEqual(events.map((event) => event.type), ["toolCall", "toolResult", "text", "done"]);
   assert.deepEqual(tokenTexts, ["notes.md"]);
   assert.match(calls[0] ?? "", /Tool instructions:/);
+  assert.match(calls[0] ?? "", /requiresConfirmation must still be called with a tool_call/);
+  assert.match(calls[0] ?? "", /Do not ask for separate confirmation/);
   assert.match(calls[1] ?? "", /^<tool_response>/);
 });
 

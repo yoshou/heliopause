@@ -365,6 +365,46 @@ textarea:disabled {
   margin: 0;
 }
 
+.web-search-result-list {
+  display: grid;
+  gap: 10px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.web-search-result-list li {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.web-search-result-list a {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  color: #285f54;
+  font-weight: 850;
+  text-decoration: none;
+}
+
+.web-search-result-list a:hover {
+  text-decoration: underline;
+}
+
+.web-search-result-list small {
+  overflow-wrap: anywhere;
+  color: #6b776f;
+  font-size: 0.72rem;
+  line-height: 1.35;
+}
+
+.web-search-result-list p {
+  margin: 0;
+  color: #354139;
+  font-size: 0.78rem;
+  line-height: 1.45;
+}
+
 .prompt-form {
   display: grid;
   gap: 10px;
@@ -420,6 +460,135 @@ textarea:disabled {
 .attachment-menu-wrap {
   position: relative;
   flex: 0 0 auto;
+}
+
+.tavily-menu-wrap {
+  position: relative;
+  flex: 0 0 auto;
+}
+
+.tavily-popover {
+  position: absolute;
+  bottom: calc(100% + 8px);
+  left: 0;
+  z-index: 4;
+  display: grid;
+  gap: 10px;
+  width: min(320px, calc(100vw - 56px));
+  padding: 12px;
+  border: 1px solid #c9d2cb;
+  border-radius: 8px;
+  background: #ffffff;
+  box-shadow: 0 12px 30px rgba(23, 32, 38, 0.14);
+}
+
+.tavily-popover-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.tavily-popover-heading strong {
+  color: #1f2a30;
+  font-size: 0.9rem;
+}
+
+.tavily-popover-heading span {
+  color: #5e6d65;
+  font-size: 0.76rem;
+  font-weight: 850;
+}
+
+.tavily-popover label {
+  display: grid;
+  gap: 6px;
+  color: #29343b;
+  font-size: 0.78rem;
+  font-weight: 850;
+}
+
+.tavily-popover input {
+  min-width: 0;
+  padding: 9px 10px;
+  border: 1px solid #c9d2cb;
+  border-radius: 6px;
+  color: #172026;
+  background: #ffffff;
+}
+
+.tavily-popover input:focus {
+  border-color: #2f7565;
+  outline: 3px solid rgba(47, 117, 101, 0.16);
+}
+
+.tavily-popover p,
+.tavily-error {
+  margin: 0;
+  color: #647064;
+  font-size: 0.78rem;
+  line-height: 1.45;
+}
+
+.tavily-error {
+  color: #a23a2a;
+}
+
+.tavily-actions,
+.web-search-confirmation-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.tavily-actions button,
+.web-search-confirmation-actions button {
+  min-height: 32px;
+  padding: 6px 10px;
+  border: 1px solid #c9d2cb;
+  border-radius: 6px;
+  color: #263238;
+  background: #f8faf7;
+  font-size: 0.82rem;
+  font-weight: 850;
+  cursor: pointer;
+}
+
+.tavily-actions button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.web-search-confirmation {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 12px;
+  border: 1px solid #bfd8d1;
+  border-radius: 8px;
+  background: #eef7f4;
+}
+
+.web-search-confirmation strong {
+  display: block;
+  color: #23302b;
+  font-size: 0.84rem;
+}
+
+.web-search-confirmation p {
+  margin: 3px 0;
+  overflow-wrap: anywhere;
+  color: #354139;
+  font-size: 0.86rem;
+  line-height: 1.35;
+}
+
+.web-search-confirmation small {
+  color: #607168;
+  font-size: 0.74rem;
+  font-weight: 800;
 }
 
 .generation-error {

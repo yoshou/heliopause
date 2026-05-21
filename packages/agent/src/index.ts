@@ -338,6 +338,8 @@ function buildInitialUserContent(
     `- To call a tool, output exactly one <${TOOL_CALL_TAG}> tag containing compact JSON.`,
     "- The JSON object must include tool and arguments fields.",
     "- Do not output more than one tool call in a single response.",
+    "- Tools marked requiresConfirmation must still be called with a tool_call; the app will ask the user for confirmation before execution.",
+    "- Do not ask for separate confirmation in natural language when a requiresConfirmation tool is appropriate.",
     "- If no tool is needed, answer normally without tool tags.",
     "Available tools:",
     toolDescriptions,

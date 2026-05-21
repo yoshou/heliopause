@@ -4,6 +4,32 @@ export type MemoryProfile = "auto" | "low" | "full";
 
 export type WorkerAgentEvent = Exclude<AgentEvent, { type: "text" }>;
 
+export type WorkerWebSearchResult = {
+  title: string;
+  url: string;
+  snippet: string;
+};
+
+export type WorkerWebSearchToolResult =
+  | {
+      callId: string;
+      ok: true;
+      content: {
+        kind: "web_search";
+        query: string;
+        results: WorkerWebSearchResult[];
+      };
+    }
+  | {
+      callId: string;
+      ok: false;
+      error: {
+        code: string;
+        message: string;
+        retryable?: boolean;
+      };
+    };
+
 export type ResolvedRuntimeProfile = {
   requested: MemoryProfile;
   resolved: "low" | "full";
@@ -70,6 +96,14 @@ export type EngineWorkerRequest =
       image?: WorkerImageInput;
       audio?: WorkerAudioInput;
       maxNewTokens: number;
+      webSearchAvailable: boolean;
+    }
+  | {
+      type: "resolveWebSearchConfirmation";
+      requestId: number;
+      callId: string;
+      approved: boolean;
+      result?: WorkerWebSearchToolResult;
     }
   | {
       type: "cancelGeneration";
@@ -91,6 +125,13 @@ export type EngineWorkerResponse =
       type: "agentEvent";
       requestId: number;
       event: WorkerAgentEvent;
+    }
+  | {
+      type: "webSearchConfirmationRequested";
+      requestId: number;
+      callId: string;
+      query: string;
+      maxResults: number;
     }
   | {
       type: "generationDone";
