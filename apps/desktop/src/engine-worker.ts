@@ -15,6 +15,7 @@ import {
   checkWasmSupport,
   checkWebGpuSupport,
   estimateWeightCacheBytes,
+  generateChatTurn,
   generatePreparedAudioChatTurn,
   generatePreparedImageChatTurn,
   getGgufModelName,
@@ -256,16 +257,45 @@ async function handleGenerateTurn(
       const encoded = await runAudioEncoder(audioSession, features, {
         signal: abortController.signal,
       });
-      await generatePreparedAudioChatTurn(
+      let isFirstAgentStep = true;
+      await generateAgentTurn(
         session,
         tokenizer,
         workingState,
         request.userContent,
         {
-          hidden: encoded.hidden,
-          tokenCount: encoded.tokenCount,
+          ...turnOptions,
+          tools: SANDBOX_AGENT_TOOLS,
+          executeTool: (call, signal) => executeSandboxAgentTool(sandboxFs, call, signal),
+          maxToolSteps: DEFAULT_MAX_TOOL_STEPS,
+          onAgentEvent(event) {
+            if (event.type === "text") {
+              return;
+            }
+            workerScope.postMessage({
+              type: "agentEvent",
+              requestId: request.requestId,
+              event,
+            });
+          },
+          chatTurnGenerator(nextSession, nextTokenizer, nextState, userContent, options) {
+            if (!isFirstAgentStep) {
+              return generateChatTurn(nextSession, nextTokenizer, nextState, userContent, options);
+            }
+            isFirstAgentStep = false;
+            return generatePreparedAudioChatTurn(
+              nextSession,
+              nextTokenizer,
+              nextState,
+              userContent,
+              {
+                hidden: encoded.hidden,
+                tokenCount: encoded.tokenCount,
+              },
+              options,
+            );
+          },
         },
-        turnOptions,
       );
     } else if (request.image) {
       if (!visionSession) {
