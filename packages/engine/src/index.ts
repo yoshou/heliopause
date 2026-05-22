@@ -95,6 +95,7 @@ export {
 export {
   applyChatGenerationPrompt,
   applyChatTemplate,
+  closeChatModelTurn,
   createChatSession,
   createFileGgufTensorReader,
   DEFAULT_SYSTEM_PROMPT,
@@ -110,6 +111,9 @@ export {
   type ChatMessage,
   type ChatPrefillOptions,
   type ChatTemplateOptions,
+  type ChatToolCall,
+  type ChatToolDeclaration,
+  type ChatTurnInput,
   type ChatTurnOptions,
   type ChatTurnResult,
   type FileGgufTensorReaderOptions,

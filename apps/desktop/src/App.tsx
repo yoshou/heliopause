@@ -1760,10 +1760,10 @@ function describeToolAction(
 
 function stripAgentArtifacts(content: string): string {
   return content
-    .replace(/<tool_call>[\s\S]*?<\/tool_call>/g, "")
-    .replace(/<tool_response>[\s\S]*?<\/tool_response>/g, "")
-    .replace(/<tool_call>[\s\S]*$/g, "")
-    .replace(/<tool_response>[\s\S]*$/g, "");
+    .replace(/<\|tool_call>[\s\S]*?<tool_call\|>/g, "")
+    .replace(/<\|tool_response>[\s\S]*?<tool_response\|>/g, "")
+    .replace(/<\|tool_call>[\s\S]*$/g, "")
+    .replace(/<\|tool_response>[\s\S]*$/g, "");
 }
 
 function isSandboxListFilesContent(value: unknown): value is SandboxListFilesContent {

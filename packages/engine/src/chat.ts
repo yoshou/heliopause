@@ -22,10 +22,42 @@ import {
 } from "./tensor-reader";
 import type { Tokenizer } from "./tokenizer";
 
-export type ChatMessage = {
-  role: "system" | "user" | "assistant";
-  content: string;
+export type ChatToolDeclaration = {
+  type?: "function";
+  function: {
+    name: string;
+    description: string;
+    parameters?: unknown;
+    response?: unknown;
+  };
 };
+
+export type ChatToolCall = {
+  id?: string;
+  type?: "function";
+  function: {
+    name: string;
+    arguments: unknown;
+  };
+};
+
+export type ChatMessage =
+  | {
+      role: "system" | "developer" | "user";
+      content: string;
+      toolDeclarations?: readonly ChatToolDeclaration[];
+    }
+  | {
+      role: "assistant";
+      content?: string;
+      tool_calls?: readonly ChatToolCall[];
+    }
+  | {
+      role: "tool";
+      tool_call_id: string;
+      name?: string;
+      content: unknown;
+    };
 
 export type PreparedImageInput = {
   hidden: Float32Array;
@@ -40,6 +72,7 @@ export type PreparedAudioInput = {
 export type ChatTemplateOptions = {
   addGenerationPrompt?: boolean;
   enableThinking?: boolean;
+  closeFinalTurn?: boolean;
 };
 
 export type FileGgufTensorReaderOptions = {
@@ -59,12 +92,18 @@ export type ChatPrefillOptions = {
   signal?: AbortSignal;
 };
 
-export type ChatTurnOptions = ChatCompletionOptions;
+export type ChatTurnOptions = ChatCompletionOptions & {
+  appendTurnEnd?: boolean;
+  continueModelTurn?: boolean;
+};
+
+export type ChatTurnInput = string | readonly ChatMessage[];
 
 export type ChatTurnResult = {
   content: string;
   finishReason: "stop" | "length";
   state: InferenceState;
+  modelTurnClosed?: boolean;
 };
 
 export type ChatCompletionChunk = {
@@ -90,11 +129,48 @@ export function applyChatTemplate(
 ): string {
   const addGenerationPrompt = options.addGenerationPrompt ?? true;
   const enableThinking = options.enableThinking ?? false;
+  const closeFinalTurn = options.closeFinalTurn ?? true;
   let output = "";
 
-  for (const message of messages) {
+  for (let index = 0; index < messages.length; index += 1) {
+    const message = messages[index];
+
+    if (message.role === "tool") {
+      output += formatToolResponseMessage(message, findToolNameForToolMessage(messages, index));
+      if (messages[index + 1]?.role !== "tool" && (closeFinalTurn || index + 1 < messages.length)) {
+        output += "<turn|>\n";
+      }
+      continue;
+    }
+
     const role = message.role === "assistant" ? "model" : message.role;
-    output += `<|turn>${role}\n${message.content.trim()}<turn|>\n`;
+    output += `<|turn>${role}\n`;
+
+    if (message.role === "assistant") {
+      const toolCalls = message.tool_calls ?? [];
+      for (const toolCall of toolCalls) {
+        output += formatToolCall(toolCall);
+      }
+      output += stripThinking(message.content ?? "");
+      if (toolCalls.length > 0) {
+        if (messages[index + 1]?.role !== "tool") {
+          output += "<|tool_response>";
+        }
+      } else {
+        if (closeFinalTurn || index + 1 < messages.length) {
+          output += "<turn|>\n";
+        }
+      }
+      continue;
+    }
+
+    output += message.content.trim();
+    for (const tool of message.toolDeclarations ?? []) {
+      output += `<|tool>${formatToolDeclaration(tool)}<tool|>`;
+    }
+    if (closeFinalTurn || index + 1 < messages.length) {
+      output += "<turn|>\n";
+    }
   }
 
   if (addGenerationPrompt) {
@@ -108,6 +184,135 @@ export function applyChatGenerationPrompt(
   options: Pick<ChatTemplateOptions, "enableThinking"> = {},
 ): string {
   return (options.enableThinking ?? false) ? "<|think|>\n<|turn>model\n" : "<|turn>model\n";
+}
+
+function formatToolDeclaration(tool: ChatToolDeclaration): string {
+  const declaration = tool.function;
+  let output = `declaration:${declaration.name}{description:${formatGemma4Value(declaration.description)}`;
+  if (declaration.parameters !== undefined) {
+    output += `,parameters:${formatToolSchema(declaration.parameters)}`;
+  }
+  if (declaration.response !== undefined) {
+    output += `,response:${formatToolSchema(declaration.response)}`;
+  }
+  return `${output}}`;
+}
+
+function formatToolSchema(schema: unknown): string {
+  if (!isRecord(schema)) {
+    return formatGemma4Value(schema);
+  }
+
+  const parts: string[] = [];
+  if (isRecord(schema.properties)) {
+    parts.push(`properties:{${formatToolParameters(schema.properties)}}`);
+  }
+  if (Array.isArray(schema.required) && schema.required.length > 0) {
+    parts.push(`required:${formatGemma4Value(schema.required)}`);
+  }
+  if (typeof schema.type === "string") {
+    parts.push(`type:${formatGemma4Value(schema.type.toUpperCase())}`);
+  }
+  return `{${parts.join(",")}}`;
+}
+
+function formatToolParameters(properties: Record<string, unknown>): string {
+  return Object.keys(properties)
+    .sort()
+    .map((key) => `${key}:${formatToolParameter(properties[key])}`)
+    .join(",");
+}
+
+function formatToolParameter(parameter: unknown): string {
+  if (!isRecord(parameter)) {
+    return formatGemma4Value(parameter);
+  }
+
+  const parts: string[] = [];
+  if (typeof parameter.description === "string") {
+    parts.push(`description:${formatGemma4Value(parameter.description)}`);
+  }
+  if (typeof parameter.type === "string" && parameter.type.toUpperCase() === "STRING" && Array.isArray(parameter.enum)) {
+    parts.push(`enum:${formatGemma4Value(parameter.enum)}`);
+  }
+  if (typeof parameter.type === "string" && parameter.type.toUpperCase() === "ARRAY" && isRecord(parameter.items)) {
+    parts.push(`items:${formatToolSchema(parameter.items)}`);
+  }
+  if (parameter.nullable === true) {
+    parts.push("nullable:true");
+  }
+  if (typeof parameter.type === "string" && parameter.type.toUpperCase() === "OBJECT") {
+    if (isRecord(parameter.properties)) {
+      parts.push(`properties:{${formatToolParameters(parameter.properties)}}`);
+    }
+    if (Array.isArray(parameter.required) && parameter.required.length > 0) {
+      parts.push(`required:${formatGemma4Value(parameter.required)}`);
+    }
+  }
+  if (typeof parameter.type === "string") {
+    parts.push(`type:${formatGemma4Value(parameter.type.toUpperCase())}`);
+  }
+  return `{${parts.join(",")}}`;
+}
+
+function formatToolCall(toolCall: ChatToolCall): string {
+  return `<|tool_call>call:${toolCall.function.name}${formatGemma4ObjectBody(toolCall.function.arguments)}<tool_call|>`;
+}
+
+function formatToolResponseMessage(message: Extract<ChatMessage, { role: "tool" }>, fallbackName: string): string {
+  return `<|tool_response>response:${message.name ?? fallbackName}${formatGemma4ObjectBody(message.content)}<tool_response|>`;
+}
+
+function formatGemma4ObjectBody(value: unknown): string {
+  if (isRecord(value)) {
+    return formatGemma4Value(value, false);
+  }
+  return `{value:${formatGemma4Value(value, false)}}`;
+}
+
+function formatGemma4Value(value: unknown, escapeKeys = true): string {
+  if (typeof value === "string") {
+    return `<|"|>${value}<|"|>`;
+  }
+  if (typeof value === "number") {
+    return Number.isFinite(value) ? String(value) : "null";
+  }
+  if (typeof value === "boolean") {
+    return value ? "true" : "false";
+  }
+  if (value === null || value === undefined) {
+    return "null";
+  }
+  if (Array.isArray(value)) {
+    return `[${value.map((item) => formatGemma4Value(item, escapeKeys)).join(",")}]`;
+  }
+  if (isRecord(value)) {
+    return `{${Object.keys(value)
+      .sort()
+      .filter((key) => value[key] !== undefined)
+      .map((key) => {
+        const formattedKey = escapeKeys ? formatGemma4Value(key) : key;
+        return `${formattedKey}:${formatGemma4Value(value[key], escapeKeys)}`;
+      })
+      .join(",")}}`;
+  }
+  return String(value);
+}
+
+function findToolNameForToolMessage(messages: readonly ChatMessage[], toolMessageIndex: number): string {
+  const toolMessage = messages[toolMessageIndex];
+  if (toolMessage.role !== "tool") {
+    return "unknown";
+  }
+  for (let index = toolMessageIndex - 1; index >= 0; index -= 1) {
+    const previous = messages[index];
+    if (previous.role !== "assistant") {
+      continue;
+    }
+    const call = previous.tool_calls?.find((candidate) => candidate.id === toolMessage.tool_call_id);
+    return call?.function.name ?? "unknown";
+  }
+  return "unknown";
 }
 
 export async function createFileGgufTensorReader(
@@ -152,96 +357,67 @@ export async function generateChatTurn(
   session: ModelSession,
   tokenizer: Tokenizer,
   state: InferenceState,
-  userContent: string,
+  turn: ChatTurnInput,
   options: ChatTurnOptions = {},
 ): Promise<ChatTurnResult> {
   throwIfAborted(options.signal);
+
+  const messages = normalizeChatTurnInput(turn);
+  const prefillText = applyChatTemplate(messages, {
+    addGenerationPrompt: false,
+    closeFinalTurn: !options.continueModelTurn,
+  });
+
+  if (options.continueModelTurn) {
+    const prefillResult = await prefillChatText(
+      session,
+      tokenizer,
+      state,
+      prefillText,
+      { signal: options.signal, returnNextToken: true, requireGenerationSlot: true },
+    );
+    return generateAssistantFromNextToken(session, tokenizer, state, prefillResult.nextTokenId, options);
+  }
 
   await prefillChatText(
     session,
     tokenizer,
     state,
-    applyChatTemplate([{ role: "user", content: userContent }], {
-      addGenerationPrompt: false,
-    }),
+    prefillText,
     { signal: options.signal, requireGenerationSlot: true },
   );
 
-  const promptPrefill = await prefillChatText(
-    session,
-    tokenizer,
-    state,
-    applyChatGenerationPrompt(),
-    {
-      signal: options.signal,
-      returnNextToken: true,
-      requireGenerationSlot: true,
-    },
-  );
-  let nextTokenId = promptPrefill.nextTokenId;
+  return generateAssistantFromState(session, tokenizer, state, options);
+}
 
-  const stopTokenIds = new Set([
-    tokenizer.eosTokenId,
-    tokenizer.tokenToId("<turn|>"),
-    tokenizer.tokenToId("<eos>"),
-    tokenizer.tokenToId("<|im_end|>"),
-    ...(options.stopTokenIds ?? []),
-  ].filter((id): id is number => typeof id === "number"));
-  const maxNewTokens = options.maxNewTokens ?? DEFAULT_MAX_NEW_TOKENS;
-  let content = "";
-  let finishReason: ChatTurnResult["finishReason"] = "length";
-
-  for (let index = 0; index < maxNewTokens; index += 1) {
-    throwIfAborted(options.signal);
-
-    const tokenId = nextTokenId;
-    if (stopTokenIds.has(tokenId)) {
-      finishReason = "stop";
-      break;
-    }
-    if (state.nextPosition >= state.contextLength) {
-      finishReason = "length";
-      break;
-    }
-
-    const decodeResult = await decodeToken(session, state, tokenId, {
-      logitsTopK: 1,
-    });
-    nextTokenId = decodeResult.nextTokenId;
-
-    const token = tokenizer.idToToken(tokenId) ?? "";
-    const text = tokenizer.detokenize([tokenId]);
-    content = sanitizeChatOutput(content + text);
-
-    options.onToken?.({
-      tokenId,
-      token,
-      text,
-      content,
-    });
-  }
-
-  if (state.nextPosition < state.contextLength) {
-    await prefillChatText(session, tokenizer, state, "<turn|>\n", {
-      signal: options.signal,
-      requireGenerationSlot: false,
-    });
-  }
-
-  return { content, finishReason, state };
+export async function closeChatModelTurn(
+  session: ModelSession,
+  tokenizer: Tokenizer,
+  state: InferenceState,
+  options: ChatPrefillOptions = {},
+): Promise<InferenceState> {
+  await prefillChatText(session, tokenizer, state, "<turn|>\n", {
+    signal: options.signal,
+    requireGenerationSlot: false,
+  });
+  return state;
 }
 
 export async function generatePreparedImageChatTurn(
   session: ModelSession,
   tokenizer: Tokenizer,
   state: InferenceState,
-  userContent: string,
+  turn: ChatTurnInput,
   image: PreparedImageInput,
   options: ChatTurnOptions = {},
 ): Promise<ChatTurnResult> {
   throwIfAborted(options.signal);
   if (image.tokenCount <= 0 || image.hidden.length !== image.tokenCount * session.manifest.embeddingLength) {
     throw new Error(`Prepared image hidden shape mismatch: ${image.hidden.length}`);
+  }
+  const { prefillMessages, userContent } = splitPreparedTurnInput(turn);
+  if (prefillMessages.length > 0) {
+    await prefillChatMessages(session, tokenizer, state, prefillMessages, { signal: options.signal });
   }
 
   await prefillChatText(session, tokenizer, state, "<|turn>user\n<|image>", {
@@ -260,81 +436,45 @@ export async function generatePreparedImageChatTurn(
     requireGenerationSlot: true,
   });
 
-  const promptPrefill = await prefillChatText(
-    session,
-    tokenizer,
-    state,
-    applyChatGenerationPrompt(),
-    {
-      signal: options.signal,
-      returnNextToken: true,
-      requireGenerationSlot: true,
-    },
-  );
-  let nextTokenId = promptPrefill.nextTokenId;
+  return generateAssistantFromState(session, tokenizer, state, options);
+}
 
-  const stopTokenIds = new Set([
-    tokenizer.eosTokenId,
-    tokenizer.tokenToId("<turn|>"),
-    tokenizer.tokenToId("<eos>"),
-    tokenizer.tokenToId("<|im_end|>"),
-    ...(options.stopTokenIds ?? []),
-  ].filter((id): id is number => typeof id === "number"));
-  const maxNewTokens = options.maxNewTokens ?? DEFAULT_MAX_NEW_TOKENS;
-  let content = "";
-  let finishReason: ChatTurnResult["finishReason"] = "length";
+function normalizeChatTurnInput(turn: ChatTurnInput): readonly ChatMessage[] {
+  return typeof turn === "string" ? [{ role: "user", content: turn }] : turn;
+}
 
-  for (let index = 0; index < maxNewTokens; index += 1) {
-    throwIfAborted(options.signal);
-
-    const tokenId = nextTokenId;
-    if (stopTokenIds.has(tokenId)) {
-      finishReason = "stop";
-      break;
-    }
-    if (state.nextPosition >= state.contextLength) {
-      finishReason = "length";
-      break;
-    }
-
-    const decodeResult = await decodeToken(session, state, tokenId, {
-      logitsTopK: 1,
-    });
-    nextTokenId = decodeResult.nextTokenId;
-
-    const token = tokenizer.idToToken(tokenId) ?? "";
-    const text = tokenizer.detokenize([tokenId]);
-    content = sanitizeChatOutput(content + text);
-
-    options.onToken?.({
-      tokenId,
-      token,
-      text,
-      content,
-    });
+function splitPreparedTurnInput(turn: ChatTurnInput): {
+  prefillMessages: readonly ChatMessage[];
+  userContent: string;
+} {
+  if (typeof turn === "string") {
+    return { prefillMessages: [], userContent: turn };
   }
-
-  if (state.nextPosition < state.contextLength) {
-    await prefillChatText(session, tokenizer, state, "<turn|>\n", {
-      signal: options.signal,
-      requireGenerationSlot: false,
-    });
+  const lastMessage = turn.at(-1);
+  if (!lastMessage || lastMessage.role !== "user") {
+    throw new Error("Prepared media chat turns require the final structured message to be a user text turn.");
   }
-
-  return { content, finishReason, state };
+  return {
+    prefillMessages: turn.slice(0, -1),
+    userContent: lastMessage.content,
+  };
 }
 
 export async function generatePreparedAudioChatTurn(
   session: ModelSession,
   tokenizer: Tokenizer,
   state: InferenceState,
-  userContent: string,
+  turn: ChatTurnInput,
   audio: PreparedAudioInput,
   options: ChatTurnOptions = {},
 ): Promise<ChatTurnResult> {
   throwIfAborted(options.signal);
   if (audio.tokenCount <= 0 || audio.hidden.length !== audio.tokenCount * session.manifest.embeddingLength) {
     throw new Error(`Prepared audio hidden shape mismatch: ${audio.hidden.length}`);
+  }
+  const { prefillMessages, userContent } = splitPreparedTurnInput(turn);
+  if (prefillMessages.length > 0) {
+    await prefillChatMessages(session, tokenizer, state, prefillMessages, { signal: options.signal });
   }
 
   await prefillChatText(session, tokenizer, state, "<|turn>user\n<|audio>", {
@@ -361,6 +501,9 @@ async function generateAssistantFromState(
   state: InferenceState,
   options: ChatTurnOptions = {},
 ): Promise<ChatTurnResult> {
+  if (options.continueModelTurn) {
+    throw new Error("Cannot continue a model turn without prefilled continuation text.");
+  }
   const promptPrefill = await prefillChatText(
     session,
     tokenizer,
@@ -372,8 +515,16 @@ async function generateAssistantFromState(
       requireGenerationSlot: true,
     },
   );
-  let nextTokenId = promptPrefill.nextTokenId;
+  return generateAssistantFromNextToken(session, tokenizer, state, promptPrefill.nextTokenId, options);
+}
 
+async function generateAssistantFromNextToken(
+  session: ModelSession,
+  tokenizer: Tokenizer,
+  state: InferenceState,
+  nextTokenId: number,
+  options: ChatTurnOptions = {},
+): Promise<ChatTurnResult> {
   const stopTokenIds = new Set([
     tokenizer.eosTokenId,
     tokenizer.tokenToId("<turn|>"),
@@ -415,14 +566,15 @@ async function generateAssistantFromState(
     });
   }
 
-  if (state.nextPosition < state.contextLength) {
+  const appendTurnEnd = options.appendTurnEnd ?? true;
+  if (appendTurnEnd && state.nextPosition < state.contextLength) {
     await prefillChatText(session, tokenizer, state, "<turn|>\n", {
       signal: options.signal,
       requireGenerationSlot: false,
     });
   }
 
-  return { content, finishReason, state };
+  return { content, finishReason, state, modelTurnClosed: appendTurnEnd };
 }
 
 export async function* generateChatCompletion(
@@ -588,6 +740,10 @@ function sanitizeChatOutput(content: string): string {
     output = end < 0 ? output.slice(0, start) : `${output.slice(0, start)}${output.slice(end + "<channel|>".length)}`;
   }
   return output;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 export function getGgufModelName(reader: GgufTensorReader): string {

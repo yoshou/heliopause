@@ -29,11 +29,14 @@ export const SANDBOX_AGENT_TOOLS: readonly AgentToolDefinition[] = [
   {
     name: "sandbox_list_files",
     description:
-      'List files under /workspace. Example: <tool_call>{"tool":"sandbox_list_files","arguments":{"path":"/workspace"}}</tool_call>',
+      "List files and directories under the virtual /workspace filesystem.",
     parametersJsonSchema: {
       type: "object",
       properties: {
-        path: { type: "string" },
+        path: {
+          type: "string",
+          description: "Directory path to list. Defaults to /workspace when omitted.",
+        },
       },
       additionalProperties: false,
     },
@@ -41,11 +44,14 @@ export const SANDBOX_AGENT_TOOLS: readonly AgentToolDefinition[] = [
   {
     name: "sandbox_read_file",
     description:
-      'Read a text file from the virtual /workspace filesystem. Example: <tool_call>{"tool":"sandbox_read_file","arguments":{"path":"/workspace/notes.md"}}</tool_call>',
+      "Read the full UTF-8 text content of a file from the virtual /workspace filesystem.",
     parametersJsonSchema: {
       type: "object",
       properties: {
-        path: { type: "string" },
+        path: {
+          type: "string",
+          description: "File path to read, relative to /workspace or an absolute /workspace path.",
+        },
       },
       required: ["path"],
       additionalProperties: false,
@@ -54,12 +60,18 @@ export const SANDBOX_AGENT_TOOLS: readonly AgentToolDefinition[] = [
   {
     name: "sandbox_write_file",
     description:
-      'Write a text file into the virtual /workspace filesystem. Example: <tool_call>{"tool":"sandbox_write_file","arguments":{"path":"/workspace/notes.md","content":"hello\\n"}}</tool_call>',
+      "Write UTF-8 text content to a file in the virtual /workspace filesystem, creating parent directories as needed.",
     parametersJsonSchema: {
       type: "object",
       properties: {
-        path: { type: "string" },
-        content: { type: "string" },
+        path: {
+          type: "string",
+          description: "Destination file path, relative to /workspace or an absolute /workspace path.",
+        },
+        content: {
+          type: "string",
+          description: "Complete file content to write.",
+        },
       },
       required: ["path", "content"],
       additionalProperties: false,
@@ -68,13 +80,18 @@ export const SANDBOX_AGENT_TOOLS: readonly AgentToolDefinition[] = [
   {
     name: "sandbox_command",
     description:
-      'Run an allowed virtual sandbox command. Use structured arguments only, never a shell string. Example: <tool_call>{"tool":"sandbox_command","arguments":{"cmd":"ls","args":["/workspace"]}}</tool_call>',
+      "Run one allowed virtual sandbox command against the /workspace filesystem. Use structured arguments only, never a shell string.",
     parametersJsonSchema: {
       type: "object",
       properties: {
-        cmd: { type: "string", enum: SANDBOX_COMMAND_NAMES },
+        cmd: {
+          type: "string",
+          enum: SANDBOX_COMMAND_NAMES,
+          description: "Allowed command name to execute.",
+        },
         args: {
           type: "array",
+          description: "Command arguments, such as paths or flags, as separate strings.",
           items: { type: "string" },
         },
       },
@@ -87,17 +104,19 @@ export const SANDBOX_AGENT_TOOLS: readonly AgentToolDefinition[] = [
 export const WEB_SEARCH_AGENT_TOOL: AgentToolDefinition = {
   name: "web_search",
   description:
-    'Request a public web search with Tavily. The app, not the assistant, will ask the user to confirm before running it. If the user asks you to search or confirms a previous search suggestion, call this tool with the best query from the current request or recent conversation. Results include title, url, and snippet only; raw page content, images, cookies, credentials, and private URLs are not available. Example: <tool_call>{"tool":"web_search","arguments":{"query":"OpenAI latest model release","max_results":5}}</tool_call>',
+    "Request a public web search with Tavily. Use the best query from the current request or recent conversation. Results include title, url, and snippet only; raw page content, images, cookies, credentials, and private URLs are not available.",
   parametersJsonSchema: {
     type: "object",
     properties: {
       query: {
         type: "string",
+        description: "Search query text.",
         minLength: 1,
         maxLength: 500,
       },
       max_results: {
         type: "integer",
+        description: "Maximum number of search results to return.",
         minimum: 1,
         maximum: 5,
       },

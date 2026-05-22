@@ -49,18 +49,19 @@ test("buildAgentTools exposes web_search only when enabled", () => {
 
 test("WEB_SEARCH_AGENT_TOOL requires a query and limits max_results", () => {
   assert.equal(WEB_SEARCH_AGENT_TOOL.requiresConfirmation, true);
-  assert.match(WEB_SEARCH_AGENT_TOOL.description, /app, not the assistant/i);
   assert.match(WEB_SEARCH_AGENT_TOOL.description, /recent conversation/i);
   assert.deepEqual(WEB_SEARCH_AGENT_TOOL.parametersJsonSchema, {
     type: "object",
     properties: {
       query: {
         type: "string",
+        description: "Search query text.",
         minLength: 1,
         maxLength: 500,
       },
       max_results: {
         type: "integer",
+        description: "Maximum number of search results to return.",
         minimum: 1,
         maximum: 5,
       },
@@ -68,6 +69,13 @@ test("WEB_SEARCH_AGENT_TOOL requires a query and limits max_results", () => {
     required: ["query"],
     additionalProperties: false,
   });
+});
+
+test("agent tool descriptions do not include legacy XML+JSON examples", () => {
+  for (const tool of buildAgentTools({ webSearchAvailable: true })) {
+    assert.equal(tool.description.includes("<tool_call>"), false);
+    assert.equal(tool.description.includes("</tool_call>"), false);
+  }
 });
 
 test("sandbox_list_files lists the default workspace and explicit paths", async () => {

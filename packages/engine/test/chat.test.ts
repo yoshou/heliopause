@@ -15,6 +15,9 @@ import {
   type GgufMetadata,
 } from "../src/index.ts";
 
+// Gemma 4 chat template snapshot: tmp/gemma4-chat-template-2026-05-22.jinja
+// sha256: 2f1b4d75d067bae3fe44e676721c7f077d243bc007156cb9c2f8b5836613d082
+
 test("chat template formats history and disables thinking by default", () => {
   assert.equal(
     applyChatTemplate([
@@ -36,6 +39,81 @@ test("chat template can leave thinking enabled", () => {
     ], { enableThinking: true }),
     "<|turn>user\nHello<turn|>\n" +
       "<|think|>\n<|turn>model\n",
+  );
+});
+
+test("chat template serializes Gemma 4 native tool declarations", () => {
+  assert.equal(
+    applyChatTemplate([
+      {
+        role: "system",
+        content: "",
+        toolDeclarations: [{
+          type: "function",
+          function: {
+            name: "sandbox_list_files",
+            description: "List files under /workspace.",
+            parameters: {
+              type: "object",
+              properties: {
+                path: {
+                  type: "string",
+                  description: "Directory path to list.",
+                },
+              },
+              required: ["path"],
+            },
+          },
+        }],
+      },
+    ], { addGenerationPrompt: false }),
+    "<|turn>system\n" +
+      '<|tool>declaration:sandbox_list_files{description:<|"|>List files under /workspace.<|"|>,parameters:{properties:{path:{description:<|"|>Directory path to list.<|"|>,type:<|"|>STRING<|"|>}},required:[<|"|>path<|"|>],type:<|"|>OBJECT<|"|>}}<tool|>' +
+      "<turn|>\n",
+  );
+});
+
+test("chat template serializes Gemma 4 native tool calls and responses", () => {
+  assert.equal(
+    applyChatTemplate([
+      {
+        role: "assistant",
+        tool_calls: [{
+          id: "tool_1",
+          type: "function",
+          function: {
+            name: "sandbox_list_files",
+            arguments: { path: "/workspace" },
+          },
+        }],
+      },
+      {
+        role: "tool",
+        tool_call_id: "tool_1",
+        content: {
+          ok: true,
+          content: { entries: ["notes.md"] },
+        },
+      },
+    ], { addGenerationPrompt: false }),
+    "<|turn>model\n" +
+      '<|tool_call>call:sandbox_list_files{path:<|"|>/workspace<|"|>}<tool_call|>' +
+      '<|tool_response>response:sandbox_list_files{content:{entries:[<|"|>notes.md<|"|>]},ok:true}<tool_response|>' +
+      "<turn|>\n",
+  );
+});
+
+test("chat template can leave a model tool turn open for incremental tool responses", () => {
+  assert.equal(
+    applyChatTemplate([
+      {
+        role: "tool",
+        tool_call_id: "tool_1",
+        name: "sandbox_list_files",
+        content: { ok: true },
+      },
+    ], { addGenerationPrompt: false, closeFinalTurn: false }),
+    '<|tool_response>response:sandbox_list_files{ok:true}<tool_response|>',
   );
 });
 

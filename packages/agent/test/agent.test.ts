@@ -3,16 +3,18 @@ import test from "node:test";
 
 import {
   DEFAULT_MAX_TOOL_STEPS,
-  formatToolResponse,
   generateAgentTurn,
   parseToolCall,
   type AgentChatTurnGenerator,
   type AgentEvent,
+  type AgentModelTurnCloser,
   type AgentToolDefinition,
   type AgentToolResult,
 } from "../src/index.ts";
 import type {
   ChatCompletionChunk,
+  ChatTurnOptions,
+  ChatTurnInput,
   InferenceState,
   ModelSession,
   Tokenizer,
@@ -49,10 +51,47 @@ test("parseToolCall returns none for normal assistant text", () => {
   assert.deepEqual(parseToolCall("Hello there.", [sandboxCommandTool], 1), { type: "none" });
 });
 
+test("generateAgentTurn continues an open model turn for tool responses", async () => {
+  const callOptions: Array<Pick<ChatTurnOptions, "appendTurnEnd" | "continueModelTurn">> = [];
+  let index = 0;
+  const chatTurnGenerator: AgentChatTurnGenerator = async (_session, _tokenizer, state, _turn, options = {}) => {
+    callOptions.push({
+      appendTurnEnd: options.appendTurnEnd,
+      continueModelTurn: options.continueModelTurn,
+    });
+    index += 1;
+    const content = index === 1
+      ? '<|tool_call>call:sandbox_command{cmd:<|"|>ls<|"|>,args:[]}<tool_call|>'
+      : "done";
+    options.onToken?.(chunk(content));
+    return {
+      content,
+      finishReason: "stop",
+      state,
+      modelTurnClosed: index !== 1,
+    };
+  };
+
+  await generateAgentTurn(fakeSession, fakeTokenizer, fakeState(), "List files.", {
+    tools: [sandboxCommandTool],
+    chatTurnGenerator,
+    executeTool: async (call) => ({
+      callId: call.id,
+      ok: true,
+      content: { stdout: "notes.md\n" },
+    }),
+  });
+
+  assert.deepEqual(callOptions, [
+    { appendTurnEnd: false, continueModelTurn: false },
+    { appendTurnEnd: false, continueModelTurn: true },
+  ]);
+});
+
 test("parseToolCall accepts a valid tool call and assigns a step id", () => {
   assert.deepEqual(
     parseToolCall(
-      '<tool_call>{"tool":"sandbox_command","arguments":{"cmd":"ls","args":["/workspace"]}}</tool_call>',
+      '<|tool_call>call:sandbox_command{cmd:<|"|>ls<|"|>,args:[<|"|>/workspace<|"|>]}<tool_call|>',
       [sandboxCommandTool],
       2,
     ),
@@ -87,7 +126,7 @@ test("parseToolCall accepts tag text inside JSON string values", () => {
 
   assert.deepEqual(
     parseToolCall(
-      '<tool_call>{"tool":"sandbox_write_file","arguments":{"path":"a.txt","content":"literal </tool_call> text"}}</tool_call>',
+      '<|tool_call>call:sandbox_write_file{path:<|"|>a.txt<|"|>,content:<|"|>literal <tool_call|> text<|"|>}<tool_call|>',
       [writeFileTool],
       1,
     ),
@@ -98,26 +137,26 @@ test("parseToolCall accepts tag text inside JSON string values", () => {
         name: "sandbox_write_file",
         arguments: {
           path: "a.txt",
-          content: "literal </tool_call> text",
+          content: "literal <tool_call|> text",
         },
       },
     },
   );
 });
 
-test("parseToolCall rejects malformed JSON and unmatched tags", () => {
+test("parseToolCall rejects malformed native calls and unmatched tags", () => {
   assert.equal(
-    parseToolCall('<tool_call>{"tool":</tool_call>', [sandboxCommandTool], 1).type,
+    parseToolCall('<|tool_call>call:sandbox_command{cmd:<|"|>ls<|"|><tool_call|>', [sandboxCommandTool], 1).type,
     "error",
   );
   assert.deepEqual(
-    parseToolCall("<tool_call>{}", [sandboxCommandTool], 1),
+    parseToolCall("<|tool_call>call:sandbox_command{}", [sandboxCommandTool], 1),
     {
       type: "error",
       callId: "tool_1",
       error: {
-        code: "invalid_tool_call_json",
-        message: "Tool call tags are incomplete or malformed.",
+        code: "invalid_tool_call_format",
+        message: "Native tool call tags are incomplete or malformed.",
       },
     },
   );
@@ -125,7 +164,7 @@ test("parseToolCall rejects malformed JSON and unmatched tags", () => {
 
 test("parseToolCall rejects multiple complete tool calls", () => {
   const result = parseToolCall(
-    '<tool_call>{"tool":"sandbox_read_file","arguments":{"path":"a.txt"}}</tool_call><tool_call>{"tool":"sandbox_read_file","arguments":{"path":"b.txt"}}</tool_call>',
+    '<|tool_call>call:sandbox_read_file{path:<|"|>a.txt<|"|>}<tool_call|><|tool_call>call:sandbox_read_file{path:<|"|>b.txt<|"|>}<tool_call|>',
     [readFileTool],
     1,
   );
@@ -135,21 +174,21 @@ test("parseToolCall rejects multiple complete tool calls", () => {
 
 test("parseToolCall rejects unknown tools, missing arguments, and schema mismatches", () => {
   const unknown = parseToolCall(
-    '<tool_call>{"tool":"missing_tool","arguments":{}}</tool_call>',
+    '<|tool_call>call:missing_tool{}<tool_call|>',
     [sandboxCommandTool],
     1,
   );
   assert.equal(unknown.type === "error" ? unknown.error.code : "", "unknown_tool");
 
-  const missingArguments = parseToolCall(
-    '<tool_call>{"tool":"sandbox_command"}</tool_call>',
+  const malformedArguments = parseToolCall(
+    '<|tool_call>call:sandbox_command[]<tool_call|>',
     [sandboxCommandTool],
     1,
   );
-  assert.equal(missingArguments.type === "error" ? missingArguments.error.code : "", "invalid_tool_arguments");
+  assert.equal(malformedArguments.type === "error" ? malformedArguments.error.code : "", "invalid_tool_call_format");
 
   const invalidArguments = parseToolCall(
-    '<tool_call>{"tool":"sandbox_command","arguments":{"cmd":"rm","args":[]}}</tool_call>',
+    '<|tool_call>call:sandbox_command{cmd:<|"|>rm<|"|>,args:[]}<tool_call|>',
     [sandboxCommandTool],
     1,
   );
@@ -166,7 +205,7 @@ test("parseToolCall treats invalid schemas as argument validation failures", () 
   };
 
   const result = parseToolCall(
-    '<tool_call>{"tool":"sandbox_read_file","arguments":{"path":"a.txt"}}</tool_call>',
+    '<|tool_call>call:sandbox_read_file{path:<|"|>a.txt<|"|>}<tool_call|>',
     [invalidSchemaTool],
     1,
   );
@@ -185,23 +224,12 @@ test("parseToolCall rejects additional properties when properties are omitted", 
   };
 
   const result = parseToolCall(
-    '<tool_call>{"tool":"sandbox_read_file","arguments":{"path":"a.txt"}}</tool_call>',
+    '<|tool_call>call:sandbox_read_file{path:<|"|>a.txt<|"|>}<tool_call|>',
     [noPropertiesTool],
     1,
   );
 
   assert.equal(result.type === "error" ? result.error.code : "", "invalid_tool_arguments");
-});
-
-test("formatToolResponse wraps success and failure envelopes", () => {
-  assert.equal(
-    formatToolResponse({ callId: "tool_1", ok: true, content: { answer: 42 } }),
-    '<tool_response>{"callId":"tool_1","ok":true,"content":{"answer":42}}</tool_response>',
-  );
-  assert.equal(
-    formatToolResponse({ callId: "tool_2", ok: false, error: { code: "nope", message: "Nope." } }),
-    '<tool_response>{"callId":"tool_2","ok":false,"error":{"code":"nope","message":"Nope."}}</tool_response>',
-  );
 });
 
 test("generateAgentTurn returns a normal answer without executing tools", async () => {
@@ -225,15 +253,16 @@ test("generateAgentTurn returns a normal answer without executing tools", async 
 });
 
 test("generateAgentTurn executes a valid tool call and then emits final text", async () => {
-  const calls: string[] = [];
+  const calls: ChatTurnInput[] = [];
+  const callOptions: Array<Pick<ChatTurnOptions, "appendTurnEnd" | "continueModelTurn">> = [];
   const events: AgentEvent[] = [];
   const tokenTexts: string[] = [];
   const result = await generateAgentTurn(fakeSession, fakeTokenizer, fakeState(), "List files.", {
     tools: [sandboxCommandTool],
     chatTurnGenerator: mockGenerator([
-      '<tool_call>{"tool":"sandbox_command","arguments":{"cmd":"ls","args":["/workspace"]}}</tool_call>',
+      '<|tool_call>call:sandbox_command{cmd:<|"|>ls<|"|>,args:[<|"|>/workspace<|"|>]}<tool_call|>',
       "notes.md",
-    ], calls),
+    ], calls, callOptions),
     executeTool: async (call) => ({
       callId: call.id,
       ok: true,
@@ -247,19 +276,44 @@ test("generateAgentTurn executes a valid tool call and then emits final text", a
   assert.equal(result.steps, 1);
   assert.deepEqual(events.map((event) => event.type), ["toolCall", "toolResult", "text", "done"]);
   assert.deepEqual(tokenTexts, ["notes.md"]);
-  assert.match(calls[0] ?? "", /Tool instructions:/);
-  assert.match(calls[0] ?? "", /requiresConfirmation must still be called with a tool_call/);
-  assert.match(calls[0] ?? "", /Do not ask for separate confirmation/);
-  assert.match(calls[1] ?? "", /^<tool_response>/);
+  assert.deepEqual(calls[0], [
+    {
+      role: "system",
+      content: "",
+      toolDeclarations: [{
+        type: "function",
+        function: {
+          name: "sandbox_command",
+          description: "Run an allowed sandbox command.",
+          parameters: sandboxCommandTool.parametersJsonSchema,
+        },
+      }],
+    },
+    { role: "user", content: "List files." },
+  ]);
+  assert.deepEqual(calls[1], [{
+    role: "tool",
+    tool_call_id: "tool_1",
+    name: "sandbox_command",
+    content: {
+      callId: "tool_1",
+      ok: true,
+      content: { kind: "sandbox_command", exitCode: 0, stdout: "notes.md\n", stderr: "", truncated: false },
+    },
+  }]);
+  assert.deepEqual(callOptions, [
+    { appendTurnEnd: false, continueModelTurn: false },
+    { appendTurnEnd: false, continueModelTurn: false },
+  ]);
 });
 
 test("generateAgentTurn returns parser errors as tool responses without toolResult events", async () => {
-  const calls: string[] = [];
+  const calls: ChatTurnInput[] = [];
   const events: AgentEvent[] = [];
   const result = await generateAgentTurn(fakeSession, fakeTokenizer, fakeState(), "Use a tool.", {
     tools: [sandboxCommandTool],
     chatTurnGenerator: mockGenerator([
-      '<tool_call>{"tool":</tool_call>',
+      '<|tool_call>call:sandbox_command{cmd:<|"|>ls<|"|><tool_call|>',
       "Recovered.",
     ], calls),
     executeTool: async () => {
@@ -270,16 +324,18 @@ test("generateAgentTurn returns parser errors as tool responses without toolResu
 
   assert.equal(result.content, "Recovered.");
   assert.deepEqual(events.map((event) => event.type), ["stepError", "text", "done"]);
-  assert.match(calls[1] ?? "", /"code":"invalid_tool_call_json"/);
+  assert.equal(Array.isArray(calls[1]), true);
+  const recoveryTurn = calls[1] as unknown as Array<{ content?: unknown }>;
+  assert.match(JSON.stringify(recoveryTurn[0]?.content), /invalid_tool_call_format/);
 });
 
 test("generateAgentTurn normalizes executor throws into tool results", async () => {
-  const calls: string[] = [];
+  const calls: ChatTurnInput[] = [];
   const events: AgentEvent[] = [];
   const result = await generateAgentTurn(fakeSession, fakeTokenizer, fakeState(), "List files.", {
     tools: [sandboxCommandTool],
     chatTurnGenerator: mockGenerator([
-      '<tool_call>{"tool":"sandbox_command","arguments":{"cmd":"ls","args":[]}}</tool_call>',
+      '<|tool_call>call:sandbox_command{cmd:<|"|>ls<|"|>,args:[]}<tool_call|>',
       "Recovered after failure.",
     ], calls),
     executeTool: async () => {
@@ -299,7 +355,7 @@ test("generateAgentTurn normalizes executor throws into tool results", async () 
       retryable: true,
     },
   });
-  assert.match(calls[1] ?? "", /"code":"custom_failure"/);
+  assert.match(JSON.stringify(calls[1]), /custom_failure/);
 });
 
 test("generateAgentTurn stops executing tools after maxToolSteps and hides final raw tool JSON", async () => {
@@ -311,8 +367,8 @@ test("generateAgentTurn stops executing tools after maxToolSteps and hides final
     tools: [sandboxCommandTool],
     maxToolSteps: 1,
     chatTurnGenerator: mockGenerator([
-      '<tool_call>{"tool":"sandbox_command","arguments":{"cmd":"ls","args":[]}}</tool_call>',
-      '<tool_call>{"tool":"sandbox_command","arguments":{"cmd":"cat","args":["a.txt"]}}</tool_call>',
+      '<|tool_call>call:sandbox_command{cmd:<|"|>ls<|"|>,args:[]}<tool_call|>',
+      '<|tool_call>call:sandbox_command{cmd:<|"|>cat<|"|>,args:[<|"|>a.txt<|"|>]}<tool_call|>',
     ]),
     executeTool: async (call): Promise<AgentToolResult> => {
       executeCount += 1;
@@ -325,7 +381,7 @@ test("generateAgentTurn stops executing tools after maxToolSteps and hides final
   assert.equal(executeCount, 1);
   assert.equal(result.finishReason, "maxToolSteps");
   assert.equal(result.steps, 1);
-  assert.equal(result.content.includes("<tool_call>"), false);
+  assert.equal(result.content.includes("<|tool_call>"), false);
   assert.deepEqual(tokenTexts, [result.content]);
   assert.deepEqual(events.map((event) => event.type), ["toolCall", "toolResult", "text", "done"]);
   const doneEvent = events.at(-1);
@@ -338,9 +394,9 @@ test("generateAgentTurn propagates the same AbortSignal to generation and execut
   let executorSignal: AbortSignal | undefined;
   const chatTurnGenerator: AgentChatTurnGenerator = async (_session, _tokenizer, state, _userContent, options = {}) => {
     generationSignal = options.signal;
-    options.onToken?.(chunk('<tool_call>{"tool":"sandbox_command","arguments":{"cmd":"ls","args":[]}}</tool_call>'));
+    options.onToken?.(chunk('<|tool_call>call:sandbox_command{cmd:<|"|>ls<|"|>,args:[]}<tool_call|>'));
     return {
-      content: '<tool_call>{"tool":"sandbox_command","arguments":{"cmd":"ls","args":[]}}</tool_call>',
+      content: '<|tool_call>call:sandbox_command{cmd:<|"|>ls<|"|>,args:[]}<tool_call|>',
       finishReason: "stop",
       state,
     };
@@ -363,19 +419,43 @@ test("generateAgentTurn propagates the same AbortSignal to generation and execut
 
 test("generateAgentTurn returns the pre-final state when max-step fallback discards a tool call", async () => {
   const state = fakeState();
+  const closedStates: InferenceState[] = [];
   const result = await generateAgentTurn(fakeSession, fakeTokenizer, state, "Keep using tools.", {
     tools: [sandboxCommandTool],
     maxToolSteps: 1,
-    chatTurnGenerator: mutatingMockGenerator([
-      '<tool_call>{"tool":"sandbox_command","arguments":{"cmd":"ls","args":[]}}</tool_call>',
-      '<tool_call>{"tool":"sandbox_command","arguments":{"cmd":"cat","args":["a.txt"]}}</tool_call>',
+    chatTurnGenerator: mutatingOpenTurnMockGenerator([
+      '<|tool_call>call:sandbox_command{cmd:<|"|>ls<|"|>,args:[]}<tool_call|>',
+      '<|tool_call>call:sandbox_command{cmd:<|"|>cat<|"|>,args:[<|"|>a.txt<|"|>]}<tool_call|>',
     ]),
+    closeModelTurn: markingCloseModelTurn(closedStates),
     executeTool: async (call): Promise<AgentToolResult> => ({ callId: call.id, ok: true, content: { ok: true } }),
   });
 
-  assert.equal(state.nextPosition, 1);
-  assert.equal(result.state.nextPosition, 1);
+  assert.equal(state.nextPosition, 2);
+  assert.equal(result.state.nextPosition, 2);
   assert.notEqual(result.state, state);
+  assert.deepEqual(closedStates, [state, result.state]);
+});
+
+test("generateAgentTurn closes the committed state when max-step final text is generated on a clone", async () => {
+  const state = fakeState();
+  const closedStates: InferenceState[] = [];
+  const result = await generateAgentTurn(fakeSession, fakeTokenizer, state, "Keep using tools.", {
+    tools: [sandboxCommandTool],
+    maxToolSteps: 1,
+    chatTurnGenerator: mutatingOpenTurnMockGenerator([
+      '<|tool_call>call:sandbox_command{cmd:<|"|>ls<|"|>,args:[]}<tool_call|>',
+      "Enough information.",
+    ]),
+    closeModelTurn: markingCloseModelTurn(closedStates),
+    executeTool: async (call): Promise<AgentToolResult> => ({ callId: call.id, ok: true, content: { ok: true } }),
+  });
+
+  assert.equal(result.content, "Enough information.");
+  assert.equal(result.finishReason, "maxToolSteps");
+  assert.equal(state.nextPosition, 2);
+  assert.equal(result.state.nextPosition, 3);
+  assert.deepEqual(closedStates, [state, result.state]);
 });
 
 test("generateAgentTurn rejects immediately for pre-aborted signals", async () => {
@@ -395,10 +475,18 @@ test("DEFAULT_MAX_TOOL_STEPS is three", () => {
   assert.equal(DEFAULT_MAX_TOOL_STEPS, 3);
 });
 
-function mockGenerator(outputs: readonly string[], calls: string[] = []): AgentChatTurnGenerator {
+function mockGenerator(
+  outputs: readonly string[],
+  calls: ChatTurnInput[] = [],
+  callOptions: Array<Pick<ChatTurnOptions, "appendTurnEnd" | "continueModelTurn">> = [],
+): AgentChatTurnGenerator {
   let index = 0;
-  return async (_session, _tokenizer, state, userContent, options = {}) => {
-    calls.push(userContent);
+  return async (_session, _tokenizer, state, turn, options = {}) => {
+    calls.push(turn);
+    callOptions.push({
+      appendTurnEnd: options.appendTurnEnd,
+      continueModelTurn: options.continueModelTurn,
+    });
     const content = outputs[index] ?? outputs.at(-1) ?? "";
     index += 1;
     options.onToken?.(chunk(content));
@@ -412,9 +500,25 @@ function mockGenerator(outputs: readonly string[], calls: string[] = []): AgentC
 
 function mutatingMockGenerator(outputs: readonly string[]): AgentChatTurnGenerator {
   const generator = mockGenerator(outputs);
-  return async (session, tokenizer, state, userContent, options) => {
+  return async (session, tokenizer, state, turn, options) => {
     state.nextPosition += 1;
-    return generator(session, tokenizer, state, userContent, options);
+    return generator(session, tokenizer, state, turn, options);
+  };
+}
+
+function mutatingOpenTurnMockGenerator(outputs: readonly string[]): AgentChatTurnGenerator {
+  const generator = mutatingMockGenerator(outputs);
+  return async (session, tokenizer, state, turn, options) => {
+    const result = await generator(session, tokenizer, state, turn, options);
+    return { ...result, modelTurnClosed: false };
+  };
+}
+
+function markingCloseModelTurn(closedStates: InferenceState[]): AgentModelTurnCloser {
+  return async (_session, _tokenizer, state) => {
+    closedStates.push(state);
+    state.nextPosition += 1;
+    return state;
   };
 }
 

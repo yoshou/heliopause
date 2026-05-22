@@ -1,7 +1,11 @@
 import {
   cloneInferenceState,
+  closeChatModelTurn,
   generateChatTurn,
+  type ChatMessage,
   type ChatCompletionChunk,
+  type ChatToolDeclaration,
+  type ChatTurnInput,
   type ChatTurnOptions,
   type ChatTurnResult,
   type InferenceState,
@@ -9,15 +13,15 @@ import {
   type Tokenizer,
 } from "@heliopause/engine";
 
-export const TOOL_CALL_TAG = "tool_call";
-export const TOOL_RESPONSE_TAG = "tool_response";
+export const TOOL_CALL_OPEN_TAG = "<|tool_call>";
+export const TOOL_CALL_CLOSE_TAG = "<tool_call|>";
+export const TOOL_RESPONSE_OPEN_TAG = "<|tool_response>";
+export const TOOL_RESPONSE_CLOSE_TAG = "<tool_response|>";
 export const DEFAULT_MAX_TOOL_STEPS = 3;
 
-const TOOL_CALL_OPEN_TAG = `<${TOOL_CALL_TAG}>`;
-const TOOL_CALL_CLOSE_TAG = `</${TOOL_CALL_TAG}>`;
 const MAX_TOOL_STEPS_FINAL_PROMPT =
   "You have reached the maximum number of tool steps. Answer the user using only the tool responses already provided. Do not call another tool.";
-const MAX_TOOL_STEPS_FALLBACK =
+const MAX_TOOL_STEPS_FINAL_MESSAGE =
   "I reached the maximum number of tool steps and cannot call another tool. I do not have enough final text to show beyond the tool results already gathered.";
 
 const AGENT_TOOL_NAMES = [
@@ -77,9 +81,16 @@ export type AgentChatTurnGenerator = (
   session: ModelSession,
   tokenizer: Tokenizer,
   state: InferenceState,
-  userContent: string,
+  turn: ChatTurnInput,
   options?: ChatTurnOptions,
 ) => Promise<ChatTurnResult>;
+
+export type AgentModelTurnCloser = (
+  session: ModelSession,
+  tokenizer: Tokenizer,
+  state: InferenceState,
+  options?: Pick<ChatTurnOptions, "signal">,
+) => Promise<InferenceState>;
 
 export type AgentTurnOptions = ChatTurnOptions & {
   tools: readonly AgentToolDefinition[];
@@ -87,6 +98,7 @@ export type AgentTurnOptions = ChatTurnOptions & {
   maxToolSteps?: number;
   onAgentEvent?: (event: AgentEvent) => void;
   chatTurnGenerator?: AgentChatTurnGenerator;
+  closeModelTurn?: AgentModelTurnCloser;
 };
 
 export type AgentTurnResult = {
@@ -109,7 +121,7 @@ export function parseToolCall(
   step: number,
 ): AgentToolParseResult {
   const callId = toolCallIdForStep(step);
-  const extraction = extractToolCallBody(content);
+  const extraction = extractNativeToolCall(content);
 
   if (extraction.type === "none") {
     return { type: "none" };
@@ -127,32 +139,19 @@ export function parseToolCall(
   }
 
   if (extraction.type === "malformed") {
-    return invalidToolCallJson(callId, "Tool call tags are incomplete or malformed.");
+    return invalidToolCallFormat(callId, "Native tool call tags are incomplete or malformed.");
   }
 
-  let parsed: unknown;
+  let parsed: NativeToolCall;
   try {
-    parsed = JSON.parse(extraction.body);
+    parsed = parseNativeToolCallBody(extraction.body);
   } catch {
-    return invalidToolCallJson(callId, "Tool call JSON could not be parsed.");
+    return invalidToolCallFormat(callId, "Native tool call body could not be parsed.");
   }
 
-  if (!isPlainObject(parsed)) {
-    return invalidToolCallJson(callId, "Tool call JSON must be an object.");
-  }
-
-  const toolName = parsed.tool;
-  if (typeof toolName !== "string") {
-    return unknownTool(callId, "Tool call must include a string tool name.");
-  }
-
-  const tool = tools.find((candidate) => candidate.name === toolName);
-  if (!tool || !isAgentToolName(toolName)) {
-    return unknownTool(callId, `Unknown tool: ${toolName}`);
-  }
-
-  if (!Object.hasOwn(parsed, "arguments")) {
-    return invalidToolArguments(callId, "Tool call must include arguments.");
+  const tool = tools.find((candidate) => candidate.name === parsed.name);
+  if (!tool || !isAgentToolName(parsed.name)) {
+    return unknownTool(callId, `Unknown tool: ${parsed.name}`);
   }
 
   if (!validateJsonSchema(parsed.arguments, tool.parametersJsonSchema)) {
@@ -167,10 +166,6 @@ export function parseToolCall(
       arguments: parsed.arguments,
     },
   };
-}
-
-export function formatToolResponse(result: AgentToolResult): string {
-  return `<${TOOL_RESPONSE_TAG}>${JSON.stringify(result)}</${TOOL_RESPONSE_TAG}>`;
 }
 
 export async function generateAgentTurn(
@@ -191,28 +186,47 @@ export async function generateAgentTurn(
     executeTool: _executeTool,
     maxToolSteps: _maxToolSteps,
     onAgentEvent: _onAgentEvent,
+    closeModelTurn: _closeModelTurn,
     ...chatOptions
   } = options;
-  let nextUserContent = buildInitialUserContent(userContent, options.tools);
+  const modelTurnCloser = options.closeModelTurn ?? closeChatModelTurn;
+  let nextTurn: ChatTurnInput = buildInitialTurn(userContent, options.tools);
   let toolSteps = 0;
   let finalOnly = maxToolSteps === 0;
+  let modelTurnOpen = false;
 
   while (true) {
     throwIfAborted(options.signal);
 
     const step = toolSteps + 1;
     const chunks: ChatCompletionChunk[] = [];
+    const committedModelTurnOpen = modelTurnOpen;
     const stateBeforeFinalGeneration = finalOnly ? cloneInferenceState(state) : undefined;
     const generationState = finalOnly ? cloneInferenceState(state) : state;
-    const generation = await chatTurnGenerator(session, tokenizer, generationState, nextUserContent, {
+    const continueModelTurn = committedModelTurnOpen && isOnlyToolResponseTurn(nextTurn);
+    const generation = await chatTurnGenerator(session, tokenizer, generationState, nextTurn, {
       ...chatOptions,
+      appendTurnEnd: false,
+      continueModelTurn,
       onToken: (chunk: ChatCompletionChunk) => {
         chunks.push(chunk);
       },
     });
+    const generatedModelTurnOpen = generation.modelTurnClosed === false;
+    if (!finalOnly) {
+      modelTurnOpen = generatedModelTurnOpen;
+    }
     const parseResult = parseToolCall(generation.content, options.tools, step);
 
     if (parseResult.type === "none") {
+      if (finalOnly && committedModelTurnOpen) {
+        await modelTurnCloser(session, tokenizer, state, { signal: options.signal });
+        modelTurnOpen = false;
+      }
+      if (generatedModelTurnOpen) {
+        await modelTurnCloser(session, tokenizer, generation.state, { signal: options.signal });
+        modelTurnOpen = false;
+      }
       replayVisibleText(chunks, step, originalOnToken, options.onAgentEvent);
       const finishReason = finalOnly ? "maxToolSteps" : generation.finishReason;
       options.onAgentEvent?.({ type: "done", steps: toolSteps, finishReason });
@@ -225,10 +239,17 @@ export async function generateAgentTurn(
     }
 
     if (finalOnly) {
-      emitVisibleText(MAX_TOOL_STEPS_FALLBACK, step, originalOnToken, options.onAgentEvent);
+      if (committedModelTurnOpen) {
+        await modelTurnCloser(session, tokenizer, state, { signal: options.signal });
+        if (stateBeforeFinalGeneration && stateBeforeFinalGeneration !== state) {
+          await modelTurnCloser(session, tokenizer, stateBeforeFinalGeneration, { signal: options.signal });
+        }
+        modelTurnOpen = false;
+      }
+      emitVisibleText(MAX_TOOL_STEPS_FINAL_MESSAGE, step, originalOnToken, options.onAgentEvent);
       options.onAgentEvent?.({ type: "done", steps: toolSteps, finishReason: "maxToolSteps" });
       return {
-        content: MAX_TOOL_STEPS_FALLBACK,
+        content: MAX_TOOL_STEPS_FINAL_MESSAGE,
         finishReason: "maxToolSteps",
         steps: toolSteps,
         state: stateBeforeFinalGeneration ?? state,
@@ -237,18 +258,26 @@ export async function generateAgentTurn(
 
     toolSteps += 1;
 
+    const toolCall = parseResult.type === "call" ? parseResult.call : undefined;
     const toolResult = parseResult.type === "call"
       ? await executeParsedTool(parseResult.call, step, options)
       : toolStepErrorResult(parseResult, step, options);
 
-    const toolResponse = formatToolResponse(toolResult);
+    const toolResponseTurn = buildToolResponseTurn(toolResult, toolCall?.name ?? "unknown");
     if (toolSteps >= maxToolSteps) {
       finalOnly = true;
-      nextUserContent = `${toolResponse}\n\n${MAX_TOOL_STEPS_FINAL_PROMPT}`;
+      nextTurn = [
+        toolResponseTurn,
+        { role: "user", content: MAX_TOOL_STEPS_FINAL_PROMPT },
+      ];
     } else {
-      nextUserContent = toolResponse;
+      nextTurn = [toolResponseTurn];
     }
   }
+}
+
+function isOnlyToolResponseTurn(turn: ChatTurnInput): boolean {
+  return Array.isArray(turn) && turn.length > 0 && turn.every((message) => message.role === "tool");
 }
 
 async function executeParsedTool(
@@ -318,35 +347,40 @@ function emitVisibleText(
   });
 }
 
-function buildInitialUserContent(
+function buildInitialTurn(
   userContent: string,
   tools: readonly AgentToolDefinition[],
-): string {
-  const toolDescriptions = tools.length === 0
-    ? "No tools are available."
-    : tools
-      .map((tool) => JSON.stringify({
-        name: tool.name,
-        description: tool.description,
-        parametersJsonSchema: tool.parametersJsonSchema,
-        requiresConfirmation: tool.requiresConfirmation ?? false,
-      }))
-      .join("\n");
+): ChatMessage[] {
+  const messages: ChatMessage[] = [];
+  if (tools.length > 0) {
+    messages.push({
+      role: "system",
+      content: "",
+      toolDeclarations: tools.map(toChatToolDeclaration),
+    });
+  }
+  messages.push({ role: "user", content: userContent });
+  return messages;
+}
 
-  return [
-    "Tool instructions:",
-    `- To call a tool, output exactly one <${TOOL_CALL_TAG}> tag containing compact JSON.`,
-    "- The JSON object must include tool and arguments fields.",
-    "- Do not output more than one tool call in a single response.",
-    "- Tools marked requiresConfirmation must still be called with a tool_call; the app will ask the user for confirmation before execution.",
-    "- Do not ask for separate confirmation in natural language when a requiresConfirmation tool is appropriate.",
-    "- If no tool is needed, answer normally without tool tags.",
-    "Available tools:",
-    toolDescriptions,
-    "",
-    "User request:",
-    userContent,
-  ].join("\n");
+function toChatToolDeclaration(tool: AgentToolDefinition): ChatToolDeclaration {
+  return {
+    type: "function",
+    function: {
+      name: tool.name,
+      description: tool.description,
+      parameters: tool.parametersJsonSchema,
+    },
+  };
+}
+
+function buildToolResponseTurn(result: AgentToolResult, toolName: AgentToolName | "unknown"): ChatMessage {
+  return {
+    role: "tool",
+    tool_call_id: result.callId,
+    name: toolName,
+    content: result,
+  };
 }
 
 function normalizeThrownToolError(error: unknown): AgentToolError {
@@ -529,12 +563,12 @@ function jsonValuesEqual(left: unknown, right: unknown): boolean {
   return JSON.stringify(left) === JSON.stringify(right);
 }
 
-function invalidToolCallJson(callId: string, message: string): AgentToolParseResult {
+function invalidToolCallFormat(callId: string, message: string): AgentToolParseResult {
   return {
     type: "error",
     callId,
     error: {
-      code: "invalid_tool_call_json",
+      code: "invalid_tool_call_format",
       message,
     },
   };
@@ -584,7 +618,12 @@ type ToolCallExtraction =
   | { type: "multiple" }
   | { type: "malformed" };
 
-function extractToolCallBody(content: string): ToolCallExtraction {
+type NativeToolCall = {
+  name: string;
+  arguments: JsonObject;
+};
+
+function extractNativeToolCall(content: string): ToolCallExtraction {
   const firstOpen = content.indexOf(TOOL_CALL_OPEN_TAG);
   const firstClose = content.indexOf(TOOL_CALL_CLOSE_TAG);
 
@@ -596,7 +635,7 @@ function extractToolCallBody(content: string): ToolCallExtraction {
   }
 
   const bodyStart = firstOpen + TOOL_CALL_OPEN_TAG.length;
-  const closeIndex = findTagOutsideJsonString(content, TOOL_CALL_CLOSE_TAG, bodyStart);
+  const closeIndex = findNativeTagOutsideString(content, TOOL_CALL_CLOSE_TAG, bodyStart);
   if (closeIndex < 0) {
     return { type: "malformed" };
   }
@@ -604,7 +643,7 @@ function extractToolCallBody(content: string): ToolCallExtraction {
   const afterClose = closeIndex + TOOL_CALL_CLOSE_TAG.length;
   const nextOpen = content.indexOf(TOOL_CALL_OPEN_TAG, afterClose);
   if (nextOpen >= 0) {
-    const nextClose = findTagOutsideJsonString(content, TOOL_CALL_CLOSE_TAG, nextOpen + TOOL_CALL_OPEN_TAG.length);
+    const nextClose = findNativeTagOutsideString(content, TOOL_CALL_CLOSE_TAG, nextOpen + TOOL_CALL_OPEN_TAG.length);
     return nextClose >= 0 ? { type: "multiple" } : { type: "malformed" };
   }
   if (content.indexOf(TOOL_CALL_CLOSE_TAG, afterClose) >= 0) {
@@ -617,35 +656,176 @@ function extractToolCallBody(content: string): ToolCallExtraction {
   };
 }
 
-function findTagOutsideJsonString(content: string, tag: string, start: number): number {
+function parseNativeToolCallBody(body: string): NativeToolCall {
+  const parser = new NativeValueParser(body);
+  parser.consumeLiteral("call:");
+  const name = parser.consumeIdentifier();
+  const parsedArguments = parser.consumeValue();
+  parser.consumeWhitespace();
+  if (!parser.isDone()) {
+    throw new Error("Unexpected trailing native tool call text.");
+  }
+  if (!isPlainObject(parsedArguments)) {
+    throw new Error("Native tool call arguments must be an object.");
+  }
+  return { name, arguments: parsedArguments };
+}
+
+function findNativeTagOutsideString(content: string, tag: string, start: number): number {
   let inString = false;
-  let escaped = false;
 
   for (let index = start; index < content.length; index += 1) {
-    const char = content[index];
-
-    if (inString) {
-      if (escaped) {
-        escaped = false;
-      } else if (char === "\\") {
-        escaped = true;
-      } else if (char === "\"") {
-        inString = false;
-      }
+    if (content.startsWith('<|"|>', index)) {
+      inString = !inString;
+      index += '<|"|>'.length - 1;
       continue;
     }
 
-    if (char === "\"") {
-      inString = true;
-      continue;
-    }
-
-    if (content.startsWith(tag, index)) {
+    if (!inString && content.startsWith(tag, index)) {
       return index;
     }
   }
 
   return -1;
+}
+
+class NativeValueParser {
+  private index = 0;
+  private readonly input: string;
+
+  constructor(input: string) {
+    this.input = input;
+  }
+
+  isDone(): boolean {
+    return this.index >= this.input.length;
+  }
+
+  consumeWhitespace(): void {
+    while (this.index < this.input.length && /\s/.test(this.input[this.index] ?? "")) {
+      this.index += 1;
+    }
+  }
+
+  consumeLiteral(literal: string): void {
+    this.consumeWhitespace();
+    if (!this.input.startsWith(literal, this.index)) {
+      throw new Error(`Expected ${literal}.`);
+    }
+    this.index += literal.length;
+  }
+
+  consumeIdentifier(): string {
+    this.consumeWhitespace();
+    const match = /^[A-Za-z_][A-Za-z0-9_-]*/.exec(this.input.slice(this.index));
+    if (!match) {
+      throw new Error("Expected native identifier.");
+    }
+    this.index += match[0].length;
+    return match[0];
+  }
+
+  consumeValue(): unknown {
+    this.consumeWhitespace();
+    if (this.input.startsWith('<|"|>', this.index)) {
+      return this.consumeString();
+    }
+    const char = this.input[this.index];
+    if (char === "{") {
+      return this.consumeObject();
+    }
+    if (char === "[") {
+      return this.consumeArray();
+    }
+    if (this.input.startsWith("true", this.index)) {
+      this.index += 4;
+      return true;
+    }
+    if (this.input.startsWith("false", this.index)) {
+      this.index += 5;
+      return false;
+    }
+    if (this.input.startsWith("null", this.index)) {
+      this.index += 4;
+      return null;
+    }
+    return this.consumeNumber();
+  }
+
+  private consumeString(): string {
+    this.consumeLiteral('<|"|>');
+    const end = this.input.indexOf('<|"|>', this.index);
+    if (end < 0) {
+      throw new Error("Unclosed native string delimiter.");
+    }
+    const value = this.input.slice(this.index, end);
+    this.index = end + '<|"|>'.length;
+    return value;
+  }
+
+  private consumeObject(): JsonObject {
+    this.consumeLiteral("{");
+    const output: JsonObject = {};
+    this.consumeWhitespace();
+    if (this.input[this.index] === "}") {
+      this.index += 1;
+      return output;
+    }
+
+    while (true) {
+      const key = this.input.startsWith('<|"|>', this.index)
+        ? this.consumeString()
+        : this.consumeIdentifier();
+      this.consumeLiteral(":");
+      output[key] = this.consumeValue();
+      this.consumeWhitespace();
+      const char = this.input[this.index];
+      if (char === ",") {
+        this.index += 1;
+        continue;
+      }
+      if (char === "}") {
+        this.index += 1;
+        return output;
+      }
+      throw new Error("Expected native object delimiter.");
+    }
+  }
+
+  private consumeArray(): unknown[] {
+    this.consumeLiteral("[");
+    const output: unknown[] = [];
+    this.consumeWhitespace();
+    if (this.input[this.index] === "]") {
+      this.index += 1;
+      return output;
+    }
+
+    while (true) {
+      output.push(this.consumeValue());
+      this.consumeWhitespace();
+      const char = this.input[this.index];
+      if (char === ",") {
+        this.index += 1;
+        continue;
+      }
+      if (char === "]") {
+        this.index += 1;
+        return output;
+      }
+      throw new Error("Expected native array delimiter.");
+    }
+  }
+
+  private consumeNumber(): number {
+    this.consumeWhitespace();
+    const match = /^-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?/.exec(this.input.slice(this.index));
+    if (!match) {
+      throw new Error("Expected native value.");
+    }
+    this.index += match[0].length;
+    return Number(match[0]);
+  }
 }
 
 function throwIfAborted(signal: AbortSignal | undefined): void {
