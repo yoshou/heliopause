@@ -13,8 +13,13 @@ import {
   BATCHED_RMS_NORM_Q8_K_QUANTIZE_WGSL,
   BATCHED_FULL_QUERY_NORM_ROPE_WGSL,
   BATCHED_FULL_KV_UPDATE_WGSL,
-  BATCHED_FULL_ATTENTION_SCORE_WGSL,
-  BATCHED_FULL_ATTENTION_APPLY_WGSL,
+  BATCHED_FULL_ATTENTION_MATERIALIZED_APPLY_WGSL,
+  BATCHED_FULL_ATTENTION_MATERIALIZED_SCORE_WGSL,
+  BATCHED_FULL_ATTENTION_ROLLING_TILE_APPLY_WGSL,
+  BATCHED_FULL_ATTENTION_ROLLING_TILE_FINAL_WGSL,
+  BATCHED_FULL_ATTENTION_ROLLING_TILE_INIT_WGSL,
+  BATCHED_FULL_ATTENTION_ROLLING_TILE_MERGE_WGSL,
+  BATCHED_FULL_ATTENTION_ROLLING_TILE_PROBABILITY_WGSL,
   BATCHED_RMS_NORM_RESIDUAL_ADD_WGSL,
   BATCHED_RMS_NORM_RESIDUAL_ADD_SCALE_WGSL,
   BATCHED_GEGLU_SLICE_WGSL,
@@ -1061,7 +1066,278 @@ export function createBatchedFullKvUpdateResources(
   };
 }
 
-export function createBatchedFullAttentionScoreResources(
+export function createBatchedFullAttentionRollingTileInitResources(
+  device: WebGpuDeviceLike,
+  outputBuffer: WebGpuBufferLike,
+  options: {
+    valueSize: number;
+    queryHeadCount: number;
+    tokenCount: number;
+  },
+): { pipeline: unknown; bindGroup: unknown; destroy: () => void } {
+  const params = new Uint32Array([
+    options.valueSize,
+    options.queryHeadCount,
+    options.tokenCount,
+    0,
+  ]);
+  const paramsBuffer = device.createBuffer({ size: uniformBufferSize(params.byteLength), usage: GPU_UNIFORM | GPU_COPY_DST });
+  device.queue.writeBuffer(paramsBuffer, 0, params);
+  const bindGroupLayout = device.createBindGroupLayout({
+    entries: [
+      { binding: 0, visibility: GPU_SHADER_STAGE_COMPUTE, buffer: { type: "uniform" } },
+      storageEntry(1, "storage"),
+    ],
+  });
+  const pipeline = device.createComputePipeline({
+    layout: device.createPipelineLayout({ bindGroupLayouts: [bindGroupLayout] }),
+    compute: { module: device.createShaderModule({ code: BATCHED_FULL_ATTENTION_ROLLING_TILE_INIT_WGSL }), entryPoint: "main" },
+  });
+  return {
+    pipeline,
+    bindGroup: device.createBindGroup({
+      layout: bindGroupLayout,
+      entries: [
+        bindBuffer(0, paramsBuffer),
+        bindBuffer(1, outputBuffer),
+      ],
+    }),
+    destroy: () => paramsBuffer.destroy?.(),
+  };
+}
+
+export function createBatchedFullAttentionRollingTileProbabilityResources(
+  device: WebGpuDeviceLike,
+  queryBuffer: WebGpuBufferLike,
+  keyBuffer: WebGpuBufferLike,
+  positionsBuffer: WebGpuBufferLike,
+  probabilityTileBuffer: WebGpuBufferLike,
+  tileMaxBuffer: WebGpuBufferLike,
+  tileSumBuffer: WebGpuBufferLike,
+  options: {
+    headSize: number;
+    queryHeadCount: number;
+    keyValueHeadCount: number;
+    keyValueTokenCount: number;
+    contextLength: number;
+    slidingWindow?: number;
+    tokenCount: number;
+    scale: number;
+    causal: boolean;
+    tileSize: number;
+    tileStart: number;
+    tileLength: number;
+  },
+): { pipeline: unknown; bindGroup: unknown; destroy: () => void } {
+  const paramsF32 = new Float32Array([options.scale, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+  const params = new Uint32Array(paramsF32.buffer);
+  params[1] = options.headSize;
+  params[2] = options.queryHeadCount;
+  params[3] = options.keyValueHeadCount;
+  params[4] = options.keyValueTokenCount;
+  params[5] = options.contextLength;
+  params[6] = options.slidingWindow ?? 0;
+  params[7] = options.slidingWindow === undefined ? 0 : 1;
+  params[8] = options.tokenCount;
+  params[9] = options.causal ? 1 : 0;
+  params[10] = options.tileSize;
+  params[11] = options.tileStart;
+  params[12] = options.tileLength;
+  const paramsBuffer = device.createBuffer({ size: uniformBufferSize(params.byteLength), usage: GPU_UNIFORM | GPU_COPY_DST });
+  device.queue.writeBuffer(paramsBuffer, 0, params);
+  const bindGroupLayout = device.createBindGroupLayout({
+    entries: [
+      storageEntry(0, "read-only-storage"),
+      storageEntry(1, "read-only-storage"),
+      storageEntry(2, "read-only-storage"),
+      { binding: 3, visibility: GPU_SHADER_STAGE_COMPUTE, buffer: { type: "uniform" } },
+      storageEntry(4, "storage"),
+      storageEntry(5, "storage"),
+      storageEntry(6, "storage"),
+    ],
+  });
+  const pipeline = device.createComputePipeline({
+    layout: device.createPipelineLayout({ bindGroupLayouts: [bindGroupLayout] }),
+    compute: { module: device.createShaderModule({ code: BATCHED_FULL_ATTENTION_ROLLING_TILE_PROBABILITY_WGSL }), entryPoint: "main" },
+  });
+  return {
+    pipeline,
+    bindGroup: device.createBindGroup({
+      layout: bindGroupLayout,
+      entries: [
+        bindBuffer(0, queryBuffer),
+        bindBuffer(1, keyBuffer),
+        bindBuffer(2, positionsBuffer),
+        bindBuffer(3, paramsBuffer),
+        bindBuffer(4, probabilityTileBuffer),
+        bindBuffer(5, tileMaxBuffer),
+        bindBuffer(6, tileSumBuffer),
+      ],
+    }),
+    destroy: () => paramsBuffer.destroy?.(),
+  };
+}
+
+export function createBatchedFullAttentionRollingTileMergeResources(
+  device: WebGpuDeviceLike,
+  rowMaxBuffer: WebGpuBufferLike,
+  rowSumBuffer: WebGpuBufferLike,
+  tileMaxBuffer: WebGpuBufferLike,
+  tileSumBuffer: WebGpuBufferLike,
+  oldScaleBuffer: WebGpuBufferLike,
+  tileScaleBuffer: WebGpuBufferLike,
+  options: {
+    queryHeadCount: number;
+    tokenCount: number;
+    firstTile: boolean;
+  },
+): { pipeline: unknown; bindGroup: unknown; destroy: () => void } {
+  const params = new Uint32Array([
+    options.queryHeadCount,
+    options.tokenCount,
+    options.firstTile ? 1 : 0,
+    0,
+  ]);
+  const paramsBuffer = device.createBuffer({ size: uniformBufferSize(params.byteLength), usage: GPU_UNIFORM | GPU_COPY_DST });
+  device.queue.writeBuffer(paramsBuffer, 0, params);
+  const bindGroupLayout = device.createBindGroupLayout({
+    entries: [
+      { binding: 0, visibility: GPU_SHADER_STAGE_COMPUTE, buffer: { type: "uniform" } },
+      storageEntry(1, "storage"),
+      storageEntry(2, "storage"),
+      storageEntry(3, "read-only-storage"),
+      storageEntry(4, "read-only-storage"),
+      storageEntry(5, "storage"),
+      storageEntry(6, "storage"),
+    ],
+  });
+  const pipeline = device.createComputePipeline({
+    layout: device.createPipelineLayout({ bindGroupLayouts: [bindGroupLayout] }),
+    compute: { module: device.createShaderModule({ code: BATCHED_FULL_ATTENTION_ROLLING_TILE_MERGE_WGSL }), entryPoint: "main" },
+  });
+  return {
+    pipeline,
+    bindGroup: device.createBindGroup({
+      layout: bindGroupLayout,
+      entries: [
+        bindBuffer(0, paramsBuffer),
+        bindBuffer(1, rowMaxBuffer),
+        bindBuffer(2, rowSumBuffer),
+        bindBuffer(3, tileMaxBuffer),
+        bindBuffer(4, tileSumBuffer),
+        bindBuffer(5, oldScaleBuffer),
+        bindBuffer(6, tileScaleBuffer),
+      ],
+    }),
+    destroy: () => paramsBuffer.destroy?.(),
+  };
+}
+
+export function createBatchedFullAttentionRollingTileApplyResources(
+  device: WebGpuDeviceLike,
+  valueBuffer: WebGpuBufferLike,
+  probabilityTileBuffer: WebGpuBufferLike,
+  oldScaleBuffer: WebGpuBufferLike,
+  tileScaleBuffer: WebGpuBufferLike,
+  outputBuffer: WebGpuBufferLike,
+  options: {
+    valueSize: number;
+    queryHeadCount: number;
+    keyValueHeadCount: number;
+    contextLength: number;
+    tileSize: number;
+    tileStart: number;
+    tileLength: number;
+    tokenCount: number;
+  },
+): { pipeline: unknown; bindGroup: unknown; destroy: () => void } {
+  const params = new Uint32Array([
+    options.valueSize,
+    options.queryHeadCount,
+    options.keyValueHeadCount,
+    options.contextLength,
+    options.tileSize,
+    options.tileStart,
+    options.tileLength,
+    options.tokenCount,
+  ]);
+  const paramsBuffer = device.createBuffer({ size: uniformBufferSize(params.byteLength), usage: GPU_UNIFORM | GPU_COPY_DST });
+  device.queue.writeBuffer(paramsBuffer, 0, params);
+  const bindGroupLayout = device.createBindGroupLayout({
+    entries: [
+      storageEntry(0, "read-only-storage"),
+      storageEntry(1, "read-only-storage"),
+      storageEntry(2, "read-only-storage"),
+      storageEntry(3, "read-only-storage"),
+      { binding: 4, visibility: GPU_SHADER_STAGE_COMPUTE, buffer: { type: "uniform" } },
+      storageEntry(5, "storage"),
+    ],
+  });
+  const pipeline = device.createComputePipeline({
+    layout: device.createPipelineLayout({ bindGroupLayouts: [bindGroupLayout] }),
+    compute: { module: device.createShaderModule({ code: BATCHED_FULL_ATTENTION_ROLLING_TILE_APPLY_WGSL }), entryPoint: "main" },
+  });
+  return {
+    pipeline,
+    bindGroup: device.createBindGroup({
+      layout: bindGroupLayout,
+      entries: [
+        bindBuffer(0, valueBuffer),
+        bindBuffer(1, probabilityTileBuffer),
+        bindBuffer(2, oldScaleBuffer),
+        bindBuffer(3, tileScaleBuffer),
+        bindBuffer(4, paramsBuffer),
+        bindBuffer(5, outputBuffer),
+      ],
+    }),
+    destroy: () => paramsBuffer.destroy?.(),
+  };
+}
+
+export function createBatchedFullAttentionRollingTileFinalResources(
+  device: WebGpuDeviceLike,
+  rowSumBuffer: WebGpuBufferLike,
+  outputBuffer: WebGpuBufferLike,
+  options: {
+    valueSize: number;
+    queryHeadCount: number;
+    tokenCount: number;
+  },
+): { pipeline: unknown; bindGroup: unknown; destroy: () => void } {
+  const params = new Uint32Array([
+    options.valueSize,
+    options.queryHeadCount,
+    options.tokenCount,
+    0,
+  ]);
+  const paramsBuffer = device.createBuffer({ size: uniformBufferSize(params.byteLength), usage: GPU_UNIFORM | GPU_COPY_DST });
+  device.queue.writeBuffer(paramsBuffer, 0, params);
+  const bindGroupLayout = device.createBindGroupLayout({
+    entries: [
+      { binding: 0, visibility: GPU_SHADER_STAGE_COMPUTE, buffer: { type: "uniform" } },
+      storageEntry(1, "read-only-storage"),
+      storageEntry(2, "storage"),
+    ],
+  });
+  const pipeline = device.createComputePipeline({
+    layout: device.createPipelineLayout({ bindGroupLayouts: [bindGroupLayout] }),
+    compute: { module: device.createShaderModule({ code: BATCHED_FULL_ATTENTION_ROLLING_TILE_FINAL_WGSL }), entryPoint: "main" },
+  });
+  return {
+    pipeline,
+    bindGroup: device.createBindGroup({
+      layout: bindGroupLayout,
+      entries: [
+        bindBuffer(0, paramsBuffer),
+        bindBuffer(1, rowSumBuffer),
+        bindBuffer(2, outputBuffer),
+      ],
+    }),
+    destroy: () => paramsBuffer.destroy?.(),
+  };
+}
+
+export function createBatchedFullAttentionMaterializedScoreResources(
   device: WebGpuDeviceLike,
   queryBuffer: WebGpuBufferLike,
   keyBuffer: WebGpuBufferLike,
@@ -1106,7 +1382,7 @@ export function createBatchedFullAttentionScoreResources(
   });
   const pipeline = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [bindGroupLayout] }),
-    compute: { module: device.createShaderModule({ code: BATCHED_FULL_ATTENTION_SCORE_WGSL }), entryPoint: "main" },
+    compute: { module: device.createShaderModule({ code: BATCHED_FULL_ATTENTION_MATERIALIZED_SCORE_WGSL }), entryPoint: "main" },
   });
   return {
     pipeline,
@@ -1124,7 +1400,7 @@ export function createBatchedFullAttentionScoreResources(
   };
 }
 
-export function createBatchedFullAttentionApplyResources(
+export function createBatchedFullAttentionMaterializedApplyResources(
   device: WebGpuDeviceLike,
   valueBuffer: WebGpuBufferLike,
   probabilitiesBuffer: WebGpuBufferLike,
@@ -1168,7 +1444,7 @@ export function createBatchedFullAttentionApplyResources(
   });
   const pipeline = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [bindGroupLayout] }),
-    compute: { module: device.createShaderModule({ code: BATCHED_FULL_ATTENTION_APPLY_WGSL }), entryPoint: "main" },
+    compute: { module: device.createShaderModule({ code: BATCHED_FULL_ATTENTION_MATERIALIZED_APPLY_WGSL }), entryPoint: "main" },
   });
   return {
     pipeline,

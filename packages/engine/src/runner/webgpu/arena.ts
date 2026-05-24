@@ -12,6 +12,7 @@ export class GpuMemoryArena {
   readonly device: WebGpuDeviceLike;
   readonly limitBytes: number;
   private allocatedBytes = 0;
+  private peakAllocatedBytes = 0;
   private scratchPools = new Map<string, ScratchBuffer[]>();
 
   constructor(
@@ -24,6 +25,14 @@ export class GpuMemoryArena {
 
   get residentBytes(): number {
     return this.allocatedBytes;
+  }
+
+  get peakResidentBytes(): number {
+    return this.peakAllocatedBytes;
+  }
+
+  resetPeakResidentBytes(): void {
+    this.peakAllocatedBytes = this.allocatedBytes;
   }
 
   createBuffer(label: string, size: number, usage: number, mappedAtCreation = false): WebGpuBufferLike {
@@ -41,6 +50,7 @@ export class GpuMemoryArena {
       mappedAtCreation,
     });
     this.allocatedBytes += byteLength;
+    this.peakAllocatedBytes = Math.max(this.peakAllocatedBytes, this.allocatedBytes);
     const destroy = buffer.destroy?.bind(buffer);
     let destroyed = false;
     buffer.destroy = () => {
@@ -75,6 +85,7 @@ export class GpuMemoryArena {
       usage,
     }) as ScratchBuffer;
     this.allocatedBytes += byteLength;
+    this.peakAllocatedBytes = Math.max(this.peakAllocatedBytes, this.allocatedBytes);
     const destroy = buffer.destroy?.bind(buffer);
     buffer.__heliopauseScratchKey = key;
     buffer.__heliopauseScratchBytes = byteLength;

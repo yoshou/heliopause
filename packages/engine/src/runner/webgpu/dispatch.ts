@@ -1,8 +1,13 @@
 import type { WebGpuBufferLike, WebGpuComputePassLike, WebGpuDeviceLike } from "./gpu-types";
 import type { Q8_0Buffers, Q8KBuffers, QuantizedHandle } from "./arena";
 import {
-  createBatchedFullAttentionApplyResources,
-  createBatchedFullAttentionScoreResources,
+  createBatchedFullAttentionMaterializedApplyResources,
+  createBatchedFullAttentionMaterializedScoreResources,
+  createBatchedFullAttentionRollingTileApplyResources,
+  createBatchedFullAttentionRollingTileFinalResources,
+  createBatchedFullAttentionRollingTileInitResources,
+  createBatchedFullAttentionRollingTileMergeResources,
+  createBatchedFullAttentionRollingTileProbabilityResources,
   createBatchedFullKvUpdateResources,
   createBatchedFullQueryResources,
   createBatchedGegluSliceResources,
@@ -142,7 +147,103 @@ export function dispatchBatchedFullKvUpdate(
   pass.dispatchWorkgroups(options.headCount, options.tokenCount);
 }
 
-export function dispatchBatchedFullAttentionScore(
+export function dispatchBatchedFullAttentionRollingTile(
+  device: WebGpuDeviceLike,
+  pass: WebGpuComputePassLike,
+  resources: Array<{ destroy: () => void }>,
+  query: WebGpuBufferLike,
+  key: WebGpuBufferLike,
+  value: WebGpuBufferLike,
+  positions: WebGpuBufferLike,
+  probabilityTile: WebGpuBufferLike,
+  rowMax: WebGpuBufferLike,
+  rowSum: WebGpuBufferLike,
+  tileMax: WebGpuBufferLike,
+  tileSum: WebGpuBufferLike,
+  oldScale: WebGpuBufferLike,
+  tileScale: WebGpuBufferLike,
+  output: WebGpuBufferLike,
+  options: {
+    headSize: number;
+    valueSize: number;
+    queryHeadCount: number;
+    keyValueHeadCount: number;
+    keyValueTokenCount: number;
+    contextLength: number;
+    slidingWindow?: number;
+    tokenCount: number;
+    scale: number;
+    causal: boolean;
+    tileSize?: number;
+  },
+): void {
+  const tileSize = options.tileSize ?? 512;
+  const init = createBatchedFullAttentionRollingTileInitResources(device, output, {
+    valueSize: options.valueSize,
+    queryHeadCount: options.queryHeadCount,
+    tokenCount: options.tokenCount,
+  });
+  resources.push(init);
+  pass.setPipeline(init.pipeline);
+  pass.setBindGroup(0, init.bindGroup);
+  pass.dispatchWorkgroups(options.queryHeadCount, options.valueSize, options.tokenCount);
+
+  const keyIterationLimit = Math.max(1, options.keyValueTokenCount);
+  for (let tileStart = 0; tileStart < keyIterationLimit; tileStart += tileSize) {
+    const tileEnd = Math.min(options.keyValueTokenCount, tileStart + tileSize);
+    const probability = createBatchedFullAttentionRollingTileProbabilityResources(
+      device,
+      query,
+      key,
+      positions,
+      probabilityTile,
+      tileMax,
+      tileSum,
+      { ...options, tileSize, tileStart, tileLength: tileEnd - tileStart },
+    );
+    resources.push(probability);
+    pass.setPipeline(probability.pipeline);
+    pass.setBindGroup(0, probability.bindGroup);
+    pass.dispatchWorkgroups(options.queryHeadCount, options.tokenCount);
+
+    const merge = createBatchedFullAttentionRollingTileMergeResources(device, rowMax, rowSum, tileMax, tileSum, oldScale, tileScale, {
+      queryHeadCount: options.queryHeadCount,
+      tokenCount: options.tokenCount,
+      firstTile: tileStart === 0,
+    });
+    resources.push(merge);
+    pass.setPipeline(merge.pipeline);
+    pass.setBindGroup(0, merge.bindGroup);
+    pass.dispatchWorkgroups(options.queryHeadCount, options.tokenCount);
+
+    const apply = createBatchedFullAttentionRollingTileApplyResources(device, value, probabilityTile, oldScale, tileScale, output, {
+      valueSize: options.valueSize,
+      queryHeadCount: options.queryHeadCount,
+      keyValueHeadCount: options.keyValueHeadCount,
+      contextLength: options.contextLength,
+      tileSize,
+      tileStart,
+      tileLength: tileEnd - tileStart,
+      tokenCount: options.tokenCount,
+    });
+    resources.push(apply);
+    pass.setPipeline(apply.pipeline);
+    pass.setBindGroup(0, apply.bindGroup);
+    pass.dispatchWorkgroups(options.queryHeadCount, options.valueSize, options.tokenCount);
+  }
+
+  const final = createBatchedFullAttentionRollingTileFinalResources(device, rowSum, output, {
+    valueSize: options.valueSize,
+    queryHeadCount: options.queryHeadCount,
+    tokenCount: options.tokenCount,
+  });
+  resources.push(final);
+  pass.setPipeline(final.pipeline);
+  pass.setBindGroup(0, final.bindGroup);
+  pass.dispatchWorkgroups(options.queryHeadCount, options.valueSize, options.tokenCount);
+}
+
+export function dispatchBatchedFullAttentionMaterializedScore(
   device: WebGpuDeviceLike,
   pass: WebGpuComputePassLike,
   resources: Array<{ destroy: () => void }>,
@@ -164,14 +265,14 @@ export function dispatchBatchedFullAttentionScore(
     causal: boolean;
   },
 ): void {
-  const resource = createBatchedFullAttentionScoreResources(device, query, key, positions, probabilities, options);
+  const resource = createBatchedFullAttentionMaterializedScoreResources(device, query, key, positions, probabilities, options);
   resources.push(resource);
   pass.setPipeline(resource.pipeline);
   pass.setBindGroup(0, resource.bindGroup);
   pass.dispatchWorkgroups(options.queryHeadCount, options.tokenCount);
 }
 
-export function dispatchBatchedFullAttentionApply(
+export function dispatchBatchedFullAttentionMaterializedApply(
   device: WebGpuDeviceLike,
   pass: WebGpuComputePassLike,
   resources: Array<{ destroy: () => void }>,
@@ -192,7 +293,7 @@ export function dispatchBatchedFullAttentionApply(
     causal: boolean;
   },
 ): void {
-  const resource = createBatchedFullAttentionApplyResources(device, value, probabilities, positions, output, options);
+  const resource = createBatchedFullAttentionMaterializedApplyResources(device, value, probabilities, positions, output, options);
   resources.push(resource);
   pass.setPipeline(resource.pipeline);
   pass.setBindGroup(0, resource.bindGroup);

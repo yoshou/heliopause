@@ -14,8 +14,7 @@ import {
   type QuantizedHandle,
 } from "./arena";
 import {
-  dispatchBatchedFullAttentionApply,
-  dispatchBatchedFullAttentionScore,
+  dispatchBatchedFullAttentionRollingTile,
   dispatchBatchedFullKvUpdate,
   dispatchBatchedFullQuery,
   dispatchBatchedGegluSlice,
@@ -125,6 +124,8 @@ export type WebGpuRuntimeStats = {
   webgpuSteadyRunMs: number;
   webgpuSteadyRunCount: number;
   webgpuResidentBytes: number;
+  webgpuLastRunPeakResidentBytes: number;
+  webgpuLastRunAttentionTempBytes: number;
   webgpuReadbackBytes: number;
   webgpuReadbackCount: number;
   webgpuSelectedTokenReadbacks: number;
@@ -288,6 +289,8 @@ export class WebGpuSegmentRunner implements SegmentRunner {
     gpuSections: "",
     gpuTimingStatus: "not-requested",
     selectedTokenId: -1,
+    peakResidentBytes: 0,
+    attentionTempBytes: 0,
     resourceStats: undefined as ReturnType<WebGpuRuntimeResourceCache["stats"]> | undefined,
   };
   private activeRunEncodeMs = 0;
@@ -297,6 +300,7 @@ export class WebGpuSegmentRunner implements SegmentRunner {
   private activeRunGpuPassMs = 0;
   private activeRunReadbackBytes = 0;
   private activeRunDispatchCount = 0;
+  private activeRunAttentionTempBytes = 0;
   private activeRunTimestampPassCount = 0;
   private activeRunTimestampPassLabels: string[] = [];
   private activeRunGpuSections = "";
@@ -411,6 +415,8 @@ export class WebGpuSegmentRunner implements SegmentRunner {
       webgpuSteadyRunMs: this.steadyRunMs,
       webgpuSteadyRunCount: this.steadyRunCount,
       webgpuResidentBytes: this.residentBytes,
+      webgpuLastRunPeakResidentBytes: this.lastRunStats.peakResidentBytes,
+      webgpuLastRunAttentionTempBytes: this.lastRunStats.attentionTempBytes,
       webgpuReadbackBytes: this.readbackBytes,
       webgpuReadbackCount: this.readbackCount,
       webgpuSelectedTokenReadbacks: this.selectedTokenReadbacks,
@@ -484,6 +490,7 @@ export class WebGpuSegmentRunner implements SegmentRunner {
     resourceStats?: ReturnType<WebGpuRuntimeResourceCache["stats"]>;
   } {
     this.arena.destroyScratchBuffers();
+    this.arena.resetPeakResidentBytes();
     this.activeRunEncodeMs = 0;
     this.activeRunSubmitMs = 0;
     this.activeRunReadbackWaitMs = 0;
@@ -491,6 +498,7 @@ export class WebGpuSegmentRunner implements SegmentRunner {
     this.activeRunGpuPassMs = 0;
     this.activeRunReadbackBytes = 0;
     this.activeRunDispatchCount = 0;
+    this.activeRunAttentionTempBytes = 0;
     this.activeRunTimestampPassCount = 0;
     this.activeRunTimestampPassLabels = [];
     this.activeRunGpuSections = "";
@@ -531,6 +539,8 @@ export class WebGpuSegmentRunner implements SegmentRunner {
       gpuSections: this.activeRunGpuSections,
       gpuTimingStatus: this.activeRunTimestampStatus,
       selectedTokenId: this.activeRunSelectedTokenId,
+      peakResidentBytes: this.arena.peakResidentBytes,
+      attentionTempBytes: this.activeRunAttentionTempBytes,
       resourceStats: resourceDelta,
     };
     if (run.firstRun) {
@@ -1489,13 +1499,6 @@ export class WebGpuSegmentRunner implements SegmentRunner {
       throw new Error(`Missing WebGPU KV state for layer ${layer.layer}`);
     }
     const keyValueTokenCount = Math.min(contextLength, maxInt32(tokenPositions) + 1);
-    const probabilityTokenCapacity = bucketAttentionProbabilityTokenCount(keyValueTokenCount);
-    const probabilities = scratchF32(
-      this.arena,
-      tokenCount * this.manifest.headCount * probabilityTokenCapacity,
-      cleanup,
-      `blk.${layer.layer}.prefill.attention_probabilities`,
-    );
     const attention = scratchF32(this.arena, tokenCount * valueDim, cleanup, `blk.${layer.layer}.prefill.attention`);
     const slidingWindow = options.attentionCausal === false
       ? undefined
@@ -1507,14 +1510,50 @@ export class WebGpuSegmentRunner implements SegmentRunner {
       keyValueHeadCount: this.manifest.headCountKv,
       keyValueTokenCount,
       contextLength,
-      probabilityTokenCapacity,
       slidingWindow,
       tokenCount,
       scale: 1,
       causal: options.attentionCausal !== false,
     };
-    dispatchBatchedFullAttentionScore(this.arena.device, pass, resources, query, state.key, positionsBuffer, probabilities, attentionOptions);
-    dispatchBatchedFullAttentionApply(this.arena.device, pass, resources, state.value, probabilities, positionsBuffer, attention, attentionOptions);
+    const attentionHeadTokenCount = tokenCount * this.manifest.headCount;
+    const attentionTileSize = 512;
+    const attentionProbabilityTile = scratchF32(
+      this.arena,
+      attentionHeadTokenCount * attentionTileSize,
+      cleanup,
+      `blk.${layer.layer}.prefill.attention_rolling.probability`,
+    );
+    const attentionRowMax = scratchF32(this.arena, attentionHeadTokenCount, cleanup, `blk.${layer.layer}.prefill.attention_rolling.row_max`);
+    const attentionRowSum = scratchF32(this.arena, attentionHeadTokenCount, cleanup, `blk.${layer.layer}.prefill.attention_rolling.row_sum`);
+    const attentionTileMax = scratchF32(this.arena, attentionHeadTokenCount, cleanup, `blk.${layer.layer}.prefill.attention_rolling.tile_max`);
+    const attentionTileSum = scratchF32(this.arena, attentionHeadTokenCount, cleanup, `blk.${layer.layer}.prefill.attention_rolling.tile_sum`);
+    const attentionOldScale = scratchF32(this.arena, attentionHeadTokenCount, cleanup, `blk.${layer.layer}.prefill.attention_rolling.old_scale`);
+    const attentionTileScale = scratchF32(this.arena, attentionHeadTokenCount, cleanup, `blk.${layer.layer}.prefill.attention_rolling.tile_scale`);
+    this.activeRunAttentionTempBytes = Math.max(
+      this.activeRunAttentionTempBytes,
+      (
+        attentionHeadTokenCount * attentionTileSize +
+        attentionHeadTokenCount * 6
+      ) * Float32Array.BYTES_PER_ELEMENT,
+    );
+    dispatchBatchedFullAttentionRollingTile(
+      this.arena.device,
+      pass,
+      resources,
+      query,
+      state.key,
+      state.value,
+      positionsBuffer,
+      attentionProbabilityTile,
+      attentionRowMax,
+      attentionRowSum,
+      attentionTileMax,
+      attentionTileSum,
+      attentionOldScale,
+      attentionTileScale,
+      attention,
+      { ...attentionOptions, tileSize: attentionTileSize },
+    );
 
     const attentionOut = this.dispatchQuantizedMatMul(pass, resources, layer.attnOut, attention, tokenCount, cleanup, `blk.${layer.layer}.prefill.attention_out`);
     const attentionResidual = scratchF32(this.arena, hiddenSize * tokenCount, cleanup, `blk.${layer.layer}.prefill.attention_residual`);
@@ -2593,6 +2632,10 @@ export class WebGpuSegmentRunner implements SegmentRunner {
       this.manifest.headCount * probabilityTokenCapacity,
       cleanup,
       `blk.${layer.layer}.attention_probabilities`,
+    );
+    this.activeRunAttentionTempBytes = Math.max(
+      this.activeRunAttentionTempBytes,
+      this.manifest.headCount * probabilityTokenCapacity * Float32Array.BYTES_PER_ELEMENT,
     );
     const attention = scratchF32(this.arena, valueDim, cleanup, `blk.${layer.layer}.attention`);
     const attentionOptions = {

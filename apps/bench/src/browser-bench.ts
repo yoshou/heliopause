@@ -15,16 +15,32 @@ import {
   matMulTop1WebGpuQuantizedResident,
   matMulWebGpuQuantizedResident,
 } from "../../../packages/engine/src/runner/webgpu/matmul";
-import { GPU_COPY_DST } from "../../../packages/engine/src/runner/webgpu/gpu-constants";
+import { GPU_COPY_DST, GPU_COPY_SRC, GPU_MAP_READ } from "../../../packages/engine/src/runner/webgpu/gpu-constants";
 import { storageBuffer } from "../../../packages/engine/src/runner/webgpu/gpu-bindings";
-import { createKMatMulBindResources, createQ8_0MatMulBindResources } from "../../../packages/engine/src/runner/webgpu/kernel-resources";
+import {
+  createBatchedFullAttentionMaterializedApplyResources,
+  createBatchedFullAttentionMaterializedScoreResources,
+  createBatchedFullAttentionRollingTileApplyResources,
+  createBatchedFullAttentionRollingTileFinalResources,
+  createBatchedFullAttentionRollingTileInitResources,
+  createBatchedFullAttentionRollingTileMergeResources,
+  createBatchedFullAttentionRollingTileProbabilityResources,
+  createKMatMulBindResources,
+  createQ8_0MatMulBindResources,
+} from "../../../packages/engine/src/runner/webgpu/kernel-resources";
 import {
   quantizeQ8_0Columns,
   quantizeQ8_KColumns,
   quantizedWeightUploadBytes,
   webGpuQuantizedWeightLayout,
 } from "../../../packages/engine/src/runner/webgpu/quantized-handles";
-import type { WebGpuBufferLike, WebGpuComputePassLike, WebGpuDeviceLike, WebGpuQuantizedWeightHandleInternal } from "../../../packages/engine/src/runner/webgpu/gpu-types";
+import type {
+  NavigatorWithWebGpu,
+  WebGpuBufferLike,
+  WebGpuComputePassLike,
+  WebGpuDeviceLike,
+  WebGpuQuantizedWeightHandleInternal,
+} from "../../../packages/engine/src/runner/webgpu/gpu-types";
 import {
   gqaAttention,
   sigmoid,
@@ -61,6 +77,7 @@ export type BrowserBenchCaseId =
   | "swiglu"
   | "swiglu-down"
   | "full-attention-decode-out"
+  | "prefill-attention"
   | "top-token";
 
 export type BrowserBenchBackend =
@@ -95,7 +112,12 @@ export type BrowserBenchResult = {
   caseName: string;
   backend: BrowserBenchBackend;
   size: BrowserBenchSize;
-  variant: "reference" | "standalone" | "resident" | "fused";
+  variant:
+    | "reference"
+    | "standalone"
+    | "resident"
+    | "fused"
+    | "rolling-512";
   shape: string;
   status: BrowserBenchStatus;
   iterations: number;
@@ -131,6 +153,7 @@ type BenchTask = {
   relativeTolerance: number;
   referenceBackend: BrowserBenchBackend;
   reference: () => Promise<BenchRunValue>;
+  teardown?: () => void | Promise<void>;
   candidates: Array<{
     backend: BrowserBenchBackend;
     variant: BrowserBenchResult["variant"];
@@ -143,6 +166,10 @@ type PreparedBenchRun = {
   run: () => Promise<BenchRunValue | undefined>;
   teardown?: () => void | Promise<void>;
 };
+
+type PrefillAttentionBenchMode =
+  | "materialized"
+  | "rolling-512";
 
 type BenchMeasurement = {
   iterations: number;
@@ -159,6 +186,7 @@ const DEFAULT_CASES: BrowserBenchCaseId[] = [
   "swiglu",
   "swiglu-down",
   "full-attention-decode-out",
+  "prefill-attention",
   "top-token",
 ];
 const DEFAULT_SIZES: BrowserBenchSize[] = ["small", "medium"];
@@ -175,49 +203,56 @@ export async function runBrowserBench(
   const results: BrowserBenchResult[] = [];
 
   for (const task of buildBenchTasks(caseIds, sizes)) {
-    throwIfAborted(options.signal);
-    const referenceResult = await measureTask({
-      task,
-      backend: task.referenceBackend,
-      variant: "reference",
-      run: task.reference,
-      warmupIterations,
-      minimumMs,
-      signal: options.signal,
-    });
-    results.push(referenceResult);
-    options.onResult?.(referenceResult);
-
-    const referenceOutput = referenceResult.status === "ok"
-      ? normalizeBenchRunValue(await task.reference())?.output
-      : undefined;
-    for (const candidate of task.candidates) {
+    try {
       throwIfAborted(options.signal);
-      const prepared = candidate.prepare
-        ? await candidate.prepare()
-        : candidate.run
-          ? { run: candidate.run }
-          : undefined;
-      if (!prepared) {
-        const result = skippedResult({ task, backend: candidate.backend, variant: candidate.variant }, "backend unavailable");
-        results.push(result);
-        options.onResult?.(result);
-        continue;
-      }
-      const result = await measureTask({
+      const referenceResult = await measureTask({
         task,
-        backend: candidate.backend,
-        variant: candidate.variant,
-        run: prepared.run,
+        backend: task.referenceBackend,
+        variant: "reference",
+        run: task.reference,
         warmupIterations,
         minimumMs,
         signal: options.signal,
-        referenceOutput,
-        referenceMeanMs: referenceResult.status === "ok" ? referenceResult.meanMs : undefined,
       });
-      await prepared.teardown?.();
-      results.push(result);
-      options.onResult?.(result);
+      results.push(referenceResult);
+      options.onResult?.(referenceResult);
+
+      const referenceOutput = referenceResult.status === "ok"
+        ? normalizeBenchRunValue(await task.reference())?.output
+        : undefined;
+      for (const candidate of task.candidates) {
+        throwIfAborted(options.signal);
+        const prepared = candidate.prepare
+          ? await candidate.prepare()
+          : candidate.run
+            ? { run: candidate.run }
+            : undefined;
+        if (!prepared) {
+          const result = skippedResult({ task, backend: candidate.backend, variant: candidate.variant }, "backend unavailable");
+          results.push(result);
+          options.onResult?.(result);
+          continue;
+        }
+        try {
+          const result = await measureTask({
+            task,
+            backend: candidate.backend,
+            variant: candidate.variant,
+            run: prepared.run,
+            warmupIterations,
+            minimumMs,
+            signal: options.signal,
+            referenceOutput,
+            referenceMeanMs: referenceResult.status === "ok" ? referenceResult.meanMs : undefined,
+          });
+          results.push(result);
+          options.onResult?.(result);
+        } finally {
+          await prepared.teardown?.();
+        }
+      }
+    } finally {
+      await task.teardown?.();
     }
   }
 
@@ -285,12 +320,59 @@ function buildBenchTasks(caseIds: readonly BrowserBenchCaseId[], sizes: readonly
         tasks.push(createSwiGluDownTask(size));
       } else if (caseId === "full-attention-decode-out") {
         tasks.push(createFullAttentionDecodeOutTask(size));
+      } else if (caseId === "prefill-attention") {
+        tasks.push(createPrefillAttentionTask(size));
       } else {
         tasks.push(createTopTokenTask(size));
       }
     }
   }
   return tasks;
+}
+
+function createPrefillAttentionTask(sizeName: BrowserBenchSize): BenchTask {
+  const size = prefillAttentionShape(sizeName);
+  const query = sequence(size.tokenCount * size.queryHeadCount * size.headSize, seedFor("prefill-attention", sizeName, 1));
+  const key = sequence(size.contextLength * size.keyValueHeadCount * size.headSize, seedFor("prefill-attention", sizeName, 2));
+  const value = sequence(size.contextLength * size.keyValueHeadCount * size.valueSize, seedFor("prefill-attention", sizeName, 3));
+  const positions = prefillAttentionPositions(size.tokenCount, size.keyValueTokenCount);
+  const shape =
+    `${size.kind} T=${size.tokenCount} K=${size.keyValueTokenCount} ` +
+    `head=${size.headSize} value=${size.valueSize} qHeads=${size.queryHeadCount} kvHeads=${size.keyValueHeadCount} ` +
+    `oldProb=${formatBytes(prefillAttentionProbabilityBytes(size))} rolling512=${formatBytes(prefillAttentionRollingTempBytes(size, 512))}`;
+  let materializedReference: PreparedBenchRun | undefined;
+  return {
+    caseId: "prefill-attention",
+    caseName: "Prefill attention",
+    size: sizeName,
+    shape,
+    tolerance: 1e-3,
+    relativeTolerance: 1e-4,
+    referenceBackend: "webgpu-dispatch",
+    reference: async () => {
+      materializedReference ??= await prepareWebGpuPrefillAttention("materialized", query, key, value, positions, size);
+      const output = await materializedReference?.run();
+      if (!output) {
+        throw new Error("WebGPU materialized prefill attention is unavailable.");
+      }
+      return output;
+    },
+    teardown: async () => {
+      await materializedReference?.teardown?.();
+      materializedReference = undefined;
+    },
+    candidates: [
+      {
+        backend: "webgpu-dispatch",
+        variant: "rolling-512",
+        prepare: async () => {
+          await materializedReference?.teardown?.();
+          materializedReference = undefined;
+          return prepareWebGpuPrefillAttention("rolling-512", query, key, value, positions, size);
+        },
+      },
+    ],
+  };
 }
 
 function createMatMulTask(sizeName: BrowserBenchSize, type: QuantizedType, resident: boolean): BenchTask {
@@ -696,6 +778,324 @@ async function runWebGpuMatMul(
     return matMulQ6_KWebGpu(weightBytes, inputColumns, inputSize, rowCount, columnCount);
   }
   return matMulQ8_0WebGpu(weightBytes, inputColumns, inputSize, rowCount, columnCount);
+}
+
+async function prepareWebGpuPrefillAttention(
+  mode: PrefillAttentionBenchMode,
+  query: Float32Array,
+  key: Float32Array,
+  value: Float32Array,
+  positions: Uint32Array,
+  size: ReturnType<typeof prefillAttentionShape>,
+): Promise<PreparedBenchRun | undefined> {
+  const device = await requestPlainWebGpuDevice();
+  if (!device) {
+    return undefined;
+  }
+
+  const queryBuffer = uploadStorageBuffer(device, query);
+  const keyBuffer = uploadStorageBuffer(device, key);
+  const valueBuffer = uploadStorageBuffer(device, value);
+  const positionsBuffer = uploadStorageBuffer(device, positions);
+  const outputByteLength = size.tokenCount * size.queryHeadCount * size.valueSize * Float32Array.BYTES_PER_ELEMENT;
+  const outputBuffer = storageBuffer(device, outputByteLength, GPU_COPY_SRC);
+  const readbackBuffer = device.createBuffer({
+    size: outputByteLength,
+    usage: GPU_MAP_READ | GPU_COPY_DST,
+  });
+  const probabilityTokenCapacity = prefillAttentionProbabilityTokenCapacity(size.keyValueTokenCount);
+  const needsMaterialized = mode === "materialized";
+  const needsRolling = mode === "rolling-512";
+  const probabilityBuffer = needsMaterialized
+    ? storageBuffer(device, prefillAttentionProbabilityBytes(size), 0)
+    : undefined;
+  const rollingTileSize = 512;
+  const headTokenCount = size.tokenCount * size.queryHeadCount;
+  const rollingProbabilityTileBuffer = needsRolling ? storageBuffer(device, headTokenCount * rollingTileSize * Float32Array.BYTES_PER_ELEMENT, 0) : undefined;
+  const rollingRowMaxBuffer = needsRolling ? storageBuffer(device, headTokenCount * Float32Array.BYTES_PER_ELEMENT, 0) : undefined;
+  const rollingRowSumBuffer = needsRolling ? storageBuffer(device, headTokenCount * Float32Array.BYTES_PER_ELEMENT, 0) : undefined;
+  const rollingTileMaxBuffer = needsRolling ? storageBuffer(device, headTokenCount * Float32Array.BYTES_PER_ELEMENT, 0) : undefined;
+  const rollingTileSumBuffer = needsRolling ? storageBuffer(device, headTokenCount * Float32Array.BYTES_PER_ELEMENT, 0) : undefined;
+  const rollingOldScaleBuffer = needsRolling ? storageBuffer(device, headTokenCount * Float32Array.BYTES_PER_ELEMENT, 0) : undefined;
+  const rollingTileScaleBuffer = needsRolling ? storageBuffer(device, headTokenCount * Float32Array.BYTES_PER_ELEMENT, 0) : undefined;
+  const resourcesToDestroy: Array<{ destroy?: () => void }> = [
+    queryBuffer,
+    keyBuffer,
+    valueBuffer,
+    positionsBuffer,
+    outputBuffer,
+    readbackBuffer,
+  ];
+  if (probabilityBuffer) {
+    resourcesToDestroy.push(probabilityBuffer);
+  }
+  if (
+    rollingProbabilityTileBuffer && rollingRowMaxBuffer && rollingRowSumBuffer && rollingTileMaxBuffer &&
+    rollingTileSumBuffer && rollingOldScaleBuffer && rollingTileScaleBuffer
+  ) {
+    resourcesToDestroy.push(
+      rollingProbabilityTileBuffer,
+      rollingRowMaxBuffer,
+      rollingRowSumBuffer,
+      rollingTileMaxBuffer,
+      rollingTileSumBuffer,
+      rollingOldScaleBuffer,
+      rollingTileScaleBuffer,
+    );
+  }
+
+  const commonOptions = {
+    headSize: size.headSize,
+    valueSize: size.valueSize,
+    queryHeadCount: size.queryHeadCount,
+    keyValueHeadCount: size.keyValueHeadCount,
+    keyValueTokenCount: size.keyValueTokenCount,
+    contextLength: size.contextLength,
+    slidingWindow: size.slidingWindow,
+    tokenCount: size.tokenCount,
+    scale: 1,
+    causal: true,
+  };
+  const prepared = needsMaterialized && probabilityBuffer
+    ? {
+        mode,
+        score: createBatchedFullAttentionMaterializedScoreResources(
+          device,
+          queryBuffer,
+          keyBuffer,
+          positionsBuffer,
+          probabilityBuffer,
+          { ...commonOptions, probabilityTokenCapacity },
+        ),
+        apply: createBatchedFullAttentionMaterializedApplyResources(
+          device,
+          valueBuffer,
+          probabilityBuffer,
+          positionsBuffer,
+          outputBuffer,
+          { ...commonOptions, probabilityTokenCapacity },
+        ),
+      }
+    : rollingProbabilityTileBuffer && rollingRowMaxBuffer && rollingRowSumBuffer && rollingTileMaxBuffer &&
+        rollingTileSumBuffer && rollingOldScaleBuffer && rollingTileScaleBuffer
+      ? {
+          mode,
+          init: createBatchedFullAttentionRollingTileInitResources(
+            device,
+            outputBuffer,
+            {
+              valueSize: size.valueSize,
+              queryHeadCount: size.queryHeadCount,
+              tokenCount: size.tokenCount,
+            },
+          ),
+          chunks: prefillAttentionChunks(size.keyValueTokenCount, rollingTileSize).map(([tileStart, tileEnd]) => ({
+            probability: createBatchedFullAttentionRollingTileProbabilityResources(
+              device,
+              queryBuffer,
+              keyBuffer,
+              positionsBuffer,
+              rollingProbabilityTileBuffer,
+              rollingTileMaxBuffer,
+              rollingTileSumBuffer,
+              { ...commonOptions, tileSize: rollingTileSize, tileStart, tileLength: tileEnd - tileStart },
+            ),
+            merge: createBatchedFullAttentionRollingTileMergeResources(
+              device,
+              rollingRowMaxBuffer,
+              rollingRowSumBuffer,
+              rollingTileMaxBuffer,
+              rollingTileSumBuffer,
+              rollingOldScaleBuffer,
+              rollingTileScaleBuffer,
+              {
+                queryHeadCount: size.queryHeadCount,
+                tokenCount: size.tokenCount,
+                firstTile: tileStart === 0,
+              },
+            ),
+            apply: createBatchedFullAttentionRollingTileApplyResources(
+              device,
+              valueBuffer,
+              rollingProbabilityTileBuffer,
+              rollingOldScaleBuffer,
+              rollingTileScaleBuffer,
+              outputBuffer,
+              {
+                valueSize: size.valueSize,
+                queryHeadCount: size.queryHeadCount,
+                keyValueHeadCount: size.keyValueHeadCount,
+                contextLength: size.contextLength,
+                tileSize: rollingTileSize,
+                tileStart,
+                tileLength: tileEnd - tileStart,
+                tokenCount: size.tokenCount,
+              },
+            ),
+          })),
+          final: createBatchedFullAttentionRollingTileFinalResources(
+            device,
+            rollingRowSumBuffer,
+            outputBuffer,
+            {
+              valueSize: size.valueSize,
+              queryHeadCount: size.queryHeadCount,
+              tokenCount: size.tokenCount,
+            },
+          ),
+        }
+      : undefined;
+  if (!prepared) {
+    for (let index = resourcesToDestroy.length - 1; index >= 0; index -= 1) {
+      resourcesToDestroy[index]?.destroy?.();
+    }
+    device.destroy?.();
+    return undefined;
+  }
+  if ("init" in prepared) {
+    const rollingPrepared = prepared as {
+      init: { destroy: () => void };
+      chunks: Array<{
+        probability: { destroy: () => void };
+        merge: { destroy: () => void };
+        apply: { destroy: () => void };
+      }>;
+      final: { destroy: () => void };
+    };
+    resourcesToDestroy.push(
+      rollingPrepared.init,
+      ...rollingPrepared.chunks.flatMap((chunk) => [chunk.probability, chunk.merge, chunk.apply]),
+      rollingPrepared.final,
+    );
+  } else if ("score" in prepared) {
+    if (!prepared.score || !prepared.apply) {
+      for (let index = resourcesToDestroy.length - 1; index >= 0; index -= 1) {
+        resourcesToDestroy[index]?.destroy?.();
+      }
+      device.destroy?.();
+      return undefined;
+    }
+    resourcesToDestroy.push(prepared.score, prepared.apply);
+  }
+
+  const validationOutput = await runPreparedPrefillAttention(
+    device,
+    prepared,
+    outputBuffer,
+    readbackBuffer,
+    outputByteLength,
+    size,
+    true,
+  );
+  if (!validationOutput) {
+    for (let index = resourcesToDestroy.length - 1; index >= 0; index -= 1) {
+      resourcesToDestroy[index]?.destroy?.();
+    }
+    device.destroy?.();
+    return undefined;
+  }
+
+  return {
+    run: () =>
+      runPreparedPrefillAttention(
+        device,
+        prepared,
+        outputBuffer,
+        readbackBuffer,
+        outputByteLength,
+        size,
+        false,
+        validationOutput,
+      ),
+    teardown() {
+      for (let index = resourcesToDestroy.length - 1; index >= 0; index -= 1) {
+        resourcesToDestroy[index]?.destroy?.();
+      }
+      device.destroy?.();
+    },
+  };
+}
+
+async function runPreparedPrefillAttention(
+  device: WebGpuDeviceLike,
+  prepared:
+    | {
+        mode: PrefillAttentionBenchMode;
+        score: { pipeline: unknown; bindGroup: unknown };
+        apply: { pipeline: unknown; bindGroup: unknown };
+      }
+    | {
+        mode: PrefillAttentionBenchMode;
+        init: { pipeline: unknown; bindGroup: unknown };
+        chunks: Array<{
+          probability: { pipeline: unknown; bindGroup: unknown };
+          merge: { pipeline: unknown; bindGroup: unknown };
+          apply: { pipeline: unknown; bindGroup: unknown };
+        }>;
+        final: { pipeline: unknown; bindGroup: unknown };
+      },
+  outputBuffer: WebGpuBufferLike,
+  readbackBuffer: WebGpuBufferLike,
+  outputByteLength: number,
+  size: ReturnType<typeof prefillAttentionShape>,
+  readOutput: boolean,
+  validationOutput?: Float32Array,
+): Promise<Float32Array> {
+  const encoder = device.createCommandEncoder();
+  const pass = encoder.beginComputePass();
+  if ("score" in prepared) {
+    pass.setPipeline(prepared.score.pipeline);
+    pass.setBindGroup(0, prepared.score.bindGroup);
+    pass.dispatchWorkgroups(size.queryHeadCount, size.tokenCount);
+    pass.setPipeline(prepared.apply.pipeline);
+    pass.setBindGroup(0, prepared.apply.bindGroup);
+    pass.dispatchWorkgroups(size.queryHeadCount, size.valueSize, size.tokenCount);
+  } else if ("init" in prepared) {
+    pass.setPipeline(prepared.init.pipeline);
+    pass.setBindGroup(0, prepared.init.bindGroup);
+    pass.dispatchWorkgroups(size.queryHeadCount, size.valueSize, size.tokenCount);
+    for (const chunk of prepared.chunks) {
+      pass.setPipeline(chunk.probability.pipeline);
+      pass.setBindGroup(0, chunk.probability.bindGroup);
+      pass.dispatchWorkgroups(size.queryHeadCount, size.tokenCount);
+      pass.setPipeline(chunk.merge.pipeline);
+      pass.setBindGroup(0, chunk.merge.bindGroup);
+      pass.dispatchWorkgroups(size.queryHeadCount, size.tokenCount);
+      pass.setPipeline(chunk.apply.pipeline);
+      pass.setBindGroup(0, chunk.apply.bindGroup);
+      pass.dispatchWorkgroups(size.queryHeadCount, size.valueSize, size.tokenCount);
+    }
+    pass.setPipeline(prepared.final.pipeline);
+    pass.setBindGroup(0, prepared.final.bindGroup);
+    pass.dispatchWorkgroups(size.queryHeadCount, size.valueSize, size.tokenCount);
+  }
+  pass.end();
+  if (readOutput) {
+    encoder.copyBufferToBuffer(outputBuffer, 0, readbackBuffer, 0, outputByteLength);
+  }
+  device.queue.submit([encoder.finish()]);
+  await device.queue.onSubmittedWorkDone?.();
+  if (!readOutput) {
+    return validationOutput ?? new Float32Array();
+  }
+  await readbackBuffer.mapAsync(GPU_MAP_READ);
+  try {
+    return new Float32Array(readbackBuffer.getMappedRange()).slice();
+  } finally {
+    readbackBuffer.unmap();
+  }
+}
+
+function uploadStorageBuffer(device: WebGpuDeviceLike, values: Float32Array | Uint32Array): WebGpuBufferLike {
+  const buffer = storageBuffer(device, values.byteLength, GPU_COPY_DST);
+  device.queue.writeBuffer(buffer, 0, values);
+  return buffer;
+}
+
+async function requestPlainWebGpuDevice(): Promise<(WebGpuDeviceLike & { destroy?: () => void }) | undefined> {
+  const gpu = typeof navigator === "undefined" ? undefined : (navigator as NavigatorWithWebGpu).gpu;
+  const adapter = await gpu?.requestAdapter();
+  return adapter?.requestDevice?.();
 }
 
 async function prepareWebGpuMatMulDispatchOnly(
@@ -1219,6 +1619,100 @@ function fullAttentionShape(size: BrowserBenchSize): {
     return { headSize: 64, queryHeadCount: 8, keyValueHeadCount: 2, keyValueTokenCount: 64, contextLength: 64, scale: 1 / Math.sqrt(64), outputSize: 512 };
   }
   return { headSize: 64, queryHeadCount: 4, keyValueHeadCount: 2, keyValueTokenCount: 16, contextLength: 16, scale: 1 / Math.sqrt(64), outputSize: 256 };
+}
+
+function prefillAttentionShape(size: BrowserBenchSize): {
+  kind: "sliding" | "full";
+  tokenCount: number;
+  queryHeadCount: number;
+  keyValueHeadCount: number;
+  headSize: number;
+  valueSize: number;
+  contextLength: number;
+  keyValueTokenCount: number;
+  slidingWindow?: number;
+} {
+  if (size === "large") {
+    return {
+      kind: "full",
+      tokenCount: 64,
+      queryHeadCount: 8,
+      keyValueHeadCount: 2,
+      headSize: 512,
+      valueSize: 512,
+      contextLength: 4096,
+      keyValueTokenCount: 4096,
+    };
+  }
+  if (size === "medium") {
+    return {
+      kind: "full",
+      tokenCount: 16,
+      queryHeadCount: 8,
+      keyValueHeadCount: 2,
+      headSize: 512,
+      valueSize: 512,
+      contextLength: 1024,
+      keyValueTokenCount: 1024,
+    };
+  }
+  return {
+    kind: "sliding",
+    tokenCount: 16,
+    queryHeadCount: 8,
+    keyValueHeadCount: 2,
+    headSize: 256,
+    valueSize: 256,
+    contextLength: 512,
+    keyValueTokenCount: 512,
+    slidingWindow: 512,
+  };
+}
+
+function prefillAttentionPositions(tokenCount: number, keyValueTokenCount: number): Uint32Array {
+  const positions = new Uint32Array(tokenCount);
+  const start = Math.max(0, keyValueTokenCount - tokenCount);
+  for (let index = 0; index < positions.length; index += 1) {
+    positions[index] = start + index;
+  }
+  return positions;
+}
+
+function prefillAttentionProbabilityTokenCapacity(keyValueTokenCount: number): number {
+  return Math.max(1, Math.ceil(keyValueTokenCount / 256) * 256);
+}
+
+function prefillAttentionProbabilityBytes(size: ReturnType<typeof prefillAttentionShape>): number {
+  return size.tokenCount * size.queryHeadCount *
+    prefillAttentionProbabilityTokenCapacity(size.keyValueTokenCount) *
+    Float32Array.BYTES_PER_ELEMENT;
+}
+
+function prefillAttentionRollingTempBytes(size: ReturnType<typeof prefillAttentionShape>, tileSize: number): number {
+  const headTokenCount = size.tokenCount * size.queryHeadCount;
+  return (
+    headTokenCount * tileSize +
+    headTokenCount * 6
+  ) * Float32Array.BYTES_PER_ELEMENT;
+}
+
+function prefillAttentionChunks(keyValueTokenCount: number, chunkSize: number): Array<[number, number]> {
+  const chunks: Array<[number, number]> = [];
+  const limit = Math.max(1, keyValueTokenCount);
+  for (let start = 0; start < limit; start += chunkSize) {
+    chunks.push([start, Math.min(keyValueTokenCount, start + chunkSize)]);
+  }
+  return chunks;
+}
+
+function formatBytes(value: number): string {
+  if (value >= 1024 * 1024) {
+    return `${(value / 1024 / 1024).toFixed(1)}MiB`;
+  }
+  if (value >= 1024) {
+    return `${(value / 1024).toFixed(1)}KiB`;
+  }
+  return `${value}B`;
 }
 
 function seedFor(name: string, size: BrowserBenchSize, salt: number): number {
