@@ -291,7 +291,7 @@ struct Params {
   rowSize: u32,
   tokenCount: u32,
   scale: f32,
-  _pad0: u32,
+  outputTokenOffset: u32,
 };
 
 @group(0) @binding(0) var<storage, read> rows: array<f32>;
@@ -307,7 +307,8 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     return;
   }
   let row = tokenIds[token];
-  outputValues[token * params.rowSize + column] = rows[row * params.rowSize + column] * params.scale;
+  outputValues[(params.outputTokenOffset + token) * params.rowSize + column] =
+    rows[row * params.rowSize + column] * params.scale;
 }
 `;
 
@@ -318,7 +319,7 @@ struct Params {
   blockCount: u32,
   rowByteLength: u32,
   scale: f32,
-  _pad0: u32,
+  outputTokenOffset: u32,
   _pad1: u32,
   _pad2: u32,
 };
@@ -367,7 +368,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   let block = column / 32u;
   let index = column & 31u;
   let base = row * params.rowByteLength + block * 34u;
-  outputValues[token * params.rowSize + column] =
+  outputValues[(params.outputTokenOffset + token) * params.rowSize + column] =
     f32(signedByteAt(base + 2u + index)) * f16At(base) * params.scale;
 }
 `;
@@ -379,7 +380,7 @@ struct Params {
   blockCount: u32,
   rowByteLength: u32,
   scale: f32,
-  _pad0: u32,
+  outputTokenOffset: u32,
   _pad1: u32,
   _pad2: u32,
 };
@@ -449,7 +450,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   let blockBase = row * params.rowByteLength + block * 144u;
   let value = f16At(blockBase) * f32(kScale(blockBase, scaleIndex)) * f32(q4Value(blockBase, element)) -
     f16At(blockBase + 2u) * f32(kMin(blockBase, scaleIndex));
-  outputValues[token * params.rowSize + column] = value * params.scale;
+  outputValues[(params.outputTokenOffset + token) * params.rowSize + column] = value * params.scale;
 }
 `;
 
@@ -460,7 +461,7 @@ struct Params {
   blockCount: u32,
   rowByteLength: u32,
   scale: f32,
-  _pad0: u32,
+  outputTokenOffset: u32,
   _pad1: u32,
   _pad2: u32,
 };
@@ -533,7 +534,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   let blockBase = row * params.rowByteLength + block * 176u;
   let value = f16At(blockBase) * f32(kScale(blockBase, scaleIndex)) * f32(q5Value(blockBase, element)) -
     f16At(blockBase + 2u) * f32(kMin(blockBase, scaleIndex));
-  outputValues[token * params.rowSize + column] = value * params.scale;
+  outputValues[(params.outputTokenOffset + token) * params.rowSize + column] = value * params.scale;
 }
 `;
 
@@ -544,7 +545,7 @@ struct Params {
   blockCount: u32,
   rowByteLength: u32,
   scale: f32,
-  _pad0: u32,
+  outputTokenOffset: u32,
   _pad1: u32,
   _pad2: u32,
 };
@@ -630,7 +631,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   let value = f16At(blockBase + 208u) *
     f32(signedByteAt(blockBase + 192u + q6ScaleIndex(element))) *
     f32(q6Value(blockBase, element));
-  outputValues[token * params.rowSize + column] = value * params.scale;
+  outputValues[(params.outputTokenOffset + token) * params.rowSize + column] = value * params.scale;
 }
 `;
 
@@ -1198,7 +1199,7 @@ fn main(@builtin(workgroup_id) workgroupId: vec3<u32>, @builtin(local_invocation
     workgroupBarrier();
   }
   let scale = inverseSqrt(queryReduceValues[0] / f32(params.headSize) + params.epsilon);
-  for (var dim = lane; dim < params.headSize; dim = dim + 256u) {
+  for (var dim = lane + params.ropeDims; dim < params.headSize; dim = dim + 256u) {
     queryValues[outBase + dim] = normed(head, dim, scale);
   }
   let ropePairCount = params.ropeDims / 2u;
@@ -1279,8 +1280,9 @@ fn main(@builtin(workgroup_id) workgroupId: vec3<u32>, @builtin(local_invocation
     workgroupBarrier();
   }
   let scale = inverseSqrt(kvReduceValues[0] / f32(params.headSize) + params.epsilon);
+  workgroupBarrier();
   let keyBase = (params.tokenPosition * params.headCount + head) * params.headSize;
-  for (var dim = lane; dim < params.headSize; dim = dim + 256u) {
+  for (var dim = lane + params.ropeDims; dim < params.headSize; dim = dim + 256u) {
     keyCache[keyBase + dim] = normed(head, dim, scale);
   }
   var valueMeanSquare = 0.0;
@@ -1384,7 +1386,7 @@ fn main(@builtin(workgroup_id) workgroupId: vec3<u32>, @builtin(local_invocation
   }
   let scale = inverseSqrt(batchedQueryReduceValues[0] / f32(params.headSize) + params.epsilon);
   let outBase = token * params.headCount * params.headSize + head * params.headSize;
-  for (var dim = lane; dim < params.headSize; dim = dim + 256u) {
+  for (var dim = lane + params.ropeDims; dim < params.headSize; dim = dim + 256u) {
     queryValues[outBase + dim] = batchedQueryNormed(token, head, dim, scale);
   }
   let ropePairCount = params.ropeDims / 2u;
@@ -1475,9 +1477,10 @@ fn main(@builtin(workgroup_id) workgroupId: vec3<u32>, @builtin(local_invocation
     workgroupBarrier();
   }
   let scale = inverseSqrt(batchedKvReduceValues[0] / f32(params.headSize) + params.epsilon);
+  workgroupBarrier();
   let tokenPosition = positions[token];
   let keyBase = (tokenPosition * params.headCount + head) * params.headSize;
-  for (var dim = lane; dim < params.headSize; dim = dim + 256u) {
+  for (var dim = lane + params.ropeDims; dim < params.headSize; dim = dim + 256u) {
     keyCache[keyBase + dim] = batchedKvNormed(token, head, dim, scale);
   }
   var valueMeanSquare = 0.0;
@@ -2768,6 +2771,7 @@ fn main(
     workgroupBarrier();
   }
   let maxScore = reduceValues[0];
+  workgroupBarrier();
   var localSum = 0.0;
   for (var keyToken = params.keyValueStart + lane; keyToken < params.keyValueTokenCount; keyToken = keyToken + 256u) {
     let probability = exp(probabilityValues[probabilityOffset + keyToken] - maxScore);
@@ -2912,6 +2916,7 @@ fn main(@builtin(workgroup_id) workgroupId: vec3<u32>, @builtin(local_invocation
     workgroupBarrier();
   }
   let maxScore = batchedAttentionScoreReduceValues[0];
+  workgroupBarrier();
   var localSum = 0.0;
   for (var keyToken = lane; keyToken < params.keyValueTokenCount; keyToken = keyToken + 256u) {
     let index = probabilityOffset + keyToken;

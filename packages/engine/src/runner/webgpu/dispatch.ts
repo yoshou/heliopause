@@ -760,6 +760,7 @@ export function dispatchF32GatherRowsScale(
     rowSize: number;
     tokenCount: number;
     scale: number;
+    outputTokenOffset?: number;
   },
 ): void {
   const resource = createF32GatherRowsScaleResources(device, rows, tokenIds, output, options);
@@ -782,6 +783,7 @@ export function dispatchQ8_0GatherRowsScale(
     blockCount: number;
     rowByteLength: number;
     scale: number;
+    outputTokenOffset?: number;
   },
 ): void {
   const resource = createQuantizedGatherRowsScaleResources(device, "Q8_0", weight, tokenIds, output, options);
@@ -801,6 +803,7 @@ export function dispatchQuantizedGatherRowsScale(
     rowSize: number;
     tokenCount: number;
     scale: number;
+    outputTokenOffset?: number;
   },
 ): void {
   const resource = createQuantizedGatherRowsScaleResources(

@@ -1,8 +1,9 @@
-import type { GgufTensorReader } from "../../tensor-reader";
+import type { GgmlTypeName } from "../../gguf";
+import { type GgufTensorReader, type TensorByteRange } from "../../tensor-reader";
 import type { ModelManifest } from "../../model";
 import { dequantizeRow } from "../../quant";
 import { GPU_COPY_DST, GPU_COPY_SRC, GPU_MAP_READ, GPU_QUERY_RESOLVE, GPU_STORAGE, WEBGPU_MEMORY_LIMIT_BYTES } from "./gpu-constants";
-import { webGpuDevice } from "./gpu-device";
+import { webGpuAdapterLimits, webGpuDevice } from "./gpu-device";
 import {
   GpuMemoryArena,
   scratchF32,
@@ -61,6 +62,7 @@ import {
   type GpuLayer,
   type OutputStripe,
 } from "./segment-layer-loader";
+import { createQuantizedHandleFromBytes, webGpuMatMulType, webGpuQuantizedWeightLayout } from "./quantized-handles";
 import {
   diffWebGpuRuntimeResourceStats,
   installWebGpuRuntimeResourceCache,
@@ -187,10 +189,18 @@ type GpuState = {
 };
 
 type GpuInputResources = {
-  tokenEmbedding: F32Handle | QuantizedHandle;
+  tokenEmbedding?: F32Handle | QuantizedHandle;
   perLayerTokenEmbedding?: F32Handle | QuantizedHandle;
   perLayerModelProjection?: QuantizedHandle | F32Handle;
   perLayerProjectionNorm?: F32Handle;
+};
+
+type GpuEmbeddingRowChunk = {
+  handle: F32Handle | QuantizedHandle;
+  rowIds: Uint32Array;
+  outputTokenOffset: number;
+  tokenCount: number;
+  transientHandle: boolean;
 };
 
 type PreparedGpuInput = {
@@ -831,7 +841,10 @@ export class WebGpuSegmentRunner implements SegmentRunner {
     this.ensureRuntimeResources();
     const runtimeRun = this.beginRuntimeRun();
     try {
-      return await this.prepareGpuInput(tokenIds, false);
+      const prepared = await this.prepareGpuInput(tokenIds, false);
+      this.tokenIdInputBatches += 1;
+      this.tokenIdInputTokens += tokenIds.length;
+      return prepared;
     } finally {
       this.endRuntimeRun(runtimeRun);
     }
@@ -1675,130 +1688,149 @@ export class WebGpuSegmentRunner implements SegmentRunner {
     if (tokenCount <= 0) {
       throw new Error("WebGPU token-id input preparation requires at least one token.");
     }
-    const input = await this.loadGpuInputResources();
     const cleanup: GpuResource[] = [];
     const resources: Array<{ destroy: () => void }> = [];
-    const tokenIdValues = Uint32Array.from(tokenIds);
-    const tokenIdBuffer = this.arena.createScratchBuffer(
-      "input.token_ids",
-      tokenIdValues.byteLength,
-      GPU_STORAGE | GPU_COPY_DST,
-    );
-    this.arena.device.queue.writeBuffer(tokenIdBuffer, 0, tokenIdValues);
-    cleanup.push(tokenIdBuffer);
-
-    const hidden = this.arena.createScratchBuffer(
-      "input.hidden.gpu",
-      tokenCount * this.manifest.embeddingLength * Float32Array.BYTES_PER_ELEMENT,
-      GPU_STORAGE | GPU_COPY_SRC,
-    );
-    cleanup.push(hidden);
-    let perLayerInputs: WebGpuBufferLike | undefined;
-
-    const encodeStartMs = nowMs();
-    const encoder = this.arena.device.createCommandEncoder();
-    const compute = this.beginComputePass(encoder, profileGpuPass, "input.prepare");
-    this.dispatchGatherRowsScale(compute.pass, resources, input.tokenEmbedding, tokenIdBuffer, hidden, {
-      rowSize: this.manifest.embeddingLength,
-      tokenCount,
-      scale: Math.sqrt(this.manifest.embeddingLength),
-    });
-
-    if (this.manifest.perLayerEmbeddingLength > 0) {
-      if (!input.perLayerTokenEmbedding || !input.perLayerModelProjection || !input.perLayerProjectionNorm) {
-        throw new Error("WebGPU per-layer input resources are missing.");
+    try {
+      const input = await this.loadGpuInputResources();
+      const tokenEmbeddingChunks = await this.buildEmbeddingRowChunks("token_embd.weight", tokenIds, input.tokenEmbedding);
+      for (const chunk of tokenEmbeddingChunks) {
+        if (chunk.transientHandle) {
+          cleanup.push(chunk.handle);
+        }
       }
-      const perLayerLength = this.manifest.perLayerEmbeddingLength;
-      const totalPerLayerLength = perLayerLength * this.manifest.blockCount;
-      const tokenRows = this.arena.createScratchBuffer(
-        "input.per_layer_token_rows",
-        tokenCount * totalPerLayerLength * Float32Array.BYTES_PER_ELEMENT,
-        GPU_STORAGE,
-      );
-      const projected = this.arena.createScratchBuffer(
-        "input.per_layer_projected",
-        tokenCount * totalPerLayerLength * Float32Array.BYTES_PER_ELEMENT,
-        GPU_STORAGE,
-      );
-      perLayerInputs = this.arena.createScratchBuffer(
-        "input.per_layer_inputs",
-        tokenCount * totalPerLayerLength * Float32Array.BYTES_PER_ELEMENT,
-        GPU_STORAGE,
-      );
-      cleanup.push(tokenRows, projected, perLayerInputs);
+      const perLayerTokenEmbeddingChunks = this.manifest.perLayerEmbeddingLength > 0
+        ? await this.buildEmbeddingRowChunks("per_layer_token_embd.weight", tokenIds, input.perLayerTokenEmbedding)
+        : undefined;
+      if (perLayerTokenEmbeddingChunks) {
+        for (const chunk of perLayerTokenEmbeddingChunks) {
+          if (chunk.transientHandle) {
+            cleanup.push(chunk.handle);
+          }
+        }
+      }
 
-      this.dispatchGatherRowsScale(compute.pass, resources, input.perLayerTokenEmbedding, tokenIdBuffer, tokenRows, {
-        rowSize: totalPerLayerLength,
-        tokenCount,
-        scale: Math.sqrt(perLayerLength),
+      const hidden = this.arena.createScratchBuffer(
+        "input.hidden.gpu",
+        tokenCount * this.manifest.embeddingLength * Float32Array.BYTES_PER_ELEMENT,
+        GPU_STORAGE | GPU_COPY_SRC,
+      );
+      cleanup.push(hidden);
+      let perLayerInputs: WebGpuBufferLike | undefined;
+
+      const encodeStartMs = nowMs();
+      const encoder = this.arena.device.createCommandEncoder();
+      const compute = this.beginComputePass(encoder, profileGpuPass, "input.prepare");
+      this.dispatchEmbeddingRowChunks(compute.pass, resources, cleanup, tokenEmbeddingChunks, hidden, {
+        rowSize: this.manifest.embeddingLength,
+        scale: Math.sqrt(this.manifest.embeddingLength),
       });
 
-      if (isF32Handle(input.perLayerModelProjection)) {
-        dispatchF32MatMul(
+      if (this.manifest.perLayerEmbeddingLength > 0) {
+        if (!input.perLayerModelProjection || !input.perLayerProjectionNorm) {
+          throw new Error("WebGPU per-layer input resources are missing.");
+        }
+        if (!perLayerTokenEmbeddingChunks) {
+          throw new Error("WebGPU per-layer token embedding rows are missing.");
+        }
+        const perLayerLength = this.manifest.perLayerEmbeddingLength;
+        const totalPerLayerLength = perLayerLength * this.manifest.blockCount;
+        const tokenRows = this.arena.createScratchBuffer(
+          "input.per_layer_token_rows",
+          tokenCount * totalPerLayerLength * Float32Array.BYTES_PER_ELEMENT,
+          GPU_STORAGE,
+        );
+        const projected = this.arena.createScratchBuffer(
+          "input.per_layer_projected",
+          tokenCount * totalPerLayerLength * Float32Array.BYTES_PER_ELEMENT,
+          GPU_STORAGE,
+        );
+        perLayerInputs = this.arena.createScratchBuffer(
+          "input.per_layer_inputs",
+          tokenCount * totalPerLayerLength * Float32Array.BYTES_PER_ELEMENT,
+          GPU_STORAGE | GPU_COPY_SRC,
+        );
+        cleanup.push(tokenRows, projected, perLayerInputs);
+
+        this.dispatchEmbeddingRowChunks(compute.pass, resources, cleanup, perLayerTokenEmbeddingChunks, tokenRows, {
+          rowSize: totalPerLayerLength,
+          scale: Math.sqrt(perLayerLength),
+        });
+
+        if (isF32Handle(input.perLayerModelProjection)) {
+          dispatchF32MatMul(
+            this.arena.device,
+            compute.pass,
+            resources,
+            input.perLayerModelProjection.buffer,
+            hidden,
+            projected,
+            this.manifest.embeddingLength,
+            totalPerLayerLength,
+            tokenCount,
+          );
+        } else {
+          const q8 = scratchQ8K(
+            this.arena,
+            this.manifest.embeddingLength,
+            tokenCount,
+            cleanup,
+            "input.hidden.q8k",
+          );
+          dispatchQ8KQuantize(
+            this.arena.device,
+            compute.pass,
+            resources,
+            hidden,
+            q8,
+            this.manifest.embeddingLength,
+            tokenCount,
+          );
+          dispatchKMatMul(compute.pass, resources, input.perLayerModelProjection, q8, projected, tokenCount);
+        }
+
+        dispatchPreparePerLayerInputs(
           this.arena.device,
           compute.pass,
           resources,
-          input.perLayerModelProjection.buffer,
-          hidden,
+          tokenRows,
           projected,
-          this.manifest.embeddingLength,
-          totalPerLayerLength,
-          tokenCount,
+          input.perLayerProjectionNorm.buffer,
+          perLayerInputs,
+          {
+            perLayerLength,
+            totalPerLayerLength,
+            tokenCount,
+            blockCount: this.manifest.blockCount,
+            projectionScale: 1 / Math.sqrt(this.manifest.embeddingLength),
+            epsilon: this.epsilon,
+          },
         );
-      } else {
-        const q8 = scratchQ8K(
-          this.arena,
-          this.manifest.embeddingLength,
-          tokenCount,
-          cleanup,
-          "input.hidden.q8k",
-        );
-        dispatchQ8KQuantize(
-          this.arena.device,
-          compute.pass,
-          resources,
-          hidden,
-          q8,
-          this.manifest.embeddingLength,
-          tokenCount,
-        );
-        dispatchKMatMul(compute.pass, resources, input.perLayerModelProjection, q8, projected, tokenCount);
       }
 
-      dispatchPreparePerLayerInputs(
-        this.arena.device,
-        compute.pass,
-        resources,
-        tokenRows,
-        projected,
-        input.perLayerProjectionNorm.buffer,
+      this.endComputePass(encoder, compute);
+      this.activeRunEncodeMs += nowMs() - encodeStartMs;
+      this.submitCommandBuffer(encoder.finish());
+      this.deferResourceCleanup(resources);
+
+      return {
+        tokenCount,
+        hidden,
         perLayerInputs,
-        {
-          perLayerLength,
-          totalPerLayerLength,
-          tokenCount,
-          blockCount: this.manifest.blockCount,
-          projectionScale: 1 / Math.sqrt(this.manifest.embeddingLength),
-          epsilon: this.epsilon,
+        destroy: () => {
+          for (const item of cleanup.reverse()) {
+            item.destroy?.();
+          }
         },
-      );
+      };
+    } catch (error) {
+      for (const resource of resources.reverse()) {
+        resource.destroy?.();
+      }
+      for (const item of cleanup.reverse()) {
+        item.destroy?.();
+      }
+      throw error;
     }
-
-    this.endComputePass(encoder, compute);
-    this.activeRunEncodeMs += nowMs() - encodeStartMs;
-    this.submitCommandBuffer(encoder.finish());
-    this.deferResourceCleanup(resources);
-
-    return {
-      tokenCount,
-      hidden,
-      perLayerInputs,
-      destroy: () => {
-        for (const item of cleanup.reverse()) {
-          item.destroy?.();
-        }
-      },
-    };
   }
 
   private dispatchLayerKvUpdate(
@@ -1933,7 +1965,7 @@ export class WebGpuSegmentRunner implements SegmentRunner {
 
   private async loadGpuInputResourcesUncached(): Promise<GpuInputResources> {
     const startMs = nowMs();
-    const tokenEmbedding = await this.loadEmbeddingGatherHandle("token_embd.weight");
+    const tokenEmbedding = await this.loadFullEmbeddingGatherHandleIfBindable("token_embd.weight");
     if (this.manifest.perLayerEmbeddingLength <= 0) {
       this.lazyLoadMs += nowMs() - startMs;
       return { tokenEmbedding };
@@ -1941,7 +1973,7 @@ export class WebGpuSegmentRunner implements SegmentRunner {
     const projectionTensor = this.tensorReader.getTensor("per_layer_model_proj.weight");
     const resources = {
       tokenEmbedding,
-      perLayerTokenEmbedding: await this.loadEmbeddingGatherHandle("per_layer_token_embd.weight"),
+      perLayerTokenEmbedding: await this.loadFullEmbeddingGatherHandleIfBindable("per_layer_token_embd.weight"),
       perLayerModelProjection: isF32CompatibleType(projectionTensor.type)
         ? await this.loadF32CompatibleHandle("per_layer_model_proj.weight")
         : await loadQuantizedHandle(this.arena, this.tensorReader, "per_layer_model_proj.weight"),
@@ -1949,6 +1981,155 @@ export class WebGpuSegmentRunner implements SegmentRunner {
     };
     this.lazyLoadMs += nowMs() - startMs;
     return resources;
+  }
+
+  private async loadFullEmbeddingGatherHandleIfBindable(name: string): Promise<F32Handle | QuantizedHandle | undefined> {
+    const tensor = this.tensorReader.getTensor(name);
+    const rowElements = tensor.dimensions[0] ?? 0;
+    const rowCount = tensor.dimensions[1] ?? 0;
+    if (rowElements <= 0 || rowCount <= 0) {
+      throw new Error(`${name} has invalid WebGPU embedding shape [${tensor.dimensions.join(", ")}]`);
+    }
+    const fullByteLength = this.embeddingUploadByteLength(tensor.type, rowElements, rowCount);
+    const limits = await webGpuAdapterLimits();
+    const bindingLimit = limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
+    return fullByteLength <= bindingLimit ? await this.loadEmbeddingGatherHandle(name) : undefined;
+  }
+
+  private async buildEmbeddingRowChunks(
+    name: string,
+    tokenIds: readonly number[],
+    fullHandle: F32Handle | QuantizedHandle | undefined,
+  ): Promise<GpuEmbeddingRowChunk[]> {
+    const tensor = this.tensorReader.getTensor(name);
+    const rowElements = tensor.dimensions[0] ?? 0;
+    const rowCount = tensor.dimensions[1] ?? 0;
+    if (rowElements <= 0 || rowCount <= 0) {
+      throw new Error(`${name} has invalid WebGPU embedding shape [${tensor.dimensions.join(", ")}]`);
+    }
+    this.assertEmbeddingTokenIds(name, tokenIds, rowCount);
+    if (fullHandle) {
+      return [{
+        handle: fullHandle,
+        rowIds: Uint32Array.from(tokenIds),
+        outputTokenOffset: 0,
+        tokenCount: tokenIds.length,
+        transientHandle: false,
+      }];
+    }
+
+    const rowByteLength = this.embeddingRowByteLength(tensor.type, rowElements);
+    const limits = await webGpuAdapterLimits();
+    const bindingLimit = limits?.maxStorageBufferBindingSize ?? 128 * 1024 * 1024;
+    // Quantized uploads are padded to a 4-byte boundary, so reserve the maximum 3-byte padding.
+    const uploadPaddingHeadroom = tensor.type === "F32" ? 0 : 3;
+    const maxRowsPerChunk = Math.floor(Math.max(0, bindingLimit - uploadPaddingHeadroom) / rowByteLength);
+    if (maxRowsPerChunk < 1) {
+      throw new Error(`${name} row byte length ${rowByteLength} exceeds maxStorageBufferBindingSize ${bindingLimit}`);
+    }
+
+    const chunks: GpuEmbeddingRowChunk[] = [];
+    try {
+      for (let offset = 0; offset < tokenIds.length; offset += maxRowsPerChunk) {
+        const chunkTokenIds = tokenIds.slice(offset, offset + maxRowsPerChunk);
+        const compactRows = await this.readCompactEmbeddingRows(name, chunkTokenIds, rowElements, rowCount);
+        chunks.push({
+          handle: this.createCompactEmbeddingHandle(name, tensor.type, rowElements, chunkTokenIds.length, compactRows),
+          rowIds: Uint32Array.from(chunkTokenIds, (_tokenId, index) => index),
+          outputTokenOffset: offset,
+          tokenCount: chunkTokenIds.length,
+          transientHandle: true,
+        });
+      }
+    } catch (error) {
+      for (const chunk of chunks.reverse()) {
+        chunk.handle.destroy?.();
+      }
+      throw error;
+    }
+    return chunks;
+  }
+
+  private createCompactEmbeddingHandle(
+    name: string,
+    tensorType: GgmlTypeName,
+    rowElements: number,
+    rowCount: number,
+    compactRows: Uint8Array,
+  ): F32Handle | QuantizedHandle {
+    if (tensorType === "F32") {
+      const buffer = this.arena.createBuffer(`${name}.compact`, compactRows.byteLength, GPU_STORAGE | GPU_COPY_DST);
+      this.arena.device.queue.writeBuffer(buffer, 0, compactRows);
+      return {
+        length: compactRows.byteLength / Float32Array.BYTES_PER_ELEMENT,
+        byteLength: compactRows.byteLength,
+        device: this.arena.device,
+        buffer,
+        destroy: () => buffer.destroy?.(),
+      };
+    }
+    if (!isSupportedEmbeddingGatherType(tensorType)) {
+      throw new Error(`${name} has unsupported WebGPU gather type ${tensorType}`);
+    }
+    return createQuantizedHandleFromBytes(
+      this.arena,
+      `${name}.compact`,
+      webGpuMatMulType(tensorType, name),
+      rowElements,
+      rowCount,
+      compactRows,
+    );
+  }
+
+  private async readCompactEmbeddingRows(
+    name: string,
+    tokenIds: readonly number[],
+    rowElements: number,
+    rowCount: number,
+  ): Promise<Uint8Array> {
+    const tensor = this.tensorReader.getTensor(name);
+    const rowByteLength = this.embeddingRowByteLength(tensor.type, rowElements);
+    const ranges: TensorByteRange[] = tokenIds.map((tokenId) => {
+      if (!Number.isInteger(tokenId) || tokenId < 0 || tokenId >= rowCount) {
+        throw new Error(`${name} token id ${tokenId} is outside vocab row count ${rowCount}`);
+      }
+      return {
+        tensor,
+        offset: BigInt(rowByteLength * tokenId),
+        length: rowByteLength,
+      };
+    });
+    const rows = await this.tensorReader.readTensorRangesCoalesced(ranges, {
+      maxGapBytes: 1024 * 1024,
+      maxReadBytes: 256 * 1024 * 1024,
+      copyResults: false,
+    });
+    const compact = new Uint8Array(rowByteLength * tokenIds.length);
+    for (let index = 0; index < rows.length; index += 1) {
+      compact.set(rows[index] ?? new Uint8Array(0), index * rowByteLength);
+    }
+    return compact;
+  }
+
+  private assertEmbeddingTokenIds(name: string, tokenIds: readonly number[], rowCount: number): void {
+    for (const tokenId of tokenIds) {
+      if (!Number.isInteger(tokenId) || tokenId < 0 || tokenId >= rowCount) {
+        throw new Error(`${name} token id ${tokenId} is outside vocab row count ${rowCount}`);
+      }
+    }
+  }
+
+  private embeddingRowByteLength(tensorType: GgmlTypeName, rowElements: number): number {
+    if (tensorType === "F32") {
+      return rowElements * Float32Array.BYTES_PER_ELEMENT;
+    }
+    const type = webGpuMatMulType(tensorType, "embedding");
+    return webGpuQuantizedWeightLayout(type, rowElements).rowByteLength;
+  }
+
+  private embeddingUploadByteLength(tensorType: GgmlTypeName, rowElements: number, rowCount: number): number {
+    const byteLength = this.embeddingRowByteLength(tensorType, rowElements) * rowCount;
+    return tensorType === "F32" ? byteLength : Math.ceil(byteLength / 4) * 4;
   }
 
   private async loadEmbeddingGatherHandle(name: string): Promise<F32Handle | QuantizedHandle> {
@@ -1994,6 +2175,7 @@ export class WebGpuSegmentRunner implements SegmentRunner {
       rowSize: number;
       tokenCount: number;
       scale: number;
+      outputTokenOffset?: number;
     },
   ): void {
     if (isF32Handle(handle)) {
@@ -2008,6 +2190,34 @@ export class WebGpuSegmentRunner implements SegmentRunner {
       output,
       options,
     );
+  }
+
+  private dispatchEmbeddingRowChunks(
+    pass: WebGpuComputePassLike,
+    resources: Array<{ destroy: () => void }>,
+    cleanup: GpuResource[],
+    chunks: readonly GpuEmbeddingRowChunk[],
+    output: WebGpuBufferLike,
+    options: {
+      rowSize: number;
+      scale: number;
+    },
+  ): void {
+    for (const chunk of chunks) {
+      const tokenIdBuffer = this.arena.createScratchBuffer(
+        "input.token_ids.chunk",
+        chunk.rowIds.byteLength,
+        GPU_STORAGE | GPU_COPY_DST,
+      );
+      this.arena.device.queue.writeBuffer(tokenIdBuffer, 0, chunk.rowIds);
+      cleanup.push(tokenIdBuffer);
+      this.dispatchGatherRowsScale(pass, resources, chunk.handle, tokenIdBuffer, output, {
+        rowSize: options.rowSize,
+        tokenCount: chunk.tokenCount,
+        scale: options.scale,
+        outputTokenOffset: chunk.outputTokenOffset,
+      });
+    }
   }
 
   private async runTokenFromBoundaryInternal(

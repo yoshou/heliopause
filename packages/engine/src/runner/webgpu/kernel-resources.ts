@@ -55,6 +55,11 @@ import {
   Q6_K_MATMUL_WGSL,
 } from "./shaders";
 
+function uniformBufferSize(byteLength: number): number {
+  // Deno/wgpu validation reported 16-byte bindings as too small for some WGSL uniform structs expecting 32 bytes.
+  return Math.max(32, Math.ceil(byteLength / 16) * 16);
+}
+
 export function createKMatMulBindResources(
   handle: WebGpuQuantizedWeightHandleInternal,
   inputScaleBuffer: WebGpuBufferLike,
@@ -75,7 +80,7 @@ export function createKMatMulBindResources(
     0,
   ]);
   const paramsBuffer = handle.device.createBuffer({
-    size: params.byteLength,
+    size: uniformBufferSize(params.byteLength),
     usage: GPU_UNIFORM | GPU_COPY_DST,
   });
   handle.device.queue.writeBuffer(paramsBuffer, 0, params);
@@ -167,7 +172,7 @@ export function createDualQ4KMatMulBindResources(
     0,
   ]);
   const paramsBuffer = leftHandle.device.createBuffer({
-    size: params.byteLength,
+    size: uniformBufferSize(params.byteLength),
     usage: GPU_UNIFORM | GPU_COPY_DST,
   });
   leftHandle.device.queue.writeBuffer(paramsBuffer, 0, params);
@@ -222,7 +227,7 @@ export function createSwiGluResources(
 ): { pipeline: unknown; bindGroup: unknown; destroy: () => void } {
   const params = new Uint32Array([length, 0, 0, 0]);
   const paramsBuffer = device.createBuffer({
-    size: params.byteLength,
+    size: uniformBufferSize(params.byteLength),
     usage: GPU_UNIFORM | GPU_COPY_DST,
   });
   device.queue.writeBuffer(paramsBuffer, 0, params);
@@ -280,7 +285,7 @@ export function createGegluSliceResources(
 ): { pipeline: unknown; bindGroup: unknown; destroy: () => void } {
   const params = new Uint32Array([length, rightOffset, 0, 0]);
   const paramsBuffer = device.createBuffer({
-    size: params.byteLength,
+    size: uniformBufferSize(params.byteLength),
     usage: GPU_UNIFORM | GPU_COPY_DST,
   });
   device.queue.writeBuffer(paramsBuffer, 0, params);
@@ -376,7 +381,7 @@ function createBinaryElementwiseResources(
 ): { pipeline: unknown; bindGroup: unknown; destroy: () => void } {
   const params = new Uint32Array([length, 0, 0, 0]);
   const paramsBuffer = device.createBuffer({
-    size: params.byteLength,
+    size: uniformBufferSize(params.byteLength),
     usage: GPU_UNIFORM | GPU_COPY_DST,
   });
   device.queue.writeBuffer(paramsBuffer, 0, params);
@@ -423,7 +428,7 @@ function createUnaryElementwiseResources(
 ): { pipeline: unknown; bindGroup: unknown; destroy: () => void } {
   const params = new Uint32Array([length, 0, 0, 0]);
   const paramsBuffer = device.createBuffer({
-    size: params.byteLength,
+    size: uniformBufferSize(params.byteLength),
     usage: GPU_UNIFORM | GPU_COPY_DST,
   });
   device.queue.writeBuffer(paramsBuffer, 0, params);
@@ -470,7 +475,7 @@ export function createF32MatMulResources(
 ): { pipeline: unknown; bindGroup: unknown; destroy: () => void } {
   const params = new Uint32Array([inputSize, rowCount, columnCount, 0]);
   const paramsBuffer = device.createBuffer({
-    size: params.byteLength,
+    size: uniformBufferSize(params.byteLength),
     usage: GPU_UNIFORM | GPU_COPY_DST,
   });
   device.queue.writeBuffer(paramsBuffer, 0, params);
@@ -520,7 +525,7 @@ export function createQ8KQuantizeResources(
 ): { pipeline: unknown; bindGroup: unknown; destroy: () => void } {
   const params = new Uint32Array([inputSize, columnCount, blockCount, 0]);
   const paramsBuffer = device.createBuffer({
-    size: params.byteLength,
+    size: uniformBufferSize(params.byteLength),
     usage: GPU_UNIFORM | GPU_COPY_DST,
   });
   device.queue.writeBuffer(paramsBuffer, 0, params);
@@ -575,7 +580,7 @@ export function createRmsNormQ8KQuantizeResources(
   paramsU32[1] = length;
   paramsU32[2] = length / 256;
   const paramsBuffer = device.createBuffer({
-    size: paramsU32.byteLength,
+    size: uniformBufferSize(paramsU32.byteLength),
     usage: GPU_UNIFORM | GPU_COPY_DST,
   });
   device.queue.writeBuffer(paramsBuffer, 0, paramsU32);
@@ -635,7 +640,7 @@ export function createBatchedRmsNormQ8KQuantizeResources(
   paramsU32[1] = options.length;
   paramsU32[2] = options.length / 256;
   paramsU32[3] = options.tokenCount;
-  const paramsBuffer = device.createBuffer({ size: paramsU32.byteLength, usage: GPU_UNIFORM | GPU_COPY_DST });
+  const paramsBuffer = device.createBuffer({ size: uniformBufferSize(paramsU32.byteLength), usage: GPU_UNIFORM | GPU_COPY_DST });
   device.queue.writeBuffer(paramsBuffer, 0, paramsU32);
   const bindGroupLayout = device.createBindGroupLayout({
     entries: [
@@ -676,7 +681,7 @@ export function createTop1Resources(
 ): { pipeline: unknown; bindGroup: unknown; destroy: () => void } {
   const params = new Uint32Array([rowCount, 0, 0, 0]);
   const paramsBuffer = device.createBuffer({
-    size: params.byteLength,
+    size: uniformBufferSize(params.byteLength),
     usage: GPU_UNIFORM | GPU_COPY_DST,
   });
   device.queue.writeBuffer(paramsBuffer, 0, params);
@@ -720,7 +725,7 @@ export function createSelectTop1CandidateResources(
 ): { pipeline: unknown; bindGroup: unknown; destroy: () => void } {
   const params = new Uint32Array([candidateCount, 0, 0, 0]);
   const paramsBuffer = device.createBuffer({
-    size: params.byteLength,
+    size: uniformBufferSize(params.byteLength),
     usage: GPU_UNIFORM | GPU_COPY_DST,
   });
   device.queue.writeBuffer(paramsBuffer, 0, params);
@@ -767,7 +772,7 @@ export function createQ8_0QuantizeResources(
 ): { pipeline: unknown; bindGroup: unknown; destroy: () => void } {
   const params = new Uint32Array([inputSize, columnCount, blockCount, 0]);
   const paramsBuffer = device.createBuffer({
-    size: params.byteLength,
+    size: uniformBufferSize(params.byteLength),
     usage: GPU_UNIFORM | GPU_COPY_DST,
   });
   device.queue.writeBuffer(paramsBuffer, 0, params);
@@ -832,7 +837,7 @@ export function createFullAttentionScoreResources(
   paramsU32[6] = options.tokenPosition;
   paramsU32[7] = keyValueStart;
   const paramsBuffer = device.createBuffer({
-    size: paramsU32.byteLength,
+    size: uniformBufferSize(paramsU32.byteLength),
     usage: GPU_UNIFORM | GPU_COPY_DST,
   });
   device.queue.writeBuffer(paramsBuffer, 0, paramsU32);
@@ -894,7 +899,7 @@ export function createFullAttentionApplyResources(
   paramsU32[5] = options.contextLength;
   paramsU32[6] = options.keyValueStart ?? 0;
   const paramsBuffer = device.createBuffer({
-    size: paramsU32.byteLength,
+    size: uniformBufferSize(paramsU32.byteLength),
     usage: GPU_UNIFORM | GPU_COPY_DST,
   });
   device.queue.writeBuffer(paramsBuffer, 0, paramsU32);
@@ -956,7 +961,7 @@ export function createBatchedFullQueryResources(
   params[4] = options.headSize;
   params[5] = options.ropeDims;
   params[6] = options.tokenCount;
-  const paramsBuffer = device.createBuffer({ size: params.byteLength, usage: GPU_UNIFORM | GPU_COPY_DST });
+  const paramsBuffer = device.createBuffer({ size: uniformBufferSize(params.byteLength), usage: GPU_UNIFORM | GPU_COPY_DST });
   device.queue.writeBuffer(paramsBuffer, 0, params);
   const bindGroupLayout = device.createBindGroupLayout({
     entries: [
@@ -1019,7 +1024,7 @@ export function createBatchedFullKvUpdateResources(
   params[6] = options.ropeDims;
   params[7] = options.tokenCount;
   params[8] = options.contextLength;
-  const paramsBuffer = device.createBuffer({ size: params.byteLength, usage: GPU_UNIFORM | GPU_COPY_DST });
+  const paramsBuffer = device.createBuffer({ size: uniformBufferSize(params.byteLength), usage: GPU_UNIFORM | GPU_COPY_DST });
   device.queue.writeBuffer(paramsBuffer, 0, params);
   const bindGroupLayout = device.createBindGroupLayout({
     entries: [
@@ -1088,7 +1093,7 @@ export function createBatchedFullAttentionScoreResources(
   params[8] = options.slidingWindow === undefined ? 0 : 1;
   params[9] = options.tokenCount;
   params[10] = options.causal ? 1 : 0;
-  const paramsBuffer = device.createBuffer({ size: params.byteLength, usage: GPU_UNIFORM | GPU_COPY_DST });
+  const paramsBuffer = device.createBuffer({ size: uniformBufferSize(params.byteLength), usage: GPU_UNIFORM | GPU_COPY_DST });
   device.queue.writeBuffer(paramsBuffer, 0, params);
   const bindGroupLayout = device.createBindGroupLayout({
     entries: [
@@ -1150,7 +1155,7 @@ export function createBatchedFullAttentionApplyResources(
   params[8] = options.slidingWindow === undefined ? 0 : 1;
   params[9] = options.tokenCount;
   params[10] = options.causal ? 1 : 0;
-  const paramsBuffer = device.createBuffer({ size: params.byteLength, usage: GPU_UNIFORM | GPU_COPY_DST });
+  const paramsBuffer = device.createBuffer({ size: uniformBufferSize(params.byteLength), usage: GPU_UNIFORM | GPU_COPY_DST });
   device.queue.writeBuffer(paramsBuffer, 0, params);
   const bindGroupLayout = device.createBindGroupLayout({
     entries: [
@@ -1203,7 +1208,7 @@ export function createQ8_0MatMulBindResources(
     0,
   ]);
   const paramsBuffer = handle.device.createBuffer({
-    size: params.byteLength,
+    size: uniformBufferSize(params.byteLength),
     usage: GPU_UNIFORM | GPU_COPY_DST,
   });
   handle.device.queue.writeBuffer(paramsBuffer, 0, params);
@@ -1256,7 +1261,7 @@ export function createBatchedGegluSliceResources(
   },
 ): { pipeline: unknown; bindGroup: unknown; destroy: () => void } {
   const params = new Uint32Array([options.length, options.tokenCount, options.rightOffset, options.rightStride]);
-  const paramsBuffer = device.createBuffer({ size: params.byteLength, usage: GPU_UNIFORM | GPU_COPY_DST });
+  const paramsBuffer = device.createBuffer({ size: uniformBufferSize(params.byteLength), usage: GPU_UNIFORM | GPU_COPY_DST });
   device.queue.writeBuffer(paramsBuffer, 0, params);
   const bindGroupLayout = device.createBindGroupLayout({
     entries: [
@@ -1296,7 +1301,7 @@ export function createRmsNormResources(
   const paramsF32 = new Float32Array([epsilon, 0, 0, 0]);
   const paramsU32 = new Uint32Array(paramsF32.buffer);
   paramsU32[1] = length;
-  const paramsBuffer = device.createBuffer({ size: paramsU32.byteLength, usage: GPU_UNIFORM | GPU_COPY_DST });
+  const paramsBuffer = device.createBuffer({ size: uniformBufferSize(paramsU32.byteLength), usage: GPU_UNIFORM | GPU_COPY_DST });
   device.queue.writeBuffer(paramsBuffer, 0, paramsU32);
   const bindGroupLayout = device.createBindGroupLayout({
     entries: [
@@ -1328,7 +1333,7 @@ export function createResidualAddResources(
   length: number,
 ): { pipeline: unknown; bindGroup: unknown; destroy: () => void } {
   const params = new Uint32Array([length, 0, 0, 0]);
-  const paramsBuffer = device.createBuffer({ size: params.byteLength, usage: GPU_UNIFORM | GPU_COPY_DST });
+  const paramsBuffer = device.createBuffer({ size: uniformBufferSize(params.byteLength), usage: GPU_UNIFORM | GPU_COPY_DST });
   device.queue.writeBuffer(paramsBuffer, 0, params);
   const bindGroupLayout = device.createBindGroupLayout({
     entries: [
@@ -1361,7 +1366,7 @@ export function createResidualAddScaleResources(
   length: number,
 ): { pipeline: unknown; bindGroup: unknown; destroy: () => void } {
   const params = new Uint32Array([length, 0, 0, 0]);
-  const paramsBuffer = device.createBuffer({ size: params.byteLength, usage: GPU_UNIFORM | GPU_COPY_DST });
+  const paramsBuffer = device.createBuffer({ size: uniformBufferSize(params.byteLength), usage: GPU_UNIFORM | GPU_COPY_DST });
   device.queue.writeBuffer(paramsBuffer, 0, params);
   const bindGroupLayout = device.createBindGroupLayout({
     entries: [
@@ -1404,7 +1409,7 @@ export function createRmsNormResidualAddResources(
   const paramsF32 = new Float32Array([epsilon, 0, 0, 0]);
   const paramsU32 = new Uint32Array(paramsF32.buffer);
   paramsU32[1] = length;
-  const paramsBuffer = device.createBuffer({ size: paramsU32.byteLength, usage: GPU_UNIFORM | GPU_COPY_DST });
+  const paramsBuffer = device.createBuffer({ size: uniformBufferSize(paramsU32.byteLength), usage: GPU_UNIFORM | GPU_COPY_DST });
   device.queue.writeBuffer(paramsBuffer, 0, paramsU32);
   const bindGroupLayout = device.createBindGroupLayout({
     entries: [
@@ -1448,7 +1453,7 @@ export function createRmsNormResidualAddScaleResources(
   const paramsF32 = new Float32Array([epsilon, 0, 0, 0]);
   const paramsU32 = new Uint32Array(paramsF32.buffer);
   paramsU32[1] = length;
-  const paramsBuffer = device.createBuffer({ size: paramsU32.byteLength, usage: GPU_UNIFORM | GPU_COPY_DST });
+  const paramsBuffer = device.createBuffer({ size: uniformBufferSize(paramsU32.byteLength), usage: GPU_UNIFORM | GPU_COPY_DST });
   device.queue.writeBuffer(paramsBuffer, 0, paramsU32);
   const bindGroupLayout = device.createBindGroupLayout({
     entries: [
@@ -1497,7 +1502,7 @@ export function createBatchedRmsNormResidualAddResources(
   const params = new Uint32Array(paramsF32.buffer);
   params[1] = options.length;
   params[2] = options.tokenCount;
-  const paramsBuffer = device.createBuffer({ size: params.byteLength, usage: GPU_UNIFORM | GPU_COPY_DST });
+  const paramsBuffer = device.createBuffer({ size: uniformBufferSize(params.byteLength), usage: GPU_UNIFORM | GPU_COPY_DST });
   device.queue.writeBuffer(paramsBuffer, 0, params);
   const bindGroupLayout = device.createBindGroupLayout({
     entries: [
@@ -1545,7 +1550,7 @@ export function createBatchedRmsNormResidualAddScaleResources(
   const params = new Uint32Array(paramsF32.buffer);
   params[1] = options.length;
   params[2] = options.tokenCount;
-  const paramsBuffer = device.createBuffer({ size: params.byteLength, usage: GPU_UNIFORM | GPU_COPY_DST });
+  const paramsBuffer = device.createBuffer({ size: uniformBufferSize(params.byteLength), usage: GPU_UNIFORM | GPU_COPY_DST });
   device.queue.writeBuffer(paramsBuffer, 0, params);
   const bindGroupLayout = device.createBindGroupLayout({
     entries: [
@@ -1593,7 +1598,7 @@ export function createHeadRmsNormResources(
   const paramsU32 = new Uint32Array(paramsF32.buffer);
   paramsU32[1] = options.headCount;
   paramsU32[2] = options.headSize;
-  const paramsBuffer = device.createBuffer({ size: paramsU32.byteLength, usage: GPU_UNIFORM | GPU_COPY_DST });
+  const paramsBuffer = device.createBuffer({ size: uniformBufferSize(paramsU32.byteLength), usage: GPU_UNIFORM | GPU_COPY_DST });
   device.queue.writeBuffer(paramsBuffer, 0, paramsU32);
   const bindGroupLayout = device.createBindGroupLayout({
     entries: [
@@ -1636,7 +1641,7 @@ export function createHeadRmsNormNoWeightResources(
   const paramsU32 = new Uint32Array(paramsF32.buffer);
   paramsU32[1] = options.headCount;
   paramsU32[2] = options.headSize;
-  const paramsBuffer = device.createBuffer({ size: paramsU32.byteLength, usage: GPU_UNIFORM | GPU_COPY_DST });
+  const paramsBuffer = device.createBuffer({ size: uniformBufferSize(paramsU32.byteLength), usage: GPU_UNIFORM | GPU_COPY_DST });
   device.queue.writeBuffer(paramsBuffer, 0, paramsU32);
   const bindGroupLayout = device.createBindGroupLayout({
     entries: [
@@ -1683,7 +1688,7 @@ export function createRopeResources(
   params[3] = options.headCount;
   params[4] = options.headSize;
   params[5] = options.ropeDims;
-  const paramsBuffer = device.createBuffer({ size: params.byteLength, usage: GPU_UNIFORM | GPU_COPY_DST });
+  const paramsBuffer = device.createBuffer({ size: uniformBufferSize(params.byteLength), usage: GPU_UNIFORM | GPU_COPY_DST });
   device.queue.writeBuffer(paramsBuffer, 0, params);
   const bindGroupLayout = device.createBindGroupLayout({
     entries: [
@@ -1734,7 +1739,7 @@ export function createKeyCacheRopeResources(
   params[4] = options.headSize;
   params[5] = options.ropeDims;
   params[6] = options.tokenPosition;
-  const paramsBuffer = device.createBuffer({ size: params.byteLength, usage: GPU_UNIFORM | GPU_COPY_DST });
+  const paramsBuffer = device.createBuffer({ size: uniformBufferSize(params.byteLength), usage: GPU_UNIFORM | GPU_COPY_DST });
   device.queue.writeBuffer(paramsBuffer, 0, params);
   const bindGroupLayout = device.createBindGroupLayout({
     entries: [
@@ -1775,7 +1780,7 @@ export function createValueCacheWriteResources(
   },
 ): { pipeline: unknown; bindGroup: unknown; destroy: () => void } {
   const params = new Uint32Array([options.headCount, options.valueSize, options.tokenPosition, options.contextLength]);
-  const paramsBuffer = device.createBuffer({ size: params.byteLength, usage: GPU_UNIFORM | GPU_COPY_DST });
+  const paramsBuffer = device.createBuffer({ size: uniformBufferSize(params.byteLength), usage: GPU_UNIFORM | GPU_COPY_DST });
   device.queue.writeBuffer(paramsBuffer, 0, params);
   const bindGroupLayout = device.createBindGroupLayout({
     entries: [
@@ -1826,7 +1831,7 @@ export function createFullQueryResources(
   params[4] = options.headCount;
   params[5] = options.headSize;
   params[6] = options.ropeDims;
-  const paramsBuffer = device.createBuffer({ size: params.byteLength, usage: GPU_UNIFORM | GPU_COPY_DST });
+  const paramsBuffer = device.createBuffer({ size: uniformBufferSize(params.byteLength), usage: GPU_UNIFORM | GPU_COPY_DST });
   device.queue.writeBuffer(paramsBuffer, 0, params);
   const bindGroupLayout = device.createBindGroupLayout({
     entries: [
@@ -1889,7 +1894,7 @@ export function createFullKvUpdateResources(
   params[7] = options.ropeDims;
   params[8] = options.tokenPosition;
   params[9] = options.contextLength;
-  const paramsBuffer = device.createBuffer({ size: params.byteLength, usage: GPU_UNIFORM | GPU_COPY_DST });
+  const paramsBuffer = device.createBuffer({ size: uniformBufferSize(params.byteLength), usage: GPU_UNIFORM | GPU_COPY_DST });
   device.queue.writeBuffer(paramsBuffer, 0, params);
   const bindGroupLayout = device.createBindGroupLayout({
     entries: [
@@ -1937,7 +1942,7 @@ export function createTopKResources(
   },
 ): { pipeline: unknown; bindGroup: unknown; destroy: () => void } {
   const params = new Uint32Array([options.rowCount, options.rowOffset, options.slot, options.candidateOffset]);
-  const paramsBuffer = device.createBuffer({ size: params.byteLength, usage: GPU_UNIFORM | GPU_COPY_DST });
+  const paramsBuffer = device.createBuffer({ size: uniformBufferSize(params.byteLength), usage: GPU_UNIFORM | GPU_COPY_DST });
   device.queue.writeBuffer(paramsBuffer, 0, params);
   const bindGroupLayout = device.createBindGroupLayout({
     entries: [
@@ -1971,7 +1976,7 @@ export function createTop1ChunkResources(
   },
 ): { pipeline: unknown; bindGroup: unknown; destroy: () => void } {
   const params = new Uint32Array([options.rowCount, options.rowOffset, options.candidateOffset, 0]);
-  const paramsBuffer = device.createBuffer({ size: params.byteLength, usage: GPU_UNIFORM | GPU_COPY_DST });
+  const paramsBuffer = device.createBuffer({ size: uniformBufferSize(params.byteLength), usage: GPU_UNIFORM | GPU_COPY_DST });
   device.queue.writeBuffer(paramsBuffer, 0, params);
   const bindGroupLayout = device.createBindGroupLayout({
     entries: [
@@ -2004,7 +2009,7 @@ export function createTokenSliceResources(
   },
 ): { pipeline: unknown; bindGroup: unknown; destroy: () => void } {
   const params = new Uint32Array([options.rowSize, options.rowIndex, 0, 0]);
-  const paramsBuffer = device.createBuffer({ size: params.byteLength, usage: GPU_UNIFORM | GPU_COPY_DST });
+  const paramsBuffer = device.createBuffer({ size: uniformBufferSize(params.byteLength), usage: GPU_UNIFORM | GPU_COPY_DST });
   device.queue.writeBuffer(paramsBuffer, 0, params);
   const bindGroupLayout = device.createBindGroupLayout({
     entries: [
@@ -2037,7 +2042,7 @@ export function createTokenWriteResources(
   },
 ): { pipeline: unknown; bindGroup: unknown; destroy: () => void } {
   const params = new Uint32Array([options.rowSize, options.rowIndex, 0, 0]);
-  const paramsBuffer = device.createBuffer({ size: params.byteLength, usage: GPU_UNIFORM | GPU_COPY_DST });
+  const paramsBuffer = device.createBuffer({ size: uniformBufferSize(params.byteLength), usage: GPU_UNIFORM | GPU_COPY_DST });
   device.queue.writeBuffer(paramsBuffer, 0, params);
   const bindGroupLayout = device.createBindGroupLayout({
     entries: [
@@ -2069,13 +2074,15 @@ export function createF32GatherRowsScaleResources(
     rowSize: number;
     tokenCount: number;
     scale: number;
+    outputTokenOffset?: number;
   },
 ): { pipeline: unknown; bindGroup: unknown; destroy: () => void } {
   const paramsF32 = new Float32Array([0, 0, options.scale, 0]);
   const paramsU32 = new Uint32Array(paramsF32.buffer);
   paramsU32[0] = options.rowSize;
   paramsU32[1] = options.tokenCount;
-  const paramsBuffer = device.createBuffer({ size: paramsU32.byteLength, usage: GPU_UNIFORM | GPU_COPY_DST });
+  paramsU32[3] = options.outputTokenOffset ?? 0;
+  const paramsBuffer = device.createBuffer({ size: uniformBufferSize(paramsU32.byteLength), usage: GPU_UNIFORM | GPU_COPY_DST });
   device.queue.writeBuffer(paramsBuffer, 0, paramsU32);
   const bindGroupLayout = device.createBindGroupLayout({
     entries: [
@@ -2115,6 +2122,7 @@ export function createQ8_0GatherRowsScaleResources(
     blockCount: number;
     rowByteLength: number;
     scale: number;
+    outputTokenOffset?: number;
   },
 ): { pipeline: unknown; bindGroup: unknown; destroy: () => void } {
   const paramsF32 = new Float32Array([0, 0, 0, 0, options.scale, 0, 0, 0]);
@@ -2123,7 +2131,8 @@ export function createQ8_0GatherRowsScaleResources(
   paramsU32[1] = options.tokenCount;
   paramsU32[2] = options.blockCount;
   paramsU32[3] = options.rowByteLength;
-  const paramsBuffer = device.createBuffer({ size: paramsU32.byteLength, usage: GPU_UNIFORM | GPU_COPY_DST });
+  paramsU32[5] = options.outputTokenOffset ?? 0;
+  const paramsBuffer = device.createBuffer({ size: uniformBufferSize(paramsU32.byteLength), usage: GPU_UNIFORM | GPU_COPY_DST });
   device.queue.writeBuffer(paramsBuffer, 0, paramsU32);
   const bindGroupLayout = device.createBindGroupLayout({
     entries: [
@@ -2164,6 +2173,7 @@ export function createQuantizedGatherRowsScaleResources(
     blockCount: number;
     rowByteLength: number;
     scale: number;
+    outputTokenOffset?: number;
   },
 ): { pipeline: unknown; bindGroup: unknown; destroy: () => void } {
   if (type === "Q8_0") {
@@ -2175,7 +2185,8 @@ export function createQuantizedGatherRowsScaleResources(
   paramsU32[1] = options.tokenCount;
   paramsU32[2] = options.blockCount;
   paramsU32[3] = options.rowByteLength;
-  const paramsBuffer = device.createBuffer({ size: paramsU32.byteLength, usage: GPU_UNIFORM | GPU_COPY_DST });
+  paramsU32[5] = options.outputTokenOffset ?? 0;
+  const paramsBuffer = device.createBuffer({ size: uniformBufferSize(paramsU32.byteLength), usage: GPU_UNIFORM | GPU_COPY_DST });
   device.queue.writeBuffer(paramsBuffer, 0, paramsU32);
   const bindGroupLayout = device.createBindGroupLayout({
     entries: [
@@ -2230,7 +2241,7 @@ export function createPreparePerLayerInputsResources(
   paramsU32[1] = options.totalPerLayerLength;
   paramsU32[2] = options.tokenCount;
   paramsU32[3] = options.blockCount;
-  const paramsBuffer = device.createBuffer({ size: paramsU32.byteLength, usage: GPU_UNIFORM | GPU_COPY_DST });
+  const paramsBuffer = device.createBuffer({ size: uniformBufferSize(paramsU32.byteLength), usage: GPU_UNIFORM | GPU_COPY_DST });
   device.queue.writeBuffer(paramsBuffer, 0, paramsU32);
   const bindGroupLayout = device.createBindGroupLayout({
     entries: [
