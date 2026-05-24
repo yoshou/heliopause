@@ -53,7 +53,7 @@ test("WebGPU runtime resource cache creates pipelines and layouts only once per 
   assert.equal(stats.computePipelineHits, 1);
 });
 
-test("WebGPU runtime resource cache reuses bind groups with the same layout and buffers", () => {
+test("WebGPU runtime resource cache does not reuse bind groups", () => {
   const { device, counts } = fakeDevice();
   const cache = installWebGpuRuntimeResourceCache(device);
   const layout = device.createBindGroupLayout({
@@ -70,35 +70,12 @@ test("WebGPU runtime resource cache reuses bind groups with the same layout and 
     entries: [{ binding: 0, resource: { buffer } }],
   });
 
-  assert.equal(bindGroupA, bindGroupB);
-  assert.equal(counts.bindGroups, 1);
-  const stats = cache.stats();
-  assert.equal(stats.bindGroupMisses, 1);
-  assert.equal(stats.bindGroupHits, 1);
-});
-
-test("WebGPU runtime resource cache keys bind groups by buffer identity", () => {
-  const { device, counts } = fakeDevice();
-  installWebGpuRuntimeResourceCache(device);
-  const layout = device.createBindGroupLayout({
-    entries: [{ binding: 0, visibility: 4, buffer: { type: "storage" } }],
-  });
-  const bufferA = device.createBuffer({ size: 4, usage: 1 }) as { __heliopauseScratchKey?: string };
-  const bufferB = device.createBuffer({ size: 4, usage: 1 }) as { __heliopauseScratchKey?: string };
-  bufferA.__heliopauseScratchKey = "1:4";
-  bufferB.__heliopauseScratchKey = "1:4";
-
-  const bindGroupA = device.createBindGroup({
-    layout,
-    entries: [{ binding: 0, resource: { buffer: bufferA } }],
-  });
-  const bindGroupB = device.createBindGroup({
-    layout,
-    entries: [{ binding: 0, resource: { buffer: bufferB } }],
-  });
-
   assert.notEqual(bindGroupA, bindGroupB);
   assert.equal(counts.bindGroups, 2);
+  const stats = cache.stats();
+  assert.equal(stats.bindGroupMisses, 2);
+  assert.equal(stats.bindGroupHits, 0);
+  assert.equal(stats.bindGroupCreates, 2);
 });
 
 test("WebGPU runtime resource cache reuses unmapped readback buffers", async () => {

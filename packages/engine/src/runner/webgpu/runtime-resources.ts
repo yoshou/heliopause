@@ -39,7 +39,6 @@ type RuntimeResourceCacheState = WebGpuRuntimeResourceCache & {
   bindGroupLayouts: Map<string, unknown>;
   pipelineLayouts: Map<string, unknown>;
   computePipelines: Map<string, unknown>;
-  bindGroups: Map<string, unknown>;
   uniformBufferPools: Map<string, PooledUniformBuffer[]>;
   readbackBufferPools: Map<string, PooledReadbackBuffer[]>;
   statsValue: WebGpuRuntimeResourceStats;
@@ -98,7 +97,6 @@ export function installWebGpuRuntimeResourceCache(
     bindGroupLayouts: new Map<string, unknown>(),
     pipelineLayouts: new Map<string, unknown>(),
     computePipelines: new Map<string, unknown>(),
-    bindGroups: new Map<string, unknown>(),
     uniformBufferPools: new Map<string, PooledUniformBuffer[]>(),
     readbackBufferPools: new Map<string, PooledReadbackBuffer[]>(),
     bufferCreateLabels: new Map<string, number>(),
@@ -214,25 +212,10 @@ export function installWebGpuRuntimeResourceCache(
   };
 
   mutable.createBindGroup = (descriptor) => {
-    const key = bindGroupKey(descriptor, state);
-    if (key) {
-      const cached = state.bindGroups.get(key);
-      if (cached) {
-        state.statsValue.bindGroupHits += 1;
-        return cached;
-      }
-    }
     state.statsValue.bindGroupMisses += 1;
     const start = nowMs();
     try {
-      const created = createBindGroup(descriptor);
-      if (key) {
-        if (state.bindGroups.size > 8192) {
-          state.bindGroups.clear();
-        }
-        state.bindGroups.set(key, created);
-      }
-      return created;
+      return createBindGroup(descriptor);
     } finally {
       state.statsValue.bindGroupCreates += 1;
       state.statsValue.bindGroupCreateMs += nowMs() - start;
@@ -241,26 +224,6 @@ export function installWebGpuRuntimeResourceCache(
 
   mutable.__heliopauseRuntimeResources = state;
   return state;
-}
-
-function bindGroupKey(descriptor: unknown, state: RuntimeResourceCacheState): string | undefined {
-  if (!isRecord(descriptor) || !Array.isArray(descriptor.entries) || !isRecord(descriptor.layout)) {
-    return undefined;
-  }
-  let key = `l${objectId(descriptor.layout, state)}`;
-  for (const entry of descriptor.entries) {
-    if (!isRecord(entry) || typeof entry.binding !== "number" || !isRecord(entry.resource)) {
-      return undefined;
-    }
-    const buffer = entry.resource.buffer;
-    if (!isGpuBufferLike(buffer)) {
-      return undefined;
-    }
-    const offset = typeof entry.resource.offset === "number" ? entry.resource.offset : 0;
-    const size = typeof entry.resource.size === "number" ? entry.resource.size : 0;
-    key += `|${entry.binding}:${objectId(buffer, state)}:${offset}:${size}`;
-  }
-  return key;
 }
 
 function uniformBufferPoolKey(descriptor: {
@@ -460,13 +423,6 @@ function diffCounts(after: Record<string, number>, before: Record<string, number
 
 function webGpuBufferCreateLabelTimingEnabled(): boolean {
   return (globalThis as { __heliopauseDisableWebGpuBufferCreateLabels?: unknown }).__heliopauseDisableWebGpuBufferCreateLabels !== true;
-}
-
-function isGpuBufferLike(value: unknown): value is WebGpuBufferLike {
-  return isRecord(value) &&
-    typeof value.getMappedRange === "function" &&
-    typeof value.unmap === "function" &&
-    typeof value.mapAsync === "function";
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
