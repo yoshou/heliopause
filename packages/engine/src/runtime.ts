@@ -37,6 +37,8 @@ export type InferenceState = {
   nextPosition: number;
 };
 
+type InferenceStateDisposeCallback = () => void;
+
 export type OutputResult = {
   logits: Float32Array;
   topTokens: Array<{ id: number; value: number }>;
@@ -66,6 +68,9 @@ export type ForwardTrace = {
   phase: TimingPhase;
   onTiming: TimingSink;
 };
+
+const inferenceStateDisposeCallbacks = new WeakMap<InferenceState, InferenceStateDisposeCallback[]>();
+const disposedInferenceStates = new WeakSet<InferenceState>();
 
 export type CacheStats = {
   f32TensorCount: number;
@@ -287,6 +292,7 @@ export function createInferenceState(
 }
 
 export function cloneInferenceState(state: InferenceState): InferenceState {
+  assertInferenceStateActive(state);
   const fullAttention = new Map<number, FullAttentionCache>();
 
   for (const [layer, cache] of state.fullAttention) {
@@ -303,6 +309,46 @@ export function cloneInferenceState(state: InferenceState): InferenceState {
     contextLength: state.contextLength,
     nextPosition: state.nextPosition,
   };
+}
+
+export function addInferenceStateDisposeCallback(
+  state: InferenceState,
+  callback: InferenceStateDisposeCallback,
+): void {
+  assertInferenceStateActive(state);
+  const callbacks = inferenceStateDisposeCallbacks.get(state);
+  if (callbacks) {
+    callbacks.push(callback);
+    return;
+  }
+  inferenceStateDisposeCallbacks.set(state, [callback]);
+}
+
+export function assertInferenceStateActive(state: InferenceState): void {
+  if (disposedInferenceStates.has(state)) {
+    throw new Error("Inference state has been disposed.");
+  }
+}
+
+export function disposeInferenceState(state: InferenceState | undefined): void {
+  if (!state || disposedInferenceStates.has(state)) {
+    return;
+  }
+  disposedInferenceStates.add(state);
+  const callbacks = inferenceStateDisposeCallbacks.get(state) ?? [];
+  inferenceStateDisposeCallbacks.delete(state);
+  const errors: unknown[] = [];
+  for (let index = callbacks.length - 1; index >= 0; index -= 1) {
+    try {
+      callbacks[index]?.();
+    } catch (error) {
+      errors.push(error);
+    }
+  }
+  state.fullAttention.clear();
+  if (errors.length > 0) {
+    throw new AggregateError(errors, "Failed to dispose inference state.");
+  }
 }
 
 export function requiredMetadataNumber(tensorReader: GgufTensorReader, key: string): number {

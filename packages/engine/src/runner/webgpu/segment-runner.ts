@@ -1,6 +1,7 @@
 import type { GgmlTypeName } from "../../gguf";
 import { type GgufTensorReader, type TensorByteRange } from "../../tensor-reader";
 import type { ModelManifest } from "../../model";
+import { addInferenceStateDisposeCallback, type InferenceState } from "../../runtime";
 import { dequantizeRow } from "../../quant";
 import { GPU_COPY_DST, GPU_COPY_SRC, GPU_MAP_READ, GPU_QUERY_RESOLVE, GPU_STORAGE, WEBGPU_MEMORY_LIMIT_BYTES } from "./gpu-constants";
 import { webGpuAdapterLimits, webGpuDevice } from "./gpu-device";
@@ -2969,6 +2970,10 @@ export class WebGpuSegmentRunner implements SegmentRunner {
     }
     const created = { fullAttention };
     this.states.set(key, created);
+    addInferenceStateDisposeCallback(state as InferenceState, () => {
+      destroyGpuState(created);
+      this.states.delete(key);
+    });
     return created;
   }
 
@@ -3077,6 +3082,14 @@ function maxInt32(values: Int32Array): number {
     max = Math.max(max, value);
   }
   return max;
+}
+
+function destroyGpuState(state: GpuState): void {
+  for (const cache of state.fullAttention.values()) {
+    cache.key.destroy?.();
+    cache.value.destroy?.();
+  }
+  state.fullAttention.clear();
 }
 
 function mropeTextPosition(positions: Int32Array, fallback: number): number {

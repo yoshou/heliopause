@@ -9,11 +9,13 @@ import {
   createModelSession,
   createInferenceState,
   decode,
+  disposeInferenceState,
   estimateWeightCacheBytes,
   GgufTensorReader,
   prefillState,
   type ModelRunnerProvider,
 } from "../src/index.ts";
+import { addInferenceStateDisposeCallback } from "../src/runtime.ts";
 
 test("tensor coverage audit fails closed on unknown and unused tensors", async () => {
   const gguf = {
@@ -168,6 +170,26 @@ test("inference state clone deep-copies cache arrays", () => {
   assert.equal(state.nextPosition, 3);
   assert.equal(fullAttention.key[0], 1);
   assert.equal(fullAttention.value[0], 2);
+});
+
+test("inference state dispose runs cleanup once and clears cache arrays", () => {
+  const manifest = buildModelManifest({
+    ...minimalGguf(),
+    tensorCount: 0,
+    tensors: [],
+  });
+  const state = createInferenceState(manifest);
+  const calls: string[] = [];
+
+  addInferenceStateDisposeCallback(state, () => calls.push("first"));
+  addInferenceStateDisposeCallback(state, () => calls.push("second"));
+
+  disposeInferenceState(state);
+  disposeInferenceState(state);
+
+  assert.deepEqual(calls, ["second", "first"]);
+  assert.equal(state.fullAttention.size, 0);
+  assert.throws(() => cloneInferenceState(state), /disposed/);
 });
 
 test("prefill advances nextPosition from default and explicit positions", async () => {

@@ -97,6 +97,7 @@ export function installWebGpuRuntimeResourceCache(
     bindGroupLayouts: new Map<string, unknown>(),
     pipelineLayouts: new Map<string, unknown>(),
     computePipelines: new Map<string, unknown>(),
+    // TODO: Add bounded flush/eviction for these exact-size buffer pools once the cache policy is redesigned.
     uniformBufferPools: new Map<string, PooledUniformBuffer[]>(),
     readbackBufferPools: new Map<string, PooledReadbackBuffer[]>(),
     bufferCreateLabels: new Map<string, number>(),

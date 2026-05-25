@@ -1,4 +1,5 @@
 import {
+  assertInferenceStateActive,
   createForwardTrace,
   type InferenceState,
   type ModelSession,
@@ -269,6 +270,7 @@ type BuiltForwardGraph = {
 };
 
 function modelRuntimeForForward(session: ModelSession, state: InferenceState): PlannedModelForward {
+  assertInferenceStateActive(state);
   const providers = modelRuntimesForForward(session);
   const firstRuntime = providers.get(session.providers[0]?.name ?? "reference");
   if (!firstRuntime) {

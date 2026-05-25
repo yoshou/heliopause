@@ -68,6 +68,7 @@ export {
   cloneInferenceState,
   createInferenceState,
   createModelSession,
+  disposeInferenceState,
   estimateWeightCacheBytes,
   ModelSession,
   type CacheStats,

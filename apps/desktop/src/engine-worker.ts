@@ -13,6 +13,7 @@ import {
   createVisionSession,
   createWasmProvider,
   createWebGpuProvider,
+  disposeInferenceState,
   checkWasmSupport,
   checkWebGpuSupport,
   estimateWeightCacheBytes,
@@ -107,6 +108,8 @@ async function handleRequest(request: EngineWorkerRequest): Promise<void> {
 async function handleLoadModel(
   request: Extract<EngineWorkerRequest, { type: "loadModel" }>,
 ): Promise<void> {
+  const generationWasActive = activeGeneration !== undefined;
+  const previousState = currentState;
   activeGeneration?.abortController.abort();
   activeGeneration = undefined;
   visionSession?.dispose();
@@ -117,6 +120,9 @@ async function handleLoadModel(
   tokenizer = undefined;
   currentState = undefined;
   currentSystemPrompt = undefined;
+  if (!generationWasActive) {
+    disposeInferenceState(previousState);
+  }
   sandboxFs.reset();
 
   const tensorReader = await createFileGgufTensorReader(request.file);
@@ -405,6 +411,7 @@ async function resetChatState(systemPrompt: string, signal?: AbortSignal): Promi
   if (!session || !tokenizer) {
     return;
   }
+  const previousState = currentState;
   const state = session.createInferenceState();
   await prefillChatMessages(
     session,
@@ -415,6 +422,7 @@ async function resetChatState(systemPrompt: string, signal?: AbortSignal): Promi
   );
   currentState = state;
   currentSystemPrompt = systemPrompt;
+  disposeInferenceState(previousState);
 }
 
 function handleCancelGeneration(requestId: number): void {
