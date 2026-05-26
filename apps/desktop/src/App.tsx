@@ -222,6 +222,7 @@ function App() {
     createAssistantMessage(INITIAL_ASSISTANT_CONTENT),
   ]);
   const [isGenerating, setIsGenerating] = useState(false);
+  const [generatingAssistantId, setGeneratingAssistantId] = useState<string | undefined>();
   const [generationError, setGenerationError] = useState<string | undefined>();
   const workerRef = useRef<Worker | null>(null);
   const modelFilesInputRef = useRef<HTMLInputElement | null>(null);
@@ -485,6 +486,7 @@ function App() {
     setMessages(nextMessages);
     setPrompt("");
     setImageAttachment(undefined);
+    setGeneratingAssistantId(assistantId);
     setIsGenerating(true);
     setGenerationError(undefined);
 
@@ -514,6 +516,7 @@ function App() {
       setImageAttachment(imageAttachment);
     } finally {
       generationRequestRef.current = null;
+      setGeneratingAssistantId(undefined);
       setIsGenerating(false);
     }
   }
@@ -998,6 +1001,7 @@ function App() {
       userMessage,
       { id: assistantId, role: "assistant" as const, content: "" },
     ]);
+    setGeneratingAssistantId(assistantId);
     setIsGenerating(true);
     setGenerationError(undefined);
 
@@ -1026,6 +1030,7 @@ function App() {
       revokeAudioAttachment(audio);
     } finally {
       generationRequestRef.current = null;
+      setGeneratingAssistantId(undefined);
       setIsGenerating(false);
     }
   }
@@ -1297,7 +1302,7 @@ function App() {
         <div ref={messagePanelRef} className="message-panel" aria-live="polite">
           {messages.map((message) => (
             <MessageBubble
-              isGenerating={isGenerating}
+              isGenerating={isGenerating && message.id === generatingAssistantId}
               key={message.id}
               message={message}
             />
@@ -1516,7 +1521,7 @@ function MessageBubble(
     : [];
   const visibleContent = stripAgentArtifacts(stripThinking(message.content)).trim();
   const textContent = message.files && message.files.length > 0 ? "" : visibleContent;
-  const placeholder = message.role === "assistant" && isGenerating && toolCards.length === 0
+  const placeholder = message.role === "assistant" && isGenerating && textContent.length === 0
     ? "Generating..."
     : "";
   return (
@@ -1537,9 +1542,7 @@ function MessageBubble(
       {message.audio ? (
         <AudioMessage audio={message.audio} />
       ) : null}
-      {placeholder ? (
-        <p className="message-text">{placeholder}</p>
-      ) : textContent ? (
+      {textContent ? (
         message.role === "assistant" ? (
           <AssistantMarkdown content={textContent} />
         ) : (
@@ -1547,6 +1550,9 @@ function MessageBubble(
         )
       ) : null}
       {toolCards.length > 0 ? <ToolIndicators tools={toolCards} /> : null}
+      {placeholder ? (
+        <p className="message-text">{placeholder}</p>
+      ) : null}
       {message.role === "assistant" && message.inferenceDurationMs !== undefined ? (
         <footer className="message-meta">
           {formatDuration(message.inferenceDurationMs)}
