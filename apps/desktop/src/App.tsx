@@ -1,5 +1,7 @@
 import { ChangeEvent, ClipboardEvent, DragEvent, FormEvent, KeyboardEvent, PointerEvent, RefObject, useEffect, useMemo, useRef, useState } from "react";
 import { ChevronRight, FileArchive, Image, KeyRound, Mic, Plus, SendHorizontal, Square, X } from "lucide-react";
+import ReactMarkdown, { type Components } from "react-markdown";
+import remarkGfm from "remark-gfm";
 import {
   DEFAULT_SYSTEM_PROMPT,
   stripThinking,
@@ -103,6 +105,20 @@ type SandboxFileEntry = {
 };
 
 type RecordingState = "idle" | "requesting" | "recording" | "processing";
+
+const markdownPlugins = [remarkGfm];
+const markdownComponents: Components = {
+  a({ node: _node, ...props }) {
+    return <a {...props} target="_blank" rel="noreferrer" />;
+  },
+  table({ node: _node, ...props }) {
+    return (
+      <div className="message-markdown-table-wrap">
+        <table {...props} />
+      </div>
+    );
+  },
+};
 
 type ModelState =
   | { status: "empty" }
@@ -1505,7 +1521,7 @@ function MessageBubble(
     : "";
   return (
     <article className={`message message--${message.role}`}>
-      <span>{message.role === "user" ? "You" : "Assistant"}</span>
+      <span className="message-role-label">{message.role === "user" ? "You" : "Assistant"}</span>
       {message.files && message.files.length > 0 ? (
         <div className="message-files" aria-label="Attached files">
           {message.files.map((file) => (
@@ -1521,7 +1537,15 @@ function MessageBubble(
       {message.audio ? (
         <AudioMessage audio={message.audio} />
       ) : null}
-      {textContent || placeholder ? <p>{textContent || placeholder}</p> : null}
+      {placeholder ? (
+        <p className="message-text">{placeholder}</p>
+      ) : textContent ? (
+        message.role === "assistant" ? (
+          <AssistantMarkdown content={textContent} />
+        ) : (
+          <p className="message-text">{textContent}</p>
+        )
+      ) : null}
       {toolCards.length > 0 ? <ToolIndicators tools={toolCards} /> : null}
       {message.role === "assistant" && message.inferenceDurationMs !== undefined ? (
         <footer className="message-meta">
@@ -1529,6 +1553,19 @@ function MessageBubble(
         </footer>
       ) : null}
     </article>
+  );
+}
+
+function AssistantMarkdown({ content }: { content: string }) {
+  return (
+    <div className="message-markdown">
+      <ReactMarkdown
+        components={markdownComponents}
+        remarkPlugins={markdownPlugins}
+      >
+        {content}
+      </ReactMarkdown>
+    </div>
   );
 }
 
@@ -1841,11 +1878,10 @@ function describeToolAction(
     case "sandbox_write_file":
       return `Write ${typeof args.path === "string" ? args.path : "file"}`;
     case "sandbox_command": {
-      const cmd = typeof args.cmd === "string" ? args.cmd : "command";
       const commandArgs = Array.isArray(args.args)
         ? args.args.filter((item): item is string => typeof item === "string")
         : [];
-      return [cmd, ...commandArgs].join(" ");
+      return commandArgs.join(" ") || "command";
     }
     case "web_search":
       return `Search: ${typeof args.query === "string" ? args.query : "web"}`;

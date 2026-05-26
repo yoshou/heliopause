@@ -245,6 +245,12 @@ function formatToolParameter(parameter: unknown): string {
   if (typeof parameter.type === "string" && parameter.type.toUpperCase() === "ARRAY" && isRecord(parameter.items)) {
     parts.push(`items:${formatToolSchema(parameter.items)}`);
   }
+  if (typeof parameter.minItems === "number") {
+    parts.push(`minItems:${formatGemma4Value(parameter.minItems)}`);
+  }
+  if (typeof parameter.maxItems === "number") {
+    parts.push(`maxItems:${formatGemma4Value(parameter.maxItems)}`);
+  }
   if (parameter.nullable === true) {
     parts.push("nullable:true");
   }

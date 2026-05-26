@@ -93,6 +93,8 @@ export type AgentModelTurnCloser = (
   options?: Pick<ChatTurnOptions, "signal">,
 ) => Promise<InferenceState>;
 
+export type AgentStateCloner = false | ((state: InferenceState) => InferenceState);
+
 export type AgentTurnOptions = ChatTurnOptions & {
   tools: readonly AgentToolDefinition[];
   executeTool: AgentToolExecutor;
@@ -100,6 +102,7 @@ export type AgentTurnOptions = ChatTurnOptions & {
   onAgentEvent?: (event: AgentEvent) => void;
   chatTurnGenerator?: AgentChatTurnGenerator;
   closeModelTurn?: AgentModelTurnCloser;
+  cloneState?: AgentStateCloner;
 };
 
 export type AgentTurnResult = {
@@ -188,9 +191,11 @@ export async function generateAgentTurn(
     maxToolSteps: _maxToolSteps,
     onAgentEvent: _onAgentEvent,
     closeModelTurn: _closeModelTurn,
+    cloneState: _cloneState,
     ...chatOptions
   } = options;
   const modelTurnCloser = options.closeModelTurn ?? closeChatModelTurn;
+  const stateCloner = options.cloneState === undefined ? cloneInferenceState : options.cloneState;
   let nextTurn: ChatTurnInput = buildInitialTurn(userContent, options.tools);
   let toolSteps = 0;
   let finalOnly = maxToolSteps === 0;
@@ -202,8 +207,8 @@ export async function generateAgentTurn(
     const step = toolSteps + 1;
     const chunks: ChatCompletionChunk[] = [];
     const committedModelTurnOpen = modelTurnOpen;
-    const stateBeforeFinalGeneration = finalOnly ? cloneInferenceState(state) : undefined;
-    const generationState = finalOnly ? cloneInferenceState(state) : state;
+    const stateBeforeFinalGeneration = finalOnly && stateCloner ? stateCloner(state) : undefined;
+    const generationState = finalOnly && stateCloner ? stateCloner(state) : state;
     const continueModelTurn = committedModelTurnOpen && isOnlyToolResponseTurn(nextTurn);
     const generation = await chatTurnGenerator(session, tokenizer, generationState, nextTurn, {
       ...chatOptions,
@@ -221,11 +226,13 @@ export async function generateAgentTurn(
     const parseResult = parseToolCall(generation.content, options.tools, step);
 
     if (parseResult.type === "none") {
+      let closedCommittedFinalTurn = false;
       if (finalOnly && committedModelTurnOpen) {
         await modelTurnCloser(session, tokenizer, state, { signal: options.signal });
         modelTurnOpen = false;
+        closedCommittedFinalTurn = true;
       }
-      if (generatedModelTurnOpen) {
+      if (generatedModelTurnOpen && (!closedCommittedFinalTurn || generation.state !== state)) {
         await modelTurnCloser(session, tokenizer, generation.state, { signal: options.signal });
         modelTurnOpen = false;
       }
@@ -473,6 +480,12 @@ function validateNumberKeywords(value: number, schema: JsonObject): boolean {
 }
 
 function validateArrayKeywords(value: readonly unknown[], schema: JsonObject): boolean {
+  if (schema.minItems !== undefined && (!isNonNegativeInteger(schema.minItems) || value.length < schema.minItems)) {
+    return false;
+  }
+  if (schema.maxItems !== undefined && (!isNonNegativeInteger(schema.maxItems) || value.length > schema.maxItems)) {
+    return false;
+  }
   if (schema.items === undefined) {
     return true;
   }

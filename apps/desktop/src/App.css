@@ -126,7 +126,7 @@ textarea:disabled {
   align-self: flex-start;
 }
 
-.message span {
+.message > .message-role-label {
   display: block;
   margin-bottom: 6px;
   color: #4d675f;
@@ -134,11 +134,142 @@ textarea:disabled {
   font-weight: 800;
 }
 
-.message p {
+.message-text {
   margin: 0;
   overflow-wrap: anywhere;
   line-height: 1.65;
   white-space: pre-wrap;
+}
+
+.message-markdown {
+  color: #172026;
+  line-height: 1.65;
+  overflow-wrap: anywhere;
+}
+
+.message-markdown > :first-child {
+  margin-top: 0;
+}
+
+.message-markdown > :last-child {
+  margin-bottom: 0;
+}
+
+.message-markdown p,
+.message-markdown ul,
+.message-markdown ol,
+.message-markdown blockquote,
+.message-markdown pre,
+.message-markdown table {
+  margin: 0 0 0.85rem;
+}
+
+.message-markdown h1,
+.message-markdown h2,
+.message-markdown h3 {
+  margin: 1rem 0 0.45rem;
+  color: #111820;
+  font-weight: 850;
+  line-height: 1.25;
+  letter-spacing: 0;
+}
+
+.message-markdown h1 {
+  font-size: 1.35rem;
+}
+
+.message-markdown h2 {
+  font-size: 1.16rem;
+}
+
+.message-markdown h3 {
+  font-size: 1.03rem;
+}
+
+.message-markdown ul,
+.message-markdown ol {
+  padding-left: 1.35rem;
+}
+
+.message-markdown li {
+  margin: 0.2rem 0;
+}
+
+.message-markdown li > p {
+  margin: 0.25rem 0;
+}
+
+.message-markdown a {
+  color: #285f54;
+  font-weight: 750;
+  text-decoration-color: rgba(40, 95, 84, 0.45);
+  text-underline-offset: 3px;
+}
+
+.message-markdown a:hover {
+  text-decoration-color: currentColor;
+}
+
+.message-markdown blockquote {
+  padding: 0.05rem 0 0.05rem 0.85rem;
+  border-left: 3px solid #bfd8d1;
+  color: #4f5f57;
+}
+
+.message-markdown code {
+  border: 1px solid #dfe6df;
+  border-radius: 5px;
+  background: #f6f8f5;
+  color: #243029;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.9em;
+  padding: 0.08rem 0.28rem;
+}
+
+.message-markdown pre {
+  max-width: 100%;
+  overflow: auto;
+  padding: 0.85rem;
+  border: 1px solid #dfe6df;
+  border-radius: 7px;
+  background: #f6f8f5;
+}
+
+.message-markdown pre code {
+  display: block;
+  min-width: min-content;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  white-space: pre;
+}
+
+.message-markdown-table-wrap {
+  max-width: 100%;
+  margin: 0 0 0.85rem;
+  overflow: auto;
+}
+
+.message-markdown-table-wrap table {
+  width: max-content;
+  min-width: 100%;
+  margin: 0;
+  border-collapse: collapse;
+  font-size: 0.92rem;
+}
+
+.message-markdown th,
+.message-markdown td {
+  padding: 0.45rem 0.55rem;
+  border: 1px solid #dfe6df;
+  text-align: left;
+  vertical-align: top;
+}
+
+.message-markdown th {
+  background: #eef4f1;
+  color: #29343b;
+  font-weight: 850;
 }
 
 .message-image {

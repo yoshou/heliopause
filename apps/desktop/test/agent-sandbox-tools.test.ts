@@ -183,7 +183,7 @@ test("sandbox_command routes allowed commands through the virtual filesystem", a
 
   const result = await executeSandboxAgentTool(
     fs,
-    call("sandbox_command", { cmd: "ls", args: ["/workspace"] }),
+    call("sandbox_command", { args: ["ls", "/workspace"] }),
     new AbortController().signal,
   );
 
@@ -213,7 +213,7 @@ test("sandbox tool errors become failed tool results", async () => {
 
   const invalidArguments = await executeSandboxAgentTool(
     fs,
-    call("sandbox_command", { cmd: "ls", args: "--help" }),
+    call("sandbox_command", { args: "--help" }),
     new AbortController().signal,
   );
   assert.equal(invalidArguments.ok, false);
@@ -337,7 +337,7 @@ test("pre-aborted sandbox commands reject instead of becoming tool results", asy
     () =>
       executeSandboxAgentTool(
         fs,
-        call("sandbox_command", { cmd: "ls", args: ["/workspace"] }),
+        call("sandbox_command", { args: ["ls", "/workspace"] }),
         abortController.signal,
       ),
     { name: "AbortError" },

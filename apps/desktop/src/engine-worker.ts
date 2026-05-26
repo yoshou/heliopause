@@ -269,6 +269,7 @@ async function handleGenerateTurn(
       ? currentState
       : cloneInferenceState(currentState);
     activeGeneration.workingState = workingState;
+    let nextState = workingState;
 
     const turnOptions = {
       maxNewTokens: request.maxNewTokens,
@@ -306,7 +307,7 @@ async function handleGenerateTurn(
         signal: abortController.signal,
       });
       let isFirstAgentStep = true;
-      await generateAgentTurn(
+      const result = await generateAgentTurn(
         session,
         tokenizer,
         workingState,
@@ -316,6 +317,7 @@ async function handleGenerateTurn(
           tools,
           executeTool,
           maxToolSteps: DEFAULT_MAX_TOOL_STEPS,
+          cloneState: session.hasProvider("webgpu") ? false : cloneInferenceState,
           onAgentEvent(event) {
             if (event.type === "text") {
               return;
@@ -345,6 +347,7 @@ async function handleGenerateTurn(
           },
         },
       );
+      nextState = result.state;
     } else if (request.image) {
       if (!visionSession) {
         throw new Error("No vision encoder loaded.");
@@ -353,7 +356,7 @@ async function handleGenerateTurn(
         signal: abortController.signal,
       });
       const encoded = await runVisionEncoder(visionSession, pixels);
-      await generatePreparedImageChatTurn(
+      const result = await generatePreparedImageChatTurn(
         session,
         tokenizer,
         workingState,
@@ -364,8 +367,9 @@ async function handleGenerateTurn(
         },
         turnOptions,
       );
+      nextState = result.state;
     } else {
-      await generateAgentTurn(
+      const result = await generateAgentTurn(
         session,
         tokenizer,
         workingState,
@@ -375,6 +379,7 @@ async function handleGenerateTurn(
           tools,
           executeTool,
           maxToolSteps: DEFAULT_MAX_TOOL_STEPS,
+          cloneState: session.hasProvider("webgpu") ? false : cloneInferenceState,
           onAgentEvent(event) {
             if (event.type === "text") {
               return;
@@ -387,10 +392,11 @@ async function handleGenerateTurn(
           },
         },
       );
+      nextState = result.state;
     }
 
     if (!abortController.signal.aborted) {
-      currentState = workingState;
+      currentState = nextState;
     }
 
     if (abortController.signal.aborted) {

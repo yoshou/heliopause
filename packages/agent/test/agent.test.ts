@@ -505,6 +505,28 @@ test("generateAgentTurn closes the committed state when max-step final text is g
   assert.deepEqual(closedStates, [state, result.state]);
 });
 
+test("generateAgentTurn can avoid state cloning for provider-owned state", async () => {
+  const state = fakeState();
+  const closedStates: InferenceState[] = [];
+  const result = await generateAgentTurn(fakeSession, fakeTokenizer, state, "Keep using tools.", {
+    tools: [sandboxCommandTool],
+    maxToolSteps: 1,
+    cloneState: false,
+    chatTurnGenerator: mutatingOpenTurnMockGenerator([
+      '<|tool_call>call:sandbox_command{cmd:<|"|>ls<|"|>,args:[]}<tool_call|>',
+      "Enough information.",
+    ]),
+    closeModelTurn: markingCloseModelTurn(closedStates),
+    executeTool: async (call): Promise<AgentToolResult> => ({ callId: call.id, ok: true, content: { ok: true } }),
+  });
+
+  assert.equal(result.content, "Enough information.");
+  assert.equal(result.finishReason, "maxToolSteps");
+  assert.equal(result.state, state);
+  assert.equal(state.nextPosition, 3);
+  assert.deepEqual(closedStates, [state]);
+});
+
 test("generateAgentTurn rejects immediately for pre-aborted signals", async () => {
   const controller = new AbortController();
   controller.abort();

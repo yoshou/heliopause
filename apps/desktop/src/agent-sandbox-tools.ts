@@ -10,7 +10,6 @@ import {
   SANDBOX_ROOT,
   SandboxError,
   type SandboxCommandName,
-  type SandboxCommandRequest,
   type VirtualFileSystem,
 } from "@heliopause/sandbox";
 
@@ -44,7 +43,7 @@ export const SANDBOX_AGENT_TOOLS: readonly AgentToolDefinition[] = [
   {
     name: "sandbox_read_file",
     description:
-      "Read the full UTF-8 text content of a small file from the virtual /workspace filesystem. For larger files, inspect first with sandbox_command using wc, head, tail, or grep.",
+      "Read the full UTF-8 text content of a small file from the virtual /workspace filesystem. Use this directly when the user asks to view or confirm the contents of a file that is known to be small. For larger files, inspect first with sandbox_command using wc, head, tail, or grep.",
     parametersJsonSchema: {
       type: "object",
       properties: {
@@ -80,22 +79,18 @@ export const SANDBOX_AGENT_TOOLS: readonly AgentToolDefinition[] = [
   {
     name: "sandbox_command",
     description:
-      "Run one allowed virtual sandbox command against the /workspace filesystem. Prefer wc, head, tail, or grep to inspect large files before reading them. Use structured arguments only, never a shell string.",
+      "Run one allowed virtual sandbox command against the /workspace filesystem. Prefer sandbox_read_file for known small files. Use wc, head, tail, or grep only to inspect larger files before reading them. Use a tokenized command vector, never a shell string. The first args item must be the command name, followed by flags and paths. For head or tail, use -n only when the next argument is a numeric line count.",
     parametersJsonSchema: {
       type: "object",
       properties: {
-        cmd: {
-          type: "string",
-          enum: SANDBOX_COMMAND_NAMES,
-          description: "Allowed command name to execute.",
-        },
         args: {
           type: "array",
-          description: "Command arguments, such as paths or flags, as separate strings.",
+          description: "Tokenized command vector as separate strings. The first item is the allowed command name; remaining items are flags, numeric option values, and paths. Do not repeat the command name.",
           items: { type: "string" },
+          minItems: 1,
         },
       },
-      required: ["cmd", "args"],
+      required: ["args"],
       additionalProperties: false,
     },
   },
@@ -260,7 +255,7 @@ export async function executeSandboxAgentTool(
       }
 
       case "sandbox_command": {
-        const request = requireSandboxCommandRequest(call.arguments);
+        const request = requireSandboxCommandRequestFromArgv(call.arguments);
         const result = await runSandboxCommand(fs, request, { signal });
         return {
           callId: call.id,
@@ -292,18 +287,21 @@ export async function executeSandboxAgentTool(
   }
 }
 
-function requireSandboxCommandRequest(value: unknown): SandboxCommandRequest {
+function requireSandboxCommandRequestFromArgv(value: unknown): { cmd: SandboxCommandName; args: string[] } {
   const args = requireObject(value);
-  const cmd = requireString(args.cmd, "cmd");
-  if (!isSandboxCommandName(cmd)) {
-    throw new SandboxError("unknown_command", `unknown command: ${cmd}`);
-  }
   if (!Array.isArray(args.args) || !args.args.every((item) => typeof item === "string")) {
     throw new SandboxError("invalid_arguments", "args must be an array of strings.");
   }
+  const [cmd, ...commandArgs] = args.args;
+  if (!cmd) {
+    throw new SandboxError("invalid_arguments", "args must start with a command name.");
+  }
+  if (!isSandboxCommandName(cmd)) {
+    throw new SandboxError("unknown_command", `unknown command: ${cmd}`);
+  }
   return {
     cmd,
-    args: args.args,
+    args: commandArgs,
   };
 }
 
