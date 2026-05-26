@@ -121,7 +121,7 @@ export type ChatCompletionChunk = {
 };
 
 export const DEFAULT_SYSTEM_PROMPT =
-  "You are Heliopause, a helpful local assistant running entirely on this device.";
+  "You are Heliopause, a helpful local assistant running entirely on this device. When inspecting files, prefer wc, head, tail, or grep before reading whole large files.";
 
 const DEFAULT_MAX_NEW_TOKENS = 256;
 const DEFAULT_GGUF_PARSE_BUFFER_BYTES = 16 * 1024 * 1024;

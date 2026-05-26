@@ -10,6 +10,7 @@ import type {
   MemoryProfile,
   SystemMemoryInfo,
   WorkerAgentEvent,
+  WorkerWebFetchContent,
   WorkerModelInfo,
   WorkerWebSearchResult,
   WorkerWebSearchToolResult,
@@ -92,6 +93,8 @@ type WebSearchContent = {
   results: WorkerWebSearchResult[];
 };
 
+type WebFetchContent = WorkerWebFetchContent;
+
 type SandboxFileEntry = {
   path: string;
   name: string;
@@ -137,6 +140,14 @@ type PendingWebSearchConfirmation = {
   callId: string;
   query: string;
   maxResults: number;
+};
+
+type PendingWebFetchConfirmation = {
+  worker: Worker;
+  requestId: number;
+  callId: string;
+  url: string;
+  path: string;
 };
 
 type TauriWebSearchResponse = {
@@ -190,6 +201,7 @@ function App() {
   const [tavilyStatus, setTavilyStatus] = useState<TavilyTokenStatus | undefined>();
   const [tavilyError, setTavilyError] = useState<string | undefined>();
   const [pendingWebSearch, setPendingWebSearch] = useState<PendingWebSearchConfirmation | undefined>();
+  const [pendingWebFetch, setPendingWebFetch] = useState<PendingWebFetchConfirmation | undefined>();
   const [messages, setMessages] = useState<UiMessage[]>(() => [
     createAssistantMessage(INITIAL_ASSISTANT_CONTENT),
   ]);
@@ -624,6 +636,34 @@ function App() {
         error: normalizeToolError(error, "tavily_error"),
       };
     }
+  }
+
+  function approveWebFetch() {
+    const confirmation = pendingWebFetch;
+    if (!confirmation) {
+      return;
+    }
+    setPendingWebFetch(undefined);
+    confirmation.worker.postMessage({
+      type: "resolveWebFetchConfirmation",
+      requestId: confirmation.requestId,
+      callId: confirmation.callId,
+      approved: true,
+    } satisfies EngineWorkerRequest);
+  }
+
+  function declineWebFetch() {
+    const confirmation = pendingWebFetch;
+    if (!confirmation) {
+      return;
+    }
+    setPendingWebFetch(undefined);
+    confirmation.worker.postMessage({
+      type: "resolveWebFetchConfirmation",
+      requestId: confirmation.requestId,
+      callId: confirmation.callId,
+      approved: false,
+    } satisfies EngineWorkerRequest);
   }
 
   function handleModelMenuSelect() {
@@ -1092,6 +1132,12 @@ function App() {
     }
 
     if (message.type === "error") {
+      setPendingWebSearch((confirmation) =>
+        confirmation?.requestId === message.requestId ? undefined : confirmation
+      );
+      setPendingWebFetch((confirmation) =>
+        confirmation?.requestId === message.requestId ? undefined : confirmation
+      );
       pendingRequestsRef.current.delete(message.requestId);
       pending.reject(new Error(message.message));
       return;
@@ -1138,6 +1184,17 @@ function App() {
       return;
     }
 
+    if (message.type === "webFetchConfirmationRequested") {
+      setPendingWebFetch({
+        worker,
+        requestId: message.requestId,
+        callId: message.callId,
+        url: message.url,
+        path: message.path,
+      });
+      return;
+    }
+
     if (message.type === "agentEvent") {
       setMessages((currentMessages) =>
         currentMessages.map((uiMessage) =>
@@ -1167,6 +1224,9 @@ function App() {
       setPendingWebSearch((confirmation) =>
         confirmation?.requestId === message.requestId ? undefined : confirmation
       );
+      setPendingWebFetch((confirmation) =>
+        confirmation?.requestId === message.requestId ? undefined : confirmation
+      );
       setMessages((currentMessages) =>
         currentMessages.filter((uiMessage) =>
           uiMessage.id !== pending.userId && uiMessage.id !== pending.assistantId
@@ -1181,6 +1241,9 @@ function App() {
 
     if (message.type === "generationDone") {
       setPendingWebSearch((confirmation) =>
+        confirmation?.requestId === message.requestId ? undefined : confirmation
+      );
+      setPendingWebFetch((confirmation) =>
         confirmation?.requestId === message.requestId ? undefined : confirmation
       );
       setMessages((currentMessages) =>
@@ -1198,6 +1261,9 @@ function App() {
 
   function rejectWorkerRequests(worker: Worker, error: Error) {
     setPendingWebSearch((confirmation) =>
+      confirmation?.worker === worker ? undefined : confirmation
+    );
+    setPendingWebFetch((confirmation) =>
       confirmation?.worker === worker ? undefined : confirmation
     );
     for (const [requestId, pending] of pendingRequestsRef.current) {
@@ -1296,6 +1362,13 @@ function App() {
                   confirmation={pendingWebSearch}
                   onApprove={() => void approveWebSearch()}
                   onDecline={declineWebSearch}
+                />
+              ) : null}
+              {pendingWebFetch ? (
+                <WebFetchConfirmationPanel
+                  confirmation={pendingWebFetch}
+                  onApprove={approveWebFetch}
+                  onDecline={declineWebFetch}
                 />
               ) : null}
             </>
@@ -1615,6 +1688,27 @@ function ToolResultDetail(
     );
   }
 
+  if (isWebFetchContent(content)) {
+    return (
+      <div className="tool-result">
+        <dl className="tool-detail-grid">
+          <dt>Path</dt>
+          <dd>{content.path}</dd>
+          <dt>Status</dt>
+          <dd>{content.status}</dd>
+          <dt>Type</dt>
+          <dd>{content.contentType}</dd>
+          <dt>Written</dt>
+          <dd>{formatBytes(content.bytesWritten)}</dd>
+          <dt>Truncated</dt>
+          <dd>{content.truncated ? "Yes" : "No"}</dd>
+        </dl>
+        {content.title ? <ToolPreBlock label="Title" value={content.title} /> : null}
+        <ToolPreBlock label="Final URL" value={content.finalUrl} />
+      </div>
+    );
+  }
+
   return <ToolPreBlock label="Result" value={formatJson(content)} />;
 }
 
@@ -1755,6 +1849,8 @@ function describeToolAction(
     }
     case "web_search":
       return `Search: ${typeof args.query === "string" ? args.query : "web"}`;
+    case "web_fetch":
+      return `Fetch: ${typeof args.url === "string" ? args.url : "web"}`;
   }
 }
 
@@ -1820,6 +1916,21 @@ function isWebSearchResult(value: unknown): value is WorkerWebSearchResult {
     typeof value.title === "string" &&
     typeof value.url === "string" &&
     typeof value.snippet === "string"
+  );
+}
+
+function isWebFetchContent(value: unknown): value is WebFetchContent {
+  return (
+    isRecord(value) &&
+    value.kind === "web_fetch" &&
+    typeof value.url === "string" &&
+    typeof value.finalUrl === "string" &&
+    typeof value.path === "string" &&
+    typeof value.status === "number" &&
+    typeof value.contentType === "string" &&
+    typeof value.bytesWritten === "number" &&
+    typeof value.truncated === "boolean" &&
+    (value.title === undefined || typeof value.title === "string")
   );
 }
 
@@ -2057,6 +2168,36 @@ function WebSearchConfirmationPanel(
         <strong>Web search</strong>
         <p>{confirmation.query}</p>
         <small>{confirmation.maxResults} results maximum</small>
+      </div>
+      <div className="web-search-confirmation-actions">
+        <button type="button" onClick={onDecline}>
+          Decline
+        </button>
+        <button type="button" onClick={onApprove}>
+          Approve
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function WebFetchConfirmationPanel(
+  {
+    confirmation,
+    onApprove,
+    onDecline,
+  }: {
+    confirmation: PendingWebFetchConfirmation;
+    onApprove: () => void;
+    onDecline: () => void;
+  },
+) {
+  return (
+    <div className="web-search-confirmation" role="alert">
+      <div>
+        <strong>Web fetch</strong>
+        <p>{confirmation.url}</p>
+        <small>Save to {confirmation.path}</small>
       </div>
       <div className="web-search-confirmation-actions">
         <button type="button" onClick={onDecline}>

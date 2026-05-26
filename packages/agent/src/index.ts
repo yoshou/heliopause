@@ -30,6 +30,7 @@ const AGENT_TOOL_NAMES = [
   "sandbox_write_file",
   "sandbox_command",
   "web_search",
+  "web_fetch",
 ] as const;
 
 export type AgentToolName = (typeof AGENT_TOOL_NAMES)[number];

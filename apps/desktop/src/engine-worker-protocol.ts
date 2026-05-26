@@ -30,6 +30,34 @@ export type WorkerWebSearchToolResult =
       };
     };
 
+export type WorkerWebFetchContent = {
+  kind: "web_fetch";
+  url: string;
+  finalUrl: string;
+  path: string;
+  status: number;
+  contentType: string;
+  bytesWritten: number;
+  truncated: boolean;
+  title?: string;
+};
+
+export type WorkerWebFetchToolResult =
+  | {
+      callId: string;
+      ok: true;
+      content: WorkerWebFetchContent;
+    }
+  | {
+      callId: string;
+      ok: false;
+      error: {
+        code: string;
+        message: string;
+        retryable?: boolean;
+      };
+    };
+
 export type ResolvedRuntimeProfile = {
   requested: MemoryProfile;
   resolved: "low" | "full";
@@ -111,6 +139,12 @@ export type EngineWorkerRequest =
       result?: WorkerWebSearchToolResult;
     }
   | {
+      type: "resolveWebFetchConfirmation";
+      requestId: number;
+      callId: string;
+      approved: boolean;
+    }
+  | {
       type: "cancelGeneration";
       requestId: number;
     };
@@ -137,6 +171,13 @@ export type EngineWorkerResponse =
       callId: string;
       query: string;
       maxResults: number;
+    }
+  | {
+      type: "webFetchConfirmationRequested";
+      requestId: number;
+      callId: string;
+      url: string;
+      path: string;
     }
   | {
       type: "generationDone";

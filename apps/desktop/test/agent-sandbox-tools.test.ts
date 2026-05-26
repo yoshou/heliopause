@@ -7,6 +7,7 @@ import {
   executeDesktopAgentTool,
   executeSandboxAgentTool,
   SANDBOX_AGENT_TOOLS,
+  WEB_FETCH_AGENT_TOOL,
   WEB_SEARCH_AGENT_TOOL,
 } from "../src/agent-sandbox-tools";
 
@@ -30,11 +31,12 @@ test("buildAgentTools hides web_search when the desktop runtime is unavailable",
       "sandbox_read_file",
       "sandbox_write_file",
       "sandbox_command",
+      "web_fetch",
     ],
   );
 });
 
-test("buildAgentTools exposes web_search only when enabled", () => {
+test("buildAgentTools exposes web_search only when enabled and always exposes web_fetch by default", () => {
   assert.deepEqual(
     buildAgentTools({ webSearchAvailable: true }).map((tool) => tool.name),
     [
@@ -43,6 +45,7 @@ test("buildAgentTools exposes web_search only when enabled", () => {
       "sandbox_write_file",
       "sandbox_command",
       "web_search",
+      "web_fetch",
     ],
   );
 });
@@ -67,6 +70,31 @@ test("WEB_SEARCH_AGENT_TOOL requires a query and limits max_results", () => {
       },
     },
     required: ["query"],
+    additionalProperties: false,
+  });
+});
+
+test("WEB_FETCH_AGENT_TOOL requires a url and destination path", () => {
+  assert.equal(WEB_FETCH_AGENT_TOOL.requiresConfirmation, true);
+  assert.match(WEB_FETCH_AGENT_TOOL.description, /browser sandbox/i);
+  assert.match(WEB_FETCH_AGENT_TOOL.description, /virtual \/workspace/i);
+  assert.deepEqual(WEB_FETCH_AGENT_TOOL.parametersJsonSchema, {
+    type: "object",
+    properties: {
+      url: {
+        type: "string",
+        description: "Public http:// or https:// URL to fetch. The browser must be allowed to read it by CORS.",
+        minLength: 1,
+        maxLength: 2048,
+      },
+      path: {
+        type: "string",
+        description: "Destination file path inside /workspace, such as /workspace/fetched/page.txt.",
+        minLength: 1,
+        maxLength: 512,
+      },
+    },
+    required: ["url", "path"],
     additionalProperties: false,
   });
 });
@@ -205,6 +233,19 @@ test("desktop executor reports web_search unavailable without a host executor", 
   assert.equal(result.error.code, "web_search_unavailable");
 });
 
+test("desktop executor reports web_fetch unavailable without a host executor", async () => {
+  const fs = createVirtualFileSystem();
+
+  const result = await executeDesktopAgentTool(
+    fs,
+    call("web_fetch", { url: "https://example.com/", path: "/workspace/example.txt" }),
+    new AbortController().signal,
+  );
+
+  assert.equal(result.ok, false);
+  assert.equal(result.error.code, "web_fetch_unavailable");
+});
+
 test("desktop executor delegates web_search to the host executor", async () => {
   const fs = createVirtualFileSystem();
 
@@ -240,6 +281,49 @@ test("desktop executor delegates web_search to the host executor", async () => {
         url: "https://openai.com/",
         snippet: "OpenAI news",
       }],
+    },
+  });
+});
+
+test("desktop executor delegates web_fetch to the host executor", async () => {
+  const fs = createVirtualFileSystem();
+
+  const result = await executeDesktopAgentTool(
+    fs,
+    call("web_fetch", { url: "https://example.com/", path: "/workspace/example.txt" }),
+    new AbortController().signal,
+    {
+      executeWebFetch: async (toolCall) => ({
+        callId: toolCall.id,
+        ok: true,
+        content: {
+          kind: "web_fetch",
+          url: "https://example.com/",
+          finalUrl: "https://example.com/",
+          path: "/workspace/example.txt",
+          status: 200,
+          contentType: "text/html; charset=utf-8",
+          bytesWritten: 11,
+          truncated: false,
+          title: "Example",
+        },
+      }),
+    },
+  );
+
+  assert.deepEqual(result, {
+    callId: "tool_1",
+    ok: true,
+    content: {
+      kind: "web_fetch",
+      url: "https://example.com/",
+      finalUrl: "https://example.com/",
+      path: "/workspace/example.txt",
+      status: 200,
+      contentType: "text/html; charset=utf-8",
+      bytesWritten: 11,
+      truncated: false,
+      title: "Example",
     },
   });
 });

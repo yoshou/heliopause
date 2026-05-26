@@ -35,7 +35,7 @@ import {
   type Tokenizer,
   type VisionSession,
 } from "@heliopause/engine";
-import { createVirtualFileSystem } from "@heliopause/sandbox";
+import { createVirtualFileSystem, normalizeVirtualPath } from "@heliopause/sandbox";
 import {
   buildAgentTools,
   executeDesktopAgentTool,
@@ -46,8 +46,10 @@ import type {
   MemoryProfile,
   ResolvedRuntimeProfile,
   SystemMemoryInfo,
+  WorkerWebFetchToolResult,
   WorkerWebSearchToolResult,
 } from "./engine-worker-protocol";
+import { fetchBrowserTextResource } from "./web-fetch";
 
 const CHAT_CONTEXT_LENGTH = 16_384;
 const LOW_WEIGHT_CACHE_BYTES = 768 * 1024 * 1024;
@@ -70,6 +72,13 @@ let activeGeneration:
         string,
         {
           resolve: (result: WorkerWebSearchToolResult) => void;
+          reject: (error: unknown) => void;
+        }
+      >;
+      pendingWebFetches: Map<
+        string,
+        {
+          resolve: (approved: boolean) => void;
           reject: (error: unknown) => void;
         }
       >;
@@ -97,6 +106,10 @@ async function handleRequest(request: EngineWorkerRequest): Promise<void> {
     }
     if (request.type === "resolveWebSearchConfirmation") {
       handleResolveWebSearchConfirmation(request);
+      return;
+    }
+    if (request.type === "resolveWebFetchConfirmation") {
+      handleResolveWebFetchConfirmation(request);
       return;
     }
     handleCancelGeneration(request.requestId);
@@ -242,6 +255,7 @@ async function handleGenerateTurn(
     requestId: request.requestId,
     abortController,
     pendingWebSearches: new Map(),
+    pendingWebFetches: new Map(),
   };
   const inferenceStartedAt = performance.now();
 
@@ -272,10 +286,11 @@ async function handleGenerateTurn(
         });
       },
     };
-    const tools = buildAgentTools({ webSearchAvailable: request.webSearchAvailable });
+    const tools = buildAgentTools({ webSearchAvailable: request.webSearchAvailable, webFetchAvailable: true });
     const executeTool = (call: AgentToolCall, signal: AbortSignal) =>
       executeDesktopAgentTool(sandboxFs, call, signal, {
         executeWebSearch: executeWebSearchWithUserConfirmation,
+        executeWebFetch: executeWebFetchWithUserConfirmation,
       });
     if (request.audio) {
       if (!audioSession) {
@@ -511,6 +526,90 @@ function handleResolveWebSearchConfirmation(
   });
 }
 
+async function executeWebFetchWithUserConfirmation(
+  call: AgentToolCall,
+  signal: AbortSignal,
+): Promise<WorkerWebFetchToolResult> {
+  const args = requireWebFetchArguments(call.arguments);
+  const generation = activeGeneration;
+  if (!generation) {
+    return {
+      callId: call.id,
+      ok: false,
+      error: {
+        code: "web_fetch_unavailable",
+        message: "No active generation can confirm web_fetch.",
+      },
+    };
+  }
+
+  const approved = await new Promise<boolean>((resolve, reject) => {
+    const abort = () => {
+      generation.pendingWebFetches.delete(call.id);
+      reject(new DOMException("web_fetch was aborted.", "AbortError"));
+    };
+    if (signal.aborted) {
+      abort();
+      return;
+    }
+
+    generation.pendingWebFetches.set(call.id, { resolve, reject });
+    signal.addEventListener("abort", abort, { once: true });
+    workerScope.postMessage({
+      type: "webFetchConfirmationRequested",
+      requestId: generation.requestId,
+      callId: call.id,
+      url: args.url,
+      path: args.path,
+    });
+  });
+
+  if (!approved) {
+    return {
+      callId: call.id,
+      ok: false,
+      error: {
+        code: "user_denied",
+        message: "The user declined the web fetch.",
+      },
+    };
+  }
+
+  try {
+    const result = await fetchBrowserTextResource(args, { signal });
+    sandboxFs.writeText(result.path, result.content);
+    const { content: _content, ...content } = result;
+    return {
+      callId: call.id,
+      ok: true,
+      content,
+    };
+  } catch (error) {
+    if (isAbortError(error)) {
+      throw error;
+    }
+    return {
+      callId: call.id,
+      ok: false,
+      error: normalizeWorkerToolError(error, "web_fetch_failed", "web_fetch failed."),
+    };
+  }
+}
+
+function handleResolveWebFetchConfirmation(
+  request: Extract<EngineWorkerRequest, { type: "resolveWebFetchConfirmation" }>,
+): void {
+  if (!activeGeneration || activeGeneration.requestId !== request.requestId) {
+    return;
+  }
+  const pending = activeGeneration.pendingWebFetches.get(request.callId);
+  if (!pending) {
+    return;
+  }
+  activeGeneration.pendingWebFetches.delete(request.callId);
+  pending.resolve(request.approved);
+}
+
 function requireWebSearchArguments(value: unknown): { query: string; max_results?: unknown } {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     throw {
@@ -531,6 +630,32 @@ function requireWebSearchArguments(value: unknown): { query: string; max_results
   };
 }
 
+function requireWebFetchArguments(value: unknown): { url: string; path: string } {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw {
+      code: "invalid_arguments",
+      message: "web_fetch arguments must be an object.",
+    };
+  }
+  const args = value as Record<string, unknown>;
+  if (typeof args.url !== "string" || args.url.trim().length === 0) {
+    throw {
+      code: "invalid_arguments",
+      message: "web_fetch url must be a non-empty string.",
+    };
+  }
+  if (typeof args.path !== "string" || args.path.trim().length === 0) {
+    throw {
+      code: "invalid_arguments",
+      message: "web_fetch path must be a non-empty string.",
+    };
+  }
+  return {
+    url: args.url.trim(),
+    path: normalizeVirtualPath(args.path.trim()),
+  };
+}
+
 function normalizeWebSearchMaxResults(value: unknown): number {
   if (value === undefined) {
     return 5;
@@ -539,6 +664,34 @@ function normalizeWebSearchMaxResults(value: unknown): number {
     return 5;
   }
   return Math.min(5, Math.max(1, value));
+}
+
+function normalizeWorkerToolError(
+  error: unknown,
+  fallbackCode: string,
+  fallbackMessage: string,
+): { code: string; message: string; retryable?: boolean } {
+  if (typeof error === "object" && error !== null) {
+    const record = error as Record<string, unknown>;
+    const code = typeof record.code === "string" ? record.code : fallbackCode;
+    const message = typeof record.message === "string" ? record.message : fallbackMessage;
+    const retryable = typeof record.retryable === "boolean" ? record.retryable : undefined;
+    return retryable === undefined ? { code, message } : { code, message, retryable };
+  }
+  if (error instanceof Error) {
+    return {
+      code: fallbackCode,
+      message: error.message,
+    };
+  }
+  return {
+    code: fallbackCode,
+    message: fallbackMessage,
+  };
+}
+
+function isAbortError(error: unknown): boolean {
+  return error instanceof DOMException && error.name === "AbortError";
 }
 
 function resolveRuntimeProfile(

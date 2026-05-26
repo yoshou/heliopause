@@ -47,6 +47,21 @@ const readFileTool: AgentToolDefinition = {
   },
 };
 
+const webFetchTool: AgentToolDefinition = {
+  name: "web_fetch",
+  description: "Fetch a CORS-readable text resource to the virtual filesystem.",
+  parametersJsonSchema: {
+    type: "object",
+    required: ["url", "path"],
+    additionalProperties: false,
+    properties: {
+      url: { type: "string", minLength: 1, maxLength: 2048 },
+      path: { type: "string", minLength: 1, maxLength: 512 },
+    },
+  },
+  requiresConfirmation: true,
+};
+
 test("parseToolCall returns none for normal assistant text", () => {
   assert.deepEqual(parseToolCall("Hello there.", [sandboxCommandTool], 1), { type: "none" });
 });
@@ -108,6 +123,37 @@ test("parseToolCall accepts a valid tool call and assigns a step id", () => {
       },
     },
   );
+});
+
+test("parseToolCall accepts web_fetch and validates its schema", () => {
+  assert.deepEqual(
+    parseToolCall(
+      '<|tool_call>call:web_fetch{url:<|"|>https://example.com/<|"|>,path:<|"|>/workspace/example.txt<|"|>}<tool_call|>',
+      [webFetchTool],
+      3,
+    ),
+    {
+      type: "call",
+      call: {
+        id: "tool_3",
+        name: "web_fetch",
+        arguments: {
+          url: "https://example.com/",
+          path: "/workspace/example.txt",
+        },
+      },
+    },
+  );
+
+  for (const body of [
+    'call:web_fetch{path:<|"|>/workspace/example.txt<|"|>}',
+    'call:web_fetch{url:<|"|>https://example.com/<|"|>}',
+    'call:web_fetch{url:<|"|>https://example.com/<|"|>,path:<|"|>/workspace/example.txt<|"|>,extra:true}',
+    'call:web_fetch{url:42,path:<|"|>/workspace/example.txt<|"|>}',
+  ]) {
+    const result = parseToolCall(`<|tool_call>${body}<tool_call|>`, [webFetchTool], 1);
+    assert.equal(result.type === "error" ? result.error.code : "", "invalid_tool_arguments");
+  }
 });
 
 test("parseToolCall accepts tag text inside JSON string values", () => {
