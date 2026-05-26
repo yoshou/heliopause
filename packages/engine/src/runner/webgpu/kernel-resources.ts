@@ -36,7 +36,8 @@ import {
   VALUE_CACHE_WRITE_WGSL,
   FULL_QUERY_NORM_ROPE_WGSL,
   FULL_KV_UPDATE_WGSL,
-  TOPK_WGSL,
+  TOPK_CHUNK_CANDIDATES_WGSL,
+  TOPK_MERGE_CANDIDATES_WGSL,
   Q8_0_MATMUL_WGSL,
   SWIGLU_WGSL,
   GEGLU_WGSL,
@@ -2205,19 +2206,17 @@ export function createFullKvUpdateResources(
   };
 }
 
-export function createTopKResources(
+export function createTopKChunkCandidatesResources(
   device: WebGpuDeviceLike,
   logits: WebGpuBufferLike,
-  output: WebGpuBufferLike,
+  candidates: WebGpuBufferLike,
   options: {
     rowCount: number;
     rowOffset: number;
     topK: number;
-    candidateOffset: number;
-    slot: number;
   },
 ): { pipeline: unknown; bindGroup: unknown; destroy: () => void } {
-  const params = new Uint32Array([options.rowCount, options.rowOffset, options.slot, options.candidateOffset]);
+  const params = new Uint32Array([options.rowCount, options.rowOffset, options.topK, 0]);
   const paramsBuffer = device.createBuffer({ size: uniformBufferSize(params.byteLength), usage: GPU_UNIFORM | GPU_COPY_DST });
   device.queue.writeBuffer(paramsBuffer, 0, params);
   const bindGroupLayout = device.createBindGroupLayout({
@@ -2229,13 +2228,47 @@ export function createTopKResources(
   });
   const pipeline = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [bindGroupLayout] }),
-    compute: { module: device.createShaderModule({ code: TOPK_WGSL }), entryPoint: "main" },
+    compute: { module: device.createShaderModule({ code: TOPK_CHUNK_CANDIDATES_WGSL }), entryPoint: "main" },
   });
   return {
     pipeline,
     bindGroup: device.createBindGroup({
       layout: bindGroupLayout,
-      entries: [bindBuffer(0, logits), bindBuffer(1, paramsBuffer), bindBuffer(2, output)],
+      entries: [bindBuffer(0, logits), bindBuffer(1, paramsBuffer), bindBuffer(2, candidates)],
+    }),
+    destroy: () => paramsBuffer.destroy?.(),
+  };
+}
+
+export function createTopKMergeCandidatesResources(
+  device: WebGpuDeviceLike,
+  candidates: WebGpuBufferLike,
+  output: WebGpuBufferLike,
+  options: {
+    candidateCount: number;
+    topK: number;
+    candidateOffset: number;
+  },
+): { pipeline: unknown; bindGroup: unknown; destroy: () => void } {
+  const params = new Uint32Array([options.candidateCount, options.topK, options.candidateOffset, 0]);
+  const paramsBuffer = device.createBuffer({ size: uniformBufferSize(params.byteLength), usage: GPU_UNIFORM | GPU_COPY_DST });
+  device.queue.writeBuffer(paramsBuffer, 0, params);
+  const bindGroupLayout = device.createBindGroupLayout({
+    entries: [
+      storageEntry(0, "read-only-storage"),
+      { binding: 1, visibility: GPU_SHADER_STAGE_COMPUTE, buffer: { type: "uniform" } },
+      storageEntry(2, "storage"),
+    ],
+  });
+  const pipeline = device.createComputePipeline({
+    layout: device.createPipelineLayout({ bindGroupLayouts: [bindGroupLayout] }),
+    compute: { module: device.createShaderModule({ code: TOPK_MERGE_CANDIDATES_WGSL }), entryPoint: "main" },
+  });
+  return {
+    pipeline,
+    bindGroup: device.createBindGroup({
+      layout: bindGroupLayout,
+      entries: [bindBuffer(0, candidates), bindBuffer(1, paramsBuffer), bindBuffer(2, output)],
     }),
     destroy: () => paramsBuffer.destroy?.(),
   };

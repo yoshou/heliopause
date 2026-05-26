@@ -24,6 +24,7 @@ const CASE_LABELS: Record<BrowserBenchCaseId, string> = {
   "swiglu-down": "SwiGLU + down",
   "full-attention-decode-out": "Full attention decode/out",
   "prefill-attention": "Prefill attention",
+  "top-k": "Top-k dispatch",
   "top-token": "Top token",
 };
 

@@ -1516,40 +1516,123 @@ fn main(@builtin(workgroup_id) workgroupId: vec3<u32>, @builtin(local_invocation
 }
 `;
 
-export const TOPK_WGSL = `
+export const TOPK_CHUNK_CANDIDATES_WGSL = `
 struct Params {
   rowCount: u32,
   rowOffset: u32,
-  slot: u32,
-  candidateOffset: u32,
+  topK: u32,
+  _pad0: u32,
 };
 
 @group(0) @binding(0) var<storage, read> logits: array<f32>;
 @group(0) @binding(1) var<uniform> params: Params;
+@group(0) @binding(2) var<storage, read_write> candidates: array<f32>;
+
+fn betterValue(leftValue: f32, leftId: u32, rightValue: f32, rightId: u32) -> bool {
+  return leftValue > rightValue || (leftValue == rightValue && leftId < rightId);
+}
+
+@compute @workgroup_size(1, 1, 1)
+fn main(@builtin(workgroup_id) group: vec3<u32>) {
+  var bestValues: array<f32, 64>;
+  var bestIds: array<u32, 64>;
+  for (var slot = 0u; slot < 64u; slot = slot + 1u) {
+    bestValues[slot] = -3.4028234663852886e38;
+    bestIds[slot] = 4294967295u;
+  }
+
+  let rowStart = group.x * 256u;
+  let rowEnd = min(params.rowCount, rowStart + 256u);
+  for (var row = rowStart; row < rowEnd; row = row + 1u) {
+    let value = logits[row];
+    let tokenId = params.rowOffset + row;
+    if (betterValue(value, tokenId, bestValues[params.topK - 1u], bestIds[params.topK - 1u])) {
+      var insertAt = params.topK - 1u;
+      loop {
+        if (insertAt == 0u || !betterValue(value, tokenId, bestValues[insertAt - 1u], bestIds[insertAt - 1u])) {
+          break;
+        }
+        insertAt = insertAt - 1u;
+      }
+      var shift = params.topK - 1u;
+      loop {
+        if (shift <= insertAt) {
+          break;
+        }
+        bestValues[shift] = bestValues[shift - 1u];
+        bestIds[shift] = bestIds[shift - 1u];
+        shift = shift - 1u;
+      }
+      bestValues[insertAt] = value;
+      bestIds[insertAt] = tokenId;
+    }
+  }
+
+  let chunkBase = group.x * params.topK * 2u;
+  for (var slot = 0u; slot < params.topK; slot = slot + 1u) {
+    let outputBase = chunkBase + slot * 2u;
+    candidates[outputBase] = f32(bestIds[slot]);
+    candidates[outputBase + 1u] = bestValues[slot];
+  }
+}
+`;
+
+export const TOPK_MERGE_CANDIDATES_WGSL = `
+struct Params {
+  candidateCount: u32,
+  topK: u32,
+  candidateOffset: u32,
+  _pad0: u32,
+};
+
+@group(0) @binding(0) var<storage, read> candidates: array<f32>;
+@group(0) @binding(1) var<uniform> params: Params;
 @group(0) @binding(2) var<storage, read_write> outputValues: array<f32>;
+
+fn betterValue(leftValue: f32, leftId: u32, rightValue: f32, rightId: u32) -> bool {
+  return leftValue > rightValue || (leftValue == rightValue && leftId < rightId);
+}
 
 @compute @workgroup_size(1, 1, 1)
 fn main() {
-  let slot = params.slot;
-  var bestId = 0u;
-  var bestValue = -3.4028234663852886e38;
-  for (var row = 0u; row < params.rowCount; row = row + 1u) {
-    let value = logits[row];
-    var alreadyUsed = false;
-    for (var prev = 0u; prev < slot; prev = prev + 1u) {
-      let prevId = u32(outputValues[params.candidateOffset + prev * 2u]);
-      if (prevId == row + params.rowOffset) {
-        alreadyUsed = true;
+  var bestValues: array<f32, 64>;
+  var bestIds: array<u32, 64>;
+  for (var slot = 0u; slot < 64u; slot = slot + 1u) {
+    bestValues[slot] = -3.4028234663852886e38;
+    bestIds[slot] = 4294967295u;
+  }
+
+  for (var index = 0u; index < params.candidateCount; index = index + 1u) {
+    let candidateBase = index * 2u;
+    let tokenId = u32(candidates[candidateBase]);
+    let value = candidates[candidateBase + 1u];
+    if (betterValue(value, tokenId, bestValues[params.topK - 1u], bestIds[params.topK - 1u])) {
+      var insertAt = params.topK - 1u;
+      loop {
+        if (insertAt == 0u || !betterValue(value, tokenId, bestValues[insertAt - 1u], bestIds[insertAt - 1u])) {
+          break;
+        }
+        insertAt = insertAt - 1u;
       }
-    }
-    if (!alreadyUsed && value > bestValue) {
-      bestValue = value;
-      bestId = row;
+      var shift = params.topK - 1u;
+      loop {
+        if (shift <= insertAt) {
+          break;
+        }
+        bestValues[shift] = bestValues[shift - 1u];
+        bestIds[shift] = bestIds[shift - 1u];
+        shift = shift - 1u;
+      }
+      bestValues[insertAt] = value;
+      bestIds[insertAt] = tokenId;
     }
   }
-  let outputBase = params.candidateOffset + slot * 2u;
-  outputValues[outputBase] = f32(bestId + params.rowOffset);
-  outputValues[outputBase + 1u] = bestValue;
+
+  for (var slot = 0u; slot < params.topK; slot = slot + 1u) {
+    let outputBase = params.candidateOffset + slot * 2u;
+    outputValues[outputBase] = f32(bestIds[slot]);
+    outputValues[outputBase + 1u] = bestValues[slot];
+  }
 }
 `;
 

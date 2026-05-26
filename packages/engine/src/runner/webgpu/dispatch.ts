@@ -48,10 +48,12 @@ import {
   createSwiGluResources,
   createTokenSliceResources,
   createTokenWriteResources,
-  createTopKResources,
+  createTopKChunkCandidatesResources,
+  createTopKMergeCandidatesResources,
   createTop1ChunkResources,
   createValueCacheWriteResources,
 } from "./kernel-resources";
+import { GPU_STORAGE } from "./gpu-constants";
 
 export function dispatchBatchedRmsNormQ8KQuantize(
   device: WebGpuDeviceLike,
@@ -767,13 +769,32 @@ export function dispatchTopK(
     candidateOffset: number;
   },
 ): void {
-  for (let slot = 0; slot < options.topK; slot += 1) {
-    const resource = createTopKResources(device, logits, output, { ...options, slot });
-    resources.push(resource);
-    pass.setPipeline(resource.pipeline);
-    pass.setBindGroup(0, resource.bindGroup);
-    pass.dispatchWorkgroups(1);
+  if (options.topK < 1 || options.topK > TOPK_MAX) {
+    throw new Error(`dispatchTopK supports topK 1..${TOPK_MAX}, got ${options.topK}`);
   }
+  const chunkCount = Math.ceil(options.rowCount / TOPK_CHUNK_SIZE);
+  const candidateCount = chunkCount * options.topK;
+  const candidates = device.createBuffer({
+    size: candidateCount * 2 * Float32Array.BYTES_PER_ELEMENT,
+    usage: GPU_STORAGE,
+  });
+  resources.push({ destroy: () => candidates.destroy?.() });
+
+  const chunkResources = createTopKChunkCandidatesResources(device, logits, candidates, options);
+  resources.push(chunkResources);
+  pass.setPipeline(chunkResources.pipeline);
+  pass.setBindGroup(0, chunkResources.bindGroup);
+  pass.dispatchWorkgroups(chunkCount);
+
+  const mergeResources = createTopKMergeCandidatesResources(device, candidates, output, {
+    candidateCount,
+    topK: options.topK,
+    candidateOffset: options.candidateOffset,
+  });
+  resources.push(mergeResources);
+  pass.setPipeline(mergeResources.pipeline);
+  pass.setBindGroup(0, mergeResources.bindGroup);
+  pass.dispatchWorkgroups(1);
 }
 
 export function dispatchTop1Chunks(
@@ -813,6 +834,8 @@ export function dispatchSelectTop1Candidate(
 }
 
 export const TOP1_CHUNK_SIZE = 256;
+export const TOPK_CHUNK_SIZE = 256;
+export const TOPK_MAX = 64;
 
 export function dispatchTokenSlice(
   device: WebGpuDeviceLike,

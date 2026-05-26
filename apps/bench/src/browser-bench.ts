@@ -4,6 +4,7 @@ import {
   type WebGpuSupport,
 } from "../../../packages/engine/src/runner/webgpu/index";
 import { createWebGpuQuantizedWeightHandle } from "../../../packages/engine/src/runner/webgpu/quantized-handles";
+import { dispatchTopK } from "../../../packages/engine/src/runner/webgpu/dispatch";
 import {
   fullAttentionDecodeOutWebGpuResident,
   matMulQ4_KWebGpu,
@@ -78,6 +79,7 @@ export type BrowserBenchCaseId =
   | "swiglu-down"
   | "full-attention-decode-out"
   | "prefill-attention"
+  | "top-k"
   | "top-token";
 
 export type BrowserBenchBackend =
@@ -143,6 +145,7 @@ export type BrowserBenchReport = {
 
 type BenchOutput = Float32Array;
 type BenchRunValue = BenchOutput | { output: BenchOutput; gpuMs?: number };
+type BenchDiff = { maxAbs: number; maxRel: number };
 
 type BenchTask = {
   caseId: BrowserBenchCaseId;
@@ -153,6 +156,10 @@ type BenchTask = {
   relativeTolerance: number;
   referenceBackend: BrowserBenchBackend;
   reference: () => Promise<BenchRunValue>;
+  measureReference?: boolean;
+  warmupIterations?: number;
+  minimumMs?: number;
+  compare?: (actual: BenchOutput, expected: BenchOutput) => BenchDiff;
   teardown?: () => void | Promise<void>;
   candidates: Array<{
     backend: BrowserBenchBackend;
@@ -187,10 +194,12 @@ const DEFAULT_CASES: BrowserBenchCaseId[] = [
   "swiglu-down",
   "full-attention-decode-out",
   "prefill-attention",
+  "top-k",
   "top-token",
 ];
 const DEFAULT_SIZES: BrowserBenchSize[] = ["small", "medium"];
 const GPU_QUERY_RESOLVE = 512;
+const GEMMA4_E4B_VOCAB_SIZE = 262144;
 
 export async function runBrowserBench(
   options: BrowserBenchRunOptions = {},
@@ -205,21 +214,29 @@ export async function runBrowserBench(
   for (const task of buildBenchTasks(caseIds, sizes)) {
     try {
       throwIfAborted(options.signal);
-      const referenceResult = await measureTask({
-        task,
-        backend: task.referenceBackend,
-        variant: "reference",
-        run: task.reference,
-        warmupIterations,
-        minimumMs,
-        signal: options.signal,
-      });
-      results.push(referenceResult);
-      options.onResult?.(referenceResult);
+      const taskWarmupIterations = task.warmupIterations ?? warmupIterations;
+      const taskMinimumMs = task.minimumMs ?? minimumMs;
+      const referenceResult = task.measureReference === false
+        ? undefined
+        : await measureTask({
+            task,
+            backend: task.referenceBackend,
+            variant: "reference",
+            run: task.reference,
+            warmupIterations: taskWarmupIterations,
+            minimumMs: taskMinimumMs,
+            signal: options.signal,
+          });
+      if (referenceResult) {
+        results.push(referenceResult);
+        options.onResult?.(referenceResult);
+      }
 
-      const referenceOutput = referenceResult.status === "ok"
-        ? normalizeBenchRunValue(await task.reference())?.output
-        : undefined;
+      const referenceOutput = referenceResult
+        ? referenceResult.status === "ok"
+          ? normalizeBenchRunValue(await task.reference())?.output
+          : undefined
+        : normalizeBenchRunValue(await task.reference())?.output;
       for (const candidate of task.candidates) {
         throwIfAborted(options.signal);
         const prepared = candidate.prepare
@@ -239,11 +256,11 @@ export async function runBrowserBench(
             backend: candidate.backend,
             variant: candidate.variant,
             run: prepared.run,
-            warmupIterations,
-            minimumMs,
+            warmupIterations: taskWarmupIterations,
+            minimumMs: taskMinimumMs,
             signal: options.signal,
             referenceOutput,
-            referenceMeanMs: referenceResult.status === "ok" ? referenceResult.meanMs : undefined,
+            referenceMeanMs: referenceResult?.status === "ok" ? referenceResult.meanMs : undefined,
           });
           results.push(result);
           options.onResult?.(result);
@@ -322,8 +339,12 @@ function buildBenchTasks(caseIds: readonly BrowserBenchCaseId[], sizes: readonly
         tasks.push(createFullAttentionDecodeOutTask(size));
       } else if (caseId === "prefill-attention") {
         tasks.push(createPrefillAttentionTask(size));
-      } else {
+      } else if (caseId === "top-token") {
         tasks.push(createTopTokenTask(size));
+      } else {
+        for (const topK of topKDispatchShape(size).topKs) {
+          tasks.push(createTopKDispatchTask(size, topK));
+        }
       }
     }
   }
@@ -621,6 +642,32 @@ function createTopTokenTask(sizeName: BrowserBenchSize): BenchTask {
   };
 }
 
+function createTopKDispatchTask(sizeName: BrowserBenchSize, topK: number): BenchTask {
+  const size = topKDispatchShape(sizeName);
+  const logits = sequence(size.vocabSize, seedFor("topk-bench", sizeName, topK));
+  return {
+    caseId: "top-k",
+    caseName: `dispatch top-k ${topK}`,
+    size: sizeName,
+    shape: `vocab=${size.vocabSize} topK=${topK}`,
+    tolerance: 1e-6,
+    relativeTolerance: 1e-6,
+    referenceBackend: "ts-reference",
+    reference: async () => topKReference(logits, topK),
+    measureReference: false,
+    warmupIterations: 0,
+    minimumMs: 0,
+    compare: topKCandidateDiff,
+    candidates: [
+      {
+        backend: "webgpu-dispatch",
+        variant: "standalone",
+        prepare: () => prepareWebGpuTopKDispatch(logits, topK),
+      },
+    ],
+  };
+}
+
 async function measureTask(params: {
   task: BenchTask;
   backend: BrowserBenchBackend;
@@ -638,7 +685,9 @@ async function measureTask(params: {
       return skippedResult(params, "backend unavailable");
     }
     const meanMs = measured.totalMs / measured.iterations;
-    const diff = params.referenceOutput ? tensorDiff(measured.output, params.referenceOutput) : undefined;
+    const diff = params.referenceOutput
+      ? (params.task.compare ?? tensorDiff)(measured.output, params.referenceOutput)
+      : undefined;
     const tolerancePass = diff
       ? diff.maxAbs <= params.task.tolerance || diff.maxRel <= params.task.relativeTolerance
       : undefined;
@@ -1242,6 +1291,96 @@ async function prepareWebGpuMatMulTimestamp(
   };
 }
 
+async function prepareWebGpuTopKDispatch(
+  logits: Float32Array,
+  topK: number,
+): Promise<PreparedBenchRun | undefined> {
+  const device = await requestPlainWebGpuDevice();
+  if (!device) {
+    return undefined;
+  }
+
+  const logitsBuffer = uploadStorageBuffer(device, logits);
+  const outputByteLength = topK * 2 * Float32Array.BYTES_PER_ELEMENT;
+  const outputBuffer = storageBuffer(device, outputByteLength, GPU_COPY_SRC);
+  const readbackBuffer = device.createBuffer({
+    size: outputByteLength,
+    usage: GPU_MAP_READ | GPU_COPY_DST,
+  });
+  const resourcesToDestroy: Array<{ destroy?: () => void }> = [logitsBuffer, outputBuffer, readbackBuffer];
+  const validationOutput = await runPreparedTopKDispatch(
+    device,
+    logitsBuffer,
+    outputBuffer,
+    readbackBuffer,
+    logits.length,
+    topK,
+    true,
+  );
+
+  return {
+    run: () =>
+      runPreparedTopKDispatch(
+        device,
+        logitsBuffer,
+        outputBuffer,
+        readbackBuffer,
+        logits.length,
+        topK,
+        false,
+        validationOutput,
+      ),
+    teardown() {
+      for (let index = resourcesToDestroy.length - 1; index >= 0; index -= 1) {
+        resourcesToDestroy[index]?.destroy?.();
+      }
+      device.destroy?.();
+    },
+  };
+}
+
+async function runPreparedTopKDispatch(
+  device: WebGpuDeviceLike,
+  logitsBuffer: WebGpuBufferLike,
+  outputBuffer: WebGpuBufferLike,
+  readbackBuffer: WebGpuBufferLike,
+  rowCount: number,
+  topK: number,
+  readOutput: boolean,
+  validationOutput?: Float32Array,
+): Promise<Float32Array> {
+  const resources: Array<{ destroy: () => void }> = [];
+  try {
+    const encoder = device.createCommandEncoder();
+    const pass = encoder.beginComputePass();
+    dispatchTopK(device, pass, resources, logitsBuffer, outputBuffer, {
+      rowCount,
+      rowOffset: 0,
+      topK,
+      candidateOffset: 0,
+    });
+    pass.end();
+    if (readOutput) {
+      encoder.copyBufferToBuffer(outputBuffer, 0, readbackBuffer, 0, topK * 2 * Float32Array.BYTES_PER_ELEMENT);
+    }
+    device.queue.submit([encoder.finish()]);
+    await waitForSubmittedWork(device);
+    if (!readOutput) {
+      return validationOutput ?? new Float32Array();
+    }
+    await readbackBuffer.mapAsync(GPU_MAP_READ);
+    try {
+      return new Float32Array(readbackBuffer.getMappedRange()).slice();
+    } finally {
+      readbackBuffer.unmap();
+    }
+  } finally {
+    for (let index = resources.length - 1; index >= 0; index -= 1) {
+      resources[index]?.destroy();
+    }
+  }
+}
+
 async function runTimestampMatMulReadback(
   handle: WebGpuQuantizedWeightHandleInternal,
   inputColumns: Float32Array,
@@ -1473,6 +1612,58 @@ async function topTokenReference(
   return new Float32Array([bestId, bestValue]);
 }
 
+function topKReference(logits: Float32Array, topK: number): Float32Array {
+  const bestIds = new Int32Array(topK);
+  const bestValues = new Float32Array(topK);
+  bestIds.fill(-1);
+  bestValues.fill(-Infinity);
+
+  for (let row = 0; row < logits.length; row += 1) {
+    const value = logits[row] ?? -Infinity;
+    if (value <= bestValues[topK - 1]!) {
+      continue;
+    }
+
+    let insertAt = topK - 1;
+    while (insertAt > 0 && value > bestValues[insertAt - 1]!) {
+      insertAt -= 1;
+    }
+    for (let index = topK - 1; index > insertAt; index -= 1) {
+      bestValues[index] = bestValues[index - 1]!;
+      bestIds[index] = bestIds[index - 1]!;
+    }
+    bestValues[insertAt] = value;
+    bestIds[insertAt] = row;
+  }
+
+  const output = new Float32Array(topK * 2);
+  for (let slot = 0; slot < topK; slot += 1) {
+    output[slot * 2] = bestIds[slot]!;
+    output[slot * 2 + 1] = bestValues[slot]!;
+  }
+  return output;
+}
+
+function topKCandidateDiff(actual: Float32Array, expected: Float32Array): BenchDiff {
+  if (actual.length !== expected.length) {
+    return { maxAbs: Infinity, maxRel: Infinity };
+  }
+  let maxAbs = 0;
+  let maxRel = 0;
+  for (let index = 0; index < actual.length; index += 2) {
+    if (actual[index] !== expected[index]) {
+      return { maxAbs: Infinity, maxRel: Infinity };
+    }
+    const actualValue = actual[index + 1] ?? 0;
+    const expectedValue = expected[index + 1] ?? 0;
+    const abs = Math.abs(actualValue - expectedValue);
+    const rel = abs / Math.max(Math.abs(expectedValue), 1e-12);
+    maxAbs = Math.max(maxAbs, abs);
+    maxRel = Math.max(maxRel, rel);
+  }
+  return { maxAbs, maxRel };
+}
+
 function multiply(left: Float32Array, right: Float32Array): Float32Array {
   const output = new Float32Array(left.length);
   for (let index = 0; index < left.length; index += 1) {
@@ -1494,6 +1685,14 @@ function tensorDiff(actual: Float32Array, expected: Float32Array): { maxAbs: num
     maxRel = Math.max(maxRel, rel);
   }
   return { maxAbs, maxRel };
+}
+
+async function waitForSubmittedWork(device: WebGpuDeviceLike): Promise<void> {
+  const wait = device.queue.onSubmittedWorkDone;
+  if (!wait) {
+    throw new Error("WebGPU queue.onSubmittedWorkDone is unavailable.");
+  }
+  await wait.call(device.queue);
 }
 
 function checksum(values: Float32Array): number {
@@ -1619,6 +1818,16 @@ function fullAttentionShape(size: BrowserBenchSize): {
     return { headSize: 64, queryHeadCount: 8, keyValueHeadCount: 2, keyValueTokenCount: 64, contextLength: 64, scale: 1 / Math.sqrt(64), outputSize: 512 };
   }
   return { headSize: 64, queryHeadCount: 4, keyValueHeadCount: 2, keyValueTokenCount: 16, contextLength: 16, scale: 1 / Math.sqrt(64), outputSize: 256 };
+}
+
+function topKDispatchShape(size: BrowserBenchSize): { vocabSize: number; topKs: readonly number[] } {
+  if (size === "large") {
+    return { vocabSize: GEMMA4_E4B_VOCAB_SIZE, topKs: [1, 8, 16, 32, 64] };
+  }
+  if (size === "medium") {
+    return { vocabSize: 8192, topKs: [1, 8, 16] };
+  }
+  return { vocabSize: 2048, topKs: [1, 8] };
 }
 
 function prefillAttentionShape(size: BrowserBenchSize): {
