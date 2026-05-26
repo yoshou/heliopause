@@ -394,7 +394,6 @@ export async function forwardOutput(
     }
   }
   return {
-    logits,
     topTokens: topK(logits, options.topK ?? 10),
   };
 }

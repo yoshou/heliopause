@@ -31,7 +31,6 @@ import type {
 
 export type PrefillOptions = {
   positions?: Int32Array | number[];
-  computeLogits?: boolean;
   logitsTopK?: number;
   onTiming?: TimingSink;
 };
@@ -47,12 +46,11 @@ export type PreparedHiddenPrefillStateOptions = PrefillStateOptions & {
 
 export type NextTokenResult = {
   nextTokenId: number;
-  logits?: Float32Array;
+  topTokens?: Array<{ id: number; value: number }>;
 };
 
 export type DecodeOptions = {
   position?: number;
-  computeLogits?: boolean;
   logitsTopK?: number;
   onTiming?: TimingSink;
 };
@@ -158,7 +156,7 @@ export async function prefill(
   updateNextPosition(state, positions, tokenIds.length);
 
   const output = requireGraphOutput(graphResult.outputs, built.outputId ?? "output").result;
-  return nextTokenResultFromOutput(output, { computeLogits: options.computeLogits === true });
+  return nextTokenResultFromOutput(output);
 }
 
 export async function decode(
@@ -188,7 +186,7 @@ export async function decode(
   });
   state.nextPosition = Math.max(state.nextPosition, position + 1);
   const output = requireGraphOutput(graphResult.outputs, built.outputId ?? "output").result;
-  return nextTokenResultFromOutput(output, { computeLogits: options.computeLogits === true });
+  return nextTokenResultFromOutput(output);
 }
 
 function createPreparedHiddenInputNode(runtime: ModelRuntimeForForward, hidden: Float32Array): ForwardRunnerNode {
@@ -208,38 +206,16 @@ function requireGraphOutput(values: ReadonlyMap<string, ForwardOutputValue>, id:
   return value;
 }
 
-function nextTokenResultFromOutput(
-  output: OutputResult,
-  options: { computeLogits: boolean },
-): NextTokenResult {
-  const nextTokenId = output.topTokens[0]?.id ?? nextTokenFromLogits(output.logits);
+function nextTokenResultFromOutput(output: OutputResult): NextTokenResult {
+  const nextTokenId = output.topTokens[0]?.id;
   if (nextTokenId === undefined) {
     throw new Error("Forward output did not produce a next token.");
   }
   const result: NextTokenResult = { nextTokenId };
-  if (options.computeLogits) {
-    if (output.logits.length === 0) {
-      throw new Error("Full logits were requested but the selected provider did not return them.");
-    }
-    result.logits = output.logits;
+  if (output.topTokens.length > 0) {
+    result.topTokens = output.topTokens;
   }
   return result;
-}
-
-function nextTokenFromLogits(logits: Float32Array): number | undefined {
-  if (logits.length === 0) {
-    return undefined;
-  }
-  let bestId = 0;
-  let bestValue = Number.NEGATIVE_INFINITY;
-  for (let id = 0; id < logits.length; id += 1) {
-    const value = logits[id] ?? Number.NEGATIVE_INFINITY;
-    if (value > bestValue) {
-      bestId = id;
-      bestValue = value;
-    }
-  }
-  return bestId;
 }
 
 function normalizePositions(positions: PrefillStateOptions["positions"], tokenCount: number): Int32Array {

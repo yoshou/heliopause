@@ -40,7 +40,6 @@ export type InferenceState = {
 type InferenceStateDisposeCallback = () => void;
 
 export type OutputResult = {
-  logits: Float32Array;
   topTokens: Array<{ id: number; value: number }>;
 };
 

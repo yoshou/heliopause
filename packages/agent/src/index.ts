@@ -206,6 +206,7 @@ export async function generateAgentTurn(
     const continueModelTurn = committedModelTurnOpen && isOnlyToolResponseTurn(nextTurn);
     const generation = await chatTurnGenerator(session, tokenizer, generationState, nextTurn, {
       ...chatOptions,
+      doSample: chatOptions.doSample ?? false,
       appendTurnEnd: false,
       continueModelTurn,
       onToken: (chunk: ChatCompletionChunk) => {

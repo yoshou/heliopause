@@ -52,12 +52,13 @@ test("parseToolCall returns none for normal assistant text", () => {
 });
 
 test("generateAgentTurn continues an open model turn for tool responses", async () => {
-  const callOptions: Array<Pick<ChatTurnOptions, "appendTurnEnd" | "continueModelTurn">> = [];
+  const callOptions: Array<Pick<ChatTurnOptions, "appendTurnEnd" | "continueModelTurn" | "doSample">> = [];
   let index = 0;
   const chatTurnGenerator: AgentChatTurnGenerator = async (_session, _tokenizer, state, _turn, options = {}) => {
     callOptions.push({
       appendTurnEnd: options.appendTurnEnd,
       continueModelTurn: options.continueModelTurn,
+      doSample: options.doSample,
     });
     index += 1;
     const content = index === 1
@@ -83,8 +84,8 @@ test("generateAgentTurn continues an open model turn for tool responses", async 
   });
 
   assert.deepEqual(callOptions, [
-    { appendTurnEnd: false, continueModelTurn: false },
-    { appendTurnEnd: false, continueModelTurn: true },
+    { appendTurnEnd: false, continueModelTurn: false, doSample: false },
+    { appendTurnEnd: false, continueModelTurn: true, doSample: false },
   ]);
 });
 

@@ -13,7 +13,6 @@ import {
   referenceVisionPreprocessRunner,
 } from "./vision-runner";
 import {
-  referenceOutput,
   referenceSegmentRunner,
 } from "./execution-provider";
 import {
@@ -39,7 +38,6 @@ export function createReferenceModelRunner(): ModelRunner {
     prepareInput,
     preparePreparedHiddenInput,
     segmentRunner: referenceSegmentRunner,
-    output: referenceOutput,
     graphNodes: {
       createEmbeddingNode: (tokenIds) => new ReferenceEmbeddingNode(tokenIds),
       createPreparedHiddenInputNode: (hidden) => new ReferencePreparedHiddenInputNode(hidden),

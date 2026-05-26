@@ -258,6 +258,11 @@ async function handleGenerateTurn(
 
     const turnOptions = {
       maxNewTokens: request.maxNewTokens,
+      doSample: request.doSample,
+      temperature: request.temperature,
+      topP: request.topP,
+      topK: request.topK,
+      seed: request.seed,
       signal: abortController.signal,
       onToken(chunk: { content: string }) {
         workerScope.postMessage({

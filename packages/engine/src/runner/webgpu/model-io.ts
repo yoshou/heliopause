@@ -7,18 +7,15 @@ import {
 import type {
   ForwardTrace,
   ModelSession,
-  OutputResult,
 } from "../../runtime";
 import {
   timedAsync,
-  topK,
 } from "../../runtime";
 import type {
   ModelPreparedInput,
 } from "../model-runner";
 import {
   GpuMemoryArena,
-  scratchF32,
   scratchQ8_0,
   scratchQ8K,
   type F32Handle,
@@ -51,14 +48,10 @@ import {
   dispatchQ8_0Quantize,
   dispatchQ8KQuantize,
   dispatchQuantizedGatherRowsScale,
-  dispatchRmsNorm,
-  dispatchRmsNormQ8KQuantize,
 } from "./dispatch";
 import {
   loadF32Handle,
-  loadOutputStripes,
   loadQuantizedHandle,
-  type OutputStripe,
 } from "./segment-layer-loader";
 import {
   webGpuExecutionProviderOptions,
@@ -92,119 +85,6 @@ export async function prepareWebGpuPreparedHiddenInputHandle(
   return timedAsync(trace, "WebGPU prepared hidden input handle", () =>
     createWebGpuPreparedHiddenInputHandle(session, hidden, tokenCount)
   );
-}
-
-export async function webGpuOutput(
-  session: ModelSession,
-  hidden: Float32Array,
-  options: { topK: number; trace?: ForwardTrace },
-): Promise<OutputResult> {
-  return timedAsync(options.trace, "WebGPU output", async () => {
-    const device = await requireDevice();
-    const arena = new GpuMemoryArena(device, webGpuMemoryLimitBytes(session));
-    const cleanup: GpuResource[] = [];
-    const resources: Array<{ destroy: () => void }> = [];
-    try {
-      const hiddenSize = session.manifest.embeddingLength;
-      const tokenCount = hidden.length / hiddenSize;
-      if (!Number.isInteger(tokenCount) || tokenCount <= 0) {
-        throw new Error(`WebGPU output hidden shape mismatch: ${hidden.length}`);
-      }
-      const lastHidden = hidden.subarray((tokenCount - 1) * hiddenSize, tokenCount * hiddenSize);
-      const hiddenBuffer = arena.createBuffer(
-        "model-output.hidden",
-        hiddenSize * Float32Array.BYTES_PER_ELEMENT,
-        GPU_STORAGE | GPU_COPY_DST,
-      );
-      cleanup.push(hiddenBuffer);
-      device.queue.writeBuffer(hiddenBuffer, 0, lastHidden);
-
-      const outputNorm = await loadF32Handle(arena, session.tensorReader, "output_norm.weight");
-      cleanup.push(outputNorm);
-      const outputWeightName = session.tensorReader.metadata.tensors.some((tensor) => tensor.name === "output.weight")
-        ? "output.weight"
-        : "token_embd.weight";
-      const outputTensor = session.tensorReader.getTensor(outputWeightName);
-      const rowCount = outputTensor.dimensions[1] ?? 0;
-      const logitsReadback = device.createBuffer({
-        label: "model-output.logits.readback",
-        size: rowCount * Float32Array.BYTES_PER_ELEMENT,
-        usage: GPU_COPY_DST | GPU_MAP_READ,
-      });
-      cleanup.push(logitsReadback);
-
-      const encoder = device.createCommandEncoder();
-      const pass = encoder.beginComputePass();
-      const outputCopies: Array<{
-        source: WebGpuBufferLike;
-        sourceOffset: number;
-        destinationOffset: number;
-        size: number;
-      }> = [];
-      if (outputTensor.type === "F32") {
-        const outputWeight = await loadF32Handle(arena, session.tensorReader, outputWeightName);
-        cleanup.push(outputWeight);
-        const normalized = scratchF32(arena, hiddenSize, cleanup, "model-output.norm");
-        const logits = scratchF32(arena, rowCount, cleanup, "model-output.logits");
-        dispatchRmsNorm(device, pass, resources, hiddenBuffer, outputNorm.buffer, normalized, hiddenSize, session.epsilon);
-        dispatchF32MatMul(device, pass, resources, outputWeight.buffer, normalized, logits, hiddenSize, rowCount, 1);
-        outputCopies.push({
-          source: logits,
-          sourceOffset: 0,
-          destinationOffset: 0,
-          size: rowCount * Float32Array.BYTES_PER_ELEMENT,
-        });
-      } else {
-        const stripes = await loadOutputStripes(arena, session.tensorReader, session.manifest);
-        cleanup.push(...stripes);
-        const firstStripe = requireFirstStripe(stripes);
-        if (firstStripe.type === "Q8_0") {
-          const normalized = scratchF32(arena, hiddenSize, cleanup, "model-output.norm");
-          const q8 = scratchQ8_0(arena, hiddenSize, 1, hiddenSize / 32, cleanup, "model-output.norm.q8_0");
-          dispatchRmsNorm(device, pass, resources, hiddenBuffer, outputNorm.buffer, normalized, hiddenSize, session.epsilon);
-          dispatchQ8_0Quantize(device, pass, resources, normalized, q8, hiddenSize, 1, hiddenSize / 32);
-          for (const stripe of stripes) {
-            const logits = scratchF32(arena, stripe.rowCount, cleanup, `model-output.logits.${stripe.rowOffset}`);
-            dispatchQ8_0MatMul(pass, resources, stripe, q8, logits, 1);
-            outputCopies.push({
-              source: logits,
-              sourceOffset: 0,
-              destinationOffset: stripe.rowOffset * Float32Array.BYTES_PER_ELEMENT,
-              size: stripe.rowCount * Float32Array.BYTES_PER_ELEMENT,
-            });
-          }
-        } else {
-          const q8 = scratchQ8K(arena, hiddenSize, 1, cleanup, "model-output.norm.q8k");
-          dispatchRmsNormQ8KQuantize(device, pass, resources, hiddenBuffer, outputNorm.buffer, q8, hiddenSize, session.epsilon);
-          for (const stripe of stripes) {
-            const logits = scratchF32(arena, stripe.rowCount, cleanup, `model-output.logits.${stripe.rowOffset}`);
-            dispatchKMatMul(pass, resources, stripe, q8, logits, 1);
-            outputCopies.push({
-              source: logits,
-              sourceOffset: 0,
-              destinationOffset: stripe.rowOffset * Float32Array.BYTES_PER_ELEMENT,
-              size: stripe.rowCount * Float32Array.BYTES_PER_ELEMENT,
-            });
-          }
-        }
-      }
-      pass.end();
-      for (const copy of outputCopies) {
-        encoder.copyBufferToBuffer(copy.source, copy.sourceOffset, logitsReadback, copy.destinationOffset, copy.size);
-      }
-      device.queue.submit([encoder.finish()]);
-      const logits = await readMappedF32(logitsReadback, rowCount);
-      applyFinalLogitSoftcap(logits, session.manifest.finalLogitSoftcap);
-      return {
-        logits,
-        topTokens: topK(logits, options.topK ?? 10),
-      };
-    } finally {
-      destroyAll(resources);
-      destroyAll(cleanup.reverse());
-      arena.destroyScratchBuffers();
-    }
-  });
 }
 
 async function runWebGpuInputPreparation(
@@ -541,15 +421,6 @@ async function readMappedF32(buffer: WebGpuBufferLike, length: number): Promise<
   return values;
 }
 
-function applyFinalLogitSoftcap(values: Float32Array, softcap: number | undefined): void {
-  if (softcap === undefined || softcap <= 0) {
-    return;
-  }
-  for (let index = 0; index < values.length; index += 1) {
-    values[index] = Math.fround(Math.tanh((values[index] ?? 0) / softcap) * softcap);
-  }
-}
-
 function isF32Handle(value: F32Handle | QuantizedHandle): value is F32Handle {
   return "buffer" in value;
 }
@@ -564,14 +435,6 @@ function isF32CompatibleType(type: GgmlTypeName): boolean {
 
 function isSupportedProjectionType(type: GgmlTypeName): boolean {
   return isF32CompatibleType(type) || type === "Q4_K" || type === "Q5_K" || type === "Q6_K" || type === "Q8_0";
-}
-
-function requireFirstStripe(stripes: readonly OutputStripe[]): OutputStripe {
-  const stripe = stripes[0];
-  if (!stripe) {
-    throw new Error("WebGPU output has no output weight stripes.");
-  }
-  return stripe;
 }
 
 function destroyAll(items: readonly { destroy?: () => void }[]): void {

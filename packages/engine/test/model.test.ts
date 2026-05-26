@@ -215,7 +215,7 @@ test("prefill advances nextPosition from default and explicit positions", async 
   assert.equal(mropeState.nextPosition, 7);
 });
 
-test("decode uses state position, explicit position, and returns fixed logits", async () => {
+test("decode uses state position, explicit position, and returns top token candidates", async () => {
   const reader = tensorReaderFromTensors([
     f32Tensor("token_embd.weight", [4, 8], sequence(32)),
     f32Tensor("output_norm.weight", [4], new Float32Array([1, 1, 1, 1])),
@@ -229,25 +229,15 @@ test("decode uses state position, explicit position, and returns fixed logits", 
   const state = session.createInferenceState();
   state.nextPosition = 4;
 
-  const first = await decode(session, state, 2, { computeLogits: true, logitsTopK: 2 });
+  const first = await decode(session, state, 2, { logitsTopK: 2 });
   assert.equal(state.nextPosition, 5);
   assert.equal(first.nextTokenId, 1);
-  assert.ok(first.logits);
-  assertFloatArrayClose(first.logits, new Float32Array([
-    -0.16329793632030487,
-    0.5715428590774536,
-    -0.5715428590774536,
-  ]), 2e-5);
+  assert.deepEqual(first.topTokens?.map((token) => token.id), [1, 0]);
 
-  const second = await decode(session, state, 3, { position: 9, computeLogits: true, logitsTopK: 2 });
+  const second = await decode(session, state, 3, { position: 9, logitsTopK: 2 });
   assert.equal(state.nextPosition, 10);
   assert.equal(second.nextTokenId, 0);
-  assert.ok(second.logits);
-  assertFloatArrayClose(second.logits, new Float32Array([
-    0.1568925976753235,
-    -0.7452399134635925,
-    -0.23533886671066284,
-  ]), 2e-5);
+  assert.deepEqual(second.topTokens?.map((token) => token.id), [0, 2]);
 });
 
 test("model session caches F32 tensors and embedding rows", async () => {

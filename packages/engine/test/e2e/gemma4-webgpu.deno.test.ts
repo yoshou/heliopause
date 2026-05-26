@@ -23,10 +23,14 @@ Deno.test({
       buildTokenizer,
       checkWebGpuSupport,
       createChatSession,
+      createDeterministicRng,
       createFileGgufTensorReader,
       createWebGpuProvider,
+      DEFAULT_GENERATION_CONFIG,
       decode,
       prefill,
+      resolveGenerationSamplingOptions,
+      sampleNextToken,
     } = await import("../../src/index.ts");
 
     const support = await checkWebGpuSupport();
@@ -34,6 +38,7 @@ Deno.test({
 
     const reader = await createFileGgufTensorReader(new RangeFile(MODEL.path));
     const tokenizer = buildTokenizer(reader.metadata);
+    assertEquals(tokenizer.tokenToId("<turn|>"), 106, "Gemma 4 tokenizer should resolve <turn|> to official EOS id 106");
     const session = createChatSession(reader, {
       maxContextLength: 256,
       providers: [createWebGpuProvider({
@@ -66,6 +71,40 @@ Deno.test({
     const text = generated.map((id) => tokenizer.detokenize([id])).join("");
     assertArrayEquals(generated, EXPECTED_TOKENS, `generated text: ${JSON.stringify(text)}`);
     assertNaturalSentence(text);
+
+    const sampledState = session.createInferenceState();
+    const sampling = resolveGenerationSamplingOptions({ seed: 0 });
+    assertEquals(sampling.doSample, DEFAULT_GENERATION_CONFIG.doSample);
+    assertEquals(sampling.temperature, DEFAULT_GENERATION_CONFIG.temperature);
+    assertEquals(sampling.topP, DEFAULT_GENERATION_CONFIG.topP);
+    assertEquals(sampling.topK, DEFAULT_GENERATION_CONFIG.topK);
+    assertEquals(sampling.logitsTopK, 64);
+
+    let sampledResult = await prefill(session, sampledState, promptTokenIds, { logitsTopK: sampling.logitsTopK });
+    assertEquals(sampledResult.topTokens?.length, 64, "official sampling prefill should request topK=64 candidates");
+    const sampled: number[] = [];
+    const rng = createDeterministicRng(sampling.seed);
+    let sampledTokenId = sampleNextToken(sampledResult.topTokens ?? [], sampling, rng);
+    const stopTokenIds = new Set([
+      tokenizer.eosTokenId,
+      tokenizer.tokenToId("<turn|>"),
+      tokenizer.tokenToId("<eos>"),
+      tokenizer.tokenToId("<|im_end|>"),
+      ...DEFAULT_GENERATION_CONFIG.eosTokenIds,
+    ].filter((id): id is number => typeof id === "number"));
+    let sampledStopped = false;
+    for (let index = 0; index < 128; index += 1) {
+      if (stopTokenIds.has(sampledTokenId)) {
+        sampledStopped = true;
+        break;
+      }
+      sampled.push(sampledTokenId);
+      sampledResult = await decode(session, sampledState, sampledTokenId, { logitsTopK: sampling.logitsTopK });
+      assertEquals(sampledResult.topTokens?.length, 64, "official sampling decode should request topK=64 candidates");
+      sampledTokenId = sampleNextToken(sampledResult.topTokens ?? [], sampling, rng);
+    }
+    assert(sampled.length > 0, "official sampling path should generate at least one token");
+    assert(sampledStopped, "official sampling path should eventually reach an official stop token");
 
     const stats = session.cacheStats().executionProviderStats;
     assert(

@@ -129,7 +129,6 @@ test("forward graph cleans provider values after successful output consumption",
         return {
           kind: "output",
           result: {
-            logits: new Float32Array(),
             topTokens: [{ id: 1, value: 1 }],
           },
         };
@@ -170,7 +169,6 @@ test("forward graph cleans shared provider values after the last consumer", asyn
         return {
           kind: "output",
           result: {
-            logits: new Float32Array(),
             topTokens: [{ id: 1, value: 1 }],
           },
         };
@@ -185,7 +183,6 @@ test("forward graph cleans shared provider values after the last consumer", asyn
         return {
           kind: "output",
           result: {
-            logits: new Float32Array(),
             topTokens: [{ id: 2, value: 1 }],
           },
         };
@@ -269,7 +266,6 @@ test("hidden transfers preserve per-layer inputs across provider buffers", async
         return {
           kind: "output",
           result: {
-            logits: new Float32Array(),
             topTokens: [{ id: 0, value: 0 }],
           },
         };
@@ -282,7 +278,7 @@ test("hidden transfers preserve per-layer inputs across provider buffers", async
   assert.equal(result.outputs.get("output")?.kind, "output");
 });
 
-test("WASM-only forward graph produces fixed logits for synthetic tensors", async () => {
+test("WASM-only forward graph produces fixed top token candidates for synthetic tensors", async () => {
   const reader = tensorReaderFromTensors([
     f32Tensor("token_embd.weight", [4, 8], sequence(32)),
     f32Tensor("output_norm.weight", [4], new Float32Array([1, 1, 1, 1])),
@@ -311,11 +307,6 @@ test("WASM-only forward graph produces fixed logits for synthetic tensors", asyn
   const output = result.outputs.get("output");
 
   assert.equal(output?.kind, "output");
-  assertFloatArrayClose(output.result.logits, new Float32Array([
-    -0.16329389810562134,
-    0.5715285539627075,
-    -0.5715285539627075,
-  ]), 2e-5);
   assert.deepEqual(output.result.topTokens.map((token) => token.id), [1, 0]);
   assertFloatArrayClose(
     Float32Array.from(output.result.topTokens.map((token) => token.value)),
@@ -669,12 +660,6 @@ function fakeProvider(
       segmentRunner() {
         throw new Error("fake segment runner should not be used");
       },
-      async output() {
-        return {
-          logits: new Float32Array([1]),
-          topTokens: [{ id: 0, value: 1 }],
-        };
-      },
     }),
     modelResourceRequirements: () => fakeRequirements(options.requirementsProvider ?? name, memoryLimitBytes),
   };
@@ -707,7 +692,6 @@ function fakeProvider(
           return {
             kind: "output",
             result: {
-              logits: new Float32Array([1]),
               topTokens: [{ id: 0, value: 1 }],
             },
           };

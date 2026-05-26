@@ -139,7 +139,7 @@ export class WebGpuLayerSegmentNode implements ForwardRunnerNode {
     context: ForwardGraphContext,
     outputOptions: WebGpuOutputOptions,
   ): Promise<WebGpuSegmentNodeResult> {
-    return outputOptions.computeSelectedToken
+    return outputOptions.computeSelectedToken || outputOptions.computeTopK
       ? await runner.runPreparedInput(prepared, context.positions, context.state, outputOptions)
       : await runner.runPreparedInputHidden(prepared, context.positions, context.state);
   }
@@ -152,7 +152,7 @@ export class WebGpuLayerSegmentNode implements ForwardRunnerNode {
   ): Promise<WebGpuSegmentNodeResult> {
     const inputHidden = await runnerBufferToCpu(input.buffer);
     if (inputHidden.length === context.manifest.embeddingLength) {
-      return outputOptions.computeSelectedToken
+      return outputOptions.computeSelectedToken || outputOptions.computeTopK
         ? await runner.runToken(inputHidden, context.positions, context.state, {
           perLayerInputs: input.perLayerInputs,
           ...outputOptions,
@@ -161,7 +161,7 @@ export class WebGpuLayerSegmentNode implements ForwardRunnerNode {
           perLayerInputs: input.perLayerInputs,
         });
     }
-    return outputOptions.computeSelectedToken
+    return outputOptions.computeSelectedToken || outputOptions.computeTopK
       ? await runner.runTokens(inputHidden, context.positions, context.state, {
         perLayerInputs: input.perLayerInputs,
         ...outputOptions,
@@ -172,19 +172,25 @@ export class WebGpuLayerSegmentNode implements ForwardRunnerNode {
   }
 
   private outputOptions(context: ForwardGraphContext): WebGpuOutputOptions {
-    const computeSelectedToken = context.outputTopK !== undefined &&
-      this.endLayerExclusive === context.manifest.blockCount;
-    return computeSelectedToken
-      ? {
-        computeSelectedToken: true,
+    if (context.outputTopK === undefined || this.endLayerExclusive !== context.manifest.blockCount) {
+      return {};
+    }
+    if (context.outputTopK > 1) {
+      return {
+        computeTopK: true,
         topK: context.outputTopK,
-      }
-      : {};
+      };
+    }
+    return {
+      computeSelectedToken: true,
+      topK: context.outputTopK,
+    };
   }
 }
 
 type WebGpuOutputOptions = {
   computeSelectedToken?: true;
+  computeTopK?: true;
   topK?: number;
 };
 
@@ -283,7 +289,6 @@ export class WebGpuOutputNode implements ForwardRunnerNode {
     return {
       kind: "output",
       result: {
-        logits: new Float32Array(),
         topTokens,
       },
     };

@@ -8,7 +8,6 @@ import type {
   WasmProviderOptions,
 } from "./options";
 import {
-  wasmOutput,
   wasmSegmentRunner,
 } from "./execution-provider";
 import {
@@ -46,7 +45,6 @@ export function createWasmModelRunner(): ModelRunner {
     prepareInput,
     preparePreparedHiddenInput,
     segmentRunner: wasmSegmentRunner,
-    output: wasmOutput,
     graphNodes: {
       createEmbeddingNode: (tokenIds) => new WasmEmbeddingNode(tokenIds),
       createPreparedHiddenInputNode: (hidden) => new WasmPreparedHiddenInputNode(hidden),

@@ -13,7 +13,19 @@ import {
   prefillChatMessages,
   stripThinking,
   type GgufMetadata,
+  type ModelRunnerProvider,
+  type ProviderResourceRequirements,
+  type SegmentRunnerProvider,
 } from "../src/index.ts";
+import {
+  cpuRunnerBuffer,
+} from "../src/runner/buffer.ts";
+import type {
+  ForwardRunnerNode,
+} from "../src/runner/graph.ts";
+import type {
+  ModelRunner,
+} from "../src/runner/model-runner.ts";
 
 // Gemma 4 chat template snapshot: tmp/gemma4-chat-template-2026-05-22.jinja
 // sha256: 2f1b4d75d067bae3fe44e676721c7f077d243bc007156cb9c2f8b5836613d082
@@ -225,12 +237,76 @@ test("chat generation stops on turn token", async () => {
     session,
     tokenizer,
     [{ role: "user", content: "A" }],
-    { maxNewTokens: 4 },
+    { maxNewTokens: 4, doSample: false },
   )) {
     chunks.push(chunk);
   }
 
   assert.deepEqual(chunks.map((chunk) => chunk.text), ["A"]);
+});
+
+test("chat generation stops on official Gemma 4 EOS token ids", async () => {
+  const tokenizer = {
+    tokenize() {
+      return [0];
+    },
+    detokenize(tokenIds: readonly number[]) {
+      return tokenIds.map((id) => `token-${id}`).join("");
+    },
+    idToToken(id: number) {
+      return `token-${id}`;
+    },
+    tokenToId() {
+      return undefined;
+    },
+  };
+  const embedding = new Float32Array(4 * 51);
+  embedding[0] = 1;
+  const output = new Float32Array(4 * 51);
+  output[50 * 4] = 10;
+  const session = createModelSession(tensorReaderFromTensors([
+    f32Tensor("token_embd.weight", [4, 51], embedding),
+    f32Tensor("output_norm.weight", [4], new Float32Array([1, 1, 1, 1])),
+    f32Tensor("output.weight", [4, 51], output),
+  ]), { providers: [createReferenceProvider()] });
+
+  const chunks = [];
+  for await (const chunk of generateChatCompletion(
+    session,
+    tokenizer,
+    [{ role: "user", content: "Stop." }],
+    { maxNewTokens: 4, doSample: false },
+  )) {
+    chunks.push(chunk);
+  }
+
+  assert.deepEqual(chunks, []);
+});
+
+test("chat generation requests official topK by default and top-1 for greedy across providers", async () => {
+  for (const provider of ["reference", "wasm", "webgpu"] as const) {
+    const defaultTopKs: number[] = [];
+    const defaultSession = sessionWithCapturingProvider(provider, defaultTopKs);
+    await generateChatTurn(
+      defaultSession,
+      singleTokenTokenizer,
+      defaultSession.createInferenceState(),
+      "Hello",
+      { maxNewTokens: 1, appendTurnEnd: false },
+    );
+    assert.deepEqual(defaultTopKs, [64, 64], provider);
+
+    const greedyTopKs: number[] = [];
+    const greedySession = sessionWithCapturingProvider(provider, greedyTopKs);
+    await generateChatTurn(
+      greedySession,
+      singleTokenTokenizer,
+      greedySession.createInferenceState(),
+      "Hello",
+      { maxNewTokens: 1, appendTurnEnd: false, doSample: false },
+    );
+    assert.deepEqual(greedyTopKs, [1, 1], provider);
+  }
 });
 
 test("stateful chat turn pre-fills only the new turn suffix", async () => {
@@ -298,6 +374,7 @@ test("stateful chat turn pre-fills only the new turn suffix", async () => {
     "Hello",
     {
       maxNewTokens: 4,
+      doSample: false,
       onToken(chunk) {
         chunks.push(chunk.text);
       },
@@ -454,6 +531,117 @@ function tensorReaderFromTensors(tensors: Array<{
       return data.subarray(Number(offset), Number(offset) + length);
     },
   });
+}
+
+const singleTokenTokenizer = {
+  tokenize() {
+    return [0];
+  },
+  detokenize(tokenIds: readonly number[]) {
+    return tokenIds.map((id) => id === 5 ? "A" : "").join("");
+  },
+  idToToken(id: number) {
+    return id === 5 ? "A" : undefined;
+  },
+  tokenToId(token: string) {
+    return token === "<turn|>" ? 106 : undefined;
+  },
+};
+
+function sessionWithCapturingProvider(provider: SegmentRunnerProvider, topKs: number[]) {
+  return createModelSession(tensorReaderFromTensors([]), {
+    providers: [capturingProvider(provider, topKs)],
+  });
+}
+
+function capturingProvider(provider: SegmentRunnerProvider, topKs: number[]): ModelRunnerProvider {
+  return {
+    name: provider,
+    createModelRunner(): ModelRunner {
+      return {
+        provider,
+        graphNodes: {
+          createEmbeddingNode: () => hiddenNode(provider, "embedding"),
+          createPreparedHiddenInputNode: () => hiddenNode(provider, "input"),
+          createLayerSegmentNode: (_start, _end, inputId) => hiddenNode(provider, `${provider}-segment`, [inputId]),
+          createOutputNode: (inputId, topK = 1) => outputNode(provider, inputId, topK, topKs),
+          createImportHiddenNode: (inputId) => hiddenNode(provider, `${provider}-import`, [inputId]),
+          createExportHiddenNode: (inputId) => hiddenNode(provider, `${provider}-export`, [inputId]),
+        },
+        async prepareInput() {
+          return { hidden: new Float32Array([1, 0, 0, 0]) };
+        },
+        async preparePreparedHiddenInput(_session, hidden) {
+          return { hidden };
+        },
+        async segmentRunner() {
+          throw new Error("capturing provider segment runner should not be called.");
+        },
+      };
+    },
+    modelResourceRequirements(): ProviderResourceRequirements {
+      return {
+        provider,
+        mode: "enabled",
+        support: { available: true },
+        memoryLimitBytes: Number.POSITIVE_INFINITY,
+        fixedBytes: 0,
+        outputBytes: 0,
+        scratchBytes: 0,
+        targetResourceConstrained: false,
+        canRunFullModel: true,
+        offReason: `${provider} off.`,
+        blockedReason: `${provider} blocked.`,
+        plannedReason: `${provider} planned.`,
+        layers: [],
+      };
+    },
+  };
+}
+
+function hiddenNode(
+  provider: SegmentRunnerProvider,
+  id: string,
+  deps: readonly string[] = [],
+): ForwardRunnerNode {
+  return {
+    id,
+    deps,
+    backend: provider,
+    run() {
+      const hidden = new Float32Array([1, 0, 0, 0]);
+      return {
+        kind: "cpu-hidden",
+        buffer: cpuRunnerBuffer(hidden, [1, 4]),
+        hidden,
+      };
+    },
+  };
+}
+
+function outputNode(
+  provider: SegmentRunnerProvider,
+  inputId: string,
+  topK: number,
+  topKs: number[],
+): ForwardRunnerNode {
+  return {
+    id: "output",
+    deps: [inputId],
+    backend: provider,
+    run() {
+      topKs.push(topK);
+      return {
+        kind: "output",
+        result: {
+          topTokens: Array.from({ length: topK }, (_, index) => ({
+            id: index === 0 ? 5 : 200 + index,
+            value: topK - index,
+          })),
+        },
+      };
+    },
+  };
 }
 
 function f32Tensor(name: string, dimensions: number[], values: Float32Array) {

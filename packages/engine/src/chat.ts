@@ -17,6 +17,13 @@ import {
   type NextTokenResult,
 } from "./forward";
 import {
+  createDeterministicRng,
+  DEFAULT_GENERATION_CONFIG,
+  resolveGenerationSamplingOptions,
+  sampleNextToken,
+  type GenerationSamplingOptions,
+} from "./generation";
+import {
   GgufTensorReader,
   type GgufTensorReadTrace,
 } from "./tensor-reader";
@@ -81,7 +88,7 @@ export type FileGgufTensorReaderOptions = {
   onRead?: GgufTensorReadTrace;
 };
 
-export type ChatCompletionOptions = {
+export type ChatCompletionOptions = GenerationSamplingOptions & {
   maxNewTokens?: number;
   stopTokenIds?: readonly number[];
   signal?: AbortSignal;
@@ -361,6 +368,7 @@ export async function generateChatTurn(
   options: ChatTurnOptions = {},
 ): Promise<ChatTurnResult> {
   throwIfAborted(options.signal);
+  resolveGenerationSamplingOptions(options);
 
   const messages = normalizeChatTurnInput(turn);
   const prefillText = applyChatTemplate(messages, {
@@ -369,14 +377,20 @@ export async function generateChatTurn(
   });
 
   if (options.continueModelTurn) {
+    const sampling = resolveGenerationSamplingOptions(options);
     const prefillResult = await prefillChatText(
       session,
       tokenizer,
       state,
       prefillText,
-      { signal: options.signal, returnNextToken: true, requireGenerationSlot: true },
+      {
+        signal: options.signal,
+        returnNextToken: true,
+        requireGenerationSlot: true,
+        logitsTopK: sampling.logitsTopK,
+      },
     );
-    return generateAssistantFromNextToken(session, tokenizer, state, prefillResult.nextTokenId, options);
+    return generateAssistantFromNextToken(session, tokenizer, state, prefillResult, options);
   }
 
   await prefillChatText(
@@ -412,6 +426,7 @@ export async function generatePreparedImageChatTurn(
   options: ChatTurnOptions = {},
 ): Promise<ChatTurnResult> {
   throwIfAborted(options.signal);
+  resolveGenerationSamplingOptions(options);
   if (image.tokenCount <= 0 || image.hidden.length !== image.tokenCount * session.manifest.embeddingLength) {
     throw new Error(`Prepared image hidden shape mismatch: ${image.hidden.length}`);
   }
@@ -469,6 +484,7 @@ export async function generatePreparedAudioChatTurn(
   options: ChatTurnOptions = {},
 ): Promise<ChatTurnResult> {
   throwIfAborted(options.signal);
+  resolveGenerationSamplingOptions(options);
   if (audio.tokenCount <= 0 || audio.hidden.length !== audio.tokenCount * session.manifest.embeddingLength) {
     throw new Error(`Prepared audio hidden shape mismatch: ${audio.hidden.length}`);
   }
@@ -513,26 +529,24 @@ async function generateAssistantFromState(
       signal: options.signal,
       returnNextToken: true,
       requireGenerationSlot: true,
+      logitsTopK: resolveGenerationSamplingOptions(options).logitsTopK,
     },
   );
-  return generateAssistantFromNextToken(session, tokenizer, state, promptPrefill.nextTokenId, options);
+  return generateAssistantFromNextToken(session, tokenizer, state, promptPrefill, options);
 }
 
 async function generateAssistantFromNextToken(
   session: ModelSession,
   tokenizer: Tokenizer,
   state: InferenceState,
-  nextTokenId: number,
+  firstTokenResult: NextTokenResult,
   options: ChatTurnOptions = {},
 ): Promise<ChatTurnResult> {
-  const stopTokenIds = new Set([
-    tokenizer.eosTokenId,
-    tokenizer.tokenToId("<turn|>"),
-    tokenizer.tokenToId("<eos>"),
-    tokenizer.tokenToId("<|im_end|>"),
-    ...(options.stopTokenIds ?? []),
-  ].filter((id): id is number => typeof id === "number"));
+  const stopTokenIds = buildStopTokenIds(tokenizer, options.stopTokenIds);
+  const sampling = resolveGenerationSamplingOptions(options);
+  const rng = createDeterministicRng(sampling.seed);
   const maxNewTokens = options.maxNewTokens ?? DEFAULT_MAX_NEW_TOKENS;
+  let nextTokenId = sampleNextTokenFromResult(firstTokenResult, sampling, rng);
   let content = "";
   let finishReason: ChatTurnResult["finishReason"] = "length";
 
@@ -550,9 +564,9 @@ async function generateAssistantFromNextToken(
     }
 
     const decodeResult = await decodeToken(session, state, tokenId, {
-      logitsTopK: 1,
+      logitsTopK: sampling.logitsTopK,
     });
-    nextTokenId = decodeResult.nextTokenId;
+    nextTokenId = sampleNextTokenFromResult(decodeResult, sampling, rng);
 
     const token = tokenizer.idToToken(tokenId) ?? "";
     const text = tokenizer.detokenize([tokenId]);
@@ -584,17 +598,14 @@ export async function* generateChatCompletion(
   options: ChatCompletionOptions = {},
 ): AsyncGenerator<ChatCompletionChunk, string> {
   throwIfAborted(options.signal);
+  resolveGenerationSamplingOptions(options);
 
   const prompt = applyChatTemplate(messages);
   const promptTokenIds = tokenizer.tokenize(prompt);
   const state = session.createInferenceState();
-  const stopTokenIds = new Set([
-    tokenizer.eosTokenId,
-    tokenizer.tokenToId("<turn|>"),
-    tokenizer.tokenToId("<eos>"),
-    tokenizer.tokenToId("<|im_end|>"),
-    ...(options.stopTokenIds ?? []),
-  ].filter((id): id is number => typeof id === "number"));
+  const stopTokenIds = buildStopTokenIds(tokenizer, options.stopTokenIds);
+  const sampling = resolveGenerationSamplingOptions(options);
+  const rng = createDeterministicRng(sampling.seed);
   const maxNewTokens = options.maxNewTokens ?? DEFAULT_MAX_NEW_TOKENS;
 
   if (promptTokenIds.length >= state.contextLength) {
@@ -604,9 +615,9 @@ export async function* generateChatCompletion(
   }
 
   const prefillResult = await prefillTokens(session, state, promptTokenIds, {
-    logitsTopK: 1,
+    logitsTopK: sampling.logitsTopK,
   });
-  let nextTokenId = prefillResult.nextTokenId;
+  let nextTokenId = sampleNextTokenFromResult(prefillResult, sampling, rng);
 
   let content = "";
   for (let index = 0; index < maxNewTokens; index += 1) {
@@ -631,12 +642,35 @@ export async function* generateChatCompletion(
     yield chunk;
 
     const decodeResult = await decodeToken(session, state, tokenId, {
-      logitsTopK: 1,
+      logitsTopK: sampling.logitsTopK,
     });
-    nextTokenId = decodeResult.nextTokenId;
+    nextTokenId = sampleNextTokenFromResult(decodeResult, sampling, rng);
   }
 
   return content;
+}
+
+function sampleNextTokenFromResult(
+  result: NextTokenResult,
+  sampling: ReturnType<typeof resolveGenerationSamplingOptions>,
+  rng: () => number,
+): number {
+  return sampleNextToken(
+    result.topTokens ?? [{ id: result.nextTokenId, value: 0 }],
+    sampling,
+    rng,
+  );
+}
+
+function buildStopTokenIds(tokenizer: Tokenizer, extraStopTokenIds: readonly number[] | undefined): Set<number> {
+  return new Set([
+    tokenizer.eosTokenId,
+    tokenizer.tokenToId("<turn|>"),
+    tokenizer.tokenToId("<eos>"),
+    tokenizer.tokenToId("<|im_end|>"),
+    ...DEFAULT_GENERATION_CONFIG.eosTokenIds,
+    ...(extraStopTokenIds ?? []),
+  ].filter((id): id is number => typeof id === "number"));
 }
 
 async function prefillChatText(
@@ -646,7 +680,7 @@ async function prefillChatText(
   text: string,
   options: {
     signal?: AbortSignal;
-    computeLogits?: boolean;
+    logitsTopK?: number;
     returnNextToken: true;
     requireGenerationSlot?: boolean;
   },
@@ -669,7 +703,7 @@ async function prefillChatText(
   text: string,
   options: {
     signal?: AbortSignal;
-    computeLogits?: boolean;
+    logitsTopK?: number;
     returnNextToken?: boolean;
     requireGenerationSlot?: boolean;
   } = {},
@@ -699,8 +733,7 @@ async function prefillChatText(
   if (options.returnNextToken) {
     return prefillTokens(session, state, tokenIds, {
       positions,
-      computeLogits: options.computeLogits,
-      logitsTopK: 1,
+      logitsTopK: options.logitsTopK ?? 1,
     });
   }
   await prefillStateTokens(session, state, tokenIds, { positions });

@@ -5,7 +5,6 @@ import type {
   ForwardTrace,
   InferenceState,
   ModelSession,
-  OutputResult,
 } from "../runtime";
 import type {
   ForwardRunnerNode,
@@ -39,7 +38,6 @@ export type ModelDecodeTokenOptions = {
 export type ModelDecodeTokenResult = {
   hidden: Float32Array;
   state: InferenceState;
-  logits?: Float32Array;
   selectedTokenId?: number;
   topTokens?: Array<{ id: number; value: number }>;
 };
@@ -67,11 +65,6 @@ export type ModelRunner = {
     trace?: ForwardTrace,
   ): Promise<ModelPreparedInput>;
   segmentRunner(options: ModelSegmentRunnerOptions): SegmentRunner | Promise<SegmentRunner>;
-  output(
-    session: ModelSession,
-    hidden: Float32Array,
-    options: { topK: number; trace?: ForwardTrace },
-  ): Promise<OutputResult>;
   decodeToken?(
     session: ModelSession,
     tokenId: number,

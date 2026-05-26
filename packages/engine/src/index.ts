@@ -94,6 +94,17 @@ export {
 } from "./forward";
 
 export {
+  DEFAULT_SAMPLING_SEED,
+  DEFAULT_GENERATION_CONFIG,
+  createDeterministicRng,
+  resolveGenerationSamplingOptions,
+  sampleNextToken,
+  type GenerationSamplingOptions,
+  type ResolvedGenerationSamplingOptions,
+  type TopTokenCandidate,
+} from "./generation";
+
+export {
   applyChatGenerationPrompt,
   applyChatTemplate,
   closeChatModelTurn,

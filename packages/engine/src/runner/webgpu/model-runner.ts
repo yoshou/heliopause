@@ -31,7 +31,6 @@ import {
 } from "./nodes";
 import {
   prepareWebGpuInput,
-  webGpuOutput,
 } from "./model-io";
 
 export function createWebGpuModelRunner(): ModelRunner {
@@ -41,7 +40,6 @@ export function createWebGpuModelRunner(): ModelRunner {
     prepareInput: prepareWebGpuInput,
     preparePreparedHiddenInput: rejectWebGpuPreparedHiddenInput,
     segmentRunner: webGpuModelSegmentRunner,
-    output: webGpuOutput,
     decodeToken: decodeWebGpuToken,
   };
 }

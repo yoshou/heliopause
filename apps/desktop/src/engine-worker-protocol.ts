@@ -96,6 +96,11 @@ export type EngineWorkerRequest =
       image?: WorkerImageInput;
       audio?: WorkerAudioInput;
       maxNewTokens: number;
+      doSample?: boolean;
+      temperature?: number;
+      topP?: number;
+      topK?: number;
+      seed?: number;
       webSearchAvailable: boolean;
     }
   | {
