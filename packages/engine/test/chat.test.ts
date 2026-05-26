@@ -129,6 +129,28 @@ test("chat template can leave a model tool turn open for incremental tool respon
   );
 });
 
+test("chat template serializes consecutive tool responses in one model turn", () => {
+  assert.equal(
+    applyChatTemplate([
+      {
+        role: "tool",
+        tool_call_id: "tool_1_1",
+        name: "sandbox_read_file",
+        content: { ok: true, content: { path: "a.txt" } },
+      },
+      {
+        role: "tool",
+        tool_call_id: "tool_1_2",
+        name: "sandbox_read_file",
+        content: { ok: true, content: { path: "b.txt" } },
+      },
+    ], { addGenerationPrompt: false }),
+    '<|tool_response>response:sandbox_read_file{content:{path:<|"|>a.txt<|"|>},ok:true}<tool_response|>' +
+      '<|tool_response>response:sandbox_read_file{content:{path:<|"|>b.txt<|"|>},ok:true}<tool_response|>' +
+      "<turn|>\n",
+  );
+});
+
 test("tokenizer preserves special chat tokens and detokenizes text", () => {
   const tokenizer = buildTokenizer(tokenizerGguf([
     "H",

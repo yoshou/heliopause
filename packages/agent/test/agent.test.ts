@@ -4,7 +4,7 @@ import test from "node:test";
 import {
   DEFAULT_MAX_TOOL_STEPS,
   generateAgentTurn,
-  parseToolCall,
+  parseToolCalls,
   type AgentChatTurnGenerator,
   type AgentEvent,
   type AgentModelTurnCloser,
@@ -62,8 +62,8 @@ const webFetchTool: AgentToolDefinition = {
   requiresConfirmation: true,
 };
 
-test("parseToolCall returns none for normal assistant text", () => {
-  assert.deepEqual(parseToolCall("Hello there.", [sandboxCommandTool], 1), { type: "none" });
+test("parseToolCalls returns none for normal assistant text", () => {
+  assert.deepEqual(parseToolCalls("Hello there.", [sandboxCommandTool], 1), { type: "none" });
 });
 
 test("generateAgentTurn continues an open model turn for tool responses", async () => {
@@ -104,44 +104,50 @@ test("generateAgentTurn continues an open model turn for tool responses", async 
   ]);
 });
 
-test("parseToolCall accepts a valid tool call and assigns a step id", () => {
+test("parseToolCalls accepts a valid tool call and assigns a step/index id", () => {
   assert.deepEqual(
-    parseToolCall(
+    parseToolCalls(
       '<|tool_call>call:sandbox_command{cmd:<|"|>ls<|"|>,args:[<|"|>/workspace<|"|>]}<tool_call|>',
       [sandboxCommandTool],
       2,
     ),
     {
-      type: "call",
-      call: {
-        id: "tool_2",
-        name: "sandbox_command",
-        arguments: {
-          cmd: "ls",
-          args: ["/workspace"],
+      type: "items",
+      items: [{
+        type: "call",
+        call: {
+          id: "tool_2_1",
+          name: "sandbox_command",
+          arguments: {
+            cmd: "ls",
+            args: ["/workspace"],
+          },
         },
-      },
+      }],
     },
   );
 });
 
-test("parseToolCall accepts web_fetch and validates its schema", () => {
+test("parseToolCalls accepts web_fetch and validates its schema", () => {
   assert.deepEqual(
-    parseToolCall(
+    parseToolCalls(
       '<|tool_call>call:web_fetch{url:<|"|>https://example.com/<|"|>,path:<|"|>/workspace/example.txt<|"|>}<tool_call|>',
       [webFetchTool],
       3,
     ),
     {
-      type: "call",
-      call: {
-        id: "tool_3",
-        name: "web_fetch",
-        arguments: {
-          url: "https://example.com/",
-          path: "/workspace/example.txt",
+      type: "items",
+      items: [{
+        type: "call",
+        call: {
+          id: "tool_3_1",
+          name: "web_fetch",
+          arguments: {
+            url: "https://example.com/",
+            path: "/workspace/example.txt",
+          },
         },
-      },
+      }],
     },
   );
 
@@ -151,12 +157,13 @@ test("parseToolCall accepts web_fetch and validates its schema", () => {
     'call:web_fetch{url:<|"|>https://example.com/<|"|>,path:<|"|>/workspace/example.txt<|"|>,extra:true}',
     'call:web_fetch{url:42,path:<|"|>/workspace/example.txt<|"|>}',
   ]) {
-    const result = parseToolCall(`<|tool_call>${body}<tool_call|>`, [webFetchTool], 1);
-    assert.equal(result.type === "error" ? result.error.code : "", "invalid_tool_arguments");
+    const result = parseToolCalls(`<|tool_call>${body}<tool_call|>`, [webFetchTool], 1);
+    assert.equal(result.type === "items" ? result.items[0]?.type : "", "error");
+    assert.equal(result.type === "items" && result.items[0]?.type === "error" ? result.items[0].error.code : "", "invalid_tool_arguments");
   }
 });
 
-test("parseToolCall accepts tag text inside JSON string values", () => {
+test("parseToolCalls accepts tag text inside native string values", () => {
   const writeFileTool: AgentToolDefinition = {
     name: "sandbox_write_file",
     description: "Write a virtual file.",
@@ -172,35 +179,46 @@ test("parseToolCall accepts tag text inside JSON string values", () => {
   };
 
   assert.deepEqual(
-    parseToolCall(
+    parseToolCalls(
       '<|tool_call>call:sandbox_write_file{path:<|"|>a.txt<|"|>,content:<|"|>literal <tool_call|> text<|"|>}<tool_call|>',
       [writeFileTool],
       1,
     ),
     {
-      type: "call",
-      call: {
-        id: "tool_1",
-        name: "sandbox_write_file",
-        arguments: {
-          path: "a.txt",
-          content: "literal <tool_call|> text",
+      type: "items",
+      items: [{
+        type: "call",
+        call: {
+          id: "tool_1_1",
+          name: "sandbox_write_file",
+          arguments: {
+            path: "a.txt",
+            content: "literal <tool_call|> text",
+          },
         },
-      },
+      }],
     },
   );
 });
 
-test("parseToolCall rejects malformed native calls and unmatched tags", () => {
+test("parseToolCalls returns per-call errors for malformed bodies and batch errors for malformed tags", () => {
+  const malformedBody = parseToolCalls(
+    '<|tool_call>call:sandbox_command{cmd:<|"|>ls<|"|><tool_call|>',
+    [sandboxCommandTool],
+    1,
+  );
+  assert.equal(malformedBody.type === "items" ? malformedBody.items[0]?.type : "", "error");
   assert.equal(
-    parseToolCall('<|tool_call>call:sandbox_command{cmd:<|"|>ls<|"|><tool_call|>', [sandboxCommandTool], 1).type,
-    "error",
+    malformedBody.type === "items" && malformedBody.items[0]?.type === "error"
+      ? malformedBody.items[0].error.code
+      : "",
+    "invalid_tool_call_format",
   );
   assert.deepEqual(
-    parseToolCall("<|tool_call>call:sandbox_command{}", [sandboxCommandTool], 1),
+    parseToolCalls("<|tool_call>call:sandbox_command{}", [sandboxCommandTool], 1),
     {
       type: "error",
-      callId: "tool_1",
+      callId: "tool_1_1",
       error: {
         code: "invalid_tool_call_format",
         message: "Native tool call tags are incomplete or malformed.",
@@ -209,40 +227,85 @@ test("parseToolCall rejects malformed native calls and unmatched tags", () => {
   );
 });
 
-test("parseToolCall rejects multiple complete tool calls", () => {
-  const result = parseToolCall(
+test("parseToolCalls accepts multiple complete tool calls in order", () => {
+  const result = parseToolCalls(
     '<|tool_call>call:sandbox_read_file{path:<|"|>a.txt<|"|>}<tool_call|><|tool_call>call:sandbox_read_file{path:<|"|>b.txt<|"|>}<tool_call|>',
     [readFileTool],
     1,
   );
-  assert.equal(result.type, "error");
-  assert.equal(result.type === "error" ? result.error.code : "", "multiple_tool_calls");
+  assert.equal(result.type, "items");
+  assert.deepEqual(result.type === "items" ? result.items : [], [
+    {
+      type: "call",
+      call: {
+        id: "tool_1_1",
+        name: "sandbox_read_file",
+        arguments: { path: "a.txt" },
+      },
+    },
+    {
+      type: "call",
+      call: {
+        id: "tool_1_2",
+        name: "sandbox_read_file",
+        arguments: { path: "b.txt" },
+      },
+    },
+  ]);
 });
 
-test("parseToolCall rejects unknown tools, missing arguments, and schema mismatches", () => {
-  const unknown = parseToolCall(
+test("parseToolCalls returns per-call errors for unknown tools, missing arguments, and schema mismatches", () => {
+  const unknown = parseToolCalls(
     '<|tool_call>call:missing_tool{}<tool_call|>',
     [sandboxCommandTool],
     1,
   );
-  assert.equal(unknown.type === "error" ? unknown.error.code : "", "unknown_tool");
+  assert.equal(unknown.type === "items" && unknown.items[0]?.type === "error" ? unknown.items[0].error.code : "", "unknown_tool");
 
-  const malformedArguments = parseToolCall(
+  const malformedArguments = parseToolCalls(
     '<|tool_call>call:sandbox_command[]<tool_call|>',
     [sandboxCommandTool],
     1,
   );
-  assert.equal(malformedArguments.type === "error" ? malformedArguments.error.code : "", "invalid_tool_call_format");
+  assert.equal(
+    malformedArguments.type === "items" && malformedArguments.items[0]?.type === "error"
+      ? malformedArguments.items[0].error.code
+      : "",
+    "invalid_tool_call_format",
+  );
 
-  const invalidArguments = parseToolCall(
+  const invalidArguments = parseToolCalls(
     '<|tool_call>call:sandbox_command{cmd:<|"|>rm<|"|>,args:[]}<tool_call|>',
     [sandboxCommandTool],
     1,
   );
-  assert.equal(invalidArguments.type === "error" ? invalidArguments.error.code : "", "invalid_tool_arguments");
+  assert.equal(
+    invalidArguments.type === "items" && invalidArguments.items[0]?.type === "error"
+      ? invalidArguments.items[0].error.code
+      : "",
+    "invalid_tool_arguments",
+  );
 });
 
-test("parseToolCall treats invalid schemas as argument validation failures", () => {
+test("parseToolCalls keeps valid calls when other calls have per-call errors", () => {
+  const result = parseToolCalls(
+    [
+      '<|tool_call>call:sandbox_read_file{path:<|"|>a.txt<|"|>}<tool_call|>',
+      '<|tool_call>call:missing_tool{}<tool_call|>',
+      '<|tool_call>call:sandbox_read_file{path:<|"|>b.txt<|"|>}<tool_call|>',
+    ].join(""),
+    [readFileTool],
+    4,
+  );
+
+  assert.equal(result.type, "items");
+  assert.deepEqual(result.type === "items" ? result.items.map((item) => item.type) : [], ["call", "error", "call"]);
+  assert.equal(result.type === "items" && result.items[0]?.type === "call" ? result.items[0].call.id : "", "tool_4_1");
+  assert.equal(result.type === "items" && result.items[1]?.type === "error" ? result.items[1].callId : "", "tool_4_2");
+  assert.equal(result.type === "items" && result.items[2]?.type === "call" ? result.items[2].call.id : "", "tool_4_3");
+});
+
+test("parseToolCalls treats invalid schemas as argument validation failures", () => {
   const invalidSchemaTool: AgentToolDefinition = {
     name: "sandbox_read_file",
     description: "Read a virtual file.",
@@ -251,16 +314,16 @@ test("parseToolCall treats invalid schemas as argument validation failures", () 
     },
   };
 
-  const result = parseToolCall(
+  const result = parseToolCalls(
     '<|tool_call>call:sandbox_read_file{path:<|"|>a.txt<|"|>}<tool_call|>',
     [invalidSchemaTool],
     1,
   );
 
-  assert.equal(result.type === "error" ? result.error.code : "", "invalid_tool_arguments");
+  assert.equal(result.type === "items" && result.items[0]?.type === "error" ? result.items[0].error.code : "", "invalid_tool_arguments");
 });
 
-test("parseToolCall rejects additional properties when properties are omitted", () => {
+test("parseToolCalls rejects additional properties when properties are omitted", () => {
   const noPropertiesTool: AgentToolDefinition = {
     name: "sandbox_read_file",
     description: "Read a virtual file.",
@@ -270,13 +333,13 @@ test("parseToolCall rejects additional properties when properties are omitted", 
     },
   };
 
-  const result = parseToolCall(
+  const result = parseToolCalls(
     '<|tool_call>call:sandbox_read_file{path:<|"|>a.txt<|"|>}<tool_call|>',
     [noPropertiesTool],
     1,
   );
 
-  assert.equal(result.type === "error" ? result.error.code : "", "invalid_tool_arguments");
+  assert.equal(result.type === "items" && result.items[0]?.type === "error" ? result.items[0].error.code : "", "invalid_tool_arguments");
 });
 
 test("generateAgentTurn returns a normal answer without executing tools", async () => {
@@ -340,10 +403,10 @@ test("generateAgentTurn executes a valid tool call and then emits final text", a
   ]);
   assert.deepEqual(calls[1], [{
     role: "tool",
-    tool_call_id: "tool_1",
+    tool_call_id: "tool_1_1",
     name: "sandbox_command",
     content: {
-      callId: "tool_1",
+      callId: "tool_1_1",
       ok: true,
       content: { kind: "sandbox_command", exitCode: 0, stdout: "notes.md\n", stderr: "", truncated: false },
     },
@@ -352,6 +415,95 @@ test("generateAgentTurn executes a valid tool call and then emits final text", a
     { appendTurnEnd: false, continueModelTurn: false },
     { appendTurnEnd: false, continueModelTurn: false },
   ]);
+});
+
+test("generateAgentTurn executes multiple tool calls sequentially in one step", async () => {
+  const calls: ChatTurnInput[] = [];
+  const events: AgentEvent[] = [];
+  const executedCallIds: string[] = [];
+  const result = await generateAgentTurn(fakeSession, fakeTokenizer, fakeState(), "Read two files.", {
+    tools: [readFileTool],
+    chatTurnGenerator: mockGenerator([
+      [
+        '<|tool_call>call:sandbox_read_file{path:<|"|>a.txt<|"|>}<tool_call|>',
+        '<|tool_call>call:sandbox_read_file{path:<|"|>b.txt<|"|>}<tool_call|>',
+      ].join(""),
+      "Read both files.",
+    ], calls),
+    executeTool: async (call) => {
+      executedCallIds.push(call.id);
+      const args = call.arguments as { path: string };
+      return {
+        callId: call.id,
+        ok: true,
+        content: { kind: "sandbox_read_file", path: args.path, content: args.path.toUpperCase(), truncated: false },
+      };
+    },
+    onAgentEvent: (event) => events.push(event),
+  });
+
+  assert.equal(result.content, "Read both files.");
+  assert.equal(result.steps, 1);
+  assert.deepEqual(executedCallIds, ["tool_1_1", "tool_1_2"]);
+  assert.deepEqual(events.map((event) => event.type), ["toolCall", "toolResult", "toolCall", "toolResult", "text", "done"]);
+  assert.deepEqual(calls[1], [
+    {
+      role: "tool",
+      tool_call_id: "tool_1_1",
+      name: "sandbox_read_file",
+      content: {
+        callId: "tool_1_1",
+        ok: true,
+        content: { kind: "sandbox_read_file", path: "a.txt", content: "A.TXT", truncated: false },
+      },
+    },
+    {
+      role: "tool",
+      tool_call_id: "tool_1_2",
+      name: "sandbox_read_file",
+      content: {
+        callId: "tool_1_2",
+        ok: true,
+        content: { kind: "sandbox_read_file", path: "b.txt", content: "B.TXT", truncated: false },
+      },
+    },
+  ]);
+});
+
+test("generateAgentTurn continues executing remaining calls after a per-call failure", async () => {
+  const calls: ChatTurnInput[] = [];
+  const events: AgentEvent[] = [];
+  const executedCallIds: string[] = [];
+  const result = await generateAgentTurn(fakeSession, fakeTokenizer, fakeState(), "Use mixed tools.", {
+    tools: [readFileTool],
+    chatTurnGenerator: mockGenerator([
+      [
+        '<|tool_call>call:sandbox_read_file{path:<|"|>a.txt<|"|>}<tool_call|>',
+        "<|tool_call>call:missing_tool{}<tool_call|>",
+        '<|tool_call>call:sandbox_read_file{path:<|"|>b.txt<|"|>}<tool_call|>',
+      ].join(""),
+      "Recovered with partial results.",
+    ], calls),
+    executeTool: async (call) => {
+      executedCallIds.push(call.id);
+      return { callId: call.id, ok: true, content: { ok: true } };
+    },
+    onAgentEvent: (event) => events.push(event),
+  });
+
+  assert.equal(result.content, "Recovered with partial results.");
+  assert.deepEqual(executedCallIds, ["tool_1_1", "tool_1_3"]);
+  assert.deepEqual(events.map((event) => event.type), [
+    "toolCall",
+    "toolResult",
+    "stepError",
+    "toolCall",
+    "toolResult",
+    "text",
+    "done",
+  ]);
+  assert.match(JSON.stringify(calls[1]), /tool_1_2/);
+  assert.match(JSON.stringify(calls[1]), /unknown_tool/);
 });
 
 test("generateAgentTurn returns parser errors as tool responses without toolResult events", async () => {
@@ -394,7 +546,7 @@ test("generateAgentTurn normalizes executor throws into tool results", async () 
   assert.equal(result.content, "Recovered after failure.");
   const toolResult = events.find((event): event is Extract<AgentEvent, { type: "toolResult" }> => event.type === "toolResult");
   assert.deepEqual(toolResult?.result, {
-    callId: "tool_1",
+    callId: "tool_1_1",
     ok: false,
     error: {
       code: "custom_failure",
@@ -433,6 +585,36 @@ test("generateAgentTurn stops executing tools after maxToolSteps and hides final
   assert.deepEqual(events.map((event) => event.type), ["toolCall", "toolResult", "text", "done"]);
   const doneEvent = events.at(-1);
   assert.equal(doneEvent?.type === "done" ? doneEvent.finishReason : "", "maxToolSteps");
+});
+
+test("generateAgentTurn executes an entire multiple-call batch before maxToolSteps final fallback", async () => {
+  const events: AgentEvent[] = [];
+  const tokenTexts: string[] = [];
+  let executeCount = 0;
+  const result = await generateAgentTurn(fakeSession, fakeTokenizer, fakeState(), "Read multiple files.", {
+    tools: [readFileTool],
+    maxToolSteps: 1,
+    chatTurnGenerator: mockGenerator([
+      [
+        '<|tool_call>call:sandbox_read_file{path:<|"|>a.txt<|"|>}<tool_call|>',
+        '<|tool_call>call:sandbox_read_file{path:<|"|>b.txt<|"|>}<tool_call|>',
+      ].join(""),
+      '<|tool_call>call:sandbox_read_file{path:<|"|>c.txt<|"|>}<tool_call|>',
+    ]),
+    executeTool: async (call): Promise<AgentToolResult> => {
+      executeCount += 1;
+      return { callId: call.id, ok: true, content: { ok: true } };
+    },
+    onAgentEvent: (event) => events.push(event),
+    onToken: (chunk) => tokenTexts.push(chunk.text),
+  });
+
+  assert.equal(executeCount, 2);
+  assert.equal(result.finishReason, "maxToolSteps");
+  assert.equal(result.steps, 1);
+  assert.equal(result.content.includes("<|tool_call>"), false);
+  assert.deepEqual(tokenTexts, [result.content]);
+  assert.deepEqual(events.map((event) => event.type), ["toolCall", "toolResult", "toolCall", "toolResult", "text", "done"]);
 });
 
 test("generateAgentTurn propagates the same AbortSignal to generation and executor", async () => {

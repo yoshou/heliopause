@@ -114,62 +114,60 @@ export type AgentTurnResult = {
 
 export type AgentToolParseResult =
   | { type: "none" }
-  | { type: "call"; call: AgentToolCall }
+  | { type: "items"; items: readonly AgentToolParseItem[] }
   | { type: "error"; callId: string; error: AgentToolError };
+
+export type AgentToolParseItem =
+  | { type: "call"; call: AgentToolCall }
+  | { type: "error"; callId: string; toolName: AgentToolName | "unknown"; error: AgentToolError };
 
 type JsonObject = Record<string, unknown>;
 
-export function parseToolCall(
+export function parseToolCalls(
   content: string,
   tools: readonly AgentToolDefinition[],
   step: number,
 ): AgentToolParseResult {
-  const callId = toolCallIdForStep(step);
-  const extraction = extractNativeToolCall(content);
+  const extraction = extractNativeToolCalls(content);
 
   if (extraction.type === "none") {
     return { type: "none" };
   }
 
-  if (extraction.type === "multiple") {
-    return {
-      type: "error",
-      callId,
-      error: {
-        code: "multiple_tool_calls",
-        message: "Only one tool call is allowed per assistant output.",
-      },
-    };
-  }
-
   if (extraction.type === "malformed") {
+    const callId = toolCallIdForStepIndex(step, 1);
     return invalidToolCallFormat(callId, "Native tool call tags are incomplete or malformed.");
   }
 
-  let parsed: NativeToolCall;
-  try {
-    parsed = parseNativeToolCallBody(extraction.body);
-  } catch {
-    return invalidToolCallFormat(callId, "Native tool call body could not be parsed.");
-  }
+  const items = extraction.bodies.map((body, index): AgentToolParseItem => {
+    const callId = toolCallIdForStepIndex(step, index + 1);
+    let parsed: NativeToolCall;
+    try {
+      parsed = parseNativeToolCallBody(body);
+    } catch {
+      return invalidToolCallFormatItem(callId, "Native tool call body could not be parsed.");
+    }
 
-  const tool = tools.find((candidate) => candidate.name === parsed.name);
-  if (!tool || !isAgentToolName(parsed.name)) {
-    return unknownTool(callId, `Unknown tool: ${parsed.name}`);
-  }
+    const tool = tools.find((candidate) => candidate.name === parsed.name);
+    if (!tool || !isAgentToolName(parsed.name)) {
+      return unknownToolItem(callId, `Unknown tool: ${parsed.name}`);
+    }
 
-  if (!validateJsonSchema(parsed.arguments, tool.parametersJsonSchema)) {
-    return invalidToolArguments(callId, `Arguments for ${tool.name} do not match the tool schema.`);
-  }
+    if (!validateJsonSchema(parsed.arguments, tool.parametersJsonSchema)) {
+      return invalidToolArgumentsItem(callId, tool.name, `Arguments for ${tool.name} do not match the tool schema.`);
+    }
 
-  return {
-    type: "call",
-    call: {
-      id: callId,
-      name: tool.name,
-      arguments: parsed.arguments,
-    },
-  };
+    return {
+      type: "call",
+      call: {
+        id: callId,
+        name: tool.name,
+        arguments: parsed.arguments,
+      },
+    };
+  });
+
+  return { type: "items", items };
 }
 
 export async function generateAgentTurn(
@@ -223,7 +221,7 @@ export async function generateAgentTurn(
     if (!finalOnly) {
       modelTurnOpen = generatedModelTurnOpen;
     }
-    const parseResult = parseToolCall(generation.content, options.tools, step);
+    const parseResult = parseToolCalls(generation.content, options.tools, step);
 
     if (parseResult.type === "none") {
       let closedCommittedFinalTurn = false;
@@ -267,20 +265,17 @@ export async function generateAgentTurn(
 
     toolSteps += 1;
 
-    const toolCall = parseResult.type === "call" ? parseResult.call : undefined;
-    const toolResult = parseResult.type === "call"
-      ? await executeParsedTool(parseResult.call, step, options)
-      : toolStepErrorResult(parseResult, step, options);
+    const toolResponses = await executeParsedToolItems(parseResult, step, options);
 
-    const toolResponseTurn = buildToolResponseTurn(toolResult, toolCall?.name ?? "unknown");
+    const toolResponseTurn = toolResponses.map(({ result, toolName }) => buildToolResponseTurn(result, toolName));
     if (toolSteps >= maxToolSteps) {
       finalOnly = true;
       nextTurn = [
-        toolResponseTurn,
+        ...toolResponseTurn,
         { role: "user", content: MAX_TOOL_STEPS_FINAL_PROMPT },
       ];
     } else {
-      nextTurn = [toolResponseTurn];
+      nextTurn = toolResponseTurn;
     }
   }
 }
@@ -311,8 +306,37 @@ async function executeParsedTool(
   return result;
 }
 
+async function executeParsedToolItems(
+  parseResult: Exclude<AgentToolParseResult, { type: "none" }>,
+  step: number,
+  options: AgentTurnOptions,
+): Promise<Array<{ result: AgentToolResult; toolName: AgentToolName | "unknown" }>> {
+  if (parseResult.type === "error") {
+    return [{
+      result: toolStepErrorResult(parseResult, step, options),
+      toolName: "unknown",
+    }];
+  }
+
+  const responses: Array<{ result: AgentToolResult; toolName: AgentToolName | "unknown" }> = [];
+  for (const item of parseResult.items) {
+    if (item.type === "call") {
+      responses.push({
+        result: await executeParsedTool(item.call, step, options),
+        toolName: item.call.name,
+      });
+    } else {
+      responses.push({
+        result: toolStepErrorResult(item, step, options),
+        toolName: item.toolName,
+      });
+    }
+  }
+  return responses;
+}
+
 function toolStepErrorResult(
-  parseResult: Extract<AgentToolParseResult, { type: "error" }>,
+  parseResult: Extract<AgentToolParseResult | AgentToolParseItem, { type: "error" }>,
   step: number,
   options: AgentTurnOptions,
 ): AgentToolResult {
@@ -589,10 +613,23 @@ function invalidToolCallFormat(callId: string, message: string): AgentToolParseR
   };
 }
 
-function unknownTool(callId: string, message: string): AgentToolParseResult {
+function invalidToolCallFormatItem(callId: string, message: string): AgentToolParseItem {
   return {
     type: "error",
     callId,
+    toolName: "unknown",
+    error: {
+      code: "invalid_tool_call_format",
+      message,
+    },
+  };
+}
+
+function unknownToolItem(callId: string, message: string): AgentToolParseItem {
+  return {
+    type: "error",
+    callId,
+    toolName: "unknown",
     error: {
       code: "unknown_tool",
       message,
@@ -600,10 +637,15 @@ function unknownTool(callId: string, message: string): AgentToolParseResult {
   };
 }
 
-function invalidToolArguments(callId: string, message: string): AgentToolParseResult {
+function invalidToolArgumentsItem(
+  callId: string,
+  toolName: AgentToolName,
+  message: string,
+): AgentToolParseItem {
   return {
     type: "error",
     callId,
+    toolName,
     error: {
       code: "invalid_tool_arguments",
       message,
@@ -615,8 +657,8 @@ function isAgentToolName(value: string): value is AgentToolName {
   return (AGENT_TOOL_NAMES as readonly string[]).includes(value);
 }
 
-function toolCallIdForStep(step: number): string {
-  return `tool_${step}`;
+function toolCallIdForStepIndex(step: number, index: number): string {
+  return `tool_${step}_${index}`;
 }
 
 function isPlainObject(value: unknown): value is JsonObject {
@@ -629,8 +671,7 @@ function isNonNegativeInteger(value: unknown): value is number {
 
 type ToolCallExtraction =
   | { type: "none" }
-  | { type: "single"; body: string }
-  | { type: "multiple" }
+  | { type: "calls"; bodies: readonly string[] }
   | { type: "malformed" };
 
 type NativeToolCall = {
@@ -638,37 +679,39 @@ type NativeToolCall = {
   arguments: JsonObject;
 };
 
-function extractNativeToolCall(content: string): ToolCallExtraction {
-  const firstOpen = content.indexOf(TOOL_CALL_OPEN_TAG);
-  const firstClose = content.indexOf(TOOL_CALL_CLOSE_TAG);
+function extractNativeToolCalls(content: string): ToolCallExtraction {
+  const bodies: string[] = [];
+  let searchStart = 0;
 
-  if (firstOpen < 0) {
-    return firstClose < 0 ? { type: "none" } : { type: "malformed" };
-  }
-  if (firstClose >= 0 && firstClose < firstOpen) {
-    return { type: "malformed" };
+  while (searchStart < content.length) {
+    const openIndex = findNativeTagOutsideString(content, TOOL_CALL_OPEN_TAG, searchStart);
+    const closeIndex = findNativeTagOutsideString(content, TOOL_CALL_CLOSE_TAG, searchStart);
+
+    if (openIndex < 0) {
+      if (closeIndex >= 0) {
+        return { type: "malformed" };
+      }
+      return extractedToolCallBodies(bodies);
+    }
+    if (closeIndex >= 0 && closeIndex < openIndex) {
+      return { type: "malformed" };
+    }
+
+    const bodyStart = openIndex + TOOL_CALL_OPEN_TAG.length;
+    const bodyCloseIndex = findNativeTagOutsideString(content, TOOL_CALL_CLOSE_TAG, bodyStart);
+    if (bodyCloseIndex < 0) {
+      return { type: "malformed" };
+    }
+
+    bodies.push(content.slice(bodyStart, bodyCloseIndex));
+    searchStart = bodyCloseIndex + TOOL_CALL_CLOSE_TAG.length;
   }
 
-  const bodyStart = firstOpen + TOOL_CALL_OPEN_TAG.length;
-  const closeIndex = findNativeTagOutsideString(content, TOOL_CALL_CLOSE_TAG, bodyStart);
-  if (closeIndex < 0) {
-    return { type: "malformed" };
-  }
+  return extractedToolCallBodies(bodies);
+}
 
-  const afterClose = closeIndex + TOOL_CALL_CLOSE_TAG.length;
-  const nextOpen = content.indexOf(TOOL_CALL_OPEN_TAG, afterClose);
-  if (nextOpen >= 0) {
-    const nextClose = findNativeTagOutsideString(content, TOOL_CALL_CLOSE_TAG, nextOpen + TOOL_CALL_OPEN_TAG.length);
-    return nextClose >= 0 ? { type: "multiple" } : { type: "malformed" };
-  }
-  if (content.indexOf(TOOL_CALL_CLOSE_TAG, afterClose) >= 0) {
-    return { type: "malformed" };
-  }
-
-  return {
-    type: "single",
-    body: content.slice(bodyStart, closeIndex),
-  };
+function extractedToolCallBodies(bodies: readonly string[]): ToolCallExtraction {
+  return bodies.length > 0 ? { type: "calls", bodies } : { type: "none" };
 }
 
 function parseNativeToolCallBody(body: string): NativeToolCall {
