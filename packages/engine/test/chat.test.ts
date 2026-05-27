@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  applyChatGenerationPrompt,
   applyChatTemplate,
   buildTokenizer,
   createFileGgufTensorReader,
@@ -44,14 +45,31 @@ test("chat template formats history and disables thinking by default", () => {
   );
 });
 
-test("chat template can leave thinking enabled", () => {
+test("chat template enables thinking through the first system turn", () => {
+  assert.equal(
+    applyChatTemplate([
+      { role: "system", content: "Be concise." },
+      { role: "user", content: "Hello" },
+    ], { enableThinking: true }),
+    "<|turn>system\n<|think|>\nBe concise.<turn|>\n" +
+      "<|turn>user\nHello<turn|>\n" +
+      "<|turn>model\n",
+  );
+});
+
+test("chat template creates a thinking system turn when none exists", () => {
   assert.equal(
     applyChatTemplate([
       { role: "user", content: "Hello" },
     ], { enableThinking: true }),
+    "<|turn>system\n<|think|><turn|>\n" +
     "<|turn>user\nHello<turn|>\n" +
-      "<|think|>\n<|turn>model\n",
+      "<|turn>model\n",
   );
+});
+
+test("chat generation prompt does not carry the thinking trigger", () => {
+  assert.equal(applyChatGenerationPrompt({ enableThinking: true }), "<|turn>model\n");
 });
 
 test("chat template serializes Gemma 4 native tool declarations", () => {
@@ -461,10 +479,10 @@ test("file GGUF tensor reader fully parses tokenizer arrays", async () => {
   });
 });
 
-test("stripThinking hides complete and partial thinking blocks", () => {
-  assert.equal(stripThinking("<think>\nsecret\n</think>\n\nVisible"), "\n\nVisible");
-  assert.equal(stripThinking("<think>\nsecret"), "");
-  assert.equal(stripThinking("Visible\n\n</think>\n<|im_end|>"), "Visible\n\n\n");
+test("stripThinking hides complete and partial official thought channels only", () => {
+  assert.equal(stripThinking("<|channel>thought\nsecret<channel|>\n\nVisible"), "\n\nVisible");
+  assert.equal(stripThinking("<|channel>thought\nsecret"), "");
+  assert.equal(stripThinking("<think>\nsecret\n</think>\n\nVisible"), "<think>\nsecret\n</think>\n\nVisible");
   assert.equal(stripThinking("Visible<turn|>\nignored"), "Visible");
 });
 

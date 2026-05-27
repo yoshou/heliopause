@@ -3,7 +3,6 @@ import {
   closeChatModelTurn,
   generateChatTurn,
   type ChatMessage,
-  type ChatCompletionChunk,
   type ChatToolDeclaration,
   type ChatTurnInput,
   type ChatTurnOptions,
@@ -18,11 +17,14 @@ export const TOOL_CALL_CLOSE_TAG = "<tool_call|>";
 export const TOOL_RESPONSE_OPEN_TAG = "<|tool_response>";
 export const TOOL_RESPONSE_CLOSE_TAG = "<tool_response|>";
 export const DEFAULT_MAX_TOOL_STEPS = 3;
+export const DEFAULT_MAX_THINKING_CHARS = 8000;
 
 const MAX_TOOL_STEPS_FINAL_PROMPT =
   "You have reached the maximum number of tool steps. Answer the user using only the tool responses already provided. Do not call another tool.";
 const MAX_TOOL_STEPS_FINAL_MESSAGE =
   "I reached the maximum number of tool steps and cannot call another tool. I do not have enough final text to show beyond the tool results already gathered.";
+const THOUGHT_CHANNEL_OPEN = "<|channel>thought\n";
+const THOUGHT_CHANNEL_CLOSE = "<channel|>";
 
 const AGENT_TOOL_NAMES = [
   "sandbox_list_files",
@@ -68,6 +70,7 @@ export type AgentToolResult =
 
 export type AgentEvent =
   | { type: "text"; step: number; content: string }
+  | { type: "thinking"; step: number; content: string; truncated?: boolean }
   | { type: "toolCall"; step: number; call: AgentToolCall }
   | { type: "toolResult"; step: number; result: AgentToolResult }
   | { type: "stepError"; step: number; callId: string; error: AgentToolError }
@@ -99,6 +102,7 @@ export type AgentTurnOptions = ChatTurnOptions & {
   tools: readonly AgentToolDefinition[];
   executeTool: AgentToolExecutor;
   maxToolSteps?: number;
+  maxThinkingChars?: number;
   onAgentEvent?: (event: AgentEvent) => void;
   chatTurnGenerator?: AgentChatTurnGenerator;
   closeModelTurn?: AgentModelTurnCloser;
@@ -180,6 +184,8 @@ export async function generateAgentTurn(
   throwIfAborted(options.signal);
 
   const maxToolSteps = normalizeMaxToolSteps(options.maxToolSteps);
+  const maxThinkingChars = normalizeMaxThinkingChars(options.maxThinkingChars);
+  const enableThinking = options.enableThinking ?? true;
   const originalOnToken = options.onToken;
   const chatTurnGenerator = options.chatTurnGenerator ?? generateChatTurn;
   const {
@@ -187,6 +193,7 @@ export async function generateAgentTurn(
     tools: _tools,
     executeTool: _executeTool,
     maxToolSteps: _maxToolSteps,
+    maxThinkingChars: _maxThinkingChars,
     onAgentEvent: _onAgentEvent,
     closeModelTurn: _closeModelTurn,
     cloneState: _cloneState,
@@ -203,7 +210,6 @@ export async function generateAgentTurn(
     throwIfAborted(options.signal);
 
     const step = toolSteps + 1;
-    const chunks: ChatCompletionChunk[] = [];
     const committedModelTurnOpen = modelTurnOpen;
     const stateBeforeFinalGeneration = finalOnly && stateCloner ? stateCloner(state) : undefined;
     const generationState = finalOnly && stateCloner ? stateCloner(state) : state;
@@ -211,17 +217,18 @@ export async function generateAgentTurn(
     const generation = await chatTurnGenerator(session, tokenizer, generationState, nextTurn, {
       ...chatOptions,
       doSample: chatOptions.doSample ?? false,
+      enableThinking,
       appendTurnEnd: false,
       continueModelTurn,
-      onToken: (chunk: ChatCompletionChunk) => {
-        chunks.push(chunk);
-      },
+      onToken: () => {},
     });
     const generatedModelTurnOpen = generation.modelTurnClosed === false;
     if (!finalOnly) {
       modelTurnOpen = generatedModelTurnOpen;
     }
-    const parseResult = parseToolCalls(generation.content, options.tools, step);
+    const separatedContent = separateThinking(generation.content);
+    emitThinking(separatedContent.thinking, step, maxThinkingChars, enableThinking, options.onAgentEvent);
+    const parseResult = parseToolCalls(separatedContent.visibleContent, options.tools, step);
 
     if (parseResult.type === "none") {
       let closedCommittedFinalTurn = false;
@@ -234,11 +241,11 @@ export async function generateAgentTurn(
         await modelTurnCloser(session, tokenizer, generation.state, { signal: options.signal });
         modelTurnOpen = false;
       }
-      replayVisibleText(chunks, step, originalOnToken, options.onAgentEvent);
+      emitVisibleText(separatedContent.visibleContent, step, originalOnToken, options.onAgentEvent);
       const finishReason = finalOnly ? "maxToolSteps" : generation.finishReason;
       options.onAgentEvent?.({ type: "done", steps: toolSteps, finishReason });
       return {
-        content: generation.content,
+        content: separatedContent.visibleContent,
         finishReason,
         steps: toolSteps,
         state: generation.state,
@@ -282,6 +289,61 @@ export async function generateAgentTurn(
 
 function isOnlyToolResponseTurn(turn: ChatTurnInput): boolean {
   return Array.isArray(turn) && turn.length > 0 && turn.every((message) => message.role === "tool");
+}
+
+function separateThinking(content: string): { visibleContent: string; thinking: string[] } {
+  const thinking: string[] = [];
+  let visibleContent = "";
+  let cursor = 0;
+
+  while (cursor < content.length) {
+    const start = content.indexOf(THOUGHT_CHANNEL_OPEN, cursor);
+    if (start < 0) {
+      visibleContent += content.slice(cursor);
+      break;
+    }
+
+    visibleContent += content.slice(cursor, start);
+    const thoughtStart = start + THOUGHT_CHANNEL_OPEN.length;
+    const end = content.indexOf(THOUGHT_CHANNEL_CLOSE, thoughtStart);
+    if (end < 0) {
+      thinking.push(content.slice(thoughtStart));
+      break;
+    }
+
+    thinking.push(content.slice(thoughtStart, end));
+    cursor = end + THOUGHT_CHANNEL_CLOSE.length;
+  }
+
+  return { visibleContent, thinking };
+}
+
+function emitThinking(
+  thinking: readonly string[],
+  step: number,
+  maxThinkingChars: number,
+  enabled: boolean,
+  onAgentEvent: AgentTurnOptions["onAgentEvent"],
+): void {
+  if (!enabled) {
+    return;
+  }
+  for (const content of thinking) {
+    const trimmed = content.trim();
+    if (trimmed.length === 0) {
+      continue;
+    }
+    if (trimmed.length > maxThinkingChars) {
+      onAgentEvent?.({
+        type: "thinking",
+        step,
+        content: trimmed.slice(0, maxThinkingChars),
+        truncated: true,
+      });
+      continue;
+    }
+    onAgentEvent?.({ type: "thinking", step, content: trimmed });
+  }
 }
 
 async function executeParsedTool(
@@ -353,24 +415,15 @@ function toolStepErrorResult(
   };
 }
 
-function replayVisibleText(
-  chunks: readonly ChatCompletionChunk[],
-  step: number,
-  onToken: ChatTurnOptions["onToken"],
-  onAgentEvent: AgentTurnOptions["onAgentEvent"],
-): void {
-  for (const chunk of chunks) {
-    onAgentEvent?.({ type: "text", step, content: chunk.text });
-    onToken?.(chunk);
-  }
-}
-
 function emitVisibleText(
   content: string,
   step: number,
   onToken: ChatTurnOptions["onToken"],
   onAgentEvent: AgentTurnOptions["onAgentEvent"],
 ): void {
+  if (content.length === 0) {
+    return;
+  }
   onAgentEvent?.({ type: "text", step, content });
   onToken?.({
     tokenId: -1,
@@ -443,6 +496,13 @@ function normalizeMaxToolSteps(value: number | undefined): number {
   }
   if (!Number.isFinite(value)) {
     return DEFAULT_MAX_TOOL_STEPS;
+  }
+  return Math.max(0, Math.floor(value));
+}
+
+function normalizeMaxThinkingChars(value: number | undefined): number {
+  if (value === undefined || !Number.isFinite(value)) {
+    return DEFAULT_MAX_THINKING_CHARS;
   }
   return Math.max(0, Math.floor(value));
 }

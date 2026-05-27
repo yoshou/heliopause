@@ -289,6 +289,78 @@ textarea:disabled {
   line-height: 1.4;
 }
 
+.thinking-panels {
+  display: grid;
+  gap: 6px;
+  margin-top: 10px;
+}
+
+.thinking-panel {
+  border-top: 1px solid #e3e8e3;
+  color: #58645d;
+  font-size: 0.78rem;
+}
+
+.thinking-panel summary {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 8px;
+  min-height: 30px;
+  padding: 5px 0 4px;
+  list-style: none;
+  cursor: pointer;
+}
+
+.thinking-panel summary::-webkit-details-marker {
+  display: none;
+}
+
+.thinking-panel summary span {
+  min-width: 0;
+  overflow: hidden;
+  color: #3f4b44;
+  font-weight: 780;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.thinking-panel summary small {
+  color: #66736b;
+  font-size: 0.74rem;
+  font-weight: 800;
+}
+
+.thinking-panel pre {
+  max-height: 280px;
+  margin: 0 0 6px;
+  padding: 8px 10px;
+  overflow: auto;
+  border-radius: 6px;
+  color: #2d3731;
+  background: #f4f7f4;
+  font-size: 0.76rem;
+  line-height: 1.45;
+  white-space: pre-wrap;
+}
+
+.thinking-details-icon {
+  color: #7b867e;
+  transition: transform 120ms ease;
+}
+
+.thinking-panel[open] > summary .thinking-details-icon {
+  transform: rotate(90deg);
+}
+
+.thinking-truncated {
+  display: block;
+  margin-bottom: 7px;
+  color: #8f4437;
+  font-size: 0.73rem;
+  font-weight: 800;
+}
+
 .tool-indicators {
   display: grid;
   gap: 6px;
@@ -907,6 +979,12 @@ textarea:disabled {
 .icon-button:disabled {
   cursor: not-allowed;
   opacity: 0.45;
+}
+
+.thinking-toggle--active {
+  border-color: #8ca79c;
+  color: #1f3a31;
+  background: #e8f3ef;
 }
 
 .icon-button--primary {

@@ -1,4 +1,5 @@
 import {
+  DEFAULT_MAX_THINKING_CHARS,
   DEFAULT_MAX_TOOL_STEPS,
   generateAgentTurn,
   type AgentToolCall,
@@ -317,6 +318,8 @@ async function handleGenerateTurn(
           tools,
           executeTool,
           maxToolSteps: DEFAULT_MAX_TOOL_STEPS,
+          maxThinkingChars: DEFAULT_MAX_THINKING_CHARS,
+          enableThinking: request.enableThinking,
           cloneState: session.hasProvider("webgpu") ? false : cloneInferenceState,
           onAgentEvent(event) {
             if (event.type === "text") {
@@ -379,6 +382,8 @@ async function handleGenerateTurn(
           tools,
           executeTool,
           maxToolSteps: DEFAULT_MAX_TOOL_STEPS,
+          maxThinkingChars: DEFAULT_MAX_THINKING_CHARS,
+          enableThinking: request.enableThinking,
           cloneState: session.hasProvider("webgpu") ? false : cloneInferenceState,
           onAgentEvent(event) {
             if (event.type === "text") {

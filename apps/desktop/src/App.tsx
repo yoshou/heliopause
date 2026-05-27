@@ -1,5 +1,5 @@
 import { ChangeEvent, ClipboardEvent, DragEvent, FormEvent, KeyboardEvent, PointerEvent, RefObject, useEffect, useMemo, useRef, useState } from "react";
-import { ChevronRight, FileArchive, Image, KeyRound, Mic, Plus, SendHorizontal, Square, X } from "lucide-react";
+import { ChevronRight, FileArchive, Image, KeyRound, Lightbulb, Mic, Plus, SendHorizontal, Square, X } from "lucide-react";
 import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import {
@@ -61,6 +61,13 @@ type ToolCardView = {
   call?: Extract<WorkerAgentEvent, { type: "toolCall" }>["call"];
   result?: Extract<WorkerAgentEvent, { type: "toolResult" }>["result"];
   stepError?: Extract<WorkerAgentEvent, { type: "stepError" }>["error"];
+};
+
+type ThinkingView = {
+  id: string;
+  step: number;
+  content: string;
+  truncated: boolean;
 };
 
 type SandboxListFilesContent = {
@@ -218,6 +225,7 @@ function App() {
   const [tavilyError, setTavilyError] = useState<string | undefined>();
   const [pendingWebSearch, setPendingWebSearch] = useState<PendingWebSearchConfirmation | undefined>();
   const [pendingWebFetch, setPendingWebFetch] = useState<PendingWebFetchConfirmation | undefined>();
+  const [isThinkingEnabled, setIsThinkingEnabled] = useState(true);
   const [messages, setMessages] = useState<UiMessage[]>(() => [
     createAssistantMessage(INITIAL_ASSISTANT_CONTENT),
   ]);
@@ -278,6 +286,8 @@ function App() {
   const canAddAttachment = model.status === "ready"
     ? model.supportsImages && !isGenerating
     : model.status !== "loading" && !isGenerating;
+  const thinkingToggleLabel = isThinkingEnabled ? "Thinking on" : "Thinking off";
+  const canToggleThinking = model.status === "ready" && !isGenerating && !isGgufComposerActive;
 
   useEffect(() => {
     imageAttachmentRef.current = imageAttachment;
@@ -504,6 +514,7 @@ function App() {
         undefined,
         CHAT_MAX_NEW_TOKENS,
         isTauriRuntime,
+        isThinkingEnabled,
       );
     } catch (error) {
       setGenerationError(error instanceof Error ? error.message : String(error));
@@ -1019,6 +1030,7 @@ function App() {
         audio,
         CHAT_MAX_NEW_TOKENS,
         isTauriRuntime,
+        isThinkingEnabled,
       );
     } catch (error) {
       setGenerationError(error instanceof Error ? error.message : String(error));
@@ -1105,6 +1117,7 @@ function App() {
     audio: UiAudioAttachment | undefined,
     maxNewTokens: number,
     webSearchAvailable: boolean,
+    enableThinking: boolean,
   ): Promise<void> {
     const requestId = nextRequestIdRef.current;
     nextRequestIdRef.current += 1;
@@ -1142,6 +1155,7 @@ function App() {
           : undefined,
         maxNewTokens,
         webSearchAvailable,
+        enableThinking,
       } satisfies EngineWorkerRequest);
     });
   }
@@ -1459,6 +1473,19 @@ function App() {
                   ) : null}
                 </div>
               ) : null}
+              {!isGgufComposerActive ? (
+                <button
+                  type="button"
+                  className={`icon-button thinking-toggle${isThinkingEnabled ? " thinking-toggle--active" : ""}`}
+                  aria-label={thinkingToggleLabel}
+                  aria-pressed={isThinkingEnabled}
+                  title={thinkingToggleLabel}
+                  onClick={() => setIsThinkingEnabled((current) => !current)}
+                  disabled={!canToggleThinking}
+                >
+                  <Lightbulb aria-hidden="true" size={19} />
+                </button>
+              ) : null}
             </div>
             <p>{composerStatusLabel(model, prompt, ggufFiles.length)}</p>
             <div className="submit-actions">
@@ -1519,9 +1546,16 @@ function MessageBubble(
   const toolCards = message.role === "assistant"
     ? buildToolCardViews(message.agentEvents ?? [])
     : [];
+  const thinking = message.role === "assistant"
+    ? buildThinkingViews(message.agentEvents ?? [])
+    : [];
   const visibleContent = stripAgentArtifacts(stripThinking(message.content)).trim();
   const textContent = message.files && message.files.length > 0 ? "" : visibleContent;
-  const placeholder = message.role === "assistant" && isGenerating && textContent.length === 0
+  const placeholder = message.role === "assistant" &&
+      isGenerating &&
+      textContent.length === 0 &&
+      thinking.length === 0 &&
+      toolCards.length === 0
     ? "Generating..."
     : "";
   return (
@@ -1549,6 +1583,7 @@ function MessageBubble(
           <p className="message-text">{textContent}</p>
         )
       ) : null}
+      {thinking.length > 0 ? <ThinkingPanel thinking={thinking} /> : null}
       {toolCards.length > 0 ? <ToolIndicators tools={toolCards} /> : null}
       {placeholder ? (
         <p className="message-text">{placeholder}</p>
@@ -1559,6 +1594,27 @@ function MessageBubble(
         </footer>
       ) : null}
     </article>
+  );
+}
+
+function ThinkingPanel({ thinking }: { thinking: ThinkingView[] }) {
+  return (
+    <div className="thinking-panels" aria-label="Thinking">
+      {thinking.map((item) => (
+        <details className="thinking-panel" key={item.id}>
+          <summary>
+            <Lightbulb aria-hidden="true" size={15} />
+            <span>Thinking</span>
+            <small>Step {item.step}</small>
+            <ChevronRight className="thinking-details-icon" aria-hidden="true" size={15} />
+          </summary>
+          <pre>{item.content}</pre>
+          {item.truncated ? (
+            <small className="thinking-truncated">Thinking truncated</small>
+          ) : null}
+        </details>
+      ))}
+    </div>
   );
 }
 
@@ -1788,6 +1844,17 @@ function ToolPreBlock({ label, value }: { label: string; value: string }) {
       <pre>{value}</pre>
     </div>
   );
+}
+
+function buildThinkingViews(events: WorkerAgentEvent[]): ThinkingView[] {
+  return events
+    .filter((event): event is Extract<WorkerAgentEvent, { type: "thinking" }> => event.type === "thinking")
+    .map((event, index) => ({
+      id: `thinking-${event.step}-${index}`,
+      step: event.step,
+      content: event.content,
+      truncated: event.truncated === true,
+    }));
 }
 
 function buildToolCardViews(events: WorkerAgentEvent[]): ToolCardView[] {

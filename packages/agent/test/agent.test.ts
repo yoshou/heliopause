@@ -67,13 +67,14 @@ test("parseToolCalls returns none for normal assistant text", () => {
 });
 
 test("generateAgentTurn continues an open model turn for tool responses", async () => {
-  const callOptions: Array<Pick<ChatTurnOptions, "appendTurnEnd" | "continueModelTurn" | "doSample">> = [];
+  const callOptions: Array<Pick<ChatTurnOptions, "appendTurnEnd" | "continueModelTurn" | "doSample" | "enableThinking">> = [];
   let index = 0;
   const chatTurnGenerator: AgentChatTurnGenerator = async (_session, _tokenizer, state, _turn, options = {}) => {
     callOptions.push({
       appendTurnEnd: options.appendTurnEnd,
       continueModelTurn: options.continueModelTurn,
       doSample: options.doSample,
+      enableThinking: options.enableThinking,
     });
     index += 1;
     const content = index === 1
@@ -99,8 +100,8 @@ test("generateAgentTurn continues an open model turn for tool responses", async 
   });
 
   assert.deepEqual(callOptions, [
-    { appendTurnEnd: false, continueModelTurn: false, doSample: false },
-    { appendTurnEnd: false, continueModelTurn: true, doSample: false },
+    { appendTurnEnd: false, continueModelTurn: false, doSample: false, enableThinking: true },
+    { appendTurnEnd: false, continueModelTurn: true, doSample: false, enableThinking: true },
   ]);
 });
 
@@ -362,9 +363,95 @@ test("generateAgentTurn returns a normal answer without executing tools", async 
   assert.deepEqual(events.map((event) => event.type), ["text", "done"]);
 });
 
+test("generateAgentTurn can disable thinking for the chat generator", async () => {
+  const callOptions: ChatTurnOptions[] = [];
+  await generateAgentTurn(fakeSession, fakeTokenizer, fakeState(), "Say hi.", {
+    tools: [sandboxCommandTool],
+    enableThinking: false,
+    chatTurnGenerator: async (_session, _tokenizer, state, _turn, options = {}) => {
+      callOptions.push(options);
+      return {
+        content: "Hello.",
+        finishReason: "stop",
+        state,
+      };
+    },
+    executeTool: async () => {
+      throw new Error("executeTool should not be called");
+    },
+  });
+
+  assert.equal(callOptions[0]?.enableThinking, false);
+});
+
+test("generateAgentTurn separates official thinking from final text", async () => {
+  const events: AgentEvent[] = [];
+  const tokenTexts: string[] = [];
+  const result = await generateAgentTurn(fakeSession, fakeTokenizer, fakeState(), "Explain.", {
+    tools: [sandboxCommandTool],
+    chatTurnGenerator: mockGenerator(["<|channel>thought\nPlan briefly.<channel|>\nFinal answer."]),
+    executeTool: async () => {
+      throw new Error("executeTool should not be called");
+    },
+    onAgentEvent: (event) => events.push(event),
+    onToken: (chunk) => tokenTexts.push(chunk.text),
+  });
+
+  assert.equal(result.content, "\nFinal answer.");
+  assert.deepEqual(events.map((event) => event.type), ["thinking", "text", "done"]);
+  assert.equal(
+    events.find((event): event is Extract<AgentEvent, { type: "thinking" }> => event.type === "thinking")?.content,
+    "Plan briefly.",
+  );
+  assert.deepEqual(tokenTexts, ["\nFinal answer."]);
+});
+
+test("generateAgentTurn ignores tool-like text inside official thinking", async () => {
+  const events: AgentEvent[] = [];
+  const result = await generateAgentTurn(fakeSession, fakeTokenizer, fakeState(), "Think only.", {
+    tools: [sandboxCommandTool],
+    chatTurnGenerator: mockGenerator([
+      [
+        "<|channel>thought\n",
+        '<|tool_call>call:sandbox_command{cmd:<|"|>ls<|"|>,args:[]}<tool_call|>',
+        "<channel|>No tool needed.",
+      ].join(""),
+    ]),
+    executeTool: async () => {
+      throw new Error("executeTool should not be called");
+    },
+    onAgentEvent: (event) => events.push(event),
+  });
+
+  assert.equal(result.steps, 0);
+  assert.equal(result.content, "No tool needed.");
+  assert.deepEqual(events.map((event) => event.type), ["thinking", "text", "done"]);
+});
+
+test("generateAgentTurn truncates long thinking events", async () => {
+  const events: AgentEvent[] = [];
+  await generateAgentTurn(fakeSession, fakeTokenizer, fakeState(), "Think long.", {
+    tools: [sandboxCommandTool],
+    maxThinkingChars: 5,
+    chatTurnGenerator: mockGenerator(["<|channel>thought\n123456789<channel|>Done."]),
+    executeTool: async () => {
+      throw new Error("executeTool should not be called");
+    },
+    onAgentEvent: (event) => events.push(event),
+  });
+
+  const thinking = events.find((event): event is Extract<AgentEvent, { type: "thinking" }> => event.type === "thinking");
+  assert.deepEqual(thinking, {
+    type: "thinking",
+    step: 1,
+    content: "12345",
+    truncated: true,
+  });
+});
+
 test("generateAgentTurn executes a valid tool call and then emits final text", async () => {
   const calls: ChatTurnInput[] = [];
-  const callOptions: Array<Pick<ChatTurnOptions, "appendTurnEnd" | "continueModelTurn">> = [];
+  const callOptions: Array<Pick<ChatTurnOptions, "appendTurnEnd" | "continueModelTurn" | "enableThinking">> = [];
   const events: AgentEvent[] = [];
   const tokenTexts: string[] = [];
   const result = await generateAgentTurn(fakeSession, fakeTokenizer, fakeState(), "List files.", {
@@ -412,8 +499,8 @@ test("generateAgentTurn executes a valid tool call and then emits final text", a
     },
   }]);
   assert.deepEqual(callOptions, [
-    { appendTurnEnd: false, continueModelTurn: false },
-    { appendTurnEnd: false, continueModelTurn: false },
+    { appendTurnEnd: false, continueModelTurn: false, enableThinking: true },
+    { appendTurnEnd: false, continueModelTurn: false, enableThinking: true },
   ]);
 });
 
@@ -729,7 +816,7 @@ test("DEFAULT_MAX_TOOL_STEPS is three", () => {
 function mockGenerator(
   outputs: readonly string[],
   calls: ChatTurnInput[] = [],
-  callOptions: Array<Pick<ChatTurnOptions, "appendTurnEnd" | "continueModelTurn">> = [],
+  callOptions: Array<Pick<ChatTurnOptions, "appendTurnEnd" | "continueModelTurn" | "enableThinking">> = [],
 ): AgentChatTurnGenerator {
   let index = 0;
   return async (_session, _tokenizer, state, turn, options = {}) => {
@@ -737,6 +824,7 @@ function mockGenerator(
     callOptions.push({
       appendTurnEnd: options.appendTurnEnd,
       continueModelTurn: options.continueModelTurn,
+      enableThinking: options.enableThinking,
     });
     const content = outputs[index] ?? outputs.at(-1) ?? "";
     index += 1;

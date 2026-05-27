@@ -130,6 +130,7 @@ export type EngineWorkerRequest =
       topK?: number;
       seed?: number;
       webSearchAvailable: boolean;
+      enableThinking: boolean;
     }
   | {
       type: "resolveWebSearchConfirmation";

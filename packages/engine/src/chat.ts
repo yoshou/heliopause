@@ -97,11 +97,13 @@ export type ChatCompletionOptions = GenerationSamplingOptions & {
 
 export type ChatPrefillOptions = {
   signal?: AbortSignal;
+  enableThinking?: boolean;
 };
 
 export type ChatTurnOptions = ChatCompletionOptions & {
   appendTurnEnd?: boolean;
   continueModelTurn?: boolean;
+  enableThinking?: boolean;
 };
 
 export type ChatTurnInput = string | readonly ChatMessage[];
@@ -125,6 +127,9 @@ export const DEFAULT_SYSTEM_PROMPT =
 
 const DEFAULT_MAX_NEW_TOKENS = 256;
 const DEFAULT_GGUF_PARSE_BUFFER_BYTES = 16 * 1024 * 1024;
+const THINKING_TRIGGER_TOKEN = "<|think|>";
+const THOUGHT_CHANNEL_OPEN = "<|channel>thought\n";
+const THOUGHT_CHANNEL_CLOSE = "<channel|>";
 const TOKENIZER_ARRAY_METADATA_KEYS = [
   "tokenizer.ggml.tokens",
   "tokenizer.ggml.merges",
@@ -138,6 +143,7 @@ export function applyChatTemplate(
   const enableThinking = options.enableThinking ?? false;
   const closeFinalTurn = options.closeFinalTurn ?? true;
   let output = "";
+  let injectedThinking = false;
 
   for (let index = 0; index < messages.length; index += 1) {
     const message = messages[index];
@@ -171,7 +177,12 @@ export function applyChatTemplate(
       continue;
     }
 
-    output += message.content.trim();
+    if (enableThinking && message.role === "system" && !injectedThinking) {
+      output += addThinkingTrigger(message.content);
+      injectedThinking = true;
+    } else {
+      output += message.content.trim();
+    }
     for (const tool of message.toolDeclarations ?? []) {
       output += `<|tool>${formatToolDeclaration(tool)}<tool|>`;
     }
@@ -180,17 +191,29 @@ export function applyChatTemplate(
     }
   }
 
+  if (enableThinking && !injectedThinking) {
+    output = `<|turn>system\n${THINKING_TRIGGER_TOKEN}<turn|>\n${output}`;
+  }
+
   if (addGenerationPrompt) {
-    output += enableThinking ? "<|think|>\n<|turn>model\n" : "<|turn>model\n";
+    output += "<|turn>model\n";
   }
 
   return output;
 }
 
 export function applyChatGenerationPrompt(
-  options: Pick<ChatTemplateOptions, "enableThinking"> = {},
+  _options: Pick<ChatTemplateOptions, "enableThinking"> = {},
 ): string {
-  return (options.enableThinking ?? false) ? "<|think|>\n<|turn>model\n" : "<|turn>model\n";
+  return "<|turn>model\n";
+}
+
+function addThinkingTrigger(content: string): string {
+  const trimmed = content.trim();
+  if (trimmed.startsWith(THINKING_TRIGGER_TOKEN)) {
+    return trimmed;
+  }
+  return trimmed.length === 0 ? THINKING_TRIGGER_TOKEN : `${THINKING_TRIGGER_TOKEN}\n${trimmed}`;
 }
 
 function formatToolDeclaration(tool: ChatToolDeclaration): string {
@@ -358,7 +381,10 @@ export async function prefillChatMessages(
   messages: readonly ChatMessage[],
   options: ChatPrefillOptions = {},
 ): Promise<InferenceState> {
-  const prompt = applyChatTemplate(messages, { addGenerationPrompt: false });
+  const prompt = applyChatTemplate(messages, {
+    addGenerationPrompt: false,
+    enableThinking: options.enableThinking,
+  });
   await prefillChatText(session, tokenizer, state, prompt, {
     signal: options.signal,
     requireGenerationSlot: false,
@@ -380,6 +406,7 @@ export async function generateChatTurn(
   const prefillText = applyChatTemplate(messages, {
     addGenerationPrompt: false,
     closeFinalTurn: !options.continueModelTurn,
+    enableThinking: options.continueModelTurn ? false : options.enableThinking,
   });
 
   if (options.continueModelTurn) {
@@ -438,7 +465,10 @@ export async function generatePreparedImageChatTurn(
   }
   const { prefillMessages, userContent } = splitPreparedTurnInput(turn);
   if (prefillMessages.length > 0) {
-    await prefillChatMessages(session, tokenizer, state, prefillMessages, { signal: options.signal });
+    await prefillChatMessages(session, tokenizer, state, prefillMessages, {
+      signal: options.signal,
+      enableThinking: options.enableThinking,
+    });
   }
 
   await prefillChatText(session, tokenizer, state, "<|turn>user\n<|image>", {
@@ -496,7 +526,10 @@ export async function generatePreparedAudioChatTurn(
   }
   const { prefillMessages, userContent } = splitPreparedTurnInput(turn);
   if (prefillMessages.length > 0) {
-    await prefillChatMessages(session, tokenizer, state, prefillMessages, { signal: options.signal });
+    await prefillChatMessages(session, tokenizer, state, prefillMessages, {
+      signal: options.signal,
+      enableThinking: options.enableThinking,
+    });
   }
 
   await prefillChatText(session, tokenizer, state, "<|turn>user\n<|audio>", {
@@ -530,7 +563,7 @@ async function generateAssistantFromState(
     session,
     tokenizer,
     state,
-    applyChatGenerationPrompt(),
+    applyChatGenerationPrompt({ enableThinking: options.enableThinking }),
     {
       signal: options.signal,
       returnNextToken: true,
@@ -748,15 +781,15 @@ async function prefillChatText(
 export function stripThinking(content: string): string {
   let output = content;
   while (true) {
-    const start = output.indexOf("<think>");
+    const start = output.indexOf(THOUGHT_CHANNEL_OPEN);
     if (start < 0) {
       return sanitizeChatOutput(output);
     }
-    const end = output.indexOf("</think>", start);
+    const end = output.indexOf(THOUGHT_CHANNEL_CLOSE, start + THOUGHT_CHANNEL_OPEN.length);
     if (end < 0) {
       return sanitizeChatOutput(output.slice(0, start).trimStart());
     }
-    output = `${output.slice(0, start)}${output.slice(end + "</think>".length)}`;
+    output = `${output.slice(0, start)}${output.slice(end + THOUGHT_CHANNEL_CLOSE.length)}`;
   }
 }
 
@@ -768,15 +801,6 @@ function sanitizeChatOutput(content: string): string {
     if (index >= 0) {
       output = output.slice(0, index);
     }
-  }
-  output = output.replaceAll("</think>", "");
-  while (true) {
-    const start = output.indexOf("<|channel>");
-    if (start < 0) {
-      break;
-    }
-    const end = output.indexOf("<channel|>", start);
-    output = end < 0 ? output.slice(0, start) : `${output.slice(0, start)}${output.slice(end + "<channel|>".length)}`;
   }
   return output;
 }
