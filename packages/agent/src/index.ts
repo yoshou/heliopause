@@ -2,6 +2,7 @@ import {
   cloneInferenceState,
   closeChatModelTurn,
   generateChatTurn,
+  type ChatCompletionChunk,
   type ChatMessage,
   type ChatToolDeclaration,
   type ChatTurnInput,
@@ -23,8 +24,15 @@ const MAX_TOOL_STEPS_FINAL_PROMPT =
   "You have reached the maximum number of tool steps. Answer the user using only the tool responses already provided. Do not call another tool.";
 const MAX_TOOL_STEPS_FINAL_MESSAGE =
   "I reached the maximum number of tool steps and cannot call another tool. I do not have enough final text to show beyond the tool results already gathered.";
-const THOUGHT_CHANNEL_OPEN = "<|channel>thought\n";
+const CHANNEL_OPEN_TAG = "<|channel>";
+const THOUGHT_CHANNEL_LABEL = "thought\n";
 const THOUGHT_CHANNEL_CLOSE = "<channel|>";
+const STREAMING_CONTROL_TAGS = [
+  TOOL_CALL_OPEN_TAG,
+  TOOL_CALL_CLOSE_TAG,
+  CHANNEL_OPEN_TAG,
+  THOUGHT_CHANNEL_CLOSE,
+] as const;
 
 const AGENT_TOOL_NAMES = [
   "sandbox_list_files",
@@ -214,20 +222,29 @@ export async function generateAgentTurn(
     const stateBeforeFinalGeneration = finalOnly && stateCloner ? stateCloner(state) : undefined;
     const generationState = finalOnly && stateCloner ? stateCloner(state) : state;
     const continueModelTurn = committedModelTurnOpen && isOnlyToolResponseTurn(nextTurn);
+    const streamingGate = new AgentStreamingGate(
+      step,
+      maxThinkingChars,
+      enableThinking,
+      originalOnToken,
+      options.onAgentEvent,
+    );
     const generation = await chatTurnGenerator(session, tokenizer, generationState, nextTurn, {
       ...chatOptions,
       doSample: chatOptions.doSample ?? false,
       enableThinking,
       appendTurnEnd: false,
       continueModelTurn,
-      onToken: () => {},
+      onToken: (chunk) => streamingGate.handleChunk(chunk),
     });
     const generatedModelTurnOpen = generation.modelTurnClosed === false;
     if (!finalOnly) {
       modelTurnOpen = generatedModelTurnOpen;
     }
-    const separatedContent = separateThinking(generation.content);
-    emitThinking(separatedContent.thinking, step, maxThinkingChars, enableThinking, options.onAgentEvent);
+    const separatedContent = separateGemmaChannels(generation.content);
+    emitThinking(separatedContent.thinking, step, maxThinkingChars, enableThinking, options.onAgentEvent, {
+      skipContents: streamingGate.thinkingContents,
+    });
     const parseResult = parseToolCalls(separatedContent.visibleContent, options.tools, step);
 
     if (parseResult.type === "none") {
@@ -241,7 +258,9 @@ export async function generateAgentTurn(
         await modelTurnCloser(session, tokenizer, generation.state, { signal: options.signal });
         modelTurnOpen = false;
       }
-      emitVisibleText(separatedContent.visibleContent, step, originalOnToken, options.onAgentEvent);
+      emitVisibleText(separatedContent.visibleContent, step, originalOnToken, options.onAgentEvent, {
+        streamedContent: streamingGate.visibleContent,
+      });
       const finishReason = finalOnly ? "maxToolSteps" : generation.finishReason;
       options.onAgentEvent?.({ type: "done", steps: toolSteps, finishReason });
       return {
@@ -260,7 +279,9 @@ export async function generateAgentTurn(
         }
         modelTurnOpen = false;
       }
-      emitVisibleText(MAX_TOOL_STEPS_FINAL_MESSAGE, step, originalOnToken, options.onAgentEvent);
+      emitVisibleText(MAX_TOOL_STEPS_FINAL_MESSAGE, step, originalOnToken, options.onAgentEvent, {
+        streamedContent: streamingGate.visibleContent,
+      });
       options.onAgentEvent?.({ type: "done", steps: toolSteps, finishReason: "maxToolSteps" });
       return {
         content: MAX_TOOL_STEPS_FINAL_MESSAGE,
@@ -270,6 +291,7 @@ export async function generateAgentTurn(
       };
     }
 
+    streamingGate.clearVisibleContent();
     toolSteps += 1;
 
     const toolResponses = await executeParsedToolItems(parseResult, step, options);
@@ -291,59 +313,68 @@ function isOnlyToolResponseTurn(turn: ChatTurnInput): boolean {
   return Array.isArray(turn) && turn.length > 0 && turn.every((message) => message.role === "tool");
 }
 
-function separateThinking(content: string): { visibleContent: string; thinking: string[] } {
-  const thinking: string[] = [];
-  let visibleContent = "";
-  let cursor = 0;
-
-  while (cursor < content.length) {
-    const start = content.indexOf(THOUGHT_CHANNEL_OPEN, cursor);
-    if (start < 0) {
-      visibleContent += content.slice(cursor);
-      break;
-    }
-
-    visibleContent += content.slice(cursor, start);
-    const thoughtStart = start + THOUGHT_CHANNEL_OPEN.length;
-    const end = content.indexOf(THOUGHT_CHANNEL_CLOSE, thoughtStart);
-    if (end < 0) {
-      thinking.push(content.slice(thoughtStart));
-      break;
-    }
-
-    thinking.push(content.slice(thoughtStart, end));
-    cursor = end + THOUGHT_CHANNEL_CLOSE.length;
-  }
-
-  return { visibleContent, thinking };
-}
-
 function emitThinking(
   thinking: readonly string[],
   step: number,
   maxThinkingChars: number,
   enabled: boolean,
   onAgentEvent: AgentTurnOptions["onAgentEvent"],
+  options: { skipContents?: readonly (string | undefined)[] } = {},
 ): void {
   if (!enabled) {
     return;
   }
-  for (const content of thinking) {
-    const trimmed = content.trim();
-    if (trimmed.length === 0) {
+  for (let index = 0; index < thinking.length; index += 1) {
+    const content = thinking[index] ?? "";
+    const event = formatThinkingEvent(content, step, maxThinkingChars);
+    if (!event) {
       continue;
     }
-    if (trimmed.length > maxThinkingChars) {
-      onAgentEvent?.({
-        type: "thinking",
-        step,
-        content: trimmed.slice(0, maxThinkingChars),
-        truncated: true,
-      });
+    if (event.content === options.skipContents?.[index]) {
       continue;
     }
-    onAgentEvent?.({ type: "thinking", step, content: trimmed });
+    onAgentEvent?.(event);
   }
+}
+
+function separateGemmaChannels(content: string): { visibleContent: string; thinking: string[] } {
+  const thinking: string[] = [];
+  let visibleContent = "";
+  let cursor = 0;
+
+  while (cursor < content.length) {
+    if (content.startsWith(CHANNEL_OPEN_TAG, cursor)) {
+      const labelStart = cursor + CHANNEL_OPEN_TAG.length;
+      const close = content.indexOf(THOUGHT_CHANNEL_CLOSE, labelStart);
+      if (!content.startsWith(THOUGHT_CHANNEL_LABEL, labelStart)) {
+        if (close < 0) {
+          break;
+        }
+        cursor = close + THOUGHT_CHANNEL_CLOSE.length;
+        continue;
+      }
+
+      const thinkingStart = labelStart + THOUGHT_CHANNEL_LABEL.length;
+      if (close < 0) {
+        thinking.push(content.slice(thinkingStart));
+        break;
+      }
+
+      thinking.push(content.slice(thinkingStart, close));
+      cursor = close + THOUGHT_CHANNEL_CLOSE.length;
+      continue;
+    }
+
+    if (content.startsWith(THOUGHT_CHANNEL_CLOSE, cursor)) {
+      cursor += THOUGHT_CHANNEL_CLOSE.length;
+      continue;
+    }
+
+    visibleContent += content[cursor] ?? "";
+    cursor += 1;
+  }
+
+  return { visibleContent, thinking };
 }
 
 async function executeParsedTool(
@@ -420,17 +451,213 @@ function emitVisibleText(
   step: number,
   onToken: ChatTurnOptions["onToken"],
   onAgentEvent: AgentTurnOptions["onAgentEvent"],
+  options: { streamedContent?: string } = {},
 ): void {
   if (content.length === 0) {
     return;
   }
   onAgentEvent?.({ type: "text", step, content });
-  onToken?.({
-    tokenId: -1,
-    token: "",
-    text: content,
-    content,
-  });
+  if (content !== options.streamedContent) {
+    const streamedContent = options.streamedContent ?? "";
+    const previousContent = content.startsWith(streamedContent) ? streamedContent : "";
+    if (streamedContent.length > 0 && previousContent.length === 0) {
+      onToken?.({
+        tokenId: -1,
+        token: "",
+        text: "",
+        content: "",
+      });
+    }
+    onToken?.({
+      tokenId: -1,
+      token: "",
+      text: content.slice(previousContent.length),
+      content,
+    });
+  }
+}
+
+class AgentStreamingGate {
+  private rawContent = "";
+  private lastVisibleContent = "";
+  private readonly lastEmittedThinkingContents: string[] = [];
+  private readonly step: number;
+  private readonly maxThinkingChars: number;
+  private readonly enableThinking: boolean;
+  private readonly onToken: ChatTurnOptions["onToken"];
+  private readonly onAgentEvent: AgentTurnOptions["onAgentEvent"];
+
+  constructor(
+    step: number,
+    maxThinkingChars: number,
+    enableThinking: boolean,
+    onToken: ChatTurnOptions["onToken"],
+    onAgentEvent: AgentTurnOptions["onAgentEvent"],
+  ) {
+    this.step = step;
+    this.maxThinkingChars = maxThinkingChars;
+    this.enableThinking = enableThinking;
+    this.onToken = onToken;
+    this.onAgentEvent = onAgentEvent;
+  }
+
+  get visibleContent(): string {
+    return this.lastVisibleContent;
+  }
+
+  get thinkingContents(): readonly string[] {
+    return this.lastEmittedThinkingContents;
+  }
+
+  handleChunk(chunk: ChatCompletionChunk): void {
+    this.rawContent = resolveStreamingRawContent(this.rawContent, chunk);
+    const sanitized = sanitizeGemmaOutput(this.rawContent);
+
+    if (this.enableThinking) {
+      for (let index = 0; index < sanitized.thinking.length; index += 1) {
+        const thinkingEvent = formatThinkingEvent(sanitized.thinking[index] ?? "", this.step, this.maxThinkingChars);
+        if (thinkingEvent && thinkingEvent.content !== this.lastEmittedThinkingContents[index]) {
+          this.lastEmittedThinkingContents[index] = thinkingEvent.content;
+          this.onAgentEvent?.(thinkingEvent);
+        }
+      }
+    }
+
+    if (sanitized.visibleContent !== this.lastVisibleContent) {
+      const previousVisibleContent = sanitized.visibleContent.startsWith(this.lastVisibleContent)
+        ? this.lastVisibleContent
+        : "";
+      if (previousVisibleContent.length !== this.lastVisibleContent.length) {
+        this.onToken?.({
+          tokenId: -1,
+          token: "",
+          text: "",
+          content: "",
+        });
+      }
+      this.onToken?.({
+        ...chunk,
+        text: sanitized.visibleContent.slice(previousVisibleContent.length),
+        content: sanitized.visibleContent,
+      });
+      this.lastVisibleContent = sanitized.visibleContent;
+    }
+  }
+
+  clearVisibleContent(): void {
+    if (this.lastVisibleContent.length === 0) {
+      return;
+    }
+    this.onToken?.({
+      tokenId: -1,
+      token: "",
+      text: "",
+      content: "",
+    });
+    this.lastVisibleContent = "";
+  }
+}
+
+function resolveStreamingRawContent(previousRawContent: string, chunk: ChatCompletionChunk): string {
+  if (chunk.content.startsWith(previousRawContent)) {
+    return chunk.content;
+  }
+  return previousRawContent + chunk.text;
+}
+
+function sanitizeGemmaOutput(content: string): { visibleContent: string; thinking: string[] } {
+  let visibleContent = "";
+  const thinking: string[] = [];
+  let cursor = 0;
+
+  while (cursor < content.length) {
+    if (content.startsWith(TOOL_CALL_OPEN_TAG, cursor)) {
+      const close = content.indexOf(TOOL_CALL_CLOSE_TAG, cursor + TOOL_CALL_OPEN_TAG.length);
+      if (close < 0) {
+        break;
+      }
+      cursor = close + TOOL_CALL_CLOSE_TAG.length;
+      continue;
+    }
+
+    if (content.startsWith(CHANNEL_OPEN_TAG, cursor)) {
+      const labelStart = cursor + CHANNEL_OPEN_TAG.length;
+      const availableLabel = content.slice(labelStart, labelStart + THOUGHT_CHANNEL_LABEL.length);
+      if (THOUGHT_CHANNEL_LABEL.startsWith(availableLabel) && availableLabel.length < THOUGHT_CHANNEL_LABEL.length) {
+        break;
+      }
+
+      const close = content.indexOf(THOUGHT_CHANNEL_CLOSE, labelStart);
+      if (!content.startsWith(THOUGHT_CHANNEL_LABEL, labelStart)) {
+        if (close < 0) {
+          break;
+        }
+        cursor = close + THOUGHT_CHANNEL_CLOSE.length;
+        continue;
+      }
+
+      const thinkingStart = labelStart + THOUGHT_CHANNEL_LABEL.length;
+      if (close < 0) {
+        thinking.push(stripIncompleteControlSuffix(content.slice(thinkingStart), [THOUGHT_CHANNEL_CLOSE]));
+        break;
+      }
+      thinking.push(content.slice(thinkingStart, close));
+      cursor = close + THOUGHT_CHANNEL_CLOSE.length;
+      continue;
+    }
+
+    if (content.startsWith(THOUGHT_CHANNEL_CLOSE, cursor)) {
+      cursor += THOUGHT_CHANNEL_CLOSE.length;
+      continue;
+    }
+
+    if (hasIncompleteControlTagAt(content, cursor)) {
+      break;
+    }
+
+    visibleContent += content[cursor] ?? "";
+    cursor += 1;
+  }
+
+  return { visibleContent, thinking };
+}
+
+function hasIncompleteControlTagAt(content: string, cursor: number): boolean {
+  const suffix = content.slice(cursor);
+  if (suffix.length === 0) {
+    return false;
+  }
+  return STREAMING_CONTROL_TAGS.some((tag) => tag.startsWith(suffix) && suffix.length < tag.length);
+}
+
+function stripIncompleteControlSuffix(content: string, tags: readonly string[]): string {
+  for (let length = Math.min(content.length, Math.max(...tags.map((tag) => tag.length)) - 1); length > 0; length -= 1) {
+    const suffix = content.slice(content.length - length);
+    if (tags.some((tag) => tag.startsWith(suffix))) {
+      return content.slice(0, content.length - length);
+    }
+  }
+  return content;
+}
+
+function formatThinkingEvent(
+  content: string,
+  step: number,
+  maxThinkingChars: number,
+): Extract<AgentEvent, { type: "thinking" }> | undefined {
+  const trimmed = content.trim();
+  if (trimmed.length === 0) {
+    return undefined;
+  }
+  if (trimmed.length > maxThinkingChars) {
+    return {
+      type: "thinking",
+      step,
+      content: trimmed.slice(0, maxThinkingChars),
+      truncated: true,
+    };
+  }
+  return { type: "thinking", step, content: trimmed };
 }
 
 function buildInitialTurn(

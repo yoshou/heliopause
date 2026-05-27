@@ -449,6 +449,125 @@ test("generateAgentTurn truncates long thinking events", async () => {
   });
 });
 
+test("generateAgentTurn streams visible text while hiding split official thinking", async () => {
+  const events: AgentEvent[] = [];
+  const tokenContents: string[] = [];
+  const result = await generateAgentTurn(fakeSession, fakeTokenizer, fakeState(), "Explain.", {
+    tools: [sandboxCommandTool],
+    chatTurnGenerator: streamingGenerator([
+      "<|chan",
+      "nel>tho",
+      "ught\nPlan",
+      " briefly",
+      ".<chan",
+      "nel|>\nFinal",
+      " answer.",
+    ]),
+    executeTool: async () => {
+      throw new Error("executeTool should not be called");
+    },
+    onAgentEvent: (event) => events.push(event),
+    onToken: (chunk) => tokenContents.push(chunk.content),
+  });
+
+  assert.equal(result.content, "\nFinal answer.");
+  assert.deepEqual(tokenContents, ["\nFinal", "\nFinal answer."]);
+  assert.deepEqual(
+    events
+      .filter((event): event is Extract<AgentEvent, { type: "thinking" }> => event.type === "thinking")
+      .map((event) => event.content),
+    ["Plan", "Plan briefly", "Plan briefly."],
+  );
+  assert.deepEqual(events.map((event) => event.type).slice(-2), ["text", "done"]);
+});
+
+test("generateAgentTurn hides split tool calls from token streaming", async () => {
+  const tokenContents: string[] = [];
+  const events: AgentEvent[] = [];
+  const result = await generateAgentTurn(fakeSession, fakeTokenizer, fakeState(), "List files.", {
+    tools: [sandboxCommandTool],
+    maxToolSteps: 1,
+    chatTurnGenerator: streamingOutputsGenerator([
+      [
+        "<|tool",
+        '_call>call:sandbox_command{cmd:<|"|>ls<|"|>,args:[]}',
+        "<tool_call|>",
+      ],
+      ["Done."],
+    ]),
+    executeTool: async (call) => ({
+      callId: call.id,
+      ok: true,
+      content: { kind: "sandbox_command", exitCode: 0, stdout: "", stderr: "", truncated: false },
+    }),
+    onAgentEvent: (event) => events.push(event),
+    onToken: (chunk) => tokenContents.push(chunk.content),
+  });
+
+  assert.equal(result.content, "Done.");
+  assert.deepEqual(tokenContents, ["Done."]);
+  assert.deepEqual(events.map((event) => event.type), ["toolCall", "toolResult", "text", "done"]);
+});
+
+test("generateAgentTurn hides non-thought Gemma channel blocks", async () => {
+  const tokenContents: string[] = [];
+  const result = await generateAgentTurn(fakeSession, fakeTokenizer, fakeState(), "Say hi.", {
+    tools: [sandboxCommandTool],
+    chatTurnGenerator: streamingGenerator([
+      "Hello ",
+      "<|channel>debug\nhidden<channel|>",
+      "there.",
+    ]),
+    executeTool: async () => {
+      throw new Error("executeTool should not be called");
+    },
+    onToken: (chunk) => tokenContents.push(chunk.content),
+  });
+
+  assert.equal(result.content, "Hello there.");
+  assert.deepEqual(tokenContents, ["Hello ", "Hello there."]);
+});
+
+test("generateAgentTurn preserves multiple streamed thinking blocks for the same step", async () => {
+  const events: AgentEvent[] = [];
+  const tokenContents: string[] = [];
+  const result = await generateAgentTurn(fakeSession, fakeTokenizer, fakeState(), "Think twice.", {
+    tools: [sandboxCommandTool],
+    chatTurnGenerator: streamingGenerator([
+      "<|channel>thought\nfirst<channel|>",
+      "<|channel>thought\nsecond<channel|>",
+      "Done.",
+    ]),
+    executeTool: async () => {
+      throw new Error("executeTool should not be called");
+    },
+    onAgentEvent: (event) => events.push(event),
+    onToken: (chunk) => tokenContents.push(chunk.content),
+  });
+
+  const thinkingEvents = events.filter((event): event is Extract<AgentEvent, { type: "thinking" }> =>
+    event.type === "thinking"
+  );
+  assert.equal(result.content, "Done.");
+  assert.deepEqual(tokenContents.at(-1), result.content);
+  assert.deepEqual(thinkingEvents.map((event) => event.content), ["first", "second"]);
+});
+
+test("generateAgentTurn strips standalone channel close markers consistently", async () => {
+  const tokenContents: string[] = [];
+  const result = await generateAgentTurn(fakeSession, fakeTokenizer, fakeState(), "Say hi.", {
+    tools: [sandboxCommandTool],
+    chatTurnGenerator: streamingGenerator(["Hello", "<channel|>", " there."]),
+    executeTool: async () => {
+      throw new Error("executeTool should not be called");
+    },
+    onToken: (chunk) => tokenContents.push(chunk.content),
+  });
+
+  assert.equal(result.content, "Hello there.");
+  assert.deepEqual(tokenContents.at(-1), result.content);
+});
+
 test("generateAgentTurn executes a valid tool call and then emits final text", async () => {
   const calls: ChatTurnInput[] = [];
   const callOptions: Array<Pick<ChatTurnOptions, "appendTurnEnd" | "continueModelTurn" | "enableThinking">> = [];
@@ -834,6 +953,35 @@ function mockGenerator(
       finishReason: "stop",
       state,
     };
+  };
+}
+
+function streamingGenerator(chunks: readonly string[]): AgentChatTurnGenerator {
+  return async (_session, _tokenizer, state, _turn, options = {}) => {
+    let content = "";
+    for (const text of chunks) {
+      content += text;
+      options.onToken?.({
+        tokenId: 0,
+        token: "",
+        text,
+        content,
+      });
+    }
+    return {
+      content,
+      finishReason: "stop",
+      state,
+    };
+  };
+}
+
+function streamingOutputsGenerator(outputs: readonly (readonly string[])[]): AgentChatTurnGenerator {
+  let index = 0;
+  return async (session, tokenizer, state, turn, options = {}) => {
+    const chunks = outputs[index] ?? outputs.at(-1) ?? [];
+    index += 1;
+    return streamingGenerator(chunks)(session, tokenizer, state, turn, options);
   };
 }
 

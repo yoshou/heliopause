@@ -202,6 +202,7 @@ const MIN_RECORDING_MS = 300;
 const MAX_RECORDING_MS = 30_000;
 const AUDIO_SAMPLE_RATE = 16_000;
 const CHAT_MAX_NEW_TOKENS = 1024;
+const MESSAGE_PANEL_BOTTOM_THRESHOLD_PX = 80;
 const INITIAL_ASSISTANT_CONTENT = [
   "Drop your GGUF files in the message box.",
   "Add the main model and optional projector together.",
@@ -244,6 +245,7 @@ function App() {
   const generationRequestRef = useRef<{ requestId: number; worker: Worker } | null>(null);
   const imageAttachmentRef = useRef<UiImageAttachment | undefined>(undefined);
   const messagesRef = useRef<UiMessage[]>([]);
+  const shouldFollowMessagesRef = useRef(true);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const recordingChunksRef = useRef<Blob[]>([]);
@@ -302,11 +304,35 @@ function App() {
     if (!messagePanel) {
       return;
     }
+    if (isGenerating) {
+      return;
+    }
+    if (!shouldFollowMessagesRef.current) {
+      return;
+    }
     messagePanel.scrollTo({
       top: messagePanel.scrollHeight,
-      behavior: isGenerating ? "auto" : "smooth",
+      behavior: "smooth",
     });
   }, [isGenerating, messages]);
+
+  useEffect(() => {
+    const messagePanel = messagePanelRef.current;
+    if (!messagePanel) {
+      return;
+    }
+    const panel = messagePanel;
+
+    function updateShouldFollowMessages() {
+      shouldFollowMessagesRef.current = isScrolledNearBottom(panel);
+    }
+
+    updateShouldFollowMessages();
+    panel.addEventListener("scroll", updateShouldFollowMessages, { passive: true });
+    return () => {
+      panel.removeEventListener("scroll", updateShouldFollowMessages);
+    };
+  }, []);
 
   useEffect(() => () => {
     const worker = workerRef.current;
@@ -1847,14 +1873,25 @@ function ToolPreBlock({ label, value }: { label: string; value: string }) {
 }
 
 function buildThinkingViews(events: WorkerAgentEvent[]): ThinkingView[] {
-  return events
-    .filter((event): event is Extract<WorkerAgentEvent, { type: "thinking" }> => event.type === "thinking")
-    .map((event, index) => ({
-      id: `thinking-${event.step}-${index}`,
+  const views = new Map<number, ThinkingView>();
+  const orderedSteps: number[] = [];
+
+  for (const event of events) {
+    if (event.type !== "thinking") {
+      continue;
+    }
+    if (!views.has(event.step)) {
+      orderedSteps.push(event.step);
+    }
+    views.set(event.step, {
+      id: `thinking-${event.step}`,
       step: event.step,
       content: event.content,
       truncated: event.truncated === true,
-    }));
+    });
+  }
+
+  return orderedSteps.map((step) => views.get(step)).filter((view): view is ThinkingView => Boolean(view));
 }
 
 function buildToolCardViews(events: WorkerAgentEvent[]): ToolCardView[] {
@@ -2095,6 +2132,10 @@ function formatBytes(bytes: number): string {
 
 function byteLength(value: string): number {
   return new TextEncoder().encode(value).byteLength;
+}
+
+function isScrolledNearBottom(element: HTMLElement): boolean {
+  return element.scrollHeight - element.scrollTop - element.clientHeight <= MESSAGE_PANEL_BOTTOM_THRESHOLD_PX;
 }
 
 function GgufComposer(
