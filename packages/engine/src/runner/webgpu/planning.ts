@@ -45,6 +45,7 @@ export function webGpuResourceRequirements(
     memoryLimitBytes: options.memoryLimitBytes ?? WEBGPU_MEMORY_LIMIT_BYTES,
     fixedBytes: DEFAULT_GPU_FIXED_BYTES,
     scratchBytes: DEFAULT_GPU_SCRATCH_BYTES,
+    cacheElementByteLength: 2,
     outputTensorNames: ["token_embd.weight", "output_norm.weight"],
     targetResourceConstrained: true,
     canRunFullModel: false,

@@ -1054,6 +1054,8 @@ fn main(@builtin(workgroup_id) workgroupId: vec3<u32>, @builtin(local_invocation
 `;
 
 export const KEY_CACHE_ROPE_WGSL = `
+enable f16;
+
 struct Params {
   freqBase: f32,
   position: f32,
@@ -1068,7 +1070,7 @@ struct Params {
 @group(0) @binding(0) var<storage, read> inputValues: array<f32>;
 @group(0) @binding(1) var<storage, read> freqFactors: array<f32>;
 @group(0) @binding(2) var<uniform> params: Params;
-@group(0) @binding(3) var<storage, read_write> keyCache: array<f32>;
+@group(0) @binding(3) var<storage, read_write> keyCache: array<f16>;
 
 fn ropeFactor(index: u32) -> f32 {
   if (params.hasFreqFactors == 0u) {
@@ -1096,7 +1098,7 @@ fn main(@builtin(workgroup_id) workgroupId: vec3<u32>, @builtin(local_invocation
     return;
   }
   for (var dim = lane + params.ropeDims; dim < params.headSize; dim = dim + 256u) {
-    keyCache[keyBase + dim] = inputValues[base + dim];
+    keyCache[keyBase + dim] = f16(inputValues[base + dim]);
   }
   let ropePairCount = params.ropeDims / 2u;
   for (var ic = lane; ic < ropePairCount; ic = ic + 256u) {
@@ -1106,13 +1108,15 @@ fn main(@builtin(workgroup_id) workgroupId: vec3<u32>, @builtin(local_invocation
     let thetaWithFactor = theta / ropeFactor(ic);
     let cosTheta = cos(thetaWithFactor);
     let sinTheta = sin(thetaWithFactor);
-    keyCache[keyBase + ic] = x0 * cosTheta - x1 * sinTheta;
-    keyCache[keyBase + ropePairCount + ic] = x0 * sinTheta + x1 * cosTheta;
+    keyCache[keyBase + ic] = f16(x0 * cosTheta - x1 * sinTheta);
+    keyCache[keyBase + ropePairCount + ic] = f16(x0 * sinTheta + x1 * cosTheta);
   }
 }
 `;
 
 export const VALUE_CACHE_WRITE_WGSL = `
+enable f16;
+
 struct Params {
   headCount: u32,
   valueSize: u32,
@@ -1122,7 +1126,7 @@ struct Params {
 
 @group(0) @binding(0) var<storage, read> inputValues: array<f32>;
 @group(0) @binding(1) var<uniform> params: Params;
-@group(0) @binding(2) var<storage, read_write> valueCache: array<f32>;
+@group(0) @binding(2) var<storage, read_write> valueCache: array<f16>;
 
 @compute @workgroup_size(256, 1, 1)
 fn main(@builtin(workgroup_id) workgroupId: vec3<u32>, @builtin(local_invocation_id) localId: vec3<u32>) {
@@ -1133,7 +1137,7 @@ fn main(@builtin(workgroup_id) workgroupId: vec3<u32>, @builtin(local_invocation
     return;
   }
   for (var dim = lane; dim < params.valueSize; dim = dim + 256u) {
-    valueCache[(dim * params.headCount + head) * params.contextLength + params.tokenPosition] = inputValues[base + dim];
+    valueCache[(dim * params.headCount + head) * params.contextLength + params.tokenPosition] = f16(inputValues[base + dim]);
   }
 }
 `;
@@ -1217,6 +1221,8 @@ fn main(@builtin(workgroup_id) workgroupId: vec3<u32>, @builtin(local_invocation
 `;
 
 export const FULL_KV_UPDATE_WGSL = `
+enable f16;
+
 struct Params {
   epsilon: f32,
   freqBase: f32,
@@ -1235,8 +1241,8 @@ struct Params {
 @group(0) @binding(2) var<storage, read> normWeights: array<f32>;
 @group(0) @binding(3) var<storage, read> freqFactors: array<f32>;
 @group(0) @binding(4) var<uniform> params: Params;
-@group(0) @binding(5) var<storage, read_write> keyCache: array<f32>;
-@group(0) @binding(6) var<storage, read_write> valueCache: array<f32>;
+@group(0) @binding(5) var<storage, read_write> keyCache: array<f16>;
+@group(0) @binding(6) var<storage, read_write> valueCache: array<f16>;
 
 fn normed(head: u32, dim: u32, scale: f32) -> f32 {
   let base = head * params.headSize;
@@ -1283,7 +1289,7 @@ fn main(@builtin(workgroup_id) workgroupId: vec3<u32>, @builtin(local_invocation
   workgroupBarrier();
   let keyBase = (params.tokenPosition * params.headCount + head) * params.headSize;
   for (var dim = lane + params.ropeDims; dim < params.headSize; dim = dim + 256u) {
-    keyCache[keyBase + dim] = normed(head, dim, scale);
+    keyCache[keyBase + dim] = f16(normed(head, dim, scale));
   }
   var valueMeanSquare = 0.0;
   let valueBase = head * params.valueSize;
@@ -1302,7 +1308,7 @@ fn main(@builtin(workgroup_id) workgroupId: vec3<u32>, @builtin(local_invocation
   let valueScale = inverseSqrt(kvReduceValues[0] / f32(params.valueSize) + params.epsilon);
   for (var dim = lane; dim < params.valueSize; dim = dim + 256u) {
     valueCache[(dim * params.headCount + head) * params.contextLength + params.tokenPosition] =
-      vProjectionValues[valueBase + dim] * valueScale;
+      f16(vProjectionValues[valueBase + dim] * valueScale);
   }
   let ropePairCount = params.ropeDims / 2u;
   for (var ic = lane; ic < ropePairCount; ic = ic + 256u) {
@@ -1312,8 +1318,8 @@ fn main(@builtin(workgroup_id) workgroupId: vec3<u32>, @builtin(local_invocation
     let thetaWithFactor = theta / ropeFactor(ic);
     let cosTheta = cos(thetaWithFactor);
     let sinTheta = sin(thetaWithFactor);
-    keyCache[keyBase + ic] = x0 * cosTheta - x1 * sinTheta;
-    keyCache[keyBase + ropePairCount + ic] = x0 * sinTheta + x1 * cosTheta;
+    keyCache[keyBase + ic] = f16(x0 * cosTheta - x1 * sinTheta);
+    keyCache[keyBase + ropePairCount + ic] = f16(x0 * sinTheta + x1 * cosTheta);
   }
 }
 `;
@@ -1405,6 +1411,8 @@ fn main(@builtin(workgroup_id) workgroupId: vec3<u32>, @builtin(local_invocation
 `;
 
 export const BATCHED_FULL_KV_UPDATE_WGSL = `
+enable f16;
+
 struct Params {
   epsilon: f32,
   freqBase: f32,
@@ -1426,8 +1434,8 @@ struct Params {
 @group(0) @binding(3) var<storage, read> freqFactors: array<f32>;
 @group(0) @binding(4) var<storage, read> positions: array<u32>;
 @group(0) @binding(5) var<uniform> params: Params;
-@group(0) @binding(6) var<storage, read_write> keyCache: array<f32>;
-@group(0) @binding(7) var<storage, read_write> valueCache: array<f32>;
+@group(0) @binding(6) var<storage, read_write> keyCache: array<f16>;
+@group(0) @binding(7) var<storage, read_write> valueCache: array<f16>;
 
 fn batchedKvInput(token: u32, head: u32, dim: u32) -> f32 {
   return kProjectionValues[token * params.headCount * params.headSize + head * params.headSize + dim];
@@ -1481,7 +1489,7 @@ fn main(@builtin(workgroup_id) workgroupId: vec3<u32>, @builtin(local_invocation
   let tokenPosition = positions[token];
   let keyBase = (tokenPosition * params.headCount + head) * params.headSize;
   for (var dim = lane + params.ropeDims; dim < params.headSize; dim = dim + 256u) {
-    keyCache[keyBase + dim] = batchedKvNormed(token, head, dim, scale);
+    keyCache[keyBase + dim] = f16(batchedKvNormed(token, head, dim, scale));
   }
   var valueMeanSquare = 0.0;
   let valueBase = token * params.headCount * params.valueSize + head * params.valueSize;
@@ -1500,7 +1508,7 @@ fn main(@builtin(workgroup_id) workgroupId: vec3<u32>, @builtin(local_invocation
   let valueScale = inverseSqrt(batchedKvReduceValues[0] / f32(params.valueSize) + params.epsilon);
   for (var dim = lane; dim < params.valueSize; dim = dim + 256u) {
     valueCache[(dim * params.headCount + head) * params.contextLength + tokenPosition] =
-      vProjectionValues[valueBase + dim] * valueScale;
+      f16(vProjectionValues[valueBase + dim] * valueScale);
   }
   let ropePairCount = params.ropeDims / 2u;
   for (var ic = lane; ic < ropePairCount; ic = ic + 256u) {
@@ -1510,8 +1518,8 @@ fn main(@builtin(workgroup_id) workgroupId: vec3<u32>, @builtin(local_invocation
     let thetaWithFactor = theta / batchedKvRopeFactor(ic);
     let cosTheta = cos(thetaWithFactor);
     let sinTheta = sin(thetaWithFactor);
-    keyCache[keyBase + ic] = x0 * cosTheta - x1 * sinTheta;
-    keyCache[keyBase + ropePairCount + ic] = x0 * sinTheta + x1 * cosTheta;
+    keyCache[keyBase + ic] = f16(x0 * cosTheta - x1 * sinTheta);
+    keyCache[keyBase + ropePairCount + ic] = f16(x0 * sinTheta + x1 * cosTheta);
   }
 }
 `;
@@ -2751,6 +2759,8 @@ fn main(@builtin(workgroup_id) workgroupId: vec3<u32>, @builtin(local_invocation
 `;
 
 export const FULL_ATTENTION_SCORE_WGSL = `
+enable f16;
+
 struct Params {
   scale: f32,
   headSize: u32,
@@ -2763,52 +2773,9 @@ struct Params {
 };
 
 @group(0) @binding(0) var<storage, read> queryValues: array<f32>;
-@group(0) @binding(1) var<storage, read> keyValues: array<f32>;
+@group(0) @binding(1) var<storage, read> keyValues: array<f16>;
 @group(0) @binding(2) var<uniform> params: Params;
 @group(0) @binding(3) var<storage, read_write> probabilityValues: array<f32>;
-
-fn f16BitsToF32(bits: u32) -> f32 {
-  let sign = select(1.0, -1.0, (bits & 0x8000u) != 0u);
-  let exponent = (bits >> 10u) & 31u;
-  let fraction = bits & 1023u;
-  if (exponent == 0u) {
-    return sign * exp2(-14.0) * (f32(fraction) / 1024.0);
-  }
-  if (exponent == 31u) {
-    return sign * 65504.0;
-  }
-  return sign * exp2(f32(exponent) - 15.0) * (1.0 + f32(fraction) / 1024.0);
-}
-
-fn f32ToF16Bits(value: f32) -> u32 {
-  let bits = bitcast<u32>(value);
-  let sign = (bits >> 16u) & 0x8000u;
-  let absBits = bits & 0x7fffffffu;
-  if (absBits == 0u) {
-    return sign;
-  }
-  if (absBits >= 0x7f800000u) {
-    return sign | 0x7c00u;
-  }
-  var exponent = i32((absBits >> 23u) & 255u) - 127 + 15;
-  let mantissa = absBits & 0x7fffffu;
-  if (exponent <= 0) {
-    if (exponent < -10) {
-      return sign;
-    }
-    let shifted = (mantissa | 0x800000u) >> u32(1 - exponent);
-    return sign | ((shifted + 0x1000u) >> 13u);
-  }
-  var halfMantissa = (mantissa + 0x1000u) >> 13u;
-  if (halfMantissa == 0x400u) {
-    halfMantissa = 0u;
-    exponent = exponent + 1;
-  }
-  if (exponent >= 31) {
-    return sign | 0x7c00u;
-  }
-  return sign | (u32(exponent) << 10u) | halfMantissa;
-}
 
 fn queryValue(index: u32) -> f32 {
   return queryValues[index];
@@ -2819,7 +2786,7 @@ fn attentionScore(qHead: u32, kvHead: u32, keyToken: u32) -> f32 {
   let keyOffset = (keyToken * params.keyValueHeadCount + kvHead) * params.headSize;
   var dot = 0.0;
   for (var dim = 0u; dim < params.headSize; dim = dim + 1u) {
-    dot = dot + queryValue(queryOffset + dim) * keyValues[keyOffset + dim];
+    dot = dot + queryValue(queryOffset + dim) * f32(keyValues[keyOffset + dim]);
   }
   return dot * params.scale;
 }
@@ -2878,6 +2845,8 @@ fn main(
 `;
 
 export const FULL_ATTENTION_APPLY_WGSL = `
+enable f16;
+
 struct Params {
   scale: f32,
   valueSize: u32,
@@ -2889,7 +2858,7 @@ struct Params {
   _pad1: u32,
 };
 
-@group(0) @binding(0) var<storage, read> valueValues: array<f32>;
+@group(0) @binding(0) var<storage, read> valueValues: array<f16>;
 @group(0) @binding(1) var<storage, read> probabilityValues: array<f32>;
 @group(0) @binding(2) var<uniform> params: Params;
 @group(0) @binding(3) var<storage, read_write> outputValues: array<f32>;
@@ -2908,7 +2877,7 @@ fn main(@builtin(workgroup_id) workgroupId: vec3<u32>, @builtin(local_invocation
   for (var keyToken = params.keyValueStart + lane; keyToken < params.keyValueTokenCount; keyToken = keyToken + 256u) {
     let probability = probabilityValues[probabilityOffset + keyToken];
     let valueIndex = (dim * params.keyValueHeadCount + kvHead) * params.contextLength + keyToken;
-    weighted = weighted + probability * valueValues[valueIndex];
+    weighted = weighted + probability * f32(valueValues[valueIndex]);
   }
   attentionApplyValues[lane] = weighted;
   workgroupBarrier();
@@ -2926,6 +2895,8 @@ fn main(@builtin(workgroup_id) workgroupId: vec3<u32>, @builtin(local_invocation
 `;
 
 export const BATCHED_FULL_ATTENTION_MATERIALIZED_SCORE_WGSL = `
+enable f16;
+
 struct Params {
   scale: f32,
   headSize: u32,
@@ -2942,7 +2913,7 @@ struct Params {
 };
 
 @group(0) @binding(0) var<storage, read> queryValues: array<f32>;
-@group(0) @binding(1) var<storage, read> keyValues: array<f32>;
+@group(0) @binding(1) var<storage, read> keyValues: array<f16>;
 @group(0) @binding(2) var<storage, read> positions: array<u32>;
 @group(0) @binding(3) var<uniform> params: Params;
 @group(0) @binding(4) var<storage, read_write> probabilityValues: array<f32>;
@@ -2962,7 +2933,7 @@ fn batchedMaterializedAttentionScore(token: u32, qHead: u32, kvHead: u32, keyTok
   let keyOffset = (keyToken * params.keyValueHeadCount + kvHead) * params.headSize;
   var dot = 0.0;
   for (var dim = 0u; dim < params.headSize; dim = dim + 1u) {
-    dot = dot + queryValues[queryOffset + dim] * keyValues[keyOffset + dim];
+    dot = dot + queryValues[queryOffset + dim] * f32(keyValues[keyOffset + dim]);
   }
   return dot * params.scale;
 }
@@ -3029,6 +3000,8 @@ fn main(@builtin(workgroup_id) workgroupId: vec3<u32>, @builtin(local_invocation
 `;
 
 export const BATCHED_FULL_ATTENTION_MATERIALIZED_APPLY_WGSL = `
+enable f16;
+
 struct Params {
   scale: f32,
   valueSize: u32,
@@ -3044,7 +3017,7 @@ struct Params {
   _pad0: u32,
 };
 
-@group(0) @binding(0) var<storage, read> valueValues: array<f32>;
+@group(0) @binding(0) var<storage, read> valueValues: array<f16>;
 @group(0) @binding(1) var<storage, read> probabilityValues: array<f32>;
 @group(0) @binding(2) var<storage, read> positions: array<u32>;
 @group(0) @binding(3) var<uniform> params: Params;
@@ -3080,7 +3053,7 @@ fn main(@builtin(workgroup_id) workgroupId: vec3<u32>, @builtin(local_invocation
     if (batchedMaterializedApplyAllowed(queryPosition, keyToken)) {
       let probability = probabilityValues[probabilityOffset + keyToken];
       let valueIndex = (dim * params.keyValueHeadCount + kvHead) * params.contextLength + keyToken;
-      weighted = weighted + probability * valueValues[valueIndex];
+      weighted = weighted + probability * f32(valueValues[valueIndex]);
     }
   }
   batchedMaterializedApplyValues[lane] = weighted;
@@ -3123,6 +3096,8 @@ fn main(@builtin(workgroup_id) workgroupId: vec3<u32>) {
 `;
 
 export const BATCHED_FULL_ATTENTION_ROLLING_TILE_PROBABILITY_WGSL = `
+enable f16;
+
 struct Params {
   scale: f32,
   headSize: u32,
@@ -3143,7 +3118,7 @@ struct Params {
 };
 
 @group(0) @binding(0) var<storage, read> queryValues: array<f32>;
-@group(0) @binding(1) var<storage, read> keyValues: array<f32>;
+@group(0) @binding(1) var<storage, read> keyValues: array<f16>;
 @group(0) @binding(2) var<storage, read> positions: array<u32>;
 @group(0) @binding(3) var<uniform> params: Params;
 @group(0) @binding(4) var<storage, read_write> probabilityTileValues: array<f32>;
@@ -3165,7 +3140,7 @@ fn rollingTileScore(token: u32, qHead: u32, kvHead: u32, keyToken: u32) -> f32 {
   let keyOffset = (keyToken * params.keyValueHeadCount + kvHead) * params.headSize;
   var dot = 0.0;
   for (var dim = 0u; dim < params.headSize; dim = dim + 1u) {
-    dot = dot + queryValues[queryOffset + dim] * keyValues[keyOffset + dim];
+    dot = dot + queryValues[queryOffset + dim] * f32(keyValues[keyOffset + dim]);
   }
   return dot * params.scale;
 }
@@ -3278,6 +3253,8 @@ fn main(@builtin(workgroup_id) workgroupId: vec3<u32>) {
 `;
 
 export const BATCHED_FULL_ATTENTION_ROLLING_TILE_APPLY_WGSL = `
+enable f16;
+
 struct Params {
   valueSize: u32,
   queryHeadCount: u32,
@@ -3289,7 +3266,7 @@ struct Params {
   tokenCount: u32,
 };
 
-@group(0) @binding(0) var<storage, read> valueValues: array<f32>;
+@group(0) @binding(0) var<storage, read> valueValues: array<f16>;
 @group(0) @binding(1) var<storage, read> probabilityTileValues: array<f32>;
 @group(0) @binding(2) var<storage, read> oldScaleValues: array<f32>;
 @group(0) @binding(3) var<storage, read> tileScaleValues: array<f32>;
@@ -3316,7 +3293,7 @@ fn main(@builtin(workgroup_id) workgroupId: vec3<u32>, @builtin(local_invocation
     let probability = probabilityTileValues[tileBase + offset];
     let keyToken = params.tileStart + offset;
     let valueIndex = (dim * params.keyValueHeadCount + kvHead) * params.contextLength + keyToken;
-    weighted = weighted + probability * valueValues[valueIndex];
+    weighted = weighted + probability * f32(valueValues[valueIndex]);
   }
   rollingApplyReduceValues[lane] = weighted;
   workgroupBarrier();

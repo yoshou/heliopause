@@ -7,7 +7,7 @@ export type WebGpuSupport =
     }
   | {
       available: false;
-      reason: "navigator-missing" | "api-missing" | "adapter-missing" | "request-failed";
+      reason: "navigator-missing" | "api-missing" | "adapter-missing" | "shader-f16-missing" | "request-failed";
       error?: string;
     };
 
@@ -19,7 +19,14 @@ export type WebGpuSmokeTest =
     }
   | {
       ok: false;
-      reason: "navigator-missing" | "api-missing" | "adapter-missing" | "device-request-failed" | "compute-failed" | "mismatch";
+      reason:
+        | "navigator-missing"
+        | "api-missing"
+        | "adapter-missing"
+        | "shader-f16-missing"
+        | "device-request-failed"
+        | "compute-failed"
+        | "mismatch";
       durationMs: number;
       error?: string;
       output?: number[];

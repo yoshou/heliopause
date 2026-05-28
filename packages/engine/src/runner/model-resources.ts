@@ -21,6 +21,7 @@ export type ModelResourceRequirementOptions = {
   memoryLimitBytes?: number;
   fixedBytes?: number;
   scratchBytes?: number;
+  cacheElementByteLength?: number;
   outputTensorNames?: readonly string[];
   targetResourceConstrained?: boolean;
   canRunFullModel?: boolean;
@@ -64,7 +65,12 @@ export function createModelResourceRequirements(
   for (let layer = 0; layer < options.manifest.blockCount; layer += 1) {
     const layerKind = options.manifest.layerKinds[layer] ?? "sliding-attention";
     const weightBytes = layerWeightBytes(tensorsByName, options.manifest, layer);
-    const cacheBytes = attentionCacheBytes(options.manifest, layer, options.contextLength);
+    const cacheBytes = attentionCacheBytes(
+      options.manifest,
+      layer,
+      options.contextLength,
+      options.cacheElementByteLength,
+    );
     const scratchBytes = options.scratchBytes ?? 0;
     const residentBytes = options.residentBytes?.({
       layer,
@@ -137,11 +143,12 @@ function attentionCacheBytes(
   manifest: ModelManifest,
   layer: number,
   contextLength: number,
+  elementByteLength = Float32Array.BYTES_PER_ELEMENT,
 ): number {
   if (!manifest.layerHasKv[layer]) {
     return 0;
   }
   const keyLength = manifest.layerKeyLengths[layer] ?? manifest.keyLength;
   const valueLength = manifest.layerValueLengths[layer] ?? manifest.valueLength;
-  return contextLength * manifest.headCountKv * (keyLength + valueLength) * Float32Array.BYTES_PER_ELEMENT;
+  return contextLength * manifest.headCountKv * (keyLength + valueLength) * elementByteLength;
 }

@@ -5,6 +5,8 @@ import type { NavigatorWithWebGpu, WebGpuAdapterLike, WebGpuDeviceLike, WebGpuSm
 let devicePromise: Promise<WebGpuDeviceLike | undefined> | undefined;
 let adapterLimitsPromise: Promise<Pick<WebGpuAdapterLike, "limits">["limits"] | undefined> | undefined;
 
+export const WEBGPU_REQUIRED_FEATURES = ["shader-f16"] as const;
+
 export async function checkWebGpuSupport(): Promise<WebGpuSupport> {
   if (typeof navigator === "undefined") {
     return {
@@ -29,6 +31,13 @@ export async function checkWebGpuSupport(): Promise<WebGpuSupport> {
       return {
         available: false,
         reason: "adapter-missing",
+      };
+    }
+
+    if (!webGpuAdapterSupportsRequiredFeatures(adapter)) {
+      return {
+        available: false,
+        reason: "shader-f16-missing",
       };
     }
 
@@ -64,8 +73,13 @@ export async function runWebGpuSmokeTest(): Promise<WebGpuSmokeTest> {
     if (!adapter?.requestDevice) {
       return smokeFailure("adapter-missing", start);
     }
+    if (!webGpuAdapterSupportsRequiredFeatures(adapter)) {
+      return smokeFailure("shader-f16-missing", start);
+    }
 
-    const device = await adapter.requestDevice();
+    const device = await adapter.requestDevice({
+      requiredFeatures: webGpuRequiredDeviceFeatures(adapter, { includeTimestampQuery: false }),
+    });
     const input = new Float32Array([1, 2, 3, 4]);
     const expected = [3, 5, 7, 9];
     const inputBuffer = device.createBuffer({
@@ -189,6 +203,21 @@ export async function webGpuDevice(): Promise<WebGpuDeviceLike | undefined> {
   return devicePromise;
 }
 
+export function webGpuAdapterSupportsRequiredFeatures(adapter: WebGpuAdapterLike): boolean {
+  return WEBGPU_REQUIRED_FEATURES.every((feature) => adapter.features?.has(feature));
+}
+
+export function webGpuRequiredDeviceFeatures(
+  adapter: WebGpuAdapterLike,
+  options: { includeTimestampQuery?: boolean } = {},
+): string[] {
+  const features: string[] = [...WEBGPU_REQUIRED_FEATURES];
+  if (options.includeTimestampQuery === true && adapter.features?.has("timestamp-query")) {
+    features.push("timestamp-query");
+  }
+  return features;
+}
+
 export async function webGpuAdapterLimits(): Promise<Pick<WebGpuAdapterLike, "limits">["limits"] | undefined> {
   adapterLimitsPromise ??= (async () => {
     if (typeof navigator === "undefined") {
@@ -227,18 +256,24 @@ async function requestWebGpuDevice(): Promise<WebGpuDeviceLike | undefined> {
   if (!adapter?.requestDevice) {
     return undefined;
   }
+  if (!webGpuAdapterSupportsRequiredFeatures(adapter)) {
+    return undefined;
+  }
   const requiredLimits = requestedDeviceLimits(adapter.limits);
   if (webGpuGpuTimingEnabled() && adapter.features?.has("timestamp-query")) {
     try {
       return await adapter.requestDevice({
-        requiredFeatures: ["timestamp-query"],
+        requiredFeatures: webGpuRequiredDeviceFeatures(adapter, { includeTimestampQuery: true }),
         requiredLimits,
       });
     } catch {
       // Timestamp profiling is optional; keep WebGPU execution available without it.
     }
   }
-  return adapter.requestDevice({ requiredLimits });
+  return adapter.requestDevice({
+    requiredFeatures: webGpuRequiredDeviceFeatures(adapter),
+    requiredLimits,
+  });
 }
 
 function webGpuGpuTimingEnabled(): boolean {

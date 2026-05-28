@@ -35,6 +35,8 @@ Deno.test({
 
     const support = await checkWebGpuSupport();
     assert(support.available, `WebGPU unavailable: ${JSON.stringify(support)}`);
+    const adapter = await navigator.gpu?.requestAdapter();
+    assert(adapter?.features.has("shader-f16"), "WebGPU native f16 support is required for KV cache storage");
 
     const reader = await createFileGgufTensorReader(new RangeFile(MODEL.path));
     const tokenizer = buildTokenizer(reader.metadata);
@@ -117,6 +119,11 @@ Deno.test({
       ),
       `WebGPU requiredLimits did not include raised buffer limits: ${JSON.stringify(capture.requiredLimits)}`,
     );
+    assert(
+      capture.requiredFeatures.some((features) => features.includes("shader-f16")),
+      `WebGPU requiredFeatures did not include shader-f16: ${JSON.stringify(capture.requiredFeatures)}`,
+    );
+    assertKvCacheBuffersUseF16(capture.buffers, session.manifest, state.contextLength);
   },
 });
 
@@ -179,15 +186,24 @@ type CapturedDevice = {
   popErrorScope?: () => Promise<unknown>;
 };
 
+type CapturedBuffer = {
+  label: string;
+  size: number;
+};
+
 function installWebGpuCapture(): {
   device?: CapturedDevice;
   requiredLimits: Array<Record<string, number>>;
+  requiredFeatures: string[][];
+  buffers: CapturedBuffer[];
 } {
   const originalGpu = navigator.gpu;
   const capture: {
     device?: CapturedDevice;
     requiredLimits: Array<Record<string, number>>;
-  } = { requiredLimits: [] };
+    requiredFeatures: string[][];
+    buffers: CapturedBuffer[];
+  } = { requiredLimits: [], requiredFeatures: [], buffers: [] };
   if (!originalGpu?.requestAdapter) {
     return capture;
   }
@@ -206,20 +222,97 @@ function installWebGpuCapture(): {
           info: adapter.info,
           limits: adapter.limits,
           requestDevice: async (...deviceArgs: Parameters<typeof adapter.requestDevice>) => {
-            const descriptor = deviceArgs[0] as { requiredLimits?: Record<string, number> } | undefined;
+            const descriptor = deviceArgs[0] as {
+              requiredFeatures?: Iterable<string>;
+              requiredLimits?: Record<string, number>;
+            } | undefined;
+            if (descriptor?.requiredFeatures) {
+              capture.requiredFeatures.push(Array.from(descriptor.requiredFeatures));
+            }
             if (descriptor?.requiredLimits) {
               capture.requiredLimits.push({ ...descriptor.requiredLimits });
             }
             const device = await adapter.requestDevice(...deviceArgs);
-            capture.device = device as CapturedDevice;
+            const rawCreateBuffer = device.createBuffer.bind(device);
+            const overrides = new Map<PropertyKey, unknown>();
+            const wrappedDevice = new Proxy(device, {
+              get(target, property) {
+                if (property === "createBuffer") {
+                  const override = overrides.get(property) as ((descriptor: GPUBufferDescriptor) => GPUBuffer) | undefined;
+                  if (!override) {
+                    return rawCreateBuffer;
+                  }
+                  return (bufferDescriptor: GPUBufferDescriptor) => {
+                    capture.buffers.push({
+                      label: String(bufferDescriptor.label ?? ""),
+                      size: Number(bufferDescriptor.size),
+                    });
+                    return override(bufferDescriptor);
+                  };
+                }
+                if (overrides.has(property)) {
+                  return overrides.get(property);
+                }
+                const value = Reflect.get(target, property, target);
+                return typeof value === "function" ? value.bind(target) : value;
+              },
+              set(_target, property, value) {
+                overrides.set(property, value);
+                return true;
+              },
+            });
+            capture.device = wrappedDevice as CapturedDevice;
             capture.device.pushErrorScope?.("validation");
-            return device;
+            return wrappedDevice;
           },
         };
       },
     },
   });
   return capture;
+}
+
+function assertKvCacheBuffersUseF16(
+  buffers: readonly CapturedBuffer[],
+  manifest: { headCountKv: number; keyLength: number; valueLength: number; layerKeyLengths: number[]; layerValueLengths: number[] },
+  contextLength: number,
+): void {
+  const keyBuffers = buffers.filter((buffer) => /\.gpu\.key_cache$/.test(buffer.label));
+  const valueBuffers = buffers.filter((buffer) => /\.gpu\.value_cache$/.test(buffer.label));
+  assert(keyBuffers.length > 0, `WebGPU key cache buffers were not created: ${JSON.stringify(buffers)}`);
+  assertEquals(valueBuffers.length, keyBuffers.length, "WebGPU key/value cache buffer counts should match");
+
+  const actualBytes = sumSizes(keyBuffers) + sumSizes(valueBuffers);
+  const expectedF16Bytes = expectedCacheBytes(keyBuffers, manifest, contextLength, "key") +
+    expectedCacheBytes(valueBuffers, manifest, contextLength, "value");
+  const expectedF32Bytes = expectedF16Bytes * 2;
+  assertEquals(
+    actualBytes,
+    expectedF16Bytes,
+    `WebGPU KV cache buffers should be native f16 sized; actual=${actualBytes}, f16=${expectedF16Bytes}, f32=${expectedF32Bytes}`,
+  );
+}
+
+function expectedCacheBytes(
+  buffers: readonly CapturedBuffer[],
+  manifest: { headCountKv: number; keyLength: number; valueLength: number; layerKeyLengths: number[]; layerValueLengths: number[] },
+  contextLength: number,
+  kind: "key" | "value",
+): number {
+  return buffers.reduce((total, buffer) => {
+    const match = /blk\.(\d+)\.gpu\.(?:key|value)_cache$/.exec(buffer.label);
+    assert(match, `Unexpected WebGPU KV cache label: ${buffer.label}`);
+    const layer = Number(match[1]);
+    const elementCount = contextLength * manifest.headCountKv *
+      (kind === "key"
+        ? (manifest.layerKeyLengths[layer] ?? manifest.keyLength)
+        : (manifest.layerValueLengths[layer] ?? manifest.valueLength));
+    return total + elementCount * 2;
+  }, 0);
+}
+
+function sumSizes(buffers: readonly CapturedBuffer[]): number {
+  return buffers.reduce((total, buffer) => total + buffer.size, 0);
 }
 
 function assertNaturalSentence(text: string): void {

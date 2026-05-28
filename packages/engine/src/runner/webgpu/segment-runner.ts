@@ -190,6 +190,8 @@ type GpuState = {
   fullAttention: Map<number, FullAttentionGpuLayerState>;
 };
 
+const F16_BYTE_LENGTH = 2;
+
 type GpuInputResources = {
   tokenEmbedding?: F32Handle | QuantizedHandle;
   perLayerTokenEmbedding?: F32Handle | QuantizedHandle;
@@ -2958,12 +2960,12 @@ export class WebGpuSegmentRunner implements SegmentRunner {
       fullAttention.set(layer.layer, {
         key: this.arena.createBuffer(
           `blk.${layer.layer}.gpu.key_cache`,
-          state.contextLength * this.manifest.headCountKv * layer.headSize * Float32Array.BYTES_PER_ELEMENT,
+          state.contextLength * this.manifest.headCountKv * layer.headSize * F16_BYTE_LENGTH,
           GPU_STORAGE,
         ),
         value: this.arena.createBuffer(
           `blk.${layer.layer}.gpu.value_cache`,
-          state.contextLength * this.manifest.headCountKv * layer.valueSize * Float32Array.BYTES_PER_ELEMENT,
+          state.contextLength * this.manifest.headCountKv * layer.valueSize * F16_BYTE_LENGTH,
           GPU_STORAGE,
         ),
       });
