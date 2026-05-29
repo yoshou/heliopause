@@ -239,15 +239,13 @@ function installWebGpuCapture(): {
               get(target, property) {
                 if (property === "createBuffer") {
                   const override = overrides.get(property) as ((descriptor: GPUBufferDescriptor) => GPUBuffer) | undefined;
-                  if (!override) {
-                    return rawCreateBuffer;
-                  }
+                  const create = override ?? rawCreateBuffer;
                   return (bufferDescriptor: GPUBufferDescriptor) => {
                     capture.buffers.push({
                       label: String(bufferDescriptor.label ?? ""),
                       size: Number(bufferDescriptor.size),
                     });
-                    return override(bufferDescriptor);
+                    return create(bufferDescriptor);
                   };
                 }
                 if (overrides.has(property)) {

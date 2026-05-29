@@ -9,8 +9,8 @@ import { GPU_COPY_DST, GPU_MAP_READ } from "../src/runner/webgpu/gpu-constants.t
 import type { WebGpuDeviceLike } from "../src/runner/webgpu/gpu-types.ts";
 
 test("WebGPU runtime resource cache creates pipelines and layouts only once per descriptor", () => {
-  const { device, counts } = fakeDevice();
-  const cache = installWebGpuRuntimeResourceCache(device);
+  const { device: rawDevice, counts } = fakeDevice();
+  const { device, cache } = installWebGpuRuntimeResourceCache(rawDevice);
 
   const moduleA = device.createShaderModule({ code: "kernel-a" });
   const moduleB = device.createShaderModule({ code: "kernel-a" });
@@ -54,8 +54,8 @@ test("WebGPU runtime resource cache creates pipelines and layouts only once per 
 });
 
 test("WebGPU runtime resource cache does not reuse bind groups", () => {
-  const { device, counts } = fakeDevice();
-  const cache = installWebGpuRuntimeResourceCache(device);
+  const { device: rawDevice, counts } = fakeDevice();
+  const { device, cache } = installWebGpuRuntimeResourceCache(rawDevice);
   const layout = device.createBindGroupLayout({
     entries: [{ binding: 0, visibility: 4, buffer: { type: "storage" } }],
   });
@@ -79,8 +79,8 @@ test("WebGPU runtime resource cache does not reuse bind groups", () => {
 });
 
 test("WebGPU runtime resource cache reuses unmapped readback buffers", async () => {
-  const { device, counts } = fakeDevice();
-  const cache = installWebGpuRuntimeResourceCache(device);
+  const { device: rawDevice, counts } = fakeDevice();
+  const { device, cache } = installWebGpuRuntimeResourceCache(rawDevice);
 
   const bufferA = device.createBuffer({ size: 4, usage: GPU_MAP_READ | GPU_COPY_DST });
   await bufferA.mapAsync(GPU_MAP_READ);
@@ -96,8 +96,8 @@ test("WebGPU runtime resource cache reuses unmapped readback buffers", async () 
 });
 
 test("WebGPU runtime resource stats diff returns per-run deltas", () => {
-  const { device } = fakeDevice();
-  const cache = installWebGpuRuntimeResourceCache(device);
+  const { device: rawDevice } = fakeDevice();
+  const { device, cache } = installWebGpuRuntimeResourceCache(rawDevice);
   const before = cache.stats();
 
   const module = device.createShaderModule({ code: "kernel-b" });

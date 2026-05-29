@@ -1,4 +1,5 @@
 import { bindBuffer, storageEntry } from "./gpu-bindings";
+import { unwrapGpuBuffer } from "./gpu-buffer";
 import { GPU_COPY_DST, GPU_SHADER_STAGE_COMPUTE, GPU_UNIFORM } from "./gpu-constants";
 import type { WebGpuBufferLike, WebGpuDeviceLike } from "./gpu-types";
 import {
@@ -448,15 +449,13 @@ function createResource(
       entryPoint: "main",
     },
   });
-  const params = entries
-    .map((entry) => typeof entry === "object" && entry !== null && "resource" in entry ? entry.resource : undefined)
-    .filter(isDisposableUniform);
+  const disposables = entries.filter(isDisposableBindEntry).map((entry) => entry.dispose);
   return {
     pipeline,
     bindGroup: device.createBindGroup({ layout: bindGroupLayout, entries }),
     destroy: () => {
-      for (const param of params) {
-        param.__buffer.destroy?.();
+      for (const buffer of disposables) {
+        buffer.destroy?.();
       }
     },
   };
@@ -470,17 +469,22 @@ function uniformEntry(binding: number): unknown {
   };
 }
 
-function uniformBuffer(device: WebGpuDeviceLike, binding: number, values: Uint32Array): { binding: number; resource: { buffer: WebGpuBufferLike } & DisposableUniform } {
+function uniformBuffer(device: WebGpuDeviceLike, binding: number, values: Uint32Array): DisposableBindEntry {
   const buffer = device.createBuffer({ size: values.byteLength, usage: GPU_UNIFORM | GPU_COPY_DST });
   device.queue.writeBuffer(buffer, 0, values);
   return {
     binding,
-    resource: Object.assign({ buffer }, { __buffer: buffer }),
+    resource: { buffer: unwrapGpuBuffer(buffer) },
+    dispose: buffer,
   };
 }
 
-type DisposableUniform = { __buffer: WebGpuBufferLike };
+type DisposableBindEntry = {
+  binding: number;
+  resource: { buffer: WebGpuBufferLike };
+  dispose: WebGpuBufferLike;
+};
 
-function isDisposableUniform(value: unknown): value is DisposableUniform {
-  return typeof value === "object" && value !== null && "__buffer" in value;
+function isDisposableBindEntry(value: unknown): value is DisposableBindEntry {
+  return typeof value === "object" && value !== null && "dispose" in value;
 }

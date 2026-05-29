@@ -1,4 +1,5 @@
 import { GPU_COPY_SRC, GPU_STORAGE } from "./gpu-constants";
+import { GpuBuffer, unwrapGpuBuffer } from "./gpu-buffer";
 import type { WebGpuBufferLike, WebGpuDeviceLike, WebGpuF32TensorHandleInternal, WebGpuQuantizedWeightHandleInternal } from "./gpu-types";
 
 export type GpuResource = {
@@ -8,8 +9,71 @@ export type GpuResource = {
 export type QuantizedHandle = WebGpuQuantizedWeightHandleInternal;
 export type F32Handle = WebGpuF32TensorHandleInternal;
 
+/** Buffer whose `destroy()` releases its bytes back to the owning arena exactly once. */
+class ArenaBuffer extends GpuBuffer {
+  #destroyed = false;
+  #release: () => void;
+
+  constructor(raw: WebGpuBufferLike, byteLength: number, release: () => void) {
+    super(raw, byteLength);
+    this.#release = release;
+  }
+
+  override destroy(): void {
+    if (this.#destroyed) {
+      return;
+    }
+    this.#destroyed = true;
+    this.#release();
+    this.raw.destroy?.();
+  }
+}
+
+/**
+ * Pooled scratch buffer. `destroy()` returns the buffer to the arena's scratch
+ * pool for reuse; the real GPU buffer is released only via `destroyForReal()`
+ * when the pool is drained.
+ */
+class ScratchBuffer extends GpuBuffer {
+  inPool = false;
+  readonly poolKey: string;
+  #destroyed = false;
+  #returnToPool: (buffer: ScratchBuffer) => void;
+  #release: () => void;
+
+  constructor(
+    raw: WebGpuBufferLike,
+    byteLength: number,
+    poolKey: string,
+    returnToPool: (buffer: ScratchBuffer) => void,
+    release: () => void,
+  ) {
+    super(raw, byteLength);
+    this.poolKey = poolKey;
+    this.#returnToPool = returnToPool;
+    this.#release = release;
+  }
+
+  override destroy(): void {
+    if (this.#destroyed || this.inPool) {
+      return;
+    }
+    this.inPool = true;
+    this.#returnToPool(this);
+  }
+
+  destroyForReal(): void {
+    if (this.#destroyed) {
+      return;
+    }
+    this.#destroyed = true;
+    this.#release();
+    this.raw.destroy?.();
+  }
+}
+
 export class GpuMemoryArena {
-  readonly device: WebGpuDeviceLike;
+  device: WebGpuDeviceLike;
   readonly limitBytes: number;
   private allocatedBytes = 0;
   private peakAllocatedBytes = 0;
@@ -43,34 +107,25 @@ export class GpuMemoryArena {
           `${this.allocatedBytes + byteLength} > ${this.limitBytes}`,
       );
     }
-    const buffer = this.device.createBuffer({
+    const raw = unwrapGpuBuffer(this.device.createBuffer({
       label,
       size: byteLength,
       usage,
       mappedAtCreation,
-    });
+    }));
     this.allocatedBytes += byteLength;
     this.peakAllocatedBytes = Math.max(this.peakAllocatedBytes, this.allocatedBytes);
-    const destroy = buffer.destroy?.bind(buffer);
-    let destroyed = false;
-    buffer.destroy = () => {
-      if (destroyed) {
-        return;
-      }
-      destroyed = true;
+    return new ArenaBuffer(raw, byteLength, () => {
       this.allocatedBytes -= byteLength;
-      destroy?.();
-    };
-    return buffer;
+    });
   }
 
   createScratchBuffer(label: string, size: number, usage: number): WebGpuBufferLike {
     const byteLength = align4(size);
     const key = `${usage}:${byteLength}`;
-    const pool = this.scratchPools.get(key);
-    const pooled = pool?.pop();
+    const pooled = this.scratchPools.get(key)?.pop();
     if (pooled) {
-      pooled.__heliopauseInScratchPool = false;
+      pooled.inPool = false;
       return pooled;
     }
     if (this.allocatedBytes + byteLength > this.limitBytes) {
@@ -79,56 +134,42 @@ export class GpuMemoryArena {
           `${this.allocatedBytes + byteLength} > ${this.limitBytes}`,
       );
     }
-    const buffer = this.device.createBuffer({
+    const raw = unwrapGpuBuffer(this.device.createBuffer({
       label,
       size: byteLength,
       usage,
-    }) as ScratchBuffer;
+    }));
     this.allocatedBytes += byteLength;
     this.peakAllocatedBytes = Math.max(this.peakAllocatedBytes, this.allocatedBytes);
-    const destroy = buffer.destroy?.bind(buffer);
-    buffer.__heliopauseScratchKey = key;
-    buffer.__heliopauseScratchBytes = byteLength;
-    buffer.__heliopauseDestroyScratch = () => {
-      if (buffer.__heliopauseScratchDestroyed) {
-        return;
-      }
-      buffer.__heliopauseScratchDestroyed = true;
-      this.allocatedBytes -= byteLength;
-      destroy?.();
-    };
-    buffer.destroy = () => {
-      if (buffer.__heliopauseScratchDestroyed || buffer.__heliopauseInScratchPool) {
-        return;
-      }
-      buffer.__heliopauseInScratchPool = true;
-      const targetPool = this.scratchPools.get(key);
-      if (targetPool) {
-        targetPool.push(buffer);
-      } else {
-        this.scratchPools.set(key, [buffer]);
-      }
-    };
-    return buffer;
+    return new ScratchBuffer(
+      raw,
+      byteLength,
+      key,
+      (buffer) => this.returnScratch(buffer),
+      () => {
+        this.allocatedBytes -= byteLength;
+      },
+    );
   }
 
   destroyScratchBuffers(): void {
     for (const pool of this.scratchPools.values()) {
       for (const buffer of pool) {
-        buffer.__heliopauseDestroyScratch?.();
+        buffer.destroyForReal();
       }
     }
     this.scratchPools.clear();
   }
-}
 
-type ScratchBuffer = WebGpuBufferLike & {
-  __heliopauseScratchKey?: string;
-  __heliopauseScratchBytes?: number;
-  __heliopauseInScratchPool?: boolean;
-  __heliopauseScratchDestroyed?: boolean;
-  __heliopauseDestroyScratch?: () => void;
-};
+  private returnScratch(buffer: ScratchBuffer): void {
+    const pool = this.scratchPools.get(buffer.poolKey);
+    if (pool) {
+      pool.push(buffer);
+    } else {
+      this.scratchPools.set(buffer.poolKey, [buffer]);
+    }
+  }
+}
 
 export type Q8KBuffers = {
   scale: WebGpuBufferLike;

@@ -1,4 +1,5 @@
 import { GPU_SHADER_STAGE_COMPUTE, GPU_STORAGE } from "./gpu-constants";
+import { unwrapGpuBuffer } from "./gpu-buffer";
 import type { WebGpuBufferLike, WebGpuDeviceLike } from "./gpu-types";
 
 export function storageBuffer(
@@ -23,6 +24,6 @@ export function storageEntry(binding: number, type: "read-only-storage" | "stora
 export function bindBuffer(binding: number, buffer: WebGpuBufferLike): unknown {
   return {
     binding,
-    resource: { buffer },
+    resource: { buffer: unwrapGpuBuffer(buffer) },
   };
 }

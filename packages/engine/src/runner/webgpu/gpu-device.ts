@@ -1,5 +1,6 @@
 import { GPU_COPY_DST, GPU_COPY_SRC, GPU_MAP_READ, GPU_SHADER_STAGE_COMPUTE, GPU_STORAGE } from "./gpu-constants";
 import { bindBuffer, storageEntry } from "./gpu-bindings";
+import { wrapWebGpuDevice } from "./gpu-buffer";
 import type { NavigatorWithWebGpu, WebGpuAdapterLike, WebGpuDeviceLike, WebGpuSmokeTest, WebGpuSupport } from "./gpu-types";
 
 let devicePromise: Promise<WebGpuDeviceLike | undefined> | undefined;
@@ -262,18 +263,18 @@ async function requestWebGpuDevice(): Promise<WebGpuDeviceLike | undefined> {
   const requiredLimits = requestedDeviceLimits(adapter.limits);
   if (webGpuGpuTimingEnabled() && adapter.features?.has("timestamp-query")) {
     try {
-      return await adapter.requestDevice({
+      return wrapWebGpuDevice(await adapter.requestDevice({
         requiredFeatures: webGpuRequiredDeviceFeatures(adapter, { includeTimestampQuery: true }),
         requiredLimits,
-      });
+      }));
     } catch {
       // Timestamp profiling is optional; keep WebGPU execution available without it.
     }
   }
-  return adapter.requestDevice({
+  return wrapWebGpuDevice(await adapter.requestDevice({
     requiredFeatures: webGpuRequiredDeviceFeatures(adapter),
     requiredLimits,
-  });
+  }));
 }
 
 function webGpuGpuTimingEnabled(): boolean {

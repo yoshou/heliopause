@@ -480,7 +480,9 @@ export class WebGpuSegmentRunner implements SegmentRunner {
       return;
     }
     const startMs = nowMs();
-    this.runtimeResourceCache = installWebGpuRuntimeResourceCache(this.arena.device);
+    const { device, cache } = installWebGpuRuntimeResourceCache(this.arena.device);
+    this.arena.device = device;
+    this.runtimeResourceCache = cache;
     this.runtimeInitMs += nowMs() - startMs;
     this.runtimeResourcesInitialized = true;
   }
