@@ -949,24 +949,6 @@ textarea:disabled {
   white-space: nowrap;
 }
 
-.message-audio a {
-  min-height: 36px;
-  padding: 0 12px;
-  border: 1px solid #c9d2cb;
-  border-radius: 8px;
-  color: #172026;
-  background: #ffffff;
-  font-size: 0.84rem;
-  font-weight: 800;
-  cursor: pointer;
-}
-
-.message-audio a {
-  display: inline-grid;
-  place-items: center;
-  text-decoration: none;
-}
-
 .icon-button {
   display: inline-grid;
   flex: 0 0 auto;
@@ -1100,7 +1082,7 @@ textarea:disabled {
 
 .message-audio {
   display: grid;
-  grid-template-columns: minmax(180px, 1fr) auto auto;
+  grid-template-columns: minmax(180px, 1fr);
   align-items: center;
   gap: 8px;
   margin: 4px 0 14px;

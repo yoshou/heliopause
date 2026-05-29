@@ -40,12 +40,7 @@ type UiImageAttachment = {
 };
 
 type UiAudioAttachment = {
-  blob: Blob;
   url: string;
-  fileName: string;
-  wavBlob?: Blob;
-  wavUrl?: string;
-  wavFileName?: string;
   pcm: Float32Array;
   durationMs: number;
 };
@@ -992,18 +987,11 @@ function App() {
     }
 
     setRecordingState("processing");
-    const timestamp = formatAudioFileTimestamp(new Date());
     const webmBlob = new Blob(chunks, { type: mimeType });
-    const fileName = `heliopause-audio-${timestamp}.webm`;
     try {
-      const { wavBlob, pcm } = await create16KhzMonoWavBlob(webmBlob);
+      const pcm = await create16KhzMonoPcm(webmBlob);
       const nextAudio: UiAudioAttachment = {
-        blob: webmBlob,
         url: URL.createObjectURL(webmBlob),
-        fileName,
-        wavBlob,
-        wavUrl: URL.createObjectURL(wavBlob),
-        wavFileName: `heliopause-audio-${timestamp}-16khz.wav`,
         pcm,
         durationMs,
       };
@@ -2361,10 +2349,6 @@ function AudioMessage({ audio }: { audio: UiAudioAttachment }) {
   return (
     <div className="message-audio">
       <audio controls src={audio.url} />
-      <a href={audio.url} download={audio.fileName}>WebM</a>
-      {audio.wavUrl && audio.wavFileName ? (
-        <a href={audio.wavUrl} download={audio.wavFileName}>WAV</a>
-      ) : null}
     </div>
   );
 }
@@ -2615,9 +2599,6 @@ function revokeAudioAttachment(audio: UiAudioAttachment | undefined) {
     return;
   }
   URL.revokeObjectURL(audio.url);
-  if (audio.wavUrl) {
-    URL.revokeObjectURL(audio.wavUrl);
-  }
 }
 
 function revokeMessageAudioAttachments(messages: UiMessage[]) {
@@ -2626,29 +2607,12 @@ function revokeMessageAudioAttachments(messages: UiMessage[]) {
   }
 }
 
-function formatAudioFileTimestamp(date: Date): string {
-  const pad = (value: number) => value.toString().padStart(2, "0");
-  return [
-    date.getFullYear(),
-    pad(date.getMonth() + 1),
-    pad(date.getDate()),
-    "-",
-    pad(date.getHours()),
-    pad(date.getMinutes()),
-    pad(date.getSeconds()),
-  ].join("");
-}
-
-async function create16KhzMonoWavBlob(audioBlob: Blob): Promise<{ wavBlob: Blob; pcm: Float32Array }> {
+async function create16KhzMonoPcm(audioBlob: Blob): Promise<Float32Array> {
   const audioContext = new AudioContext();
   try {
     const decoded = await audioContext.decodeAudioData(await audioBlob.arrayBuffer());
     const mono = mixAudioBufferToMono(decoded);
-    const resampled = resampleLinear(mono, decoded.sampleRate, AUDIO_SAMPLE_RATE);
-    return {
-      wavBlob: encodeFloat32PcmWav(resampled, AUDIO_SAMPLE_RATE),
-      pcm: resampled,
-    };
+    return resampleLinear(mono, decoded.sampleRate, AUDIO_SAMPLE_RATE);
   } finally {
     await audioContext.close();
   }
@@ -2680,40 +2644,6 @@ function resampleLinear(input: Float32Array, sourceRate: number, targetRate: num
     output[index] = input[leftIndex] * (1 - fraction) + input[rightIndex] * fraction;
   }
   return output;
-}
-
-function encodeFloat32PcmWav(samples: Float32Array, sampleRate: number): Blob {
-  const bytesPerSample = 2;
-  const dataSize = samples.length * bytesPerSample;
-  const buffer = new ArrayBuffer(44 + dataSize);
-  const view = new DataView(buffer);
-  writeAscii(view, 0, "RIFF");
-  view.setUint32(4, 36 + dataSize, true);
-  writeAscii(view, 8, "WAVE");
-  writeAscii(view, 12, "fmt ");
-  view.setUint32(16, 16, true);
-  view.setUint16(20, 1, true);
-  view.setUint16(22, 1, true);
-  view.setUint32(24, sampleRate, true);
-  view.setUint32(28, sampleRate * bytesPerSample, true);
-  view.setUint16(32, bytesPerSample, true);
-  view.setUint16(34, bytesPerSample * 8, true);
-  writeAscii(view, 36, "data");
-  view.setUint32(40, dataSize, true);
-
-  let offset = 44;
-  for (const sample of samples) {
-    const clipped = Math.max(-1, Math.min(1, sample));
-    view.setInt16(offset, clipped < 0 ? clipped * 0x8000 : clipped * 0x7fff, true);
-    offset += bytesPerSample;
-  }
-  return new Blob([buffer], { type: "audio/wav" });
-}
-
-function writeAscii(view: DataView, offset: number, text: string) {
-  for (let index = 0; index < text.length; index += 1) {
-    view.setUint8(offset + index, text.charCodeAt(index));
-  }
 }
 
 async function readSystemMemoryInfo(): Promise<SystemMemoryInfo | undefined> {
