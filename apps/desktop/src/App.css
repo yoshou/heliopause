@@ -289,6 +289,11 @@ textarea:disabled {
   line-height: 1.4;
 }
 
+.assistant-timeline {
+  display: grid;
+  gap: 8px;
+}
+
 .thinking-panels {
   display: grid;
   gap: 6px;
@@ -329,6 +334,10 @@ textarea:disabled {
   color: #66736b;
   font-size: 0.74rem;
   font-weight: 800;
+}
+
+.thinking-panel--running summary small {
+  color: #5f7168;
 }
 
 .thinking-panel pre {

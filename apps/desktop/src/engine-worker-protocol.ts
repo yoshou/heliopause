@@ -2,7 +2,7 @@ import type { AgentEvent } from "@heliopause/agent";
 
 export type MemoryProfile = "auto" | "low" | "full";
 
-export type WorkerAgentEvent = Exclude<AgentEvent, { type: "text" }>;
+export type WorkerAgentEvent = AgentEvent;
 
 export type WorkerWebSearchResult = {
   title: string;

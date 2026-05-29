@@ -67,8 +67,15 @@ type ThinkingView = {
   id: string;
   step: number;
   content: string;
+  status: "running" | "done";
+  statusLabel: string;
   truncated: boolean;
 };
+
+type AssistantTimelineItem =
+  | { type: "text"; id: string; content: string }
+  | { type: "thinking"; id: string; thinking: ThinkingView }
+  | { type: "tool"; id: string; tool: ToolCardView };
 
 type SandboxListFilesContent = {
   kind: "sandbox_list_files";
@@ -304,9 +311,6 @@ function App() {
     if (!messagePanel) {
       return;
     }
-    if (isGenerating) {
-      return;
-    }
     if (!shouldFollowMessagesRef.current) {
       return;
     }
@@ -314,7 +318,7 @@ function App() {
       top: messagePanel.scrollHeight,
       behavior: "smooth",
     });
-  }, [isGenerating, messages]);
+  }, [messages]);
 
   useEffect(() => {
     const messagePanel = messagePanelRef.current;
@@ -1569,19 +1573,18 @@ function App() {
 function MessageBubble(
   { isGenerating, message }: { isGenerating: boolean; message: UiMessage },
 ) {
-  const toolCards = message.role === "assistant"
-    ? buildToolCardViews(message.agentEvents ?? [])
-    : [];
-  const thinking = message.role === "assistant"
-    ? buildThinkingViews(message.agentEvents ?? [])
-    : [];
   const visibleContent = stripAgentArtifacts(stripThinking(message.content)).trim();
   const textContent = message.files && message.files.length > 0 ? "" : visibleContent;
+  const agentEvents = message.agentEvents ?? [];
+  const shouldUseAssistantTimeline = message.role === "assistant" && agentEvents.length > 0;
+  const assistantTimeline = shouldUseAssistantTimeline
+    ? buildAssistantTimeline(agentEvents, textContent)
+    : [];
+  const hasAssistantTimeline = assistantTimeline.length > 0;
   const placeholder = message.role === "assistant" &&
       isGenerating &&
       textContent.length === 0 &&
-      thinking.length === 0 &&
-      toolCards.length === 0
+      !hasAssistantTimeline
     ? "Generating..."
     : "";
   return (
@@ -1602,15 +1605,15 @@ function MessageBubble(
       {message.audio ? (
         <AudioMessage audio={message.audio} />
       ) : null}
-      {textContent ? (
+      {hasAssistantTimeline ? (
+        <AssistantTimeline items={assistantTimeline} />
+      ) : textContent ? (
         message.role === "assistant" ? (
           <AssistantMarkdown content={textContent} />
         ) : (
           <p className="message-text">{textContent}</p>
         )
       ) : null}
-      {thinking.length > 0 ? <ThinkingPanel thinking={thinking} /> : null}
-      {toolCards.length > 0 ? <ToolIndicators tools={toolCards} /> : null}
       {placeholder ? (
         <p className="message-text">{placeholder}</p>
       ) : null}
@@ -1623,24 +1626,73 @@ function MessageBubble(
   );
 }
 
-function ThinkingPanel({ thinking }: { thinking: ThinkingView[] }) {
+function AssistantTimeline({ items }: { items: AssistantTimelineItem[] }) {
   return (
-    <div className="thinking-panels" aria-label="Thinking">
-      {thinking.map((item) => (
-        <details className="thinking-panel" key={item.id}>
-          <summary>
-            <Lightbulb aria-hidden="true" size={15} />
-            <span>Thinking</span>
-            <small>Step {item.step}</small>
-            <ChevronRight className="thinking-details-icon" aria-hidden="true" size={15} />
-          </summary>
-          <pre>{item.content}</pre>
-          {item.truncated ? (
-            <small className="thinking-truncated">Thinking truncated</small>
-          ) : null}
-        </details>
-      ))}
+    <div className="assistant-timeline" aria-label="Assistant activity">
+      {items.map((item) => {
+        if (item.type === "thinking") {
+          return <ThinkingItem key={item.id} thinking={item.thinking} />;
+        }
+        if (item.type === "tool") {
+          return <ToolIndicator key={item.id} tool={item.tool} />;
+        }
+        return <AssistantMarkdown content={item.content} key={item.id} />;
+      })}
     </div>
+  );
+}
+
+function ThinkingItem({ thinking }: { thinking: ThinkingView }) {
+  const preRef = useRef<HTMLPreElement | null>(null);
+  const shouldFollowThinkingRef = useRef(true);
+
+  useEffect(() => {
+    const pre = preRef.current;
+    if (!pre) {
+      return;
+    }
+    const scrollingPre = pre;
+
+    function updateShouldFollowThinking() {
+      shouldFollowThinkingRef.current = isScrolledNearBottom(scrollingPre);
+    }
+
+    updateShouldFollowThinking();
+    scrollingPre.addEventListener("scroll", updateShouldFollowThinking, { passive: true });
+    return () => {
+      scrollingPre.removeEventListener("scroll", updateShouldFollowThinking);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!shouldFollowThinkingRef.current) {
+      return;
+    }
+    scrollToElementBottom(preRef.current);
+  }, [thinking.content]);
+
+  function handleToggle() {
+    if (!shouldFollowThinkingRef.current) {
+      return;
+    }
+    window.requestAnimationFrame(() => {
+      scrollToElementBottom(preRef.current);
+    });
+  }
+
+  return (
+    <details className={`thinking-panel thinking-panel--${thinking.status}`} onToggle={handleToggle}>
+      <summary>
+        <Lightbulb aria-hidden="true" size={15} />
+        <span>Thinking</span>
+        <small>{thinking.statusLabel}</small>
+        <ChevronRight className="thinking-details-icon" aria-hidden="true" size={15} />
+      </summary>
+      <pre ref={preRef}>{thinking.content}</pre>
+      {thinking.truncated ? (
+        <small className="thinking-truncated">Thinking truncated</small>
+      ) : null}
+    </details>
   );
 }
 
@@ -1657,24 +1709,19 @@ function AssistantMarkdown({ content }: { content: string }) {
   );
 }
 
-function ToolIndicators({ tools }: { tools: ToolCardView[] }) {
+function ToolIndicator({ tool }: { tool: ToolCardView }) {
   return (
-    <div className="tool-indicators" aria-label="Tool activity">
-      {tools.map((tool) => (
-        <details
-          className={`tool-indicator tool-indicator--${tool.status}`}
-          key={tool.id}
-        >
-          <summary>
-            <span className="tool-status-dot" aria-hidden="true" />
-            <span className="tool-action-label">{tool.actionLabel}</span>
-            <span className="tool-status-label">{tool.statusLabel}</span>
-            <ChevronRight className="tool-details-icon" aria-hidden="true" size={15} />
-          </summary>
-          <ToolIndicatorDetails tool={tool} />
-        </details>
-      ))}
-    </div>
+    <details
+      className={`tool-indicator tool-indicator--${tool.status}`}
+    >
+      <summary>
+        <span className="tool-status-dot" aria-hidden="true" />
+        <span className="tool-action-label">{tool.actionLabel}</span>
+        <span className="tool-status-label">{tool.statusLabel}</span>
+        <ChevronRight className="tool-details-icon" aria-hidden="true" size={15} />
+      </summary>
+      <ToolIndicatorDetails tool={tool} />
+    </details>
   );
 }
 
@@ -1872,83 +1919,148 @@ function ToolPreBlock({ label, value }: { label: string; value: string }) {
   );
 }
 
-function buildThinkingViews(events: WorkerAgentEvent[]): ThinkingView[] {
-  const views = new Map<number, ThinkingView>();
-  const orderedSteps: number[] = [];
+function buildAssistantTimeline(events: WorkerAgentEvent[], fallbackContent: string): AssistantTimelineItem[] {
+  const items: AssistantTimelineItem[] = [];
+  const itemIndexes = new Map<string, number>();
+  let hasTextItem = false;
+  let hasDoneEvent = false;
+
+  function upsert(item: AssistantTimelineItem) {
+    const index = itemIndexes.get(item.id);
+    if (index === undefined) {
+      itemIndexes.set(item.id, items.length);
+      items.push(item);
+      return;
+    }
+    items[index] = item;
+  }
+
+  function getTool(id: string): ToolCardView | undefined {
+    const index = itemIndexes.get(id);
+    const item = index === undefined ? undefined : items[index];
+    return item?.type === "tool" ? item.tool : undefined;
+  }
 
   for (const event of events) {
-    if (event.type !== "thinking") {
+    if (event.type === "done") {
+      hasDoneEvent = true;
       continue;
     }
-    if (!views.has(event.step)) {
-      orderedSteps.push(event.step);
+
+    if (event.type === "thinking") {
+      const id = `thinking-${event.step}`;
+      upsert({
+        type: "thinking",
+        id,
+        thinking: {
+          id,
+          step: event.step,
+          content: event.content,
+          status: "running",
+          statusLabel: "Running",
+          truncated: event.truncated === true,
+        },
+      });
+      continue;
     }
-    views.set(event.step, {
-      id: `thinking-${event.step}`,
-      step: event.step,
-      content: event.content,
-      truncated: event.truncated === true,
-    });
-  }
 
-  return orderedSteps.map((step) => views.get(step)).filter((view): view is ThinkingView => Boolean(view));
-}
-
-function buildToolCardViews(events: WorkerAgentEvent[]): ToolCardView[] {
-  const tools = new Map<string, ToolCardView>();
-  const orderedIds: string[] = [];
-
-  function upsert(id: string, next: ToolCardView) {
-    if (!tools.has(id)) {
-      orderedIds.push(id);
-    }
-    tools.set(id, next);
-  }
-
-  for (const event of events) {
     if (event.type === "toolCall") {
       const id = event.call.id;
-      upsert(id, {
+      upsert({
+        type: "tool",
         id,
-        step: event.step,
-        actionLabel: describeToolAction(event.call),
-        status: "running",
-        statusLabel: "Running",
-        call: event.call,
+        tool: {
+          id,
+          step: event.step,
+          actionLabel: describeToolAction(event.call),
+          status: "running",
+          statusLabel: "Running",
+          call: event.call,
+        },
       });
       continue;
     }
 
     if (event.type === "toolResult") {
-      const current = tools.get(event.result.callId);
+      const current = getTool(event.result.callId);
       const status = statusForToolResult(event.result);
-      upsert(event.result.callId, {
+      upsert({
+        type: "tool",
         id: event.result.callId,
-        step: current?.step ?? event.step,
-        actionLabel: current?.call ? describeToolAction(current.call) : "Tool call",
-        status,
-        statusLabel: labelForStatus(status),
-        call: current?.call,
-        result: event.result,
+        tool: {
+          id: event.result.callId,
+          step: current?.step ?? event.step,
+          actionLabel: current?.call ? describeToolAction(current.call) : "Tool call",
+          status,
+          statusLabel: labelForStatus(status),
+          call: current?.call,
+          result: event.result,
+        },
       });
       continue;
     }
 
     if (event.type === "stepError") {
-      const current = tools.get(event.callId);
-      upsert(event.callId, {
+      const current = getTool(event.callId);
+      upsert({
+        type: "tool",
         id: event.callId,
-        step: current?.step ?? event.step,
-        actionLabel: current?.call ? describeToolAction(current.call) : "Tool call",
-        status: "failed",
-        statusLabel: "Failed",
-        call: current?.call,
-        stepError: event.error,
+        tool: {
+          id: event.callId,
+          step: current?.step ?? event.step,
+          actionLabel: current?.call ? describeToolAction(current.call) : "Tool call",
+          status: "failed",
+          statusLabel: "Failed",
+          call: current?.call,
+          stepError: event.error,
+        },
+      });
+      continue;
+    }
+
+    if (event.type === "text") {
+      const content = stripAgentArtifacts(stripThinking(event.content)).trim();
+      if (content.length === 0) {
+        continue;
+      }
+      hasTextItem = true;
+      upsert({
+        type: "text",
+        id: `text-${event.step}`,
+        content,
       });
     }
   }
 
-  return orderedIds.map((id) => tools.get(id)).filter((tool): tool is ToolCardView => Boolean(tool));
+  if (!hasTextItem && fallbackContent.length > 0) {
+    items.push({
+      type: "text",
+      id: "text-current",
+      content: fallbackContent,
+    });
+  }
+
+  markCompletedThinkingItems(items, hasDoneEvent);
+
+  return items;
+}
+
+function markCompletedThinkingItems(items: AssistantTimelineItem[], hasDoneEvent: boolean) {
+  for (let index = 0; index < items.length; index += 1) {
+    const item = items[index];
+    if (item?.type !== "thinking") {
+      continue;
+    }
+    const hasLaterActivity = items.slice(index + 1).some((candidate) => candidate.type !== "thinking");
+    if (!hasDoneEvent && !hasLaterActivity) {
+      continue;
+    }
+    item.thinking = {
+      ...item.thinking,
+      status: "done",
+      statusLabel: "Done",
+    };
+  }
 }
 
 function statusForToolResult(
@@ -2136,6 +2248,13 @@ function byteLength(value: string): number {
 
 function isScrolledNearBottom(element: HTMLElement): boolean {
   return element.scrollHeight - element.scrollTop - element.clientHeight <= MESSAGE_PANEL_BOTTOM_THRESHOLD_PX;
+}
+
+function scrollToElementBottom(element: HTMLElement | null) {
+  if (!element) {
+    return;
+  }
+  element.scrollTop = element.scrollHeight;
 }
 
 function GgufComposer(

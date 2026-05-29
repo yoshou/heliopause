@@ -322,9 +322,6 @@ async function handleGenerateTurn(
           enableThinking: request.enableThinking,
           cloneState: session.hasProvider("webgpu") ? false : cloneInferenceState,
           onAgentEvent(event) {
-            if (event.type === "text") {
-              return;
-            }
             workerScope.postMessage({
               type: "agentEvent",
               requestId: request.requestId,
@@ -386,9 +383,6 @@ async function handleGenerateTurn(
           enableThinking: request.enableThinking,
           cloneState: session.hasProvider("webgpu") ? false : cloneInferenceState,
           onAgentEvent(event) {
-            if (event.type === "text") {
-              return;
-            }
             workerScope.postMessage({
               type: "agentEvent",
               requestId: request.requestId,
