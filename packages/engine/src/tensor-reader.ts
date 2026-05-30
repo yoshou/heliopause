@@ -288,4 +288,5 @@ export const ggmlTypeStorage: Record<string, { blockSize: number; typeSize: numb
   Q5_K: { blockSize: 256, typeSize: 176 },
   Q6_K: { blockSize: 256, typeSize: 210 },
   IQ4_XS: { blockSize: 256, typeSize: 136 },
+  I32: { blockSize: 1, typeSize: 4 },
 };

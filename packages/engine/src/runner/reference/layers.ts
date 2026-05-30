@@ -35,6 +35,17 @@ import {
   timedSync,
   topK,
 } from "../../runtime";
+import type {
+  SegmentRunnerProvider,
+} from "../segment-runner";
+
+export type ReferenceTensorSession = {
+  getTensor(name: string): ReturnType<ModelSession["getTensor"]>;
+  hasProvider(name: SegmentRunnerProvider): boolean;
+  readF32Tensor(name: string): Promise<Float32Array>;
+  readWeightBytes(name: string): Promise<Uint8Array>;
+  tensorReader: ModelSession["tensorReader"];
+};
 
 export type PreparedInput = {
   hidden: Float32Array;
@@ -526,7 +537,7 @@ async function readTensorRows(
 }
 
 export async function matMulWeight(
-  session: ModelSession,
+  session: ReferenceTensorSession,
   weightName: string,
   inputColumns: Float32Array,
   trace?: ForwardTrace,
@@ -545,7 +556,7 @@ export async function matMulWeight(
   throw new Error(`${weightName} has unsupported matmul type ${tensor.type}`);
 }
 
-function requireReferenceProvider(session: ModelSession): void {
+function requireReferenceProvider(session: ReferenceTensorSession): void {
   if (!session.hasProvider("reference")) {
     throw new Error("Reference tensor execution requires an enabled reference provider.");
   }
@@ -561,7 +572,7 @@ async function matMulWeightBatch(
 }
 
 async function matMulDenseRows(
-  session: ModelSession,
+  session: ReferenceTensorSession,
   weightName: string,
   inputColumns: Float32Array,
 ): Promise<Float32Array> {
@@ -588,7 +599,7 @@ async function matMulDenseRows(
 }
 
 async function matMulKQ8K(
-  session: ModelSession,
+  session: ReferenceTensorSession,
   weightName: string,
   inputColumns: Float32Array,
   type: Extract<GgmlTypeName, "Q4_K" | "Q5_K" | "Q6_K" | "IQ4_XS">,
@@ -638,7 +649,7 @@ function matMulKQ8KReference(
 }
 
 async function matMulQ8_0Weight(
-  session: ModelSession,
+  session: ReferenceTensorSession,
   weightName: string,
   inputColumns: Float32Array,
   trace?: ForwardTrace,

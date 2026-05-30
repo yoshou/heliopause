@@ -2,6 +2,7 @@ import type {
   ModelRunner,
 } from "../model-runner";
 import type {
+  MtpAssistantRunnerProvider,
   MultimodalRunnerProvider,
 } from "../provider";
 import {
@@ -31,6 +32,9 @@ import {
 import {
   createModelResourceRequirements,
 } from "../model-resources";
+import {
+  createReferenceMtpAssistantRunners,
+} from "./mtp-assistant-runner";
 
 export function createReferenceModelRunner(): ModelRunner {
   return {
@@ -50,7 +54,7 @@ export function createReferenceModelRunner(): ModelRunner {
   };
 }
 
-export function createReferenceProvider(): MultimodalRunnerProvider {
+export function createReferenceProvider(): MultimodalRunnerProvider & MtpAssistantRunnerProvider {
   return {
     name: "reference",
     createModelRunner: createReferenceModelRunner,
@@ -66,6 +70,7 @@ export function createReferenceProvider(): MultimodalRunnerProvider {
     }),
     createAudioRunners: createReferenceAudioRunners,
     createVisionRunners: createReferenceVisionRunners,
+    createMtpAssistantRunners: createReferenceMtpAssistantRunners,
   };
 }
 

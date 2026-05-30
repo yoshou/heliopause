@@ -5,6 +5,9 @@ import type {
   ModelRunner,
 } from "./model-runner";
 import type {
+  MtpAssistantRunners,
+} from "./mtp-assistant-runner";
+import type {
   ProviderResourceRequirements,
 } from "./planning";
 import type {
@@ -34,11 +37,15 @@ export type VisionRunnerProvider = RunnerProvider & {
   createVisionRunners(): VisionRunners;
 };
 
+export type MtpAssistantRunnerProvider = RunnerProvider & {
+  createMtpAssistantRunners(): MtpAssistantRunners;
+};
+
 export type MultimodalRunnerProvider = ModelRunnerProvider & AudioRunnerProvider & VisionRunnerProvider;
 
 export function validateProviderList<TProvider extends RunnerProvider>(
   providers: readonly TProvider[],
-  capability: keyof ModelRunnerProvider | keyof AudioRunnerProvider | keyof VisionRunnerProvider,
+  capability: keyof ModelRunnerProvider | keyof AudioRunnerProvider | keyof VisionRunnerProvider | keyof MtpAssistantRunnerProvider,
 ): readonly TProvider[] {
   if (providers.length === 0) {
     throw new Error("At least one runner provider is required.");

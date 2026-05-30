@@ -10,16 +10,20 @@ export {
 } from "./gguf";
 
 export {
+  auditMtpAssistantTensorCoverage,
   auditTensorCoverage,
   buildAudioManifest,
+  buildMtpAssistantManifest,
   buildModelManifest,
   buildVisionManifest,
   isAudioGguf,
+  isMtpAssistantGguf,
   isVisionGguf,
   type AudioManifest,
   type ExpectedTensor,
   type LayerKind,
   type ModelManifest,
+  type MtpAssistantManifest,
   type TensorCoverageAudit,
   type VisionManifest,
 } from "./model";
@@ -161,6 +165,20 @@ export {
 } from "./vision";
 
 export {
+  createMtpAssistantSession,
+  MtpAssistantSession,
+  runMtpAssistant,
+  type MtpAssistantForwardIntermediates,
+  type MtpAssistantRunInput,
+  type MtpAssistantRunResult,
+  type MtpAssistantRunner,
+  type MtpAssistantRunners,
+  type MtpAssistantSessionOptions,
+  type MtpTargetKvLayerView,
+  type MtpTargetKvView,
+} from "./mtp-assistant";
+
+export {
   createReferenceProvider,
   ReferenceSegmentRunner,
   type ReferenceHiddenResult,
@@ -199,6 +217,7 @@ export type {
   AudioRunnerProvider,
   ModelRunnerProvider,
   MultimodalRunnerProvider,
+  MtpAssistantRunnerProvider,
   RunnerProvider,
   VisionRunnerProvider,
 } from "./runner/provider";

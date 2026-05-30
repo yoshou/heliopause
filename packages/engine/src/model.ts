@@ -122,6 +122,38 @@ export type AudioManifest = {
   tensorTypes: Record<string, number>;
 };
 
+export type MtpAssistantManifest = {
+  architecture: "gemma4_assistant";
+  tensorCount: number;
+  blockCount: number;
+  embeddingLength: number;
+  backboneEmbeddingLength: number;
+  feedForwardLength: number;
+  headCount: number;
+  headCountKv: number;
+  keyLength: number;
+  valueLength: number;
+  slidingKeyLength: number;
+  slidingValueLength: number;
+  layerKeyLengths: number[];
+  layerValueLengths: number[];
+  contextLength: number;
+  slidingWindow: number;
+  layerKinds: LayerKind[];
+  nCentroids: number;
+  centroidTopK: number;
+  useOrderedEmbeddings: boolean;
+  layerNormEpsilon: number;
+  rope: {
+    slidingDimensionCount: number;
+    fullDimensionCount: number;
+    slidingFreqBase: number;
+    fullFreqBase: number;
+  };
+  tensorTypes: Record<string, number>;
+  expectedTensors: ExpectedTensor[];
+};
+
 const REQUIRED_ARCHITECTURE = "gemma4";
 const VISION_DEFAULT_IMAGE_MIN_TOKENS = 252;
 const VISION_DEFAULT_IMAGE_MAX_TOKENS = 280;
@@ -136,6 +168,10 @@ export function isAudioGguf(gguf: GgufMetadata): boolean {
   return gguf.metadata["general.architecture"] === "clip" &&
     gguf.metadata["clip.has_audio_encoder"] === true &&
     normalizeAudioProjector(getMetadataString(gguf.metadata, "clip.audio.projector_type")) === "gemma4";
+}
+
+export function isMtpAssistantGguf(gguf: GgufMetadata): boolean {
+  return gguf.metadata["general.architecture"] === "gemma4_assistant";
 }
 
 export function buildVisionManifest(gguf: GgufMetadata): VisionManifest {
@@ -227,6 +263,80 @@ export function buildAudioManifest(gguf: GgufMetadata): AudioManifest {
     melFloor: 0.001,
     maxSeconds: 30,
     tensorTypes,
+  };
+}
+
+export function buildMtpAssistantManifest(gguf: GgufMetadata): MtpAssistantManifest {
+  const metadata = gguf.metadata;
+  const architecture = requiredString(metadata, "general.architecture");
+  if (architecture !== "gemma4_assistant") {
+    throw new Error(`Expected architecture gemma4_assistant, got ${architecture}`);
+  }
+
+  const blockCount = requiredNumber(metadata, "gemma4_assistant.block_count");
+  const embeddingLength = requiredNumber(metadata, "gemma4_assistant.embedding_length");
+  const backboneEmbeddingLength = requiredNumber(metadata, "gemma4_assistant.n_embd_backbone");
+  const feedForwardLength = requiredNumber(metadata, "gemma4_assistant.feed_forward_length");
+  const headCount = requiredNumber(metadata, "gemma4_assistant.attention.head_count");
+  const headCountKv = requiredNumber(metadata, "gemma4_assistant.attention.head_count_kv");
+  const keyLength = requiredNumber(metadata, "gemma4_assistant.attention.key_length");
+  const valueLength = requiredNumber(metadata, "gemma4_assistant.attention.value_length");
+  const slidingKeyLength = firstNumber(metadata, ["gemma4_assistant.attention.key_length_swa"], keyLength);
+  const slidingValueLength = firstNumber(metadata, ["gemma4_assistant.attention.value_length_swa"], valueLength);
+  const contextLength = requiredNumber(metadata, "gemma4_assistant.context_length");
+  const slidingWindow = firstNumber(metadata, ["gemma4_assistant.attention.sliding_window"], contextLength);
+  const slidingPattern = boolArray(metadata, "gemma4_assistant.attention.sliding_window_pattern", blockCount) ??
+    range(blockCount).map((layer) => (layer + 1) % 6 !== 0);
+  const layerKinds: LayerKind[] = slidingPattern.map((isSliding) => isSliding ? "sliding-attention" : "full-attention");
+  const layerKeyLengths = layerKinds.map((kind) => kind === "sliding-attention" ? slidingKeyLength : keyLength);
+  const layerValueLengths = layerKinds.map((kind) => kind === "sliding-attention" ? slidingValueLength : valueLength);
+  const tensorTypes: Record<string, number> = {};
+  const tensorsByName = new Map(gguf.tensors.map((tensor) => [tensor.name, tensor]));
+  for (const tensor of gguf.tensors) {
+    tensorTypes[tensor.type] = (tensorTypes[tensor.type] ?? 0) + 1;
+  }
+  const nCentroids = requiredNumber(metadata, "gemma4_assistant.n_centroids");
+
+  return {
+    architecture: "gemma4_assistant",
+    tensorCount: gguf.tensorCount,
+    blockCount,
+    embeddingLength,
+    backboneEmbeddingLength,
+    feedForwardLength,
+    headCount,
+    headCountKv,
+    keyLength,
+    valueLength,
+    slidingKeyLength,
+    slidingValueLength,
+    layerKeyLengths,
+    layerValueLengths,
+    contextLength,
+    slidingWindow,
+    layerKinds,
+    nCentroids,
+    centroidTopK: requiredNumber(metadata, "gemma4_assistant.centroid_top_k"),
+    useOrderedEmbeddings: metadata["gemma4_assistant.use_ordered_embeddings"] === true,
+    layerNormEpsilon: requiredNumber(metadata, "gemma4_assistant.attention.layer_norm_rms_epsilon"),
+    rope: {
+      slidingDimensionCount: firstNumber(metadata, ["gemma4_assistant.rope.dimension_count_swa"], slidingKeyLength),
+      fullDimensionCount: firstNumber(metadata, ["gemma4_assistant.rope.dimension_count"], keyLength),
+      slidingFreqBase: firstNumber(metadata, ["gemma4_assistant.rope.freq_base_swa"], 10000),
+      fullFreqBase: firstNumber(metadata, ["gemma4_assistant.rope.freq_base"], 1000000),
+    },
+    tensorTypes,
+    expectedTensors: buildMtpAssistantExpectedTensors({
+      blockCount,
+      embeddingLength,
+      backboneEmbeddingLength,
+      feedForwardLength,
+      headCount,
+      layerKeyLengths,
+      layerValueLengths,
+      nCentroids,
+      tensorsByName,
+    }),
   };
 }
 
@@ -459,6 +569,161 @@ export function auditTensorCoverage(
     loadedButUnused,
     wrongLayerUse,
   };
+}
+
+export function auditMtpAssistantTensorCoverage(
+  gguf: GgufMetadata,
+  manifest: MtpAssistantManifest = buildMtpAssistantManifest(gguf),
+  usedTensorNames?: Iterable<string>,
+): TensorCoverageAudit {
+  const tensorsByName = new Map<string, GgufTensorInfo>();
+  for (const tensor of gguf.tensors) {
+    if (tensorsByName.has(tensor.name)) {
+      throw new Error(`Duplicate tensor in GGUF: ${tensor.name}`);
+    }
+    tensorsByName.set(tensor.name, tensor);
+  }
+
+  const expectedByName = new Map(manifest.expectedTensors.map((tensor) => [tensor.name, tensor]));
+  const usedSet = usedTensorNames ? new Set(usedTensorNames) : undefined;
+  const missing: string[] = [];
+  const unknown: string[] = [];
+  const shapeMismatches: string[] = [];
+  const typeMismatches: string[] = [];
+  const loadedButUnused: string[] = [];
+  const wrongLayerUse: string[] = [];
+  const errors: string[] = [];
+  const warnings: string[] = [];
+
+  for (const expected of manifest.expectedTensors) {
+    const actual = tensorsByName.get(expected.name);
+    if (!actual) {
+      missing.push(expected.name);
+      continue;
+    }
+    if (!sameDimensions(actual.dimensions, expected.dimensions)) {
+      shapeMismatches.push(
+        `${expected.name}: expected [${expected.dimensions.join(", ")}], got [${actual.dimensions.join(", ")}]`,
+      );
+    }
+    if (!expected.allowedTypes.includes(actual.type)) {
+      typeMismatches.push(
+        `${expected.name}: expected ${expected.allowedTypes.join(" | ")}, got ${actual.type}`,
+      );
+    }
+  }
+
+  for (const actual of gguf.tensors) {
+    if (!expectedByName.has(actual.name)) {
+      unknown.push(actual.name);
+    }
+  }
+
+  if (usedSet) {
+    for (const name of tensorsByName.keys()) {
+      if (!usedSet.has(name)) {
+        loadedButUnused.push(name);
+      }
+    }
+    for (const name of usedSet) {
+      if (!expectedByName.has(name)) {
+        unknown.push(name);
+      }
+    }
+  }
+
+  for (const item of missing) errors.push(`Missing tensor: ${item}`);
+  for (const item of unknown) errors.push(`Unknown tensor: ${item}`);
+  for (const item of shapeMismatches) errors.push(`Shape mismatch: ${item}`);
+  for (const item of typeMismatches) errors.push(`Type mismatch: ${item}`);
+  for (const item of loadedButUnused) errors.push(`Loaded but unused tensor: ${item}`);
+
+  return {
+    ok: errors.length === 0,
+    errors,
+    warnings,
+    missing,
+    unknown,
+    shapeMismatches,
+    typeMismatches,
+    loadedButUnused,
+    wrongLayerUse,
+  };
+}
+
+function buildMtpAssistantExpectedTensors(params: {
+  blockCount: number;
+  embeddingLength: number;
+  backboneEmbeddingLength: number;
+  feedForwardLength: number;
+  headCount: number;
+  layerKeyLengths: number[];
+  layerValueLengths: number[];
+  nCentroids: number;
+  tensorsByName: Map<string, GgufTensorInfo>;
+}): ExpectedTensor[] {
+  const {
+    blockCount,
+    embeddingLength,
+    backboneEmbeddingLength,
+    feedForwardLength,
+    headCount,
+    layerKeyLengths,
+    layerValueLengths,
+    nCentroids,
+    tensorsByName,
+  } = params;
+  const vocabSize = tensorsByName.get("token_embd.weight")?.dimensions[1] ?? 262144;
+  const expected: ExpectedTensor[] = [
+    ...(tensorsByName.has("rope_freqs.weight")
+      ? [{
+          name: "rope_freqs.weight",
+          dimensions: tensorsByName.get("rope_freqs.weight")?.dimensions ?? [layerKeyLengths.at(-1) ?? 0],
+          allowedTypes: observedType(tensorsByName, "rope_freqs.weight", ["F32"]),
+        } satisfies ExpectedTensor]
+      : []),
+    {
+      name: "token_embd.weight",
+      dimensions: [embeddingLength, vocabSize],
+      allowedTypes: observedType(tensorsByName, "token_embd.weight", ["Q6_K", "Q4_K"]),
+    },
+    { name: "output_norm.weight", dimensions: [embeddingLength], allowedTypes: ["F32"] },
+    {
+      name: "mtp.pre_projection.weight",
+      dimensions: [backboneEmbeddingLength * 2, embeddingLength],
+      allowedTypes: observedType(tensorsByName, "mtp.pre_projection.weight", ["Q4_K"]),
+    },
+    {
+      name: "mtp.post_projection.weight",
+      dimensions: [embeddingLength, backboneEmbeddingLength],
+      allowedTypes: observedType(tensorsByName, "mtp.post_projection.weight", ["Q4_K"]),
+    },
+    {
+      name: "mtp.centroids.weight",
+      dimensions: [embeddingLength, nCentroids],
+      allowedTypes: observedType(tensorsByName, "mtp.centroids.weight", ["Q4_K"]),
+    },
+    { name: "mtp.token_ordering.weight", dimensions: [vocabSize], allowedTypes: ["I32"] },
+  ];
+
+  for (const layer of range(blockCount)) {
+    const queryDim = (layerKeyLengths[layer] ?? 0) * headCount;
+    const valueDim = (layerValueLengths[layer] ?? 0) * headCount;
+    expected.push(
+      layerTensor(layer, "attn_q.weight", [embeddingLength, queryDim], observedType(tensorsByName, `blk.${layer}.attn_q.weight`, ["Q4_K"])),
+      layerTensor(layer, "attn_q_norm.weight", [layerKeyLengths[layer] ?? 0], ["F32"]),
+      layerTensor(layer, "attn_output.weight", [valueDim, embeddingLength], observedType(tensorsByName, `blk.${layer}.attn_output.weight`, ["Q4_K"])),
+      layerTensor(layer, "attn_norm.weight", [embeddingLength], ["F32"]),
+      layerTensor(layer, "post_attention_norm.weight", [embeddingLength], ["F32"]),
+      layerTensor(layer, "ffn_norm.weight", [embeddingLength], ["F32"]),
+      layerTensor(layer, "ffn_gate.weight", [embeddingLength, feedForwardLength], observedType(tensorsByName, `blk.${layer}.ffn_gate.weight`, ["Q4_K"])),
+      layerTensor(layer, "ffn_up.weight", [embeddingLength, feedForwardLength], observedType(tensorsByName, `blk.${layer}.ffn_up.weight`, ["Q4_K"])),
+      layerTensor(layer, "ffn_down.weight", [feedForwardLength, embeddingLength], observedType(tensorsByName, `blk.${layer}.ffn_down.weight`, ["Q4_K", "Q6_K"])),
+      layerTensor(layer, "post_ffw_norm.weight", [embeddingLength], ["F32"]),
+      layerTensor(layer, "layer_output_scale.weight", [1], ["F32"]),
+    );
+  }
+  return expected;
 }
 
 function buildExpectedTensors(params: {
