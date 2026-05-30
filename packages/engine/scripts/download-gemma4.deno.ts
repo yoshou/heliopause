@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 const MODEL = {
   url:
     "https://huggingface.co/unsloth/gemma-4-E4B-it-GGUF/resolve/653803f092503c04a65164346f3208a36e707693/gemma-4-E4B-it-Q4_K_M.gguf",
-  path: "models/gemma4/gemma-4-E4B-it-Q4_K_M.gguf",
+  path: "models/gemma4/unsloth/gemma-4-E4B-it-Q4_K_M.gguf",
   size: 4_977_169_568,
   sha256: "519b9793ed6ce0ff530f1b7c96e848e08e49e7af4d57bb97f76215963a54146d",
 };

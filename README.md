@@ -10,7 +10,7 @@ Heliopause is a local LLM runtime experiment for Gemma4 E4B GGUF models. It incl
 
 ## Supported Models
 
-- `gemma-4-E4B-it-Q4_K_M.gguf`
+- `models/gemma4/unsloth/gemma-4-E4B-it-Q4_K_M.gguf`
 
 ## Requirements
 
