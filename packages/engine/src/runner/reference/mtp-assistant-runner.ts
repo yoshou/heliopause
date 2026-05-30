@@ -21,9 +21,6 @@ import {
   gqaAttention,
   rmsNorm,
 } from "./kernels";
-import {
-  matMulWeight,
-} from "./layers";
 
 export function createReferenceMtpAssistantRunners(): MtpAssistantRunners {
   return { runner: referenceMtpAssistantRunner };
@@ -49,7 +46,7 @@ async function runReferenceMtpAssistant(
   const projectionInput = new Float32Array(session.manifest.backboneEmbeddingLength * 2);
   projectionInput.set(input.targetPreviousHidden, 0);
   projectionInput.set(input.targetCurrentHidden, session.manifest.backboneEmbeddingLength);
-  const preProjection = await matMulWeight(session, "mtp.pre_projection.weight", projectionInput);
+  const preProjection = await matMulAssistantWeight(session, "mtp.pre_projection.weight", projectionInput);
   let layerHidden: Float32Array = preProjection;
   const layerOutputs: Float32Array[] = [];
   for (let layer = 0; layer < session.manifest.blockCount; layer += 1) {
@@ -60,8 +57,8 @@ async function runReferenceMtpAssistant(
     layerOutputs.push(layerHidden.slice());
   }
   const normalizedHidden = rmsNorm(layerHidden, await session.readF32Tensor("output_norm.weight"), session.epsilon);
-  const postProjection = await matMulWeight(session, "mtp.post_projection.weight", normalizedHidden);
-  const centroidLogits = await matMulWeight(session, "mtp.centroids.weight", normalizedHidden);
+  const postProjection = await matMulAssistantWeight(session, "mtp.post_projection.weight", normalizedHidden);
+  const centroidLogits = await matMulAssistantWeight(session, "mtp.centroids.weight", normalizedHidden);
   return {
     hidden: layerHidden,
     backboneHidden: postProjection,
@@ -87,7 +84,7 @@ async function forwardAssistantLayer(
   validateTargetKvLayer(targetKv, manifest.headCountKv, headSize, valueSize, input.position, layer);
   const attnNorm = rmsNorm(hidden, await session.readF32Tensor(`blk.${layer}.attn_norm.weight`), session.epsilon);
   const qNorm = normHeads(
-    await matMulWeight(session, `blk.${layer}.attn_q.weight`, attnNorm),
+    await matMulAssistantWeight(session, `blk.${layer}.attn_q.weight`, attnNorm),
     await session.readF32Tensor(`blk.${layer}.attn_q_norm.weight`),
     session.epsilon,
   );
@@ -98,6 +95,7 @@ async function forwardAssistantLayer(
     nDims: kind === "sliding-attention" ? manifest.rope.slidingDimensionCount : manifest.rope.fullDimensionCount,
     freqBase: kind === "sliding-attention" ? manifest.rope.slidingFreqBase : manifest.rope.fullFreqBase,
     freqFactors: await readRopeFreqFactors(session, kind),
+    activePairCount: kind === "full-attention" ? Math.floor(manifest.rope.fullDimensionCount * 0.25 / 2) : undefined,
   });
   const keyValueTokenCount = Math.min(targetKv.tokenCount, targetKv.contextLength, input.position + 1);
   const attention = gqaAttention(
@@ -116,7 +114,7 @@ async function forwardAssistantLayer(
       valueLayout: "dim-head-token",
     },
   );
-  const attentionOutput = await matMulWeight(session, `blk.${layer}.attn_output.weight`, attention);
+  const attentionOutput = await matMulAssistantWeight(session, `blk.${layer}.attn_output.weight`, attention);
   const attentionResidual = residualAdd(hidden, rmsNorm(
     attentionOutput,
     await session.readF32Tensor(`blk.${layer}.post_attention_norm.weight`),
@@ -138,15 +136,51 @@ async function forwardAssistantFfn(
 ): Promise<Float32Array> {
   const ffnNorm = rmsNorm(residual, await session.readF32Tensor(`blk.${layer}.ffn_norm.weight`), session.epsilon);
   const [gate, up] = await Promise.all([
-    matMulWeight(session, `blk.${layer}.ffn_gate.weight`, ffnNorm),
-    matMulWeight(session, `blk.${layer}.ffn_up.weight`, ffnNorm),
+    matMulAssistantWeight(session, `blk.${layer}.ffn_gate.weight`, ffnNorm),
+    matMulAssistantWeight(session, `blk.${layer}.ffn_up.weight`, ffnNorm),
   ]);
   const gated = new Float32Array(gate.length);
   for (let index = 0; index < gated.length; index += 1) {
     gated[index] = Math.fround(gelu(gate[index] ?? 0) * (up[index] ?? 0));
   }
-  const ffnOut = await matMulWeight(session, `blk.${layer}.ffn_down.weight`, gated);
+  const ffnOut = await matMulAssistantWeight(session, `blk.${layer}.ffn_down.weight`, gated);
   return residualAdd(residual, rmsNorm(ffnOut, await session.readF32Tensor(`blk.${layer}.post_ffw_norm.weight`), session.epsilon));
+}
+
+async function matMulAssistantWeight(
+  session: MtpAssistantSession,
+  weightName: string,
+  input: Float32Array,
+): Promise<Float32Array> {
+  const tensor = session.getTensor(weightName);
+  const inputSize = tensor.dimensions[0] ?? 0;
+  const outputSize = tensor.dimensions[1] ?? 0;
+  if (inputSize <= 0 || outputSize <= 0) {
+    throw new Error(`${weightName} must be a matrix tensor`);
+  }
+  if (input.length % inputSize !== 0) {
+    throw new Error(`${weightName} input size mismatch: ${input.length} is not divisible by ${inputSize}`);
+  }
+  const columnCount = input.length / inputSize;
+  const output = new Float32Array(outputSize * columnCount);
+  const weightBytes = await session.readWeightBytes(weightName);
+  const rowByteLength = tensorByteLength({ ...tensor, dimensions: [inputSize] });
+  for (let row = 0; row < outputSize; row += 1) {
+    const weightRow = dequantizeRow(
+      tensor.type,
+      weightBytes.subarray(row * rowByteLength, (row + 1) * rowByteLength),
+      inputSize,
+    );
+    for (let column = 0; column < columnCount; column += 1) {
+      let sum = 0;
+      const inputOffset = column * inputSize;
+      for (let index = 0; index < inputSize; index += 1) {
+        sum = Math.fround(sum + Math.fround((weightRow[index] ?? 0) * (input[inputOffset + index] ?? 0)));
+      }
+      output[column * outputSize + row] = sum;
+    }
+  }
+  return output;
 }
 
 async function maskedEmbeddingTopTokens(
@@ -309,6 +343,7 @@ function ropeNeox(
     nDims: number;
     freqBase: number;
     freqFactors?: Float32Array;
+    activePairCount?: number;
   },
 ): Float32Array {
   const output = new Float32Array(input);
@@ -316,7 +351,8 @@ function ropeNeox(
   for (let head = 0; head < options.headCount; head += 1) {
     const rowOffset = head * options.headSize;
     let theta = options.position;
-    for (let i0 = 0; i0 < options.nDims; i0 += 2) {
+    const pairCount = options.activePairCount ?? options.nDims / 2;
+    for (let i0 = 0; i0 < pairCount * 2; i0 += 2) {
       const index = i0 / 2;
       const x0 = input[rowOffset + index] ?? 0;
       const x1 = input[rowOffset + options.nDims / 2 + index] ?? 0;
