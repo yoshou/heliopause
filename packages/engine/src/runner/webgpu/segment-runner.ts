@@ -2,7 +2,11 @@ import type { GgmlTypeName } from "../../gguf";
 import { type GgufTensorReader, type TensorByteRange } from "../../tensor-reader";
 import type { ModelManifest } from "../../model";
 import { addInferenceStateDisposeCallback, type InferenceState } from "../../runtime";
-import { dequantizeRow } from "../../quant";
+import { dequantizeRow, float16ToFloat32 } from "../../quant";
+import type {
+  MtpTargetKvLayerView,
+  MtpTargetKvView,
+} from "../mtp-assistant-runner";
 import { GPU_COPY_DST, GPU_COPY_SRC, GPU_MAP_READ, GPU_QUERY_RESOLVE, GPU_STORAGE, WEBGPU_MEMORY_LIMIT_BYTES } from "./gpu-constants";
 import { webGpuAdapterLimits, webGpuDevice } from "./gpu-device";
 import {
@@ -91,19 +95,23 @@ export type WebGpuStateLike = {
 
 export type WebGpuTokenResult = {
   selectedTokenId?: number;
+  selectedTokenIds?: number[];
   topTokens?: WebGpuTopToken[];
 };
 
 export type WebGpuHiddenResult = {
   hidden: Float32Array;
   selectedTokenId?: number;
+  selectedTokenIds?: number[];
   topTokens?: WebGpuTopToken[];
 };
 
 export type WebGpuRunOptions = {
   computeSelectedToken?: boolean;
+  computeSelectedTokens?: boolean;
   computeTopK?: boolean;
   topK?: number;
+  readAllHidden?: boolean;
   perLayerInputs?: Float32Array;
   perLayerInputsBuffer?: WebGpuBufferLike;
   attentionCausal?: boolean;
@@ -887,6 +895,30 @@ export class WebGpuSegmentRunner implements SegmentRunner {
     }
   }
 
+  async readMtpTargetKvView(
+    state: WebGpuStateLike,
+    layerIndexes: readonly number[],
+    tokenCount: number,
+  ): Promise<MtpTargetKvView> {
+    if (!Number.isInteger(tokenCount) || tokenCount < 0 || tokenCount > state.contextLength) {
+      throw new Error(`Invalid MTP KV token count ${tokenCount} for context length ${state.contextLength}.`);
+    }
+    const gpuState = this.ensureGpuState(state);
+    const layers: MtpTargetKvLayerView[] = [];
+    for (const layerIndex of layerIndexes) {
+      const layer = this.layers.find((candidate) => candidate.layer === layerIndex);
+      if (!layer) {
+        throw new Error(`WebGPU MTP KV readback requires loaded target layer ${layerIndex}.`);
+      }
+      const layerState = gpuState.fullAttention.get(layerIndex);
+      if (!layerState) {
+        throw new Error(`Missing WebGPU MTP KV state for target layer ${layerIndex}.`);
+      }
+      layers.push(await this.readMtpTargetKvLayer(layer, layerState, state.contextLength, tokenCount));
+    }
+    return { layers };
+  }
+
   async runPreparedInputHidden(
     input: WebGpuPreparedInput,
     positions: Int32Array,
@@ -1216,7 +1248,7 @@ export class WebGpuSegmentRunner implements SegmentRunner {
     const hiddenSize = this.manifest.embeddingLength;
     const hiddenByteLength = hiddenSize * Float32Array.BYTES_PER_ELEMENT;
     const outputTokenCount = readHidden
-      ? this.segmentEndLayerExclusive === this.manifest.blockCount
+      ? this.segmentEndLayerExclusive === this.manifest.blockCount && options.readAllHidden !== true
         ? 1
         : tokenCount
       : 0;
@@ -1224,10 +1256,12 @@ export class WebGpuSegmentRunner implements SegmentRunner {
     let hiddenReadback: WebGpuBufferLike | undefined;
     let topReadback: WebGpuBufferLike | undefined;
     let selectedTokenReadback: WebGpuBufferLike | undefined;
+    let selectedTokensReadback: WebGpuBufferLike | undefined;
     const profileGpuPass = webGpuGpuTimingEnabled() &&
       (
         options.computeTopK === true ||
         options.computeSelectedToken === true ||
+        options.computeSelectedTokens === true ||
         webGpuGpuDetailedTimingEnabled()
       );
 
@@ -1237,6 +1271,12 @@ export class WebGpuSegmentRunner implements SegmentRunner {
     if (readHidden) {
       hiddenReadback = this.arena.device.createBuffer({
         size: outputByteLength,
+        usage: GPU_MAP_READ | GPU_COPY_DST,
+      });
+    }
+    if (options.computeSelectedTokens === true) {
+      selectedTokensReadback = this.arena.device.createBuffer({
+        size: tokenCount * Uint32Array.BYTES_PER_ELEMENT,
         usage: GPU_MAP_READ | GPU_COPY_DST,
       });
     }
@@ -1288,6 +1328,7 @@ export class WebGpuSegmentRunner implements SegmentRunner {
           const isLastChunk = chunkStart + chunkTokenCount >= tokenCount;
           let topBuffer: WebGpuBufferLike | undefined;
           let selectedTokenBuffer: WebGpuBufferLike | undefined;
+          const selectedTokenBuffers: WebGpuBufferLike[] = [];
           const lastHiddenOffset = (chunkTokenCount - 1) * hiddenByteLength;
           const selectedHidden = isLastChunk &&
               this.segmentEndLayerExclusive === this.manifest.blockCount &&
@@ -1313,10 +1354,18 @@ export class WebGpuSegmentRunner implements SegmentRunner {
               usage: GPU_MAP_READ | GPU_COPY_DST,
             });
           }
+          if (options.computeSelectedTokens === true) {
+            for (let tokenIndex = 0; tokenIndex < chunkTokenCount; tokenIndex += 1) {
+              const tokenHidden = chunkTokenCount === 1
+                ? currentBatch
+                : this.createTokenView(compute.pass, resources, currentBatch, cleanup, tokenIndex);
+              selectedTokenBuffers.push(this.dispatchOutputSelectedToken(compute.pass, tokenHidden, cleanup, resources));
+            }
+          }
 
           this.endComputePass(encoder, compute);
           if (hiddenReadback) {
-            if (this.segmentEndLayerExclusive === this.manifest.blockCount) {
+            if (this.segmentEndLayerExclusive === this.manifest.blockCount && options.readAllHidden !== true) {
               if (isLastChunk) {
                 encoder.copyBufferToBuffer(currentBatch, lastHiddenOffset, hiddenReadback, 0, hiddenByteLength);
               }
@@ -1329,6 +1378,17 @@ export class WebGpuSegmentRunner implements SegmentRunner {
           }
           if (selectedTokenReadback && selectedTokenBuffer) {
             encoder.copyBufferToBuffer(selectedTokenBuffer, 0, selectedTokenReadback, 0, Uint32Array.BYTES_PER_ELEMENT);
+          }
+          if (selectedTokensReadback) {
+            for (let tokenIndex = 0; tokenIndex < selectedTokenBuffers.length; tokenIndex += 1) {
+              encoder.copyBufferToBuffer(
+                selectedTokenBuffers[tokenIndex] as WebGpuBufferLike,
+                0,
+                selectedTokensReadback,
+                (chunkStart + tokenIndex) * Uint32Array.BYTES_PER_ELEMENT,
+                Uint32Array.BYTES_PER_ELEMENT,
+              );
+            }
           }
 
           this.submitCommandBuffer(encoder.finish());
@@ -1345,10 +1405,11 @@ export class WebGpuSegmentRunner implements SegmentRunner {
 
       this.activeRunEncodeMs += nowMs() - encodeStartMs;
 
-      if (!hiddenReadback && !topReadback && !selectedTokenReadback) {
+      if (!hiddenReadback && !topReadback && !selectedTokenReadback && !selectedTokensReadback) {
         return {
           hidden: new Float32Array(),
           selectedTokenId: undefined,
+          selectedTokenIds: undefined,
           topTokens: undefined,
         };
       }
@@ -1392,12 +1453,28 @@ export class WebGpuSegmentRunner implements SegmentRunner {
         this.selectedTokenReadbacks += 1;
       }
 
+      let selectedTokenIds: number[] | undefined;
+      if (selectedTokensReadback) {
+        this.readbackCount += 1;
+        await this.mapReadback(selectedTokensReadback);
+        selectedTokenIds = Array.from(new Uint32Array(selectedTokensReadback.getMappedRange()).slice(0, tokenCount));
+        selectedTokensReadback.unmap();
+        selectedTokensReadback.destroy?.();
+        selectedTokensReadback = undefined;
+        const byteLength = tokenCount * Uint32Array.BYTES_PER_ELEMENT;
+        this.readbackBytes += byteLength;
+        this.activeRunReadbackBytes += byteLength;
+        this.selectedTokenReadbacks += tokenCount;
+        this.activeRunSelectedTokenId = selectedTokenIds.at(-1) ?? -1;
+      }
+
       await this.readTimestampProfiler();
-      return { hidden, selectedTokenId, topTokens };
+      return { hidden, selectedTokenId, selectedTokenIds, topTokens };
     } finally {
       hiddenReadback?.destroy?.();
       topReadback?.destroy?.();
       selectedTokenReadback?.destroy?.();
+      selectedTokensReadback?.destroy?.();
       for (const item of persistentCleanup.reverse()) {
         item.destroy?.();
       }
@@ -1695,12 +1772,141 @@ export class WebGpuSegmentRunner implements SegmentRunner {
     cleanup: GpuResource[],
     tokenCount: number,
   ): WebGpuBufferLike {
+    return this.createTokenView(pass, resources, input, cleanup, tokenCount - 1);
+  }
+
+  private createTokenView(
+    pass: WebGpuComputePassLike,
+    resources: Array<{ destroy: () => void }>,
+    input: WebGpuBufferLike,
+    cleanup: GpuResource[],
+    tokenIndex: number,
+  ): WebGpuBufferLike {
     const output = scratchF32(this.arena, this.manifest.embeddingLength, cleanup, "prefill.last_hidden");
     dispatchTokenSlice(this.arena.device, pass, resources, input, output, {
       rowSize: this.manifest.embeddingLength,
-      rowIndex: tokenCount - 1,
+      rowIndex: tokenIndex,
     });
     return output;
+  }
+
+  private async readMtpTargetKvLayer(
+    layer: GpuLayer,
+    layerState: FullAttentionGpuLayerState,
+    contextLength: number,
+    tokenCount: number,
+  ): Promise<MtpTargetKvLayerView> {
+    const keyElementCount = tokenCount * this.manifest.headCountKv * layer.headSize;
+    const valueElementCount = tokenCount * this.manifest.headCountKv * layer.valueSize;
+    const keyBytes = keyElementCount * F16_BYTE_LENGTH;
+    const valueBytes = valueElementCount * F16_BYTE_LENGTH;
+    const keyCopyBytes = alignBufferCopyBytes(keyBytes);
+    const valueRowCount = this.manifest.headCountKv * layer.valueSize;
+    const valueRowBytes = tokenCount * F16_BYTE_LENGTH;
+    const valueRowCopyBytes = alignBufferCopyBytes(valueRowBytes);
+    const valueReadbackBytes = valueRowCount * valueRowCopyBytes;
+    const keyReadback = this.arena.device.createBuffer({
+      label: `blk.${layer.layer}.mtp.key.readback`,
+      size: Math.max(1, keyCopyBytes),
+      usage: GPU_COPY_DST | GPU_MAP_READ,
+    });
+    const valueReadback = this.arena.device.createBuffer({
+      label: `blk.${layer.layer}.mtp.value.readback`,
+      size: Math.max(1, valueReadbackBytes),
+      usage: GPU_COPY_DST | GPU_MAP_READ,
+    });
+    try {
+      const encoder = this.arena.device.createCommandEncoder();
+      if (keyBytes > 0) {
+        encoder.copyBufferToBuffer(layerState.key, 0, keyReadback, 0, keyCopyBytes);
+      }
+      if (valueBytes > 0) {
+        let destinationOffset = 0;
+        const sourceRowBytes = contextLength * F16_BYTE_LENGTH;
+        if (valueRowCopyBytes > sourceRowBytes) {
+          throw new Error(`MTP KV value readback row copy ${valueRowCopyBytes} exceeds source row ${sourceRowBytes}.`);
+        }
+        for (let dim = 0; dim < layer.valueSize; dim += 1) {
+          for (let head = 0; head < this.manifest.headCountKv; head += 1) {
+            const sourceOffset = ((dim * this.manifest.headCountKv + head) * contextLength) * F16_BYTE_LENGTH;
+            if (sourceOffset % 4 !== 0) {
+              throw new Error("MTP KV value readback requires 4-byte aligned source rows.");
+            }
+            encoder.copyBufferToBuffer(layerState.value, sourceOffset, valueReadback, destinationOffset, valueRowCopyBytes);
+            destinationOffset += valueRowCopyBytes;
+          }
+        }
+      }
+      this.submitCommandBuffer(encoder.finish());
+
+      const key = await this.readF16BufferAsF32(keyReadback, keyElementCount, keyBytes);
+      const value = await this.readF16RowsAsF32(valueReadback, valueRowCount, tokenCount, valueRowCopyBytes, valueBytes);
+      this.readbackBytes += keyBytes + valueBytes;
+      this.activeRunReadbackBytes += keyBytes + valueBytes;
+      return {
+        key,
+        value,
+        keyLength: layer.headSize,
+        valueLength: layer.valueSize,
+        headCountKv: this.manifest.headCountKv,
+        contextLength: tokenCount,
+        tokenCount,
+      };
+    } finally {
+      keyReadback.destroy?.();
+      valueReadback.destroy?.();
+    }
+  }
+
+  private async readF16BufferAsF32(
+    buffer: WebGpuBufferLike,
+    elementCount: number,
+    byteLength: number,
+  ): Promise<Float32Array> {
+    if (byteLength <= 0) {
+      return new Float32Array();
+    }
+    this.readbackCount += 1;
+    await this.mapReadback(buffer);
+    try {
+      const values = new Uint16Array(buffer.getMappedRange()).slice(0, elementCount);
+      const output = new Float32Array(elementCount);
+      for (let index = 0; index < values.length; index += 1) {
+        output[index] = float16ToFloat32(values[index] ?? 0);
+      }
+      return output;
+    } finally {
+      buffer.unmap();
+    }
+  }
+
+  private async readF16RowsAsF32(
+    buffer: WebGpuBufferLike,
+    rowCount: number,
+    rowElementCount: number,
+    rowStrideBytes: number,
+    byteLength: number,
+  ): Promise<Float32Array> {
+    if (byteLength <= 0) {
+      return new Float32Array();
+    }
+    this.readbackCount += 1;
+    await this.mapReadback(buffer);
+    try {
+      const values = new Uint16Array(buffer.getMappedRange());
+      const rowStrideElements = rowStrideBytes / F16_BYTE_LENGTH;
+      const output = new Float32Array(rowCount * rowElementCount);
+      for (let row = 0; row < rowCount; row += 1) {
+        const sourceOffset = row * rowStrideElements;
+        const targetOffset = row * rowElementCount;
+        for (let index = 0; index < rowElementCount; index += 1) {
+          output[targetOffset + index] = float16ToFloat32(values[sourceOffset + index] ?? 0);
+        }
+      }
+      return output;
+    } finally {
+      buffer.unmap();
+    }
   }
 
   private async runTokenFromBoundary(
@@ -2963,12 +3169,12 @@ export class WebGpuSegmentRunner implements SegmentRunner {
         key: this.arena.createBuffer(
           `blk.${layer.layer}.gpu.key_cache`,
           state.contextLength * this.manifest.headCountKv * layer.headSize * F16_BYTE_LENGTH,
-          GPU_STORAGE,
+          GPU_STORAGE | GPU_COPY_SRC,
         ),
         value: this.arena.createBuffer(
           `blk.${layer.layer}.gpu.value_cache`,
           state.contextLength * this.manifest.headCountKv * layer.valueSize * F16_BYTE_LENGTH,
-          GPU_STORAGE,
+          GPU_STORAGE | GPU_COPY_SRC,
         ),
       });
     }
@@ -3016,6 +3222,14 @@ export class WebGpuSegmentRunner implements SegmentRunner {
     }
     return this.outputStripes;
   }
+}
+
+function alignBufferCopyBytes(byteLength: number): number {
+  if (byteLength <= 0) {
+    return 0;
+  }
+  const remainder = byteLength % 4;
+  return remainder === 0 ? byteLength : byteLength + 4 - remainder;
 }
 
 async function loadRopeFreqFactors(

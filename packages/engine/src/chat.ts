@@ -24,6 +24,19 @@ import {
   type GenerationSamplingOptions,
 } from "./generation";
 import {
+  acceptGreedyMtpDraft,
+  proposeMtpDraft,
+  validateMtpGenerationOptions,
+  type MtpGenerationOptions,
+} from "./mtp-generation";
+import {
+  finalizeMtpVerification,
+  prefillMtpTarget,
+  verifyMtpDraft,
+  type MtpTargetContext,
+  type MtpTargetPrefillResult,
+} from "./mtp-target";
+import {
   GgufTensorReader,
   type GgufTensorReadTrace,
 } from "./tensor-reader";
@@ -90,6 +103,7 @@ export type FileGgufTensorReaderOptions = {
 
 export type ChatCompletionOptions = GenerationSamplingOptions & {
   maxNewTokens?: number;
+  mtp?: MtpGenerationOptions;
   stopTokenIds?: readonly number[];
   signal?: AbortSignal;
   onToken?: (chunk: ChatCompletionChunk) => void;
@@ -400,7 +414,8 @@ export async function generateChatTurn(
   options: ChatTurnOptions = {},
 ): Promise<ChatTurnResult> {
   throwIfAborted(options.signal);
-  resolveGenerationSamplingOptions(options);
+  const sampling = resolveGenerationSamplingOptions(options);
+  validateMtpGenerationOptions(session, sampling, options.mtp);
 
   const messages = normalizeChatTurnInput(turn);
   const prefillText = applyChatTemplate(messages, {
@@ -410,19 +425,25 @@ export async function generateChatTurn(
   });
 
   if (options.continueModelTurn) {
-    const sampling = resolveGenerationSamplingOptions(options);
-    const prefillResult = await prefillChatText(
-      session,
-      tokenizer,
-      state,
-      prefillText,
-      {
+    const prefillResult = options.mtp
+      ? await prefillMtpChatText(session, tokenizer, state, prefillText, {
         signal: options.signal,
-        returnNextToken: true,
         requireGenerationSlot: true,
         logitsTopK: sampling.logitsTopK,
-      },
-    );
+        mtp: options.mtp,
+      })
+      : await prefillChatText(
+        session,
+        tokenizer,
+        state,
+        prefillText,
+        {
+          signal: options.signal,
+          returnNextToken: true,
+          requireGenerationSlot: true,
+          logitsTopK: sampling.logitsTopK,
+        },
+      );
     return generateAssistantFromNextToken(session, tokenizer, state, prefillResult, options);
   }
 
@@ -459,7 +480,11 @@ export async function generatePreparedImageChatTurn(
   options: ChatTurnOptions = {},
 ): Promise<ChatTurnResult> {
   throwIfAborted(options.signal);
-  resolveGenerationSamplingOptions(options);
+  const sampling = resolveGenerationSamplingOptions(options);
+  validateMtpGenerationOptions(session, sampling, options.mtp);
+  if (options.mtp) {
+    throw new Error("Prepared image chat turns do not support MTP yet.");
+  }
   if (image.tokenCount <= 0 || image.hidden.length !== image.tokenCount * session.manifest.embeddingLength) {
     throw new Error(`Prepared image hidden shape mismatch: ${image.hidden.length}`);
   }
@@ -520,7 +545,11 @@ export async function generatePreparedAudioChatTurn(
   options: ChatTurnOptions = {},
 ): Promise<ChatTurnResult> {
   throwIfAborted(options.signal);
-  resolveGenerationSamplingOptions(options);
+  const sampling = resolveGenerationSamplingOptions(options);
+  validateMtpGenerationOptions(session, sampling, options.mtp);
+  if (options.mtp) {
+    throw new Error("Prepared audio chat turns do not support MTP yet.");
+  }
   if (audio.tokenCount <= 0 || audio.hidden.length !== audio.tokenCount * session.manifest.embeddingLength) {
     throw new Error(`Prepared audio hidden shape mismatch: ${audio.hidden.length}`);
   }
@@ -559,22 +588,47 @@ async function generateAssistantFromState(
   if (options.continueModelTurn) {
     throw new Error("Cannot continue a model turn without prefilled continuation text.");
   }
-  const promptPrefill = await prefillChatText(
-    session,
-    tokenizer,
-    state,
-    applyChatGenerationPrompt({ enableThinking: options.enableThinking }),
-    {
+  const sampling = resolveGenerationSamplingOptions(options);
+  const prompt = applyChatGenerationPrompt({ enableThinking: options.enableThinking });
+  const promptPrefill = options.mtp
+    ? await prefillMtpChatText(session, tokenizer, state, prompt, {
       signal: options.signal,
-      returnNextToken: true,
       requireGenerationSlot: true,
-      logitsTopK: resolveGenerationSamplingOptions(options).logitsTopK,
-    },
-  );
+      logitsTopK: sampling.logitsTopK,
+      mtp: options.mtp,
+    })
+    : await prefillChatText(
+      session,
+      tokenizer,
+      state,
+      prompt,
+      {
+        signal: options.signal,
+        returnNextToken: true,
+        requireGenerationSlot: true,
+        logitsTopK: sampling.logitsTopK,
+      },
+    );
   return generateAssistantFromNextToken(session, tokenizer, state, promptPrefill, options);
 }
 
 async function generateAssistantFromNextToken(
+  session: ModelSession,
+  tokenizer: Tokenizer,
+  state: InferenceState,
+  firstTokenResult: NextTokenResult | MtpTargetPrefillResult,
+  options: ChatTurnOptions = {},
+): Promise<ChatTurnResult> {
+  if (options.mtp) {
+    return generateAssistantWithMtp(session, tokenizer, state, requireMtpPrefillResult(firstTokenResult), {
+      ...options,
+      mtp: options.mtp,
+    });
+  }
+  return generateAssistantWithoutMtp(session, tokenizer, state, firstTokenResult as NextTokenResult, options);
+}
+
+async function generateAssistantWithoutMtp(
   session: ModelSession,
   tokenizer: Tokenizer,
   state: InferenceState,
@@ -630,6 +684,90 @@ async function generateAssistantFromNextToken(
   return { content, finishReason, state, modelTurnClosed: appendTurnEnd };
 }
 
+async function generateAssistantWithMtp(
+  session: ModelSession,
+  tokenizer: Tokenizer,
+  state: InferenceState,
+  firstTokenResult: MtpTargetPrefillResult,
+  options: ChatTurnOptions & { mtp: MtpGenerationOptions },
+): Promise<ChatTurnResult> {
+  const stopTokenIds = buildStopTokenIds(tokenizer, options.stopTokenIds);
+  const sampling = resolveGenerationSamplingOptions(options);
+  const rng = createDeterministicRng(sampling.seed);
+  const maxNewTokens = options.maxNewTokens ?? DEFAULT_MAX_NEW_TOKENS;
+  let pendingTokenId = firstTokenResult.firstTokenId;
+  let context: MtpTargetContext = firstTokenResult.context;
+  let content = "";
+  let finishReason: ChatTurnResult["finishReason"] = "length";
+  let emitted = 0;
+
+  while (emitted < maxNewTokens) {
+    throwIfAborted(options.signal);
+    if (stopTokenIds.has(pendingTokenId)) {
+      finishReason = "stop";
+      break;
+    }
+    if (state.nextPosition >= state.contextLength) {
+      finishReason = "length";
+      break;
+    }
+
+    const remainingOutput = maxNewTokens - emitted;
+    const remainingContext = state.contextLength - state.nextPosition;
+    const draftBudget = Math.max(0, Math.min(options.mtp.numSpeculativeTokens, remainingOutput - 1, remainingContext - 1));
+    const proposal = draftBudget > 0
+      ? await proposeMtpDraft(
+        session,
+        { ...options.mtp, numSpeculativeTokens: draftBudget },
+        pendingTokenId,
+        context,
+        sampling,
+        rng,
+        { signal: options.signal },
+      )
+      : { draftTokenIds: [], draftDistributions: [], feedbackContexts: [] };
+    const verification = await verifyMtpDraft(
+      session,
+      state,
+      [pendingTokenId, ...proposal.draftTokenIds],
+      {
+        logitsTopK: sampling.logitsTopK,
+        assistantManifest: options.mtp.assistantSession.manifest,
+        signal: options.signal,
+      },
+    );
+    const acceptance = acceptGreedyMtpDraft(proposal.draftTokenIds, verification.targetTokenIds);
+    context = finalizeMtpVerification(session, state, verification, acceptance.committedLength);
+
+    const streamTokenIds = [pendingTokenId, ...proposal.draftTokenIds.slice(0, acceptance.acceptedDraftLength)];
+    for (const tokenId of streamTokenIds) {
+      if (emitted >= maxNewTokens) {
+        break;
+      }
+      if (stopTokenIds.has(tokenId)) {
+        finishReason = "stop";
+        break;
+      }
+      content = streamChatToken(tokenizer, tokenId, content, options.onToken);
+      emitted += 1;
+    }
+    if (finishReason === "stop") {
+      break;
+    }
+    pendingTokenId = acceptance.nextTokenId;
+  }
+
+  const appendTurnEnd = options.appendTurnEnd ?? true;
+  if (appendTurnEnd && state.nextPosition < state.contextLength) {
+    await prefillChatText(session, tokenizer, state, "<turn|>\n", {
+      signal: options.signal,
+      requireGenerationSlot: false,
+    });
+  }
+
+  return { content, finishReason, state, modelTurnClosed: appendTurnEnd };
+}
+
 export async function* generateChatCompletion(
   session: ModelSession,
   tokenizer: Tokenizer,
@@ -637,7 +775,8 @@ export async function* generateChatCompletion(
   options: ChatCompletionOptions = {},
 ): AsyncGenerator<ChatCompletionChunk, string> {
   throwIfAborted(options.signal);
-  resolveGenerationSamplingOptions(options);
+  const initialSampling = resolveGenerationSamplingOptions(options);
+  validateMtpGenerationOptions(session, initialSampling, options.mtp);
 
   const prompt = applyChatTemplate(messages);
   const promptTokenIds = tokenizer.tokenize(prompt);
@@ -651,6 +790,65 @@ export async function* generateChatCompletion(
     throw new Error(
       `Prompt uses ${promptTokenIds.length} tokens, which exceeds the configured chat context of ${state.contextLength} tokens.`,
     );
+  }
+
+  if (options.mtp) {
+    const prefillResult = await prefillMtpTarget(session, state, promptTokenIds, {
+      positions: Int32Array.from({ length: promptTokenIds.length }, (_, index) => index),
+      logitsTopK: sampling.logitsTopK,
+      assistantManifest: options.mtp.assistantSession.manifest,
+      signal: options.signal,
+    });
+    let pendingTokenId = prefillResult.firstTokenId;
+    let context: MtpTargetContext = prefillResult.context;
+    let content = "";
+    let emitted = 0;
+    while (emitted < maxNewTokens) {
+      throwIfAborted(options.signal);
+      if (stopTokenIds.has(pendingTokenId) || state.nextPosition >= state.contextLength) {
+        break;
+      }
+      const remainingOutput = maxNewTokens - emitted;
+      const remainingContext = state.contextLength - state.nextPosition;
+      const draftBudget = Math.max(0, Math.min(options.mtp.numSpeculativeTokens, remainingOutput - 1, remainingContext - 1));
+      const proposal = draftBudget > 0
+        ? await proposeMtpDraft(
+          session,
+          { ...options.mtp, numSpeculativeTokens: draftBudget },
+          pendingTokenId,
+          context,
+          sampling,
+          rng,
+          { signal: options.signal },
+        )
+        : { draftTokenIds: [], draftDistributions: [], feedbackContexts: [] };
+      const verification = await verifyMtpDraft(
+        session,
+        state,
+        [pendingTokenId, ...proposal.draftTokenIds],
+        {
+          logitsTopK: sampling.logitsTopK,
+          assistantManifest: options.mtp.assistantSession.manifest,
+          signal: options.signal,
+        },
+      );
+      const acceptance = acceptGreedyMtpDraft(proposal.draftTokenIds, verification.targetTokenIds);
+      context = finalizeMtpVerification(session, state, verification, acceptance.committedLength);
+      for (const tokenId of [pendingTokenId, ...proposal.draftTokenIds.slice(0, acceptance.acceptedDraftLength)]) {
+        if (emitted >= maxNewTokens || stopTokenIds.has(tokenId)) {
+          return content;
+        }
+        const token = tokenizer.idToToken(tokenId) ?? "";
+        const text = tokenizer.detokenize([tokenId]);
+        content = sanitizeChatOutput(content + text);
+        const chunk = { tokenId, token, text, content };
+        options.onToken?.(chunk);
+        yield chunk;
+        emitted += 1;
+      }
+      pendingTokenId = acceptance.nextTokenId;
+    }
+    return content;
   }
 
   const prefillResult = await prefillTokens(session, state, promptTokenIds, {
@@ -699,6 +897,31 @@ function sampleNextTokenFromResult(
     sampling,
     rng,
   );
+}
+
+function requireMtpPrefillResult(result: NextTokenResult | MtpTargetPrefillResult): MtpTargetPrefillResult {
+  if ("context" in result && "firstTokenId" in result) {
+    return result;
+  }
+  throw new Error("MTP generation requires an MTP target prefill result.");
+}
+
+function streamChatToken(
+  tokenizer: Tokenizer,
+  tokenId: number,
+  previousContent: string,
+  onToken: ChatCompletionOptions["onToken"] | undefined,
+): string {
+  const token = tokenizer.idToToken(tokenId) ?? "";
+  const text = tokenizer.detokenize([tokenId]);
+  const content = sanitizeChatOutput(previousContent + text);
+  onToken?.({
+    tokenId,
+    token,
+    text,
+    content,
+  });
+  return content;
 }
 
 function buildStopTokenIds(tokenizer: Tokenizer, extraStopTokenIds: readonly number[] | undefined): Set<number> {
@@ -776,6 +999,45 @@ async function prefillChatText(
     });
   }
   await prefillStateTokens(session, state, tokenIds, { positions });
+}
+
+async function prefillMtpChatText(
+  session: ModelSession,
+  tokenizer: Tokenizer,
+  state: InferenceState,
+  text: string,
+  options: {
+    signal?: AbortSignal;
+    logitsTopK: number;
+    requireGenerationSlot?: boolean;
+    mtp: MtpGenerationOptions;
+  },
+): Promise<MtpTargetPrefillResult> {
+  throwIfAborted(options.signal);
+
+  const tokenIds = tokenizer.tokenize(text, { addBos: state.nextPosition === 0 });
+  if (tokenIds.length === 0) {
+    throw new Error("Cannot produce an MTP next token from empty chat prefill text.");
+  }
+
+  const requiredPositions = state.nextPosition + tokenIds.length;
+  const limit = options.requireGenerationSlot ? state.contextLength - 1 : state.contextLength;
+  if (requiredPositions > limit) {
+    throw new Error(
+      `Chat state would use ${requiredPositions} tokens, which exceeds the configured chat context of ${state.contextLength} tokens.`,
+    );
+  }
+
+  const positions = Int32Array.from(
+    { length: tokenIds.length },
+    (_, index) => state.nextPosition + index,
+  );
+  return prefillMtpTarget(session, state, tokenIds, {
+    positions,
+    logitsTopK: options.logitsTopK,
+    assistantManifest: options.mtp.assistantSession.manifest,
+    signal: options.signal,
+  });
 }
 
 export function stripThinking(content: string): string {

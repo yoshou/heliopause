@@ -19,6 +19,7 @@ export {
   isAudioGguf,
   isMtpAssistantGguf,
   isVisionGguf,
+  mapMtpAssistantLayerToTargetKvLayer,
   type AudioManifest,
   type ExpectedTensor,
   type LayerKind,
@@ -107,6 +108,31 @@ export {
   type ResolvedGenerationSamplingOptions,
   type TopTokenCandidate,
 } from "./generation";
+
+export {
+  acceptGreedyMtpDraft,
+  proposeMtpDraft,
+  validateMtpAssistantCompatibility,
+  validateMtpGenerationOptions,
+  type GreedyMtpAcceptance,
+  type MtpGenerationOptions,
+  type MtpProposal,
+} from "./mtp-generation";
+
+export {
+  finalizeMtpVerification,
+  mtpDistributionFromTopTokens,
+  prefillMtpTarget,
+  verifyMtpDraft,
+  type MtpTargetContext,
+  type MtpTargetPrefillOptions,
+  type MtpTargetPrefillResult,
+  type MtpTargetRunner,
+  type MtpTargetRunners,
+  type MtpTargetVerificationResult,
+  type MtpTargetVerifyOptions,
+  type MtpTokenDistribution,
+} from "./mtp-target";
 
 export {
   applyChatGenerationPrompt,

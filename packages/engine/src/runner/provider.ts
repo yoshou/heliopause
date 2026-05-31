@@ -8,6 +8,9 @@ import type {
   MtpAssistantRunners,
 } from "./mtp-assistant-runner";
 import type {
+  MtpTargetRunners,
+} from "./mtp-target-runner";
+import type {
   ProviderResourceRequirements,
 } from "./planning";
 import type {
@@ -41,11 +44,20 @@ export type MtpAssistantRunnerProvider = RunnerProvider & {
   createMtpAssistantRunners(): MtpAssistantRunners;
 };
 
+export type MtpTargetRunnerProvider = ModelRunnerProvider & {
+  createMtpTargetRunners(): MtpTargetRunners;
+};
+
 export type MultimodalRunnerProvider = ModelRunnerProvider & AudioRunnerProvider & VisionRunnerProvider;
 
 export function validateProviderList<TProvider extends RunnerProvider>(
   providers: readonly TProvider[],
-  capability: keyof ModelRunnerProvider | keyof AudioRunnerProvider | keyof VisionRunnerProvider | keyof MtpAssistantRunnerProvider,
+  capability:
+    | keyof ModelRunnerProvider
+    | keyof AudioRunnerProvider
+    | keyof VisionRunnerProvider
+    | keyof MtpAssistantRunnerProvider
+    | keyof MtpTargetRunnerProvider,
 ): readonly TProvider[] {
   if (providers.length === 0) {
     throw new Error("At least one runner provider is required.");
@@ -63,6 +75,18 @@ export function validateProviderList<TProvider extends RunnerProvider>(
   }
 
   return providers.slice();
+}
+
+export function requireMtpTargetRunnerProvider(
+  provider: ModelRunnerProvider | undefined,
+): MtpTargetRunnerProvider {
+  if (!provider) {
+    throw new Error("MTP target execution requires a target runner provider.");
+  }
+  if (typeof (provider as Partial<MtpTargetRunnerProvider>).createMtpTargetRunners !== "function") {
+    throw new Error(`Runner provider ${provider.name} does not support Gemma 4 MTP target execution.`);
+  }
+  return provider as MtpTargetRunnerProvider;
 }
 
 export function resolveProviderOrder<TProvider extends RunnerProvider>(

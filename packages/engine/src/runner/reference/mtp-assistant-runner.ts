@@ -44,7 +44,7 @@ async function runReferenceMtpAssistant(
 ): Promise<MtpAssistantRunResult> {
   validateInput(session, input);
   const projectionInput = new Float32Array(session.manifest.backboneEmbeddingLength * 2);
-  projectionInput.set(input.targetPreviousHidden, 0);
+  projectionInput.set(input.targetInputEmbedding, 0);
   projectionInput.set(input.targetCurrentHidden, session.manifest.backboneEmbeddingLength);
   const preProjection = await matMulAssistantWeight(session, "mtp.pre_projection.weight", projectionInput);
   let layerHidden: Float32Array = preProjection;
@@ -77,7 +77,7 @@ async function forwardAssistantLayer(
   const kind = manifest.layerKinds[layer] ?? "sliding-attention";
   const headSize = manifest.layerKeyLengths[layer] ?? manifest.keyLength;
   const valueSize = manifest.layerValueLengths[layer] ?? manifest.valueLength;
-  const targetKv = sharedTargetKvLayer(session, input, kind);
+  const targetKv = sharedTargetKvLayer(input, layer);
   if (!targetKv) {
     throw new Error(`Missing target KV view for assistant layer ${layer}`);
   }
@@ -241,22 +241,14 @@ async function readTokenEmbeddingRows(
   return rows;
 }
 
-function sharedTargetKvLayer(
-  session: MtpAssistantSession,
-  input: MtpAssistantRunInput,
-  kind: "sliding-attention" | "full-attention",
-): MtpTargetKvLayerView | undefined {
-  const keyLength = kind === "sliding-attention" ? session.manifest.slidingKeyLength : session.manifest.keyLength;
-  for (let index = input.targetKv.layers.length - 1; index >= 0; index -= 1) {
-    const layer = input.targetKv.layers[index];
-    if (layer?.keyLength === keyLength) {
-      return layer;
-    }
-  }
-  return undefined;
+function sharedTargetKvLayer(input: MtpAssistantRunInput, assistantLayer: number): MtpTargetKvLayerView | undefined {
+  return input.targetKv.layers[assistantLayer];
 }
 
 function validateInput(session: MtpAssistantSession, input: MtpAssistantRunInput): void {
+  if (input.targetInputEmbedding.length !== session.manifest.backboneEmbeddingLength) {
+    throw new Error(`targetInputEmbedding shape mismatch: ${input.targetInputEmbedding.length}`);
+  }
   if (input.targetPreviousHidden.length !== session.manifest.backboneEmbeddingLength) {
     throw new Error(`targetPreviousHidden shape mismatch: ${input.targetPreviousHidden.length}`);
   }

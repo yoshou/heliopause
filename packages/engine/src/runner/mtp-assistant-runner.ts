@@ -22,6 +22,7 @@ export type MtpTargetKvView = {
 
 export type MtpAssistantRunInput = {
   tokenId: number;
+  targetInputEmbedding: Float32Array;
   targetPreviousHidden: Float32Array;
   targetCurrentHidden: Float32Array;
   targetKv: MtpTargetKvView;

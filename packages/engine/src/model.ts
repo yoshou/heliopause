@@ -651,6 +651,29 @@ export function auditMtpAssistantTensorCoverage(
   };
 }
 
+export function mapMtpAssistantLayerToTargetKvLayer(
+  targetManifest: ModelManifest,
+  assistantManifest: MtpAssistantManifest,
+  assistantLayer: number,
+): number {
+  if (!Number.isInteger(assistantLayer) || assistantLayer < 0 || assistantLayer >= assistantManifest.blockCount) {
+    throw new Error(`Assistant layer ${assistantLayer} is outside assistant block count ${assistantManifest.blockCount}.`);
+  }
+  const kind = assistantManifest.layerKinds[assistantLayer] ?? "sliding-attention";
+  const targetBucket = Math.min(
+    targetManifest.blockCount - 1,
+    Math.floor(((assistantLayer + 1) * targetManifest.blockCount) / assistantManifest.blockCount) - 1,
+  );
+  for (let layer = targetBucket; layer >= 0; layer -= 1) {
+    if (targetManifest.layerHasKv[layer] === true && targetManifest.layerKinds[layer] === kind) {
+      return layer;
+    }
+  }
+  throw new Error(
+    `No ${kind} target KV layer exists at or before target depth bucket ${targetBucket} for assistant layer ${assistantLayer}.`,
+  );
+}
+
 function buildMtpAssistantExpectedTensors(params: {
   blockCount: number;
   embeddingLength: number;

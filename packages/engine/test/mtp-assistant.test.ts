@@ -90,6 +90,7 @@ test("MTP assistant session validates provider capability and synthetic determin
 function assistantInput() {
   return {
     tokenId: 1,
+    targetInputEmbedding: new Float32Array([0.1, -0.2]),
     targetPreviousHidden: new Float32Array([0.25, -0.5]),
     targetCurrentHidden: new Float32Array([0.75, 0.125]),
     targetKv: {

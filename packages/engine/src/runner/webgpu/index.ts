@@ -11,11 +11,15 @@ import {
   webGpuVisionPreprocessRunner,
 } from "./vision-preprocess-runner";
 import type {
+  MtpTargetRunnerProvider,
   MultimodalRunnerProvider,
 } from "../provider";
 import {
   createWebGpuModelRunner,
 } from "./model-runner";
+import {
+  createWebGpuMtpTargetRunners,
+} from "./mtp-target-runner";
 import {
   type WebGpuProviderOptions,
   webGpuExecutionProviderOptions,
@@ -40,7 +44,7 @@ export function createWebGpuVisionRunners() {
   };
 }
 
-export function createWebGpuProvider(options: WebGpuProviderOptions = {}): MultimodalRunnerProvider & {
+export function createWebGpuProvider(options: WebGpuProviderOptions = {}): MultimodalRunnerProvider & MtpTargetRunnerProvider & {
   readonly name: "webgpu";
   readonly options: Readonly<WebGpuProviderOptions>;
 } {
@@ -58,6 +62,7 @@ export function createWebGpuProvider(options: WebGpuProviderOptions = {}): Multi
     },
     createAudioRunners: createWebGpuAudioRunners,
     createVisionRunners: createWebGpuVisionRunners,
+    createMtpTargetRunners: createWebGpuMtpTargetRunners,
   };
 }
 
