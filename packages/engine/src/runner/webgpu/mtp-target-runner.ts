@@ -40,6 +40,7 @@ const webGpuMtpTargetRunner: MtpTargetRunner = {
     try {
       const result = await runner.runPreparedInputHidden(prepared, positions, state, {
         computeSelectedToken: true,
+        computeTopK: options.logitsTopK > 1,
         topK: options.logitsTopK,
         readAllHidden: true,
       });
@@ -89,6 +90,7 @@ const webGpuMtpTargetRunner: MtpTargetRunner = {
       const result = await runner.runPreparedInputHidden(prepared, positions, state, {
         computeSelectedToken: draftTokenIds.length === 1,
         computeSelectedTokens: draftTokenIds.length > 1,
+        computeTopKTokens: options.logitsTopK > 1,
         topK: options.logitsTopK,
         readAllHidden: true,
       });
@@ -98,8 +100,8 @@ const webGpuMtpTargetRunner: MtpTargetRunner = {
       if (targetTokenIds.length !== draftTokenIds.length) {
         throw new Error(`WebGPU MTP target verification produced ${targetTokenIds.length} tokens for ${draftTokenIds.length} inputs.`);
       }
-      const targetDistributions = targetTokenIds.map((id) =>
-        mtpDistributionFromTopTokens([{ id, value: 0 }], targetVocabularySize(session))
+      const targetDistributions = targetTokenIds.map((id, index) =>
+        mtpDistributionFromTopTokens(result.topTokensByPosition?.[index] ?? [{ id, value: 0 }], targetVocabularySize(session))
       );
       const contexts: MtpTargetContext[] = [];
       for (let index = 0; index < draftTokenIds.length; index += 1) {

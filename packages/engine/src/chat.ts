@@ -24,8 +24,9 @@ import {
   type GenerationSamplingOptions,
 } from "./generation";
 import {
-  acceptGreedyMtpDraft,
+  acceptMtpDraft,
   proposeMtpDraft,
+  sampleMtpTokenDistribution,
   validateMtpGenerationOptions,
   type MtpGenerationOptions,
 } from "./mtp-generation";
@@ -695,7 +696,7 @@ async function generateAssistantWithMtp(
   const sampling = resolveGenerationSamplingOptions(options);
   const rng = createDeterministicRng(sampling.seed);
   const maxNewTokens = options.maxNewTokens ?? DEFAULT_MAX_NEW_TOKENS;
-  let pendingTokenId = firstTokenResult.firstTokenId;
+  let pendingTokenId = sampleMtpTokenDistribution(firstTokenResult.firstTokenDistribution, sampling, rng);
   let context: MtpTargetContext = firstTokenResult.context;
   let content = "";
   let finishReason: ChatTurnResult["finishReason"] = "length";
@@ -736,7 +737,7 @@ async function generateAssistantWithMtp(
         signal: options.signal,
       },
     );
-    const acceptance = acceptGreedyMtpDraft(proposal.draftTokenIds, verification.targetTokenIds);
+    const acceptance = acceptMtpDraft(proposal, verification, sampling, rng);
     context = finalizeMtpVerification(session, state, verification, acceptance.committedLength);
 
     const streamTokenIds = [pendingTokenId, ...proposal.draftTokenIds.slice(0, acceptance.acceptedDraftLength)];
@@ -799,7 +800,7 @@ export async function* generateChatCompletion(
       assistantManifest: options.mtp.assistantSession.manifest,
       signal: options.signal,
     });
-    let pendingTokenId = prefillResult.firstTokenId;
+    let pendingTokenId = sampleMtpTokenDistribution(prefillResult.firstTokenDistribution, sampling, rng);
     let context: MtpTargetContext = prefillResult.context;
     let content = "";
     let emitted = 0;
@@ -832,7 +833,7 @@ export async function* generateChatCompletion(
           signal: options.signal,
         },
       );
-      const acceptance = acceptGreedyMtpDraft(proposal.draftTokenIds, verification.targetTokenIds);
+      const acceptance = acceptMtpDraft(proposal, verification, sampling, rng);
       context = finalizeMtpVerification(session, state, verification, acceptance.committedLength);
       for (const tokenId of [pendingTokenId, ...proposal.draftTokenIds.slice(0, acceptance.acceptedDraftLength)]) {
         if (emitted >= maxNewTokens || stopTokenIds.has(tokenId)) {

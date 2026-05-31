@@ -97,6 +97,7 @@ export type WebGpuTokenResult = {
   selectedTokenId?: number;
   selectedTokenIds?: number[];
   topTokens?: WebGpuTopToken[];
+  topTokensByPosition?: WebGpuTopToken[][];
 };
 
 export type WebGpuHiddenResult = {
@@ -104,12 +105,14 @@ export type WebGpuHiddenResult = {
   selectedTokenId?: number;
   selectedTokenIds?: number[];
   topTokens?: WebGpuTopToken[];
+  topTokensByPosition?: WebGpuTopToken[][];
 };
 
 export type WebGpuRunOptions = {
   computeSelectedToken?: boolean;
   computeSelectedTokens?: boolean;
   computeTopK?: boolean;
+  computeTopKTokens?: boolean;
   topK?: number;
   readAllHidden?: boolean;
   perLayerInputs?: Float32Array;
@@ -1255,6 +1258,7 @@ export class WebGpuSegmentRunner implements SegmentRunner {
     const outputByteLength = outputTokenCount * hiddenByteLength;
     let hiddenReadback: WebGpuBufferLike | undefined;
     let topReadback: WebGpuBufferLike | undefined;
+    let topTokensReadback: WebGpuBufferLike | undefined;
     let selectedTokenReadback: WebGpuBufferLike | undefined;
     let selectedTokensReadback: WebGpuBufferLike | undefined;
     const profileGpuPass = webGpuGpuTimingEnabled() &&
@@ -1283,6 +1287,19 @@ export class WebGpuSegmentRunner implements SegmentRunner {
 
     let candidateCount = 0;
     let candidateByteLength = 0;
+    let tokenCandidateCount = 0;
+    let tokenCandidateByteLength = 0;
+    const outputStripeCount = this.segmentEndLayerExclusive === this.manifest.blockCount
+      ? this.requireOutputStripes().length
+      : 0;
+    if (options.computeTopKTokens === true) {
+      tokenCandidateCount = Math.max(1, options.topK ?? 1);
+      tokenCandidateByteLength = outputStripeCount * tokenCandidateCount * 2 * Float32Array.BYTES_PER_ELEMENT;
+      topTokensReadback = this.arena.device.createBuffer({
+        size: tokenCount * tokenCandidateByteLength,
+        usage: GPU_MAP_READ | GPU_COPY_DST,
+      });
+    }
 
     try {
       // Match llama.cpp: non-causal attention is evaluated as one physical batch.
@@ -1329,6 +1346,7 @@ export class WebGpuSegmentRunner implements SegmentRunner {
           let topBuffer: WebGpuBufferLike | undefined;
           let selectedTokenBuffer: WebGpuBufferLike | undefined;
           const selectedTokenBuffers: WebGpuBufferLike[] = [];
+          const topTokenBuffers: WebGpuBufferLike[] = [];
           const lastHiddenOffset = (chunkTokenCount - 1) * hiddenByteLength;
           const selectedHidden = isLastChunk &&
               this.segmentEndLayerExclusive === this.manifest.blockCount &&
@@ -1362,6 +1380,14 @@ export class WebGpuSegmentRunner implements SegmentRunner {
               selectedTokenBuffers.push(this.dispatchOutputSelectedToken(compute.pass, tokenHidden, cleanup, resources));
             }
           }
+          if (options.computeTopKTokens === true) {
+            for (let tokenIndex = 0; tokenIndex < chunkTokenCount; tokenIndex += 1) {
+              const tokenHidden = chunkTokenCount === 1
+                ? currentBatch
+                : this.createTokenView(compute.pass, resources, currentBatch, cleanup, tokenIndex);
+              topTokenBuffers.push(this.dispatchOutputTopK(compute.pass, tokenHidden, tokenCandidateCount, cleanup, resources));
+            }
+          }
 
           this.endComputePass(encoder, compute);
           if (hiddenReadback) {
@@ -1390,6 +1416,17 @@ export class WebGpuSegmentRunner implements SegmentRunner {
               );
             }
           }
+          if (topTokensReadback) {
+            for (let tokenIndex = 0; tokenIndex < topTokenBuffers.length; tokenIndex += 1) {
+              encoder.copyBufferToBuffer(
+                topTokenBuffers[tokenIndex] as WebGpuBufferLike,
+                0,
+                topTokensReadback,
+                (chunkStart + tokenIndex) * tokenCandidateByteLength,
+                tokenCandidateByteLength,
+              );
+            }
+          }
 
           this.submitCommandBuffer(encoder.finish());
           await this.waitForSubmittedWorkDone();
@@ -1405,12 +1442,13 @@ export class WebGpuSegmentRunner implements SegmentRunner {
 
       this.activeRunEncodeMs += nowMs() - encodeStartMs;
 
-      if (!hiddenReadback && !topReadback && !selectedTokenReadback && !selectedTokensReadback) {
+      if (!hiddenReadback && !topReadback && !topTokensReadback && !selectedTokenReadback && !selectedTokensReadback) {
         return {
           hidden: new Float32Array(),
           selectedTokenId: undefined,
           selectedTokenIds: undefined,
           topTokens: undefined,
+          topTokensByPosition: undefined,
         };
       }
 
@@ -1437,6 +1475,27 @@ export class WebGpuSegmentRunner implements SegmentRunner {
         this.readbackBytes += candidateByteLength;
         this.activeRunReadbackBytes += candidateByteLength;
         topTokens = mergeTopCandidates(values, candidateCount, this.manifest.finalLogitSoftcap);
+      }
+
+      let topTokensByPosition: WebGpuTopToken[][] | undefined;
+      if (topTokensReadback) {
+        this.readbackCount += 1;
+        await this.mapReadback(topTokensReadback);
+        const values = new Float32Array(topTokensReadback.getMappedRange()).slice();
+        topTokensReadback.unmap();
+        topTokensReadback.destroy?.();
+        topTokensReadback = undefined;
+        const byteLength = tokenCount * tokenCandidateByteLength;
+        this.readbackBytes += byteLength;
+        this.activeRunReadbackBytes += byteLength;
+        const floatsPerToken = tokenCandidateByteLength / Float32Array.BYTES_PER_ELEMENT;
+        topTokensByPosition = Array.from({ length: tokenCount }, (_, tokenIndex) =>
+          mergeTopCandidates(
+            values.subarray(tokenIndex * floatsPerToken, (tokenIndex + 1) * floatsPerToken),
+            tokenCandidateCount,
+            this.manifest.finalLogitSoftcap,
+          )
+        );
       }
 
       let selectedTokenId: number | undefined;
@@ -1469,10 +1528,11 @@ export class WebGpuSegmentRunner implements SegmentRunner {
       }
 
       await this.readTimestampProfiler();
-      return { hidden, selectedTokenId, selectedTokenIds, topTokens };
+      return { hidden, selectedTokenId, selectedTokenIds, topTokens, topTokensByPosition };
     } finally {
       hiddenReadback?.destroy?.();
       topReadback?.destroy?.();
+      topTokensReadback?.destroy?.();
       selectedTokenReadback?.destroy?.();
       selectedTokensReadback?.destroy?.();
       for (const item of persistentCleanup.reverse()) {

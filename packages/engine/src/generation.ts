@@ -11,6 +11,10 @@ export type TopTokenCandidate = {
   value: number;
 };
 
+export type TokenProbability = TopTokenCandidate & {
+  probability: number;
+};
+
 export type ResolvedGenerationSamplingOptions = {
   doSample: boolean;
   temperature: number;
@@ -83,13 +87,38 @@ export function sampleNextToken(
   options: Pick<ResolvedGenerationSamplingOptions, "doSample" | "temperature" | "topP" | "topK">,
   rng: () => number,
 ): number {
+  const distribution = tokenSamplingDistribution(candidates, options);
+  if (options.doSample === false || options.temperature === 0) {
+    return distribution[0]?.id ?? 0;
+  }
+  const draw = rng();
+  let cumulative = 0;
+
+  for (let index = 0; index < distribution.length; index += 1) {
+    cumulative += distribution[index]?.probability ?? 0;
+    if (draw < cumulative) {
+      return distribution[index]?.id ?? distribution[0]?.id ?? 0;
+    }
+  }
+
+  return distribution.at(-1)?.id ?? distribution[0]?.id ?? 0;
+}
+
+export function tokenSamplingDistribution(
+  candidates: readonly TopTokenCandidate[],
+  options: Pick<ResolvedGenerationSamplingOptions, "doSample" | "temperature" | "topP" | "topK">,
+): TokenProbability[] {
   if (candidates.length === 0) {
     throw new Error("Cannot sample from an empty candidate list.");
   }
 
   const sorted = [...candidates].sort((left, right) => right.value - left.value || left.id - right.id);
   if (options.doSample === false || options.temperature === 0) {
-    return sorted[0]?.id ?? candidates[0]?.id ?? 0;
+    const token = sorted[0] ?? candidates[0];
+    if (!token) {
+      throw new Error("Cannot sample from an empty candidate list.");
+    }
+    return [{ ...token, probability: 1 }];
   }
 
   const topKCandidates = sorted.slice(0, Math.max(1, Math.floor(options.topK)));
@@ -97,17 +126,10 @@ export function sampleNextToken(
   const probabilities = softmax(
     nucleusCandidates.map((candidate) => candidate.value / options.temperature),
   );
-  const draw = rng();
-  let cumulative = 0;
-
-  for (let index = 0; index < nucleusCandidates.length; index += 1) {
-    cumulative += probabilities[index] ?? 0;
-    if (draw < cumulative) {
-      return nucleusCandidates[index]?.id ?? nucleusCandidates[0]?.id ?? 0;
-    }
-  }
-
-  return nucleusCandidates.at(-1)?.id ?? topKCandidates[0]?.id ?? sorted[0]?.id ?? 0;
+  return nucleusCandidates.map((candidate, index) => ({
+    ...candidate,
+    probability: probabilities[index] ?? 0,
+  }));
 }
 
 function applyTopP(candidates: readonly TopTokenCandidate[], topP: number): readonly TopTokenCandidate[] {

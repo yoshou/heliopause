@@ -104,17 +104,22 @@ export {
   createDeterministicRng,
   resolveGenerationSamplingOptions,
   sampleNextToken,
+  tokenSamplingDistribution,
   type GenerationSamplingOptions,
   type ResolvedGenerationSamplingOptions,
+  type TokenProbability,
   type TopTokenCandidate,
 } from "./generation";
 
 export {
+  acceptMtpDraft,
   acceptGreedyMtpDraft,
   proposeMtpDraft,
+  sampleMtpTokenDistribution,
   validateMtpAssistantCompatibility,
   validateMtpGenerationOptions,
   type GreedyMtpAcceptance,
+  type MtpAcceptance,
   type MtpGenerationOptions,
   type MtpProposal,
 } from "./mtp-generation";

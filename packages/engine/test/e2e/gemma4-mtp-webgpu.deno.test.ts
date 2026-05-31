@@ -41,6 +41,7 @@ Deno.test({
     await assertPinnedModel(ASSISTANT_MODEL);
     const capture = installWebGpuCapture();
     const {
+      acceptMtpDraft,
       acceptGreedyMtpDraft,
       applyChatGenerationPrompt,
       applyChatTemplate,
@@ -61,6 +62,7 @@ Deno.test({
       prefillState,
       proposeMtpDraft,
       resolveGenerationSamplingOptions,
+      sampleMtpTokenDistribution,
       verifyMtpDraft,
     } = await import("../../src/index.ts");
 
@@ -145,6 +147,66 @@ Deno.test({
     assertArrayEquals(mtpTokens, EXPECTED_TOKENS, `MTP content: ${JSON.stringify(mtp.content)}`);
     assertArrayEquals(mtpTokens, baselineTokens);
     assertNaturalSentence(mtp.content);
+
+    const sampledMtpSession = createChatSession(targetReader, {
+      maxContextLength: 256,
+      providers: [createWebGpuProvider({
+        memoryLimitBytes: Number(
+          Deno.env.get("HELIOPAUSE_WEBGPU_MEMORY_LIMIT_BYTES") ?? DEFAULT_WEBGPU_MEMORY_LIMIT_BYTES,
+        ),
+        prefillChunkSize: 16,
+      })],
+    });
+    const sampledMtpTokens: number[] = [];
+    await generateChatTurn(
+      sampledMtpSession,
+      tokenizer,
+      sampledMtpSession.createInferenceState(),
+      PROMPT,
+      {
+        appendTurnEnd: false,
+        doSample: true,
+        temperature: 1,
+        topP: 1,
+        topK: 1,
+        seed: 42,
+        maxNewTokens: EXPECTED_TOKENS.length,
+        mtp: {
+          assistantSession,
+          numSpeculativeTokens: 1,
+        },
+        onToken: (chunk) => sampledMtpTokens.push(chunk.tokenId),
+      },
+    );
+    assertArrayEquals(sampledMtpTokens, EXPECTED_TOKENS, "MTP sampling path with topK=1 should match greedy target tokens");
+
+    const samplingTopK = resolveGenerationSamplingOptions({ doSample: true, temperature: 1, topP: 1, topK: 4, seed: 7 });
+    const samplingStep = await measureMtpSamplingStep(
+      targetReader,
+      tokenizer,
+      applyChatGenerationPrompt,
+      applyChatTemplate,
+      createChatSession,
+      createWebGpuProvider,
+      createDeterministicRng,
+      prefillState,
+      prefillMtpTarget,
+      proposeMtpDraft,
+      verifyMtpDraft,
+      finalizeMtpVerification,
+      acceptMtpDraft,
+      sampleMtpTokenDistribution,
+      assistantSession,
+      samplingTopK,
+      PROMPT,
+    );
+    assert(
+      samplingStep.targetDistributionWidths.every((width) => width > 1),
+      `MTP sampling verification did not expose per-position target topK distributions: ${
+        JSON.stringify(samplingStep.targetDistributionWidths)
+      }`,
+    );
+    assert(samplingStep.acceptance.committedLength >= 1, "MTP sampling acceptance did not commit the seed token");
 
     const sampling = resolveGenerationSamplingOptions({ doSample: false });
     let proposedDraftTokens = 0;
@@ -356,6 +418,66 @@ async function measureMtpAcceptance(
     pendingTokenId = acceptance.nextTokenId;
   }
   return { tokens, proposed, accepted };
+}
+
+async function measureMtpSamplingStep(
+  targetReader: unknown,
+  tokenizer: {
+    tokenize: (text: string, options?: { addBos?: boolean }) => number[];
+  },
+  applyChatGenerationPrompt: () => string,
+  applyChatTemplate: (messages: readonly { role: "user"; content: string }[], options: { addGenerationPrompt: false }) => string,
+  createChatSession: (...args: any[]) => any,
+  createWebGpuProvider: (...args: any[]) => any,
+  createDeterministicRng: (seed: number) => () => number,
+  prefillState: (...args: any[]) => Promise<void>,
+  prefillMtpTarget: (...args: any[]) => Promise<{ firstTokenDistribution: unknown; context: unknown }>,
+  proposeMtpDraft: (...args: any[]) => Promise<{ draftTokenIds: number[]; draftDistributions: unknown[] }>,
+  verifyMtpDraft: (...args: any[]) => Promise<{ targetDistributions: Array<{ tokens: unknown[] }> }>,
+  finalizeMtpVerification: (...args: any[]) => unknown,
+  acceptMtpDraft: (...args: any[]) => { committedLength: number },
+  sampleMtpTokenDistribution: (...args: any[]) => number,
+  assistantSession: { manifest: unknown },
+  sampling: { seed: number; logitsTopK: number },
+  prompt: string,
+): Promise<{ targetDistributionWidths: number[]; acceptance: { committedLength: number } }> {
+  const session = createMeasuredChatSession(targetReader, createChatSession, createWebGpuProvider);
+  const state = session.createInferenceState();
+  const rng = createDeterministicRng(sampling.seed);
+  const userPrompt = applyChatTemplate([{ role: "user", content: prompt }], { addGenerationPrompt: false });
+  const userTokenIds = tokenizer.tokenize(userPrompt, { addBos: true });
+  await prefillState(session, state, userTokenIds, {
+    positions: Int32Array.from({ length: userTokenIds.length }, (_, index) => index),
+  });
+  const generationPromptTokenIds = tokenizer.tokenize(applyChatGenerationPrompt(), { addBos: false });
+  const generationPromptStart = state.nextPosition;
+  const promptPrefill = await prefillMtpTarget(session, state, generationPromptTokenIds, {
+    positions: Int32Array.from(
+      { length: generationPromptTokenIds.length },
+      (_, index) => generationPromptStart + index,
+    ),
+    logitsTopK: sampling.logitsTopK,
+    assistantManifest: assistantSession.manifest,
+  });
+  const pendingTokenId = sampleMtpTokenDistribution(promptPrefill.firstTokenDistribution, sampling, rng);
+  const proposal = await proposeMtpDraft(
+    session,
+    { assistantSession, numSpeculativeTokens: 1 },
+    pendingTokenId,
+    promptPrefill.context,
+    sampling,
+    rng,
+  );
+  const verification = await verifyMtpDraft(session, state, [pendingTokenId, ...proposal.draftTokenIds], {
+    logitsTopK: sampling.logitsTopK,
+    assistantManifest: assistantSession.manifest,
+  });
+  const acceptance = acceptMtpDraft(proposal, verification, sampling, rng);
+  finalizeMtpVerification(session, state, verification, acceptance.committedLength);
+  return {
+    targetDistributionWidths: verification.targetDistributions.map((distribution) => distribution.tokens.length),
+    acceptance,
+  };
 }
 
 function createMeasuredChatSession(
