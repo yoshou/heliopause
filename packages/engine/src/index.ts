@@ -199,7 +199,6 @@ export {
   createMtpAssistantSession,
   MtpAssistantSession,
   runMtpAssistant,
-  type MtpAssistantForwardIntermediates,
   type MtpAssistantRunInput,
   type MtpAssistantRunResult,
   type MtpAssistantRunner,

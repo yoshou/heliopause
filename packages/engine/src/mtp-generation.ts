@@ -109,9 +109,7 @@ export async function proposeMtpDraft(
 
   for (let index = 0; index < mtp.numSpeculativeTokens; index += 1) {
     const result = await runMtpAssistant(mtp.assistantSession, {
-      tokenId,
       targetInputEmbedding: await readTargetInputEmbedding(targetSession, tokenId),
-      targetPreviousHidden: previousHidden,
       targetCurrentHidden: currentHidden,
       targetKv: constantTargetKv,
       position: constantPosition,

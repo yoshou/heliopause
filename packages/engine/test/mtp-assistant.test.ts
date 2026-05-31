@@ -41,16 +41,8 @@ test("MTP assistant dispatch calls the selected provider runner", async () => {
           async run() {
             called += 1;
             return {
-              hidden: new Float32Array([1, 2]),
               backboneHidden: new Float32Array([3, 4]),
               topTokens: [{ id: 2, value: 9 }],
-              intermediates: {
-                preProjection: new Float32Array([0, 0]),
-                layerOutputs: [],
-                normalizedHidden: new Float32Array([1, 2]),
-                postProjection: new Float32Array([3, 4]),
-                centroidLogits: new Float32Array([9, 1]),
-              },
             };
           },
         },
@@ -81,11 +73,9 @@ test("MTP assistant session validates provider capability and synthetic determin
   const first = await runMtpAssistant(session, assistantInput());
   const second = await runMtpAssistant(session, assistantInput());
   assert.deepEqual(Array.from(tokenOrdering), [0, 1, 2, 3]);
-  assert.equal(first.hidden?.length, 2);
   assert.equal(first.backboneHidden.length, 2);
-  assert.equal(first.intermediates?.centroidLogits.length, 2);
   assert.ok(first.topTokens.length > 0);
-  assert.deepEqual(Array.from(second.hidden ?? []), Array.from(first.hidden ?? []));
+  assert.deepEqual(Array.from(second.backboneHidden), Array.from(first.backboneHidden));
   assert.deepEqual(second.topTokens, first.topTokens);
 });
 
@@ -94,16 +84,8 @@ test("WASM MTP assistant provider runs synthetic deterministic smoke", async () 
   const first = await runMtpAssistant(session, assistantInput());
   const second = await runMtpAssistant(session, assistantInput());
 
-  assert.equal(first.hidden?.length, 2);
   assert.equal(first.backboneHidden.length, 2);
-  assert.equal(first.intermediates?.preProjection.length, 2);
-  assert.equal(first.intermediates?.layerOutputs.length, 1);
-  assert.equal(first.intermediates?.layerOutputs[0]?.length, 2);
-  assert.equal(first.intermediates?.normalizedHidden.length, 2);
-  assert.equal(first.intermediates?.postProjection.length, 2);
-  assert.equal(first.intermediates?.centroidLogits.length, 2);
   assert.ok(first.topTokens.length > 0);
-  assert.deepEqual(Array.from(second.hidden ?? []), Array.from(first.hidden ?? []));
   assert.deepEqual(Array.from(second.backboneHidden), Array.from(first.backboneHidden));
   assert.deepEqual(second.topTokens, first.topTokens);
   assert.equal(session.cacheStats().executionProviderStats.wasmMtpAssistantRuns, 2);
@@ -117,9 +99,7 @@ test("WebGPU MTP assistant provider exposes provider capability", () => {
 
 function assistantInput() {
   return {
-    tokenId: 1,
     targetInputEmbedding: new Float32Array([0.1, -0.2]),
-    targetPreviousHidden: new Float32Array([0.25, -0.5]),
     targetCurrentHidden: new Float32Array([0.75, 0.125]),
     targetKv: {
       layers: [{

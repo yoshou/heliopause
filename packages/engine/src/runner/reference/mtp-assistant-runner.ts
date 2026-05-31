@@ -46,24 +46,19 @@ async function runReferenceMtpAssistant(
   const projectionInput = new Float32Array(session.manifest.backboneEmbeddingLength * 2);
   projectionInput.set(input.targetInputEmbedding, 0);
   projectionInput.set(input.targetCurrentHidden, session.manifest.backboneEmbeddingLength);
-  const preProjection = await matMulAssistantWeight(session, "mtp.pre_projection.weight", projectionInput);
-  let layerHidden: Float32Array = preProjection;
-  const layerOutputs: Float32Array[] = [];
+  let layerHidden = await matMulAssistantWeight(session, "mtp.pre_projection.weight", projectionInput);
   for (let layer = 0; layer < session.manifest.blockCount; layer += 1) {
     if (options.signal?.aborted) {
       throw new DOMException("MTP assistant execution was aborted.", "AbortError");
     }
     layerHidden = await forwardAssistantLayer(session, input, layer, layerHidden);
-    layerOutputs.push(layerHidden.slice());
   }
   const normalizedHidden = rmsNorm(layerHidden, await session.readF32Tensor("output_norm.weight"), session.epsilon);
   const postProjection = await matMulAssistantWeight(session, "mtp.post_projection.weight", normalizedHidden);
   const centroidLogits = await matMulAssistantWeight(session, "mtp.centroids.weight", normalizedHidden);
   return {
-    hidden: layerHidden,
     backboneHidden: postProjection,
     topTokens: await maskedEmbeddingTopTokens(session, normalizedHidden, centroidLogits, input.topK),
-    intermediates: { preProjection, layerOutputs, normalizedHidden, postProjection, centroidLogits },
   };
 }
 
@@ -248,9 +243,6 @@ function sharedTargetKvLayer(input: MtpAssistantRunInput, assistantLayer: number
 function validateInput(session: MtpAssistantSession, input: MtpAssistantRunInput): void {
   if (input.targetInputEmbedding.length !== session.manifest.backboneEmbeddingLength) {
     throw new Error(`targetInputEmbedding shape mismatch: ${input.targetInputEmbedding.length}`);
-  }
-  if (input.targetPreviousHidden.length !== session.manifest.backboneEmbeddingLength) {
-    throw new Error(`targetPreviousHidden shape mismatch: ${input.targetPreviousHidden.length}`);
   }
   if (input.targetCurrentHidden.length !== session.manifest.backboneEmbeddingLength) {
     throw new Error(`targetCurrentHidden shape mismatch: ${input.targetCurrentHidden.length}`);

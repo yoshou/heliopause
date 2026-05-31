@@ -617,9 +617,6 @@ function validateInput(session: MtpAssistantSession, input: MtpAssistantRunInput
   if (input.targetInputEmbedding.length !== session.manifest.backboneEmbeddingLength) {
     throw new Error(`targetInputEmbedding shape mismatch: ${input.targetInputEmbedding.length}`);
   }
-  if (input.targetPreviousHidden.length !== session.manifest.backboneEmbeddingLength) {
-    throw new Error(`targetPreviousHidden shape mismatch: ${input.targetPreviousHidden.length}`);
-  }
   if (input.targetCurrentHidden.length !== session.manifest.backboneEmbeddingLength) {
     throw new Error(`targetCurrentHidden shape mismatch: ${input.targetCurrentHidden.length}`);
   }

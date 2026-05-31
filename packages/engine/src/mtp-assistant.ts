@@ -39,19 +39,9 @@ export type {
   MtpTargetKvView,
 } from "./runner/mtp-assistant-runner";
 
-export type MtpAssistantForwardIntermediates = {
-  preProjection: Float32Array;
-  layerOutputs: Float32Array[];
-  normalizedHidden: Float32Array;
-  postProjection: Float32Array;
-  centroidLogits: Float32Array;
-};
-
 export type MtpAssistantRunResult = {
-  hidden?: Float32Array;
   backboneHidden: Float32Array;
   topTokens: Array<{ id: number; value: number }>;
-  intermediates?: MtpAssistantForwardIntermediates;
 };
 
 export type MtpAssistantSessionOptions = {
