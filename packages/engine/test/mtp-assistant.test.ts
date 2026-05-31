@@ -7,6 +7,7 @@ import {
   createMtpAssistantSession,
   createReferenceProvider,
   createWasmProvider,
+  createWebGpuProvider,
   GgufTensorReader,
   runMtpAssistant,
   type GgufMetadata,
@@ -80,11 +81,11 @@ test("MTP assistant session validates provider capability and synthetic determin
   const first = await runMtpAssistant(session, assistantInput());
   const second = await runMtpAssistant(session, assistantInput());
   assert.deepEqual(Array.from(tokenOrdering), [0, 1, 2, 3]);
-  assert.equal(first.hidden.length, 2);
+  assert.equal(first.hidden?.length, 2);
   assert.equal(first.backboneHidden.length, 2);
-  assert.equal(first.intermediates.centroidLogits.length, 2);
+  assert.equal(first.intermediates?.centroidLogits.length, 2);
   assert.ok(first.topTokens.length > 0);
-  assert.deepEqual(Array.from(second.hidden), Array.from(first.hidden));
+  assert.deepEqual(Array.from(second.hidden ?? []), Array.from(first.hidden ?? []));
   assert.deepEqual(second.topTokens, first.topTokens);
 });
 
@@ -93,19 +94,25 @@ test("WASM MTP assistant provider runs synthetic deterministic smoke", async () 
   const first = await runMtpAssistant(session, assistantInput());
   const second = await runMtpAssistant(session, assistantInput());
 
-  assert.equal(first.hidden.length, 2);
+  assert.equal(first.hidden?.length, 2);
   assert.equal(first.backboneHidden.length, 2);
-  assert.equal(first.intermediates.preProjection.length, 2);
-  assert.equal(first.intermediates.layerOutputs.length, 1);
-  assert.equal(first.intermediates.layerOutputs[0]?.length, 2);
-  assert.equal(first.intermediates.normalizedHidden.length, 2);
-  assert.equal(first.intermediates.postProjection.length, 2);
-  assert.equal(first.intermediates.centroidLogits.length, 2);
+  assert.equal(first.intermediates?.preProjection.length, 2);
+  assert.equal(first.intermediates?.layerOutputs.length, 1);
+  assert.equal(first.intermediates?.layerOutputs[0]?.length, 2);
+  assert.equal(first.intermediates?.normalizedHidden.length, 2);
+  assert.equal(first.intermediates?.postProjection.length, 2);
+  assert.equal(first.intermediates?.centroidLogits.length, 2);
   assert.ok(first.topTokens.length > 0);
-  assert.deepEqual(Array.from(second.hidden), Array.from(first.hidden));
+  assert.deepEqual(Array.from(second.hidden ?? []), Array.from(first.hidden ?? []));
   assert.deepEqual(Array.from(second.backboneHidden), Array.from(first.backboneHidden));
   assert.deepEqual(second.topTokens, first.topTokens);
   assert.equal(session.cacheStats().executionProviderStats.wasmMtpAssistantRuns, 2);
+});
+
+test("WebGPU MTP assistant provider exposes provider capability", () => {
+  const provider = createWebGpuProvider();
+  assert.equal(typeof provider.createMtpAssistantRunners, "function");
+  assert.equal(provider.createMtpAssistantRunners().runner.provider, "webgpu");
 });
 
 function assistantInput() {

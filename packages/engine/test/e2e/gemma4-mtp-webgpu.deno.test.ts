@@ -51,7 +51,6 @@ Deno.test({
       createDeterministicRng,
       createFileGgufTensorReader,
       createMtpAssistantSession,
-      createWasmProvider,
       createWebGpuProvider,
       decode,
       finalizeMtpVerification,
@@ -75,7 +74,11 @@ Deno.test({
     const assistantReader = await createFileGgufTensorReader(new RangeFile(ASSISTANT_MODEL.path));
     const tokenizer = buildTokenizer(targetReader.metadata);
     const assistantSession = createMtpAssistantSession(assistantReader, {
-      providers: [createWasmProvider()],
+      providers: [createWebGpuProvider({
+        memoryLimitBytes: Number(
+          Deno.env.get("HELIOPAUSE_WEBGPU_MEMORY_LIMIT_BYTES") ?? DEFAULT_WEBGPU_MEMORY_LIMIT_BYTES,
+        ),
+      })],
     });
 
     const baselineSession = createChatSession(targetReader, {
@@ -271,8 +274,17 @@ Deno.test({
     );
     const assistantStats = assistantSession.cacheStats().executionProviderStats;
     assert(
-      typeof assistantStats.wasmMtpAssistantRuns === "number" && assistantStats.wasmMtpAssistantRuns > 0,
-      `MTP assistant WASM runner was not observed: ${JSON.stringify(assistantStats)}`,
+      typeof assistantStats.webgpuMtpAssistantRuns === "number" && assistantStats.webgpuMtpAssistantRuns > 0,
+      `MTP assistant WebGPU runner was not observed: ${JSON.stringify(assistantStats)}`,
+    );
+    const maxReadbackPerRun =
+      assistantSession.manifest.backboneEmbeddingLength * Float32Array.BYTES_PER_ELEMENT +
+      Math.min(assistantSession.manifest.centroidTopK, assistantSession.manifest.nCentroids) * 2 * Float32Array.BYTES_PER_ELEMENT +
+      64 * 2 * Float32Array.BYTES_PER_ELEMENT;
+    assert(
+      typeof assistantStats.webgpuMtpAssistantReadbackBytes === "number" &&
+        assistantStats.webgpuMtpAssistantReadbackBytes <= assistantStats.webgpuMtpAssistantRuns * maxReadbackPerRun,
+      `MTP assistant WebGPU readback exceeded production guard: ${JSON.stringify(assistantStats)}`,
     );
   },
 });

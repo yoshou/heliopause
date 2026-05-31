@@ -48,10 +48,10 @@ export type MtpAssistantForwardIntermediates = {
 };
 
 export type MtpAssistantRunResult = {
-  hidden: Float32Array;
+  hidden?: Float32Array;
   backboneHidden: Float32Array;
   topTokens: Array<{ id: number; value: number }>;
-  intermediates: MtpAssistantForwardIntermediates;
+  intermediates?: MtpAssistantForwardIntermediates;
 };
 
 export type MtpAssistantSessionOptions = {
