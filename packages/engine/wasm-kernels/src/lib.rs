@@ -94,6 +94,60 @@ pub unsafe extern "C" fn hp_matmul_quantized_f32(
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn hp_matmul_dequantized_f32(
+    type_id: i32,
+    weight_ptr: *const u8,
+    weight_len: usize,
+    input_ptr: *const f32,
+    input_len: usize,
+    input_size: usize,
+    row_count: usize,
+    column_count: usize,
+    output_ptr: *mut f32,
+    output_len: usize,
+) -> i32 {
+    if input_len != input_size.saturating_mul(column_count)
+        || output_len != row_count.saturating_mul(column_count)
+    {
+        return ERR_SHAPE;
+    }
+    let row_bytes = match quantized_row_bytes(type_id, input_size) {
+        Some(value) => value,
+        None => return ERR_TYPE,
+    };
+    if weight_len != row_bytes.saturating_mul(row_count) {
+        return ERR_SHAPE;
+    }
+
+    let weight = slice::from_raw_parts(weight_ptr, weight_len);
+    let input = slice::from_raw_parts(input_ptr, input_len);
+    let output = slice::from_raw_parts_mut(output_ptr, output_len);
+    let mut weight_row = vec![0.0_f32; input_size];
+
+    for row in 0..row_count {
+        let row_offset = row * row_bytes;
+        if !dequantize_quantized_row(
+            type_id,
+            &weight[row_offset..row_offset + row_bytes],
+            input_size,
+            &mut weight_row,
+        ) {
+            return ERR_TYPE;
+        }
+        for column in 0..column_count {
+            let input_offset = column * input_size;
+            let mut sum = 0.0_f32;
+            for index in 0..input_size {
+                sum = (sum + (weight_row[index] * input[input_offset + index]).round_to_f32()).round_to_f32();
+            }
+            output[column * row_count + row] = sum;
+        }
+    }
+
+    OK
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn hp_prepare_quantized_scales_f32(
     type_id: i32,
     weight_ptr: *const u8,
@@ -1490,6 +1544,182 @@ fn quantized_scale_values_per_row(type_id: i32, elements: usize) -> Option<usize
         TYPE_Q8_0 if elements % 32 == 0 => Some(elements / 32),
         _ => None,
     }
+}
+
+fn dequantize_quantized_row(type_id: i32, bytes: &[u8], elements: usize, output: &mut [f32]) -> bool {
+    if output.len() != elements {
+        return false;
+    }
+    match type_id {
+        TYPE_Q4_K => dequantize_q4_k(bytes, elements, output),
+        TYPE_Q5_K => dequantize_q5_k(bytes, elements, output),
+        TYPE_Q6_K => dequantize_q6_k(bytes, elements, output),
+        TYPE_IQ4_XS => dequantize_iq4_xs(bytes, elements, output),
+        TYPE_Q8_0 => dequantize_q8_0(bytes, elements, output),
+        _ => false,
+    }
+}
+
+fn dequantize_q8_0(bytes: &[u8], elements: usize, output: &mut [f32]) -> bool {
+    if elements % 32 != 0 || bytes.len() != elements / 32 * 34 {
+        return false;
+    }
+    let mut offset = 0;
+    let mut out = 0;
+    for _block in 0..elements / 32 {
+        let d = float16_to_float32(read_u16_le(bytes, offset));
+        offset += 2;
+        for index in 0..32 {
+            output[out] = signed_byte(bytes[offset + index]) as f32 * d;
+            out += 1;
+        }
+        offset += 32;
+    }
+    true
+}
+
+fn dequantize_q4_k(bytes: &[u8], elements: usize, output: &mut [f32]) -> bool {
+    if elements % QK_K != 0 || bytes.len() != elements / QK_K * 144 {
+        return false;
+    }
+    let mut offset = 0;
+    let mut out = 0;
+    for _block in 0..elements / QK_K {
+        let d = float16_to_float32(read_u16_le(bytes, offset));
+        let dmin = float16_to_float32(read_u16_le(bytes, offset + 2));
+        let scales = &bytes[offset + 4..offset + 16];
+        let qs = &bytes[offset + 16..offset + 144];
+        let mut q_offset = 0;
+        let mut scale_index = 0;
+        for _group in (0..QK_K).step_by(64) {
+            let (sc1, min1) = get_scale_min_k4(scale_index, scales);
+            let (sc2, min2) = get_scale_min_k4(scale_index + 1, scales);
+            let d1 = d * sc1 as f32;
+            let d2 = d * sc2 as f32;
+            let m1 = dmin * min1 as f32;
+            let m2 = dmin * min2 as f32;
+            for lane in 0..32 {
+                output[out] = d1 * (qs[q_offset + lane] & 0x0f) as f32 - m1;
+                out += 1;
+            }
+            for lane in 0..32 {
+                output[out] = d2 * (qs[q_offset + lane] >> 4) as f32 - m2;
+                out += 1;
+            }
+            q_offset += 32;
+            scale_index += 2;
+        }
+        offset += 144;
+    }
+    true
+}
+
+fn dequantize_q5_k(bytes: &[u8], elements: usize, output: &mut [f32]) -> bool {
+    if elements % QK_K != 0 || bytes.len() != elements / QK_K * 176 {
+        return false;
+    }
+    let mut offset = 0;
+    let mut out = 0;
+    for _block in 0..elements / QK_K {
+        let d = float16_to_float32(read_u16_le(bytes, offset));
+        let dmin = float16_to_float32(read_u16_le(bytes, offset + 2));
+        let scales = &bytes[offset + 4..offset + 16];
+        let qh = &bytes[offset + 16..offset + 48];
+        let qs = &bytes[offset + 48..offset + 176];
+        let mut q_offset = 0;
+        let mut scale_index = 0;
+        let mut low_high_mask = 1_u8;
+        let mut high_high_mask = 2_u8;
+        for _group in (0..QK_K).step_by(64) {
+            let (sc1, min1) = get_scale_min_k4(scale_index, scales);
+            let (sc2, min2) = get_scale_min_k4(scale_index + 1, scales);
+            let d1 = d * sc1 as f32;
+            let d2 = d * sc2 as f32;
+            let m1 = dmin * min1 as f32;
+            let m2 = dmin * min2 as f32;
+            for lane in 0..32 {
+                let high = if qh[lane] & low_high_mask != 0 { 16 } else { 0 };
+                output[out] = d1 * ((qs[q_offset + lane] & 0x0f) + high) as f32 - m1;
+                out += 1;
+            }
+            for lane in 0..32 {
+                let high = if qh[lane] & high_high_mask != 0 { 16 } else { 0 };
+                output[out] = d2 * ((qs[q_offset + lane] >> 4) + high) as f32 - m2;
+                out += 1;
+            }
+            q_offset += 32;
+            scale_index += 2;
+            low_high_mask <<= 2;
+            high_high_mask <<= 2;
+        }
+        offset += 176;
+    }
+    true
+}
+
+fn dequantize_q6_k(bytes: &[u8], elements: usize, output: &mut [f32]) -> bool {
+    if elements % QK_K != 0 || bytes.len() != elements / QK_K * 210 {
+        return false;
+    }
+    let mut offset = 0;
+    let mut out_base = 0;
+    for _block in 0..elements / QK_K {
+        let ql = &bytes[offset..offset + 128];
+        let qh = &bytes[offset + 128..offset + 192];
+        let scales = &bytes[offset + 192..offset + 208];
+        let d = float16_to_float32(read_u16_le(bytes, offset + 208));
+        let mut ql_offset = 0;
+        let mut qh_offset = 0;
+        let mut scale_offset = 0;
+        for _group in (0..QK_K).step_by(128) {
+            for lane in 0..32 {
+                let is = lane / 16;
+                let qh_byte = qh[qh_offset + lane];
+                let q1 = (((ql[ql_offset + lane] & 0x0f) | (((qh_byte >> 0) & 3) << 4)) as i32) - 32;
+                let q2 = (((ql[ql_offset + lane + 32] & 0x0f) | (((qh_byte >> 2) & 3) << 4)) as i32) - 32;
+                let q3 = (((ql[ql_offset + lane] >> 4) | (((qh_byte >> 4) & 3) << 4)) as i32) - 32;
+                let q4 = (((ql[ql_offset + lane + 32] >> 4) | (((qh_byte >> 6) & 3) << 4)) as i32) - 32;
+                output[out_base + lane] = d * signed_byte(scales[scale_offset + is]) as f32 * q1 as f32;
+                output[out_base + lane + 32] = d * signed_byte(scales[scale_offset + is + 2]) as f32 * q2 as f32;
+                output[out_base + lane + 64] = d * signed_byte(scales[scale_offset + is + 4]) as f32 * q3 as f32;
+                output[out_base + lane + 96] = d * signed_byte(scales[scale_offset + is + 6]) as f32 * q4 as f32;
+            }
+            out_base += 128;
+            ql_offset += 64;
+            qh_offset += 32;
+            scale_offset += 8;
+        }
+        offset += 210;
+    }
+    true
+}
+
+fn dequantize_iq4_xs(bytes: &[u8], elements: usize, output: &mut [f32]) -> bool {
+    if elements % QK_K != 0 || bytes.len() != elements / QK_K * 136 {
+        return false;
+    }
+    let mut offset = 0;
+    let mut out = 0;
+    for _block in 0..elements / QK_K {
+        let d = float16_to_float32(read_u16_le(bytes, offset));
+        let scales_h = read_u16_le(bytes, offset + 2);
+        let scales_l = &bytes[offset + 4..offset + 8];
+        let qs = &bytes[offset + 8..offset + 136];
+        let mut q_offset = 0;
+        for ib in 0..QK_K / 32 {
+            let ls = (((scales_l[ib / 2] >> (4 * (ib % 2))) & 0x0f) as u16 |
+                (((scales_h >> (2 * ib)) & 3) << 4)) as i32;
+            let dl = d * (ls - 32) as f32;
+            for lane in 0..16 {
+                output[out + lane] = dl * KVALUES_IQ4_NL[(qs[q_offset + lane] & 0x0f) as usize] as f32;
+                output[out + lane + 16] = dl * KVALUES_IQ4_NL[(qs[q_offset + lane] >> 4) as usize] as f32;
+            }
+            out += 32;
+            q_offset += 16;
+        }
+        offset += 136;
+    }
+    true
 }
 
 fn quantize_q8_k(input: &[f32]) -> QuantizedQ8K {

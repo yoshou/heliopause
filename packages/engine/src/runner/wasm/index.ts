@@ -2,6 +2,7 @@ import type {
   ModelRunner,
 } from "../model-runner";
 import type {
+  MtpAssistantRunnerProvider,
   MultimodalRunnerProvider,
 } from "../provider";
 import type {
@@ -38,6 +39,9 @@ import {
 import {
   wasmVisionEncoderRunner,
 } from "./vision-runner";
+import {
+  createWasmMtpAssistantRunners,
+} from "./mtp-assistant-runner";
 
 export function createWasmModelRunner(): ModelRunner {
   return {
@@ -57,7 +61,7 @@ export function createWasmModelRunner(): ModelRunner {
   };
 }
 
-export function createWasmProvider(options: WasmProviderOptions = {}): MultimodalRunnerProvider & {
+export function createWasmProvider(options: WasmProviderOptions = {}): MultimodalRunnerProvider & MtpAssistantRunnerProvider & {
   readonly name: "wasm";
   readonly options: Readonly<WasmProviderOptions>;
 } {
@@ -77,6 +81,7 @@ export function createWasmProvider(options: WasmProviderOptions = {}): Multimoda
     }),
     createAudioRunners: createWasmAudioRunners,
     createVisionRunners: createWasmVisionRunners,
+    createMtpAssistantRunners: createWasmMtpAssistantRunners,
   };
 }
 

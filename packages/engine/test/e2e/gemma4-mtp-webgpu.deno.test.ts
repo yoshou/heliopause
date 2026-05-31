@@ -51,7 +51,7 @@ Deno.test({
       createDeterministicRng,
       createFileGgufTensorReader,
       createMtpAssistantSession,
-      createReferenceProvider,
+      createWasmProvider,
       createWebGpuProvider,
       decode,
       finalizeMtpVerification,
@@ -75,7 +75,7 @@ Deno.test({
     const assistantReader = await createFileGgufTensorReader(new RangeFile(ASSISTANT_MODEL.path));
     const tokenizer = buildTokenizer(targetReader.metadata);
     const assistantSession = createMtpAssistantSession(assistantReader, {
-      providers: [createReferenceProvider()],
+      providers: [createWasmProvider()],
     });
 
     const baselineSession = createChatSession(targetReader, {
@@ -271,8 +271,8 @@ Deno.test({
     );
     const assistantStats = assistantSession.cacheStats().executionProviderStats;
     assert(
-      typeof assistantStats.referenceMtpAssistantRuns === "number" && assistantStats.referenceMtpAssistantRuns > 0,
-      `MTP assistant reference runner was not observed: ${JSON.stringify(assistantStats)}`,
+      typeof assistantStats.wasmMtpAssistantRuns === "number" && assistantStats.wasmMtpAssistantRuns > 0,
+      `MTP assistant WASM runner was not observed: ${JSON.stringify(assistantStats)}`,
     );
   },
 });

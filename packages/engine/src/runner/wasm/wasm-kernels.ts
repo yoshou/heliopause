@@ -17,6 +17,18 @@ type KernelExports = WebAssembly.Exports & {
     outputPtr: number,
     outputLen: number,
   ): number;
+  hp_matmul_dequantized_f32(
+    typeId: number,
+    weightPtr: number,
+    weightLen: number,
+    inputPtr: number,
+    inputLen: number,
+    inputSize: number,
+    rowCount: number,
+    columnCount: number,
+    outputPtr: number,
+    outputLen: number,
+  ): number;
   hp_prepare_quantized_scales_f32(
     typeId: number,
     weightPtr: number,
@@ -457,6 +469,58 @@ export async function matMulQuantizedWasm(
     ));
     assertWasmOk(code, "matMulQuantized");
     return timedWasmSection("matMulQuantized", "output copy + free", () => {
+      const output = readF32FromWasm(exports, outputAlloc.ptr, outputLength);
+      releaseAllocations(exports, allocations);
+      allocations.length = 0;
+      return output;
+    }, outputLength * Float32Array.BYTES_PER_ELEMENT);
+  } finally {
+    releaseAllocations(exports, allocations);
+  }
+}
+
+export async function matMulDequantizedWasm(
+  type: "Q4_K" | "Q5_K" | "Q6_K" | "IQ4_XS" | "Q8_0",
+  weightBytes: Uint8Array,
+  inputColumns: Float32Array,
+  inputSize: number,
+  rowCount: number,
+  columnCount: number,
+): Promise<Float32Array | undefined> {
+  const exports = await prefillWasmExports();
+  if (!exports) {
+    return undefined;
+  }
+  const typeId = quantizedTypeId(type);
+  if (!typeId) {
+    return undefined;
+  }
+  if (inputColumns.length !== inputSize * columnCount) {
+    throw new Error(`Dequantized matmul input shape mismatch: ${inputColumns.length}`);
+  }
+
+  const allocations: Allocation[] = [];
+  try {
+    const outputLength = rowCount * columnCount;
+    const { weightAlloc, inputAlloc, outputAlloc } = timedWasmSection("matMulDequantized", "allocation + input copy", () => ({
+      weightAlloc: copyU8ToWasm(exports, weightBytes, allocations),
+      inputAlloc: copyF32ToWasm(exports, inputColumns, allocations),
+      outputAlloc: allocateBytes(exports, outputLength * Float32Array.BYTES_PER_ELEMENT, allocations),
+    }), weightBytes.byteLength + inputColumns.byteLength + outputLength * Float32Array.BYTES_PER_ELEMENT);
+    const code = timedWasmSection("matMulDequantized", "kernel call", () => exports.hp_matmul_dequantized_f32(
+      typeId,
+      weightAlloc.ptr,
+      weightBytes.length,
+      inputAlloc.ptr,
+      inputColumns.length,
+      inputSize,
+      rowCount,
+      columnCount,
+      outputAlloc.ptr,
+      outputLength,
+    ));
+    assertWasmOk(code, "matMulDequantized");
+    return timedWasmSection("matMulDequantized", "output copy + free", () => {
       const output = readF32FromWasm(exports, outputAlloc.ptr, outputLength);
       releaseAllocations(exports, allocations);
       allocations.length = 0;
