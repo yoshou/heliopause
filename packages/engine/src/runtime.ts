@@ -29,6 +29,7 @@ export type FullAttentionCache = {
   value: Float32Array;
   keyLength: number;
   valueLength: number;
+  headCountKv: number;
 };
 
 export type InferenceState = {
@@ -279,11 +280,13 @@ export function createInferenceState(
     }
     const keyLength = manifest.layerKeyLengths[layer] ?? manifest.keyLength;
     const valueLength = manifest.layerValueLengths[layer] ?? manifest.valueLength;
+    const headCountKv = manifest.layerHeadCountKv[layer] ?? manifest.headCountKv;
     fullAttention.set(layer, {
-      key: new Float32Array(contextLength * manifest.headCountKv * keyLength),
-      value: new Float32Array(contextLength * manifest.headCountKv * valueLength),
+      key: new Float32Array(contextLength * headCountKv * keyLength),
+      value: new Float32Array(contextLength * headCountKv * valueLength),
       keyLength,
       valueLength,
+      headCountKv,
     });
   }
 
@@ -300,6 +303,7 @@ export function cloneInferenceState(state: InferenceState): InferenceState {
       value: cache.value.slice(),
       keyLength: cache.keyLength,
       valueLength: cache.valueLength,
+      headCountKv: cache.headCountKv,
     });
   }
 

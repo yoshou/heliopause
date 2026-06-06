@@ -23,6 +23,7 @@ export {
   type AudioManifest,
   type ExpectedTensor,
   type LayerKind,
+  type LayerValueProjectionMode,
   type ModelManifest,
   type MtpAssistantManifest,
   type TensorCoverageAudit,

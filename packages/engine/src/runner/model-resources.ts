@@ -150,5 +150,6 @@ function attentionCacheBytes(
   }
   const keyLength = manifest.layerKeyLengths[layer] ?? manifest.keyLength;
   const valueLength = manifest.layerValueLengths[layer] ?? manifest.valueLength;
-  return contextLength * manifest.headCountKv * (keyLength + valueLength) * elementByteLength;
+  const headCountKv = manifest.layerHeadCountKv[layer] ?? manifest.headCountKv;
+  return contextLength * headCountKv * (keyLength + valueLength) * elementByteLength;
 }

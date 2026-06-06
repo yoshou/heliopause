@@ -13,6 +13,7 @@ import {
   estimateWeightCacheBytes,
   GgufTensorReader,
   prefillState,
+  ReferenceSegmentRunner,
   type ModelRunnerProvider,
 } from "../src/index.ts";
 import { addInferenceStateDisposeCallback } from "../src/runtime.ts";
@@ -87,6 +88,109 @@ test("inference state allocates attention caches from manifest", () => {
   assert.equal(state.fullAttention.get(0)?.value.length, 2);
   assert.equal(state.fullAttention.get(0)?.keyLength, 2);
   assert.equal(state.fullAttention.get(0)?.valueLength, 2);
+});
+
+test("model manifest accepts layer-wise KV heads and shared key value projection", () => {
+  const manifest = buildModelManifest({
+    ...minimalGguf(),
+    metadata: {
+      ...minimalGguf().metadata,
+      "gemma4.block_count": 6,
+      "gemma4.attention.head_count": 8,
+      "gemma4.attention.head_count_kv": {
+        type: "int32",
+        length: 6,
+        sample: [8, 8, 8, 8, 8, 1],
+        truncated: false,
+      },
+      "gemma4.attention.sliding_window_pattern": {
+        type: "bool",
+        length: 6,
+        sample: [true, true, true, true, true, false],
+        truncated: false,
+      },
+    },
+    tensors: [{
+      name: "blk.5.attn_k.weight",
+      dimensions: [4, 2],
+      type: "F32",
+      typeId: 0,
+      offset: 0n,
+      dataOffset: 0n,
+    }],
+  });
+
+  assert.deepEqual(manifest.layerHeadCountKv, [8, 8, 8, 8, 8, 1]);
+  assert.equal(manifest.layerValueProjectionModes[5], "shared-with-key");
+  assert.ok(!manifest.expectedTensors.some((tensor) => tensor.name === "blk.5.attn_v.weight"));
+});
+
+test("model manifest rejects layer-wise KV head metadata with wrong length", () => {
+  assert.throws(
+    () => buildModelManifest({
+      ...minimalGguf(),
+      metadata: {
+        ...minimalGguf().metadata,
+        "gemma4.block_count": 2,
+        "gemma4.attention.head_count_kv": {
+          type: "int32",
+          length: 1,
+          sample: [1],
+          truncated: false,
+        },
+      },
+    }),
+    /head_count_kv length 1 does not match block_count 2/,
+  );
+});
+
+test("inference state allocates layer-wise KV head cache sizes", () => {
+  const manifest = buildModelManifest({
+    ...minimalGguf(),
+    metadata: {
+      ...minimalGguf().metadata,
+      "gemma4.block_count": 6,
+      "gemma4.attention.head_count": 8,
+      "gemma4.attention.head_count_kv": {
+        type: "int32",
+        length: 6,
+        sample: [8, 8, 8, 8, 8, 1],
+        truncated: false,
+      },
+    },
+    tensors: [
+      { name: "blk.0.attn_k.weight", dimensions: [4, 16], type: "F32", typeId: 0, offset: 0n, dataOffset: 0n },
+      { name: "blk.5.attn_k.weight", dimensions: [4, 2], type: "F32", typeId: 0, offset: 0n, dataOffset: 0n },
+    ],
+  });
+  const state = createInferenceState(manifest);
+
+  assert.equal(state.fullAttention.get(0)?.headCountKv, 8);
+  assert.equal(state.fullAttention.get(0)?.key.length, 16);
+  assert.equal(state.fullAttention.get(5)?.headCountKv, 1);
+  assert.equal(state.fullAttention.get(5)?.key.length, 2);
+});
+
+test("reference shared-with-key runs without attn_v weight", async () => {
+  const reader = tensorReaderFromTensors(sharedKeyReferenceLayerTensors(), {
+    "gemma4.block_count": 1,
+    "gemma4.attention.sliding_window_pattern": {
+      type: "bool",
+      length: 1,
+      sample: [false],
+      truncated: false,
+    },
+  });
+  const session = createModelSession(reader, { providers: [createReferenceProvider()] });
+  const runner = new ReferenceSegmentRunner({ session });
+
+  const result = await runner.runTokensHidden(
+    new Float32Array([1, 2, 3, 4]),
+    new Int32Array([0]),
+    session.createInferenceState(),
+  );
+
+  assert.equal(result.hidden.length, 4);
 });
 
 test("model session can cap inference cache context", () => {
@@ -373,6 +477,25 @@ function fullAttentionLayerTensors() {
     f32Tensor("blk.0.ffn_gate.weight", [4, 8], sequence(32)),
     f32Tensor("blk.0.ffn_up.weight", [4, 8], sequence(32)),
     f32Tensor("blk.0.ffn_down.weight", [8, 4], sequence(32)),
+  ];
+}
+
+function sharedKeyReferenceLayerTensors() {
+  return [
+    f32Tensor("token_embd.weight", [4, 8], sequence(32)),
+    f32Tensor("blk.0.attn_norm.weight", [4], new Float32Array([1, 1, 1, 1])),
+    f32Tensor("blk.0.attn_q.weight", [4, 2], sequence(8)),
+    f32Tensor("blk.0.attn_k.weight", [4, 2], sequence(8)),
+    f32Tensor("blk.0.attn_q_norm.weight", [2], new Float32Array([1, 1])),
+    f32Tensor("blk.0.attn_k_norm.weight", [2], new Float32Array([1, 1])),
+    f32Tensor("blk.0.attn_output.weight", [2, 4], sequence(8)),
+    f32Tensor("blk.0.post_attention_norm.weight", [4], new Float32Array([1, 1, 1, 1])),
+    f32Tensor("blk.0.ffn_norm.weight", [4], new Float32Array([1, 1, 1, 1])),
+    f32Tensor("blk.0.ffn_gate.weight", [4, 8], sequence(32)),
+    f32Tensor("blk.0.ffn_up.weight", [4, 8], sequence(32)),
+    f32Tensor("blk.0.ffn_down.weight", [8, 4], sequence(32)),
+    f32Tensor("blk.0.post_ffw_norm.weight", [4], new Float32Array([1, 1, 1, 1])),
+    f32Tensor("blk.0.layer_output_scale.weight", [1], new Float32Array([1])),
   ];
 }
 

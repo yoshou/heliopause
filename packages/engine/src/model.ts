@@ -11,6 +11,7 @@ import type {
 } from "./gguf";
 
 export type LayerKind = "sliding-attention" | "full-attention";
+export type LayerValueProjectionMode = "separate" | "shared-with-key";
 
 export type ModelManifest = {
   architecture: "gemma4";
@@ -20,6 +21,7 @@ export type ModelManifest = {
   feedForwardLength: number;
   headCount: number;
   headCountKv: number;
+  layerHeadCountKv: number[];
   keyLength: number;
   valueLength: number;
   slidingKeyLength: number;
@@ -27,6 +29,7 @@ export type ModelManifest = {
   layerKeyLengths: number[];
   layerValueLengths: number[];
   layerHasKv: boolean[];
+  layerValueProjectionModes: LayerValueProjectionMode[];
   kvSourceLayers: number[];
   contextLength: number;
   slidingWindow: number;
@@ -360,7 +363,8 @@ export function buildModelManifest(gguf: GgufMetadata): ModelManifest {
   const embeddingLength = requiredNumber(metadata, "gemma4.embedding_length");
   const feedForwardLength = requiredNumber(metadata, "gemma4.feed_forward_length");
   const headCount = requiredNumber(metadata, "gemma4.attention.head_count");
-  const headCountKv = requiredNumber(metadata, "gemma4.attention.head_count_kv");
+  const layerHeadCountKv = readLayerHeadCountKv(metadata, blockCount);
+  const headCountKv = layerHeadCountKv[0] ?? 0;
   const keyLength = requiredNumber(metadata, "gemma4.attention.key_length");
   const valueLength = requiredNumber(metadata, "gemma4.attention.value_length");
   const slidingKeyLength = firstNumber(metadata, ["gemma4.attention.key_length_swa"], keyLength);
@@ -380,11 +384,13 @@ export function buildModelManifest(gguf: GgufMetadata): ModelManifest {
   );
   const layerHasKv = range(blockCount).map((layer) => layer < layerKvFromStart && (
     !hasExplicitLayerKvTensors ||
-    (
-      gguf.tensors.some((tensor) => tensor.name === `blk.${layer}.attn_k.weight`) &&
-      gguf.tensors.some((tensor) => tensor.name === `blk.${layer}.attn_v.weight`)
-    )
+    gguf.tensors.some((tensor) => tensor.name === `blk.${layer}.attn_k.weight`)
   ));
+  const layerValueProjectionModes: LayerValueProjectionMode[] = range(blockCount).map((layer) =>
+    layerHasKv[layer] && !gguf.tensors.some((tensor) => tensor.name === `blk.${layer}.attn_v.weight`)
+      ? "shared-with-key"
+      : "separate"
+  );
   const kvSourceLayers = range(blockCount).map((layer) => {
     if (layerHasKv[layer]) {
       return layer;
@@ -407,11 +413,13 @@ export function buildModelManifest(gguf: GgufMetadata): ModelManifest {
     feedForwardLength,
     headCount,
     headCountKv,
+    layerHeadCountKv,
     keyLength,
     valueLength,
     layerKeyLengths,
     layerValueLengths,
     layerHasKv,
+    layerValueProjectionModes,
     perLayerEmbeddingLength,
     fullAttentionLayers,
     tensorsByName,
@@ -425,6 +433,7 @@ export function buildModelManifest(gguf: GgufMetadata): ModelManifest {
     feedForwardLength,
     headCount,
     headCountKv,
+    layerHeadCountKv,
     keyLength,
     valueLength,
     slidingKeyLength,
@@ -432,6 +441,7 @@ export function buildModelManifest(gguf: GgufMetadata): ModelManifest {
     layerKeyLengths,
     layerValueLengths,
     layerHasKv,
+    layerValueProjectionModes,
     kvSourceLayers,
     contextLength,
     slidingWindow,
@@ -756,11 +766,13 @@ function buildExpectedTensors(params: {
   feedForwardLength: number;
   headCount: number;
   headCountKv: number;
+  layerHeadCountKv: number[];
   keyLength: number;
   valueLength: number;
   layerKeyLengths: number[];
   layerValueLengths: number[];
   layerHasKv: boolean[];
+  layerValueProjectionModes: LayerValueProjectionMode[];
   fullAttentionLayers: number[];
   tensorsByName: Map<string, GgufTensorInfo>;
 }): ExpectedTensor[] {
@@ -771,9 +783,11 @@ function buildExpectedTensors(params: {
     feedForwardLength,
     headCount,
     headCountKv,
+    layerHeadCountKv,
     layerKeyLengths,
     layerValueLengths,
     layerHasKv,
+    layerValueProjectionModes,
     tensorsByName,
   } = params;
   const vocabSize = tensorsByName.get("token_embd.weight")?.dimensions[1] ?? 248320;
@@ -828,20 +842,22 @@ function buildExpectedTensors(params: {
     const headSize = layerKeyLengths[layer] ?? params.keyLength;
     const valueSize = layerValueLengths[layer] ?? params.valueLength;
     const queryDim = headSize * headCount;
-    const keyValueDim = headSize * headCountKv;
-    const valueDim = valueSize * headCountKv;
+    const layerHeadCountKvValue = layerHeadCountKv[layer] ?? headCountKv;
+    const keyValueDim = headSize * layerHeadCountKvValue;
+    const valueDim = valueSize * layerHeadCountKvValue;
     expected.push(
       layerTensor(layer, "attn_norm.weight", [embeddingLength], ["F32"]),
       layerTensor(layer, "post_attention_norm.weight", [embeddingLength], ["F32"]),
       layerTensor(layer, "post_ffw_norm.weight", [embeddingLength], ["F32"]),
-      layerTensor(layer, "post_norm.weight", [embeddingLength], ["F32"]),
       layerTensor(layer, "layer_output_scale.weight", [1], ["F32"]),
       layerTensor(layer, "attn_q.weight", [embeddingLength, queryDim], observedType(tensorsByName, `blk.${layer}.attn_q.weight`, ["Q4_K", "Q5_K", "IQ4_XS"]), layerKind),
       layerTensor(layer, "attn_output.weight", [queryDim, embeddingLength], observedType(tensorsByName, `blk.${layer}.attn_output.weight`, ["Q4_K"]), layerKind),
       layerTensor(layer, "attn_q_norm.weight", [headSize], ["F32"], layerKind),
       ...(layerHasKv[layer] ? [
         layerTensor(layer, "attn_k.weight", [embeddingLength, keyValueDim], observedType(tensorsByName, `blk.${layer}.attn_k.weight`, ["Q4_K", "Q5_K", "IQ4_XS"]), layerKind),
-        layerTensor(layer, "attn_v.weight", [embeddingLength, valueDim], observedType(tensorsByName, `blk.${layer}.attn_v.weight`, ["Q5_K", "Q6_K"]), layerKind),
+        ...(layerValueProjectionModes[layer] === "separate"
+          ? [layerTensor(layer, "attn_v.weight", [embeddingLength, valueDim], observedType(tensorsByName, `blk.${layer}.attn_v.weight`, ["Q5_K", "Q6_K"]), layerKind)]
+          : []),
         layerTensor(layer, "attn_k_norm.weight", [headSize], ["F32"], layerKind),
       ] : []),
       layerTensor(layer, "ffn_norm.weight", [embeddingLength], ["F32"]),
@@ -853,6 +869,7 @@ function buildExpectedTensors(params: {
       expected.push(
         layerTensor(layer, "inp_gate.weight", [embeddingLength, perLayerEmbeddingLength], ["F32"]),
         layerTensor(layer, "proj.weight", [perLayerEmbeddingLength, embeddingLength], ["F32"]),
+        layerTensor(layer, "post_norm.weight", [embeddingLength], ["F32"]),
       );
     }
   }
@@ -904,6 +921,20 @@ function requiredNumber(metadata: GgufMetadata["metadata"], key: string): number
     throw new Error(`Missing numeric GGUF metadata: ${key}`);
   }
   return value;
+}
+
+function readLayerHeadCountKv(metadata: GgufMetadata["metadata"], blockCount: number): number[] {
+  const arrayValue = getMetadataNumberArray(metadata, "gemma4.attention.head_count_kv");
+  if (arrayValue) {
+    if (arrayValue.length !== blockCount) {
+      throw new Error(
+        `gemma4.attention.head_count_kv length ${arrayValue.length} does not match block_count ${blockCount}`,
+      );
+    }
+    return arrayValue;
+  }
+  const scalarValue = requiredNumber(metadata, "gemma4.attention.head_count_kv");
+  return range(blockCount).map(() => scalarValue);
 }
 
 function requiredString(metadata: GgufMetadata["metadata"], key: string): string {

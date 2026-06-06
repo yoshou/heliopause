@@ -613,16 +613,28 @@ export function float32ToFloat16(value: number): number {
   let mantissa = abs / 2 ** exponent - 1;
 
   if (exponent < -14) {
-    const subnormal = Math.round(abs / 2 ** -24);
+    const subnormal = roundTiesToEven(abs / 2 ** -24);
     return sign | subnormal;
   }
 
-  let halfMantissa = Math.round(mantissa * 1024);
+  let halfMantissa = roundTiesToEven(mantissa * 1024);
   if (halfMantissa === 1024) {
     exponent += 1;
     halfMantissa = 0;
   }
   return sign | ((exponent + 15) << 10) | halfMantissa;
+}
+
+function roundTiesToEven(value: number): number {
+  const floor = Math.floor(value);
+  const fraction = value - floor;
+  if (fraction < 0.5) {
+    return floor;
+  }
+  if (fraction > 0.5) {
+    return floor + 1;
+  }
+  return floor % 2 === 0 ? floor : floor + 1;
 }
 
 function getScaleMinK4(index: number, q: Uint8Array): [number, number] {

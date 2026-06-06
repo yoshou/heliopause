@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   dequantizeQ8_0,
   float16ToFloat32,
+  float32ToFloat16,
   tensorByteLength,
 } from "../src/index.ts";
 
@@ -12,6 +13,11 @@ test("float16 conversion matches common exact values", () => {
   assert.equal(float16ToFloat32(0x3c00), 1);
   assert.equal(float16ToFloat32(0xc000), -2);
   assert.equal(float16ToFloat32(0x7c00), Infinity);
+});
+
+test("float32 to float16 rounds ties to even", () => {
+  assert.equal(float32ToFloat16(1 + 0.5 / 1024), 0x3c00);
+  assert.equal(float32ToFloat16(1 + 1.5 / 1024), 0x3c02);
 });
 
 test("Q8_0 dequantizes one block", () => {
