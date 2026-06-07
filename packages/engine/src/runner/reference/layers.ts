@@ -268,26 +268,41 @@ export async function forwardAttentionLayer(
     timedSync(
       trace,
       "KV cache update",
-      () => updateFullAttentionCache(cache, kRope, vNorm, tokenPositions, state.contextLength),
+      () => updateFullAttentionCache(cache, kRope, vNorm, tokenPositions),
       { layer, layerKind: kind },
     );
   }
 
-  const keyValueTokenCount = Math.min(state.contextLength, Math.max(...Array.from(tokenPositions)) + 1);
+  const keyValueRange = attentionRange(
+    Math.max(...Array.from(tokenPositions)),
+    cache,
+    kind === "sliding-attention" && attentionCausal ? manifest.slidingWindow : undefined,
+  );
   const mask = attentionCausal
     ? timedSync(
         trace,
         "attention mask",
-        () => causalMask(tokenPositions, keyValueTokenCount, kind === "sliding-attention" ? manifest.slidingWindow : undefined),
+        () => causalMask(tokenPositions, keyValueRange.start, keyValueRange.count),
         { layer, layerKind: kind },
       )
     : undefined;
-  const compactValue = timedSync(
-    trace,
-    "value compact",
-    () => compactValueCache(cache, keyValueTokenCount, state.contextLength),
-    { layer, layerKind: kind },
-  );
+  const directRing = cache.kind === "sliding";
+  const attentionKey = directRing
+    ? cache.key
+    : timedSync(
+      trace,
+      "key compact",
+      () => compactKeyCache(cache, keyValueRange.start, keyValueRange.count),
+      { layer, layerKind: kind },
+    );
+  const attentionValue = directRing
+    ? cache.value
+    : timedSync(
+      trace,
+      "value compact",
+      () => compactValueCache(cache, keyValueRange.start, keyValueRange.count),
+      { layer, layerKind: kind },
+    );
   const attention = await timedAsync(
     trace,
     "GQA attention",
@@ -297,7 +312,9 @@ export async function forwardAttentionLayer(
         queryHeadCount: manifest.headCount,
         keyValueHeadCount: cache.headCountKv,
         tokenCount,
-        keyValueTokenCount,
+        keyValueTokenCount: keyValueRange.count,
+        keyValueStart: directRing ? keyValueRange.start : 0,
+        keyValueCapacity: directRing ? cache.capacity : keyValueRange.count,
         scale: 1,
         causal: attentionCausal,
         mask,
@@ -306,8 +323,8 @@ export async function forwardAttentionLayer(
       };
       return gqaAttention(
         qRope,
-        cache.key.subarray(0, keyValueTokenCount * cache.headCountKv * cache.keyLength),
-        compactValue,
+        attentionKey,
+        attentionValue,
         attentionOptions,
       );
     },
@@ -749,35 +766,35 @@ function updateFullAttentionCache(
   key: Float32Array,
   value: Float32Array,
   positions: Int32Array,
-  contextLength: number,
 ): void {
   const tokenCount = positions.length;
   for (let token = 0; token < tokenCount; token += 1) {
     const position = positions[token] ?? 0;
-    if (position < 0 || position >= contextLength) {
-      throw new Error(`Position ${position} is outside context length ${contextLength}`);
+    if (position < 0 || position >= cache.contextLength) {
+      throw new Error(`Position ${position} is outside context length ${cache.contextLength}`);
     }
+    const slot = position % cache.capacity;
     for (let head = 0; head < cache.headCountKv; head += 1) {
       for (let dim = 0; dim < cache.keyLength; dim += 1) {
-        cache.key[(position * cache.headCountKv + head) * cache.keyLength + dim] =
+        cache.key[(slot * cache.headCountKv + head) * cache.keyLength + dim] =
           key[(token * cache.headCountKv + head) * cache.keyLength + dim] ?? 0;
       }
       for (let dim = 0; dim < cache.valueLength; dim += 1) {
-        cache.value[(dim * cache.headCountKv + head) * contextLength + position] =
+        cache.value[(dim * cache.headCountKv + head) * cache.capacity + slot] =
           value[(token * cache.headCountKv + head) * cache.valueLength + dim] ?? 0;
       }
     }
   }
 }
 
-function causalMask(positions: Int32Array, keyValueTokenCount: number, slidingWindow?: number): Float32Array {
+function causalMask(positions: Int32Array, keyValueStart: number, keyValueTokenCount: number): Float32Array {
   const output = new Float32Array(positions.length * keyValueTokenCount);
   for (let token = 0; token < positions.length; token += 1) {
     const position = positions[token] ?? 0;
-    const minPosition = slidingWindow === undefined ? 0 : Math.max(0, position - slidingWindow + 1);
     for (let keyToken = 0; keyToken < keyValueTokenCount; keyToken += 1) {
+      const keyPosition = keyValueStart + keyToken;
       output[token * keyValueTokenCount + keyToken] =
-        keyToken <= position && keyToken >= minPosition ? 0 : -Infinity;
+        keyPosition <= position ? 0 : -Infinity;
     }
   }
   return output;
@@ -795,19 +812,48 @@ function tokenPositionsFromMrope(positions: Int32Array, tokenCount: number): Int
 
 function compactValueCache(
   cache: FullAttentionCache,
+  keyValueStart: number,
   keyValueTokenCount: number,
-  contextLength: number,
 ): Float32Array {
   const output = new Float32Array(cache.valueLength * cache.headCountKv * keyValueTokenCount);
   for (let dim = 0; dim < cache.valueLength; dim += 1) {
     for (let head = 0; head < cache.headCountKv; head += 1) {
       for (let token = 0; token < keyValueTokenCount; token += 1) {
+        const slot = (keyValueStart + token) % cache.capacity;
         output[(dim * cache.headCountKv + head) * keyValueTokenCount + token] =
-          cache.value[(dim * cache.headCountKv + head) * contextLength + token] ?? 0;
+          cache.value[(dim * cache.headCountKv + head) * cache.capacity + slot] ?? 0;
       }
     }
   }
   return output;
+}
+
+function compactKeyCache(
+  cache: FullAttentionCache,
+  keyValueStart: number,
+  keyValueTokenCount: number,
+): Float32Array {
+  const output = new Float32Array(keyValueTokenCount * cache.headCountKv * cache.keyLength);
+  for (let token = 0; token < keyValueTokenCount; token += 1) {
+    const slot = (keyValueStart + token) % cache.capacity;
+    for (let head = 0; head < cache.headCountKv; head += 1) {
+      for (let dim = 0; dim < cache.keyLength; dim += 1) {
+        output[(token * cache.headCountKv + head) * cache.keyLength + dim] =
+          cache.key[(slot * cache.headCountKv + head) * cache.keyLength + dim] ?? 0;
+      }
+    }
+  }
+  return output;
+}
+
+function attentionRange(
+  tokenPosition: number,
+  cache: FullAttentionCache,
+  slidingWindow?: number,
+): { start: number; count: number } {
+  const available = Math.min(cache.contextLength, tokenPosition + 1);
+  const count = Math.min(cache.capacity, slidingWindow ?? cache.capacity, available);
+  return { start: Math.max(0, tokenPosition + 1 - count), count };
 }
 
 function castF16Rows(input: Float32Array): Float32Array {

@@ -532,6 +532,8 @@ pub unsafe extern "C" fn hp_gqa_attention_f32(
     key_value_head_count: usize,
     token_count: usize,
     key_value_token_count: usize,
+    key_value_start: usize,
+    key_value_capacity: usize,
     scale: f32,
     value_layout: i32,
     quantize_query_f16: i32,
@@ -539,14 +541,14 @@ pub unsafe extern "C" fn hp_gqa_attention_f32(
     output_len: usize,
 ) -> i32 {
     if query_len != token_count.saturating_mul(query_head_count).saturating_mul(head_size)
-        || key_len != key_value_token_count.saturating_mul(key_value_head_count).saturating_mul(head_size)
-        || value_len != key_value_token_count.saturating_mul(key_value_head_count).saturating_mul(head_size)
+        || key_len != key_value_capacity.saturating_mul(key_value_head_count).saturating_mul(head_size)
+        || value_len != key_value_capacity.saturating_mul(key_value_head_count).saturating_mul(head_size)
         || output_len != token_count.saturating_mul(query_head_count).saturating_mul(head_size)
         || (mask_len != 0 && mask_len != token_count.saturating_mul(key_value_token_count))
     {
         return ERR_SHAPE;
     }
-    if key_value_head_count == 0 || query_head_count % key_value_head_count != 0 {
+    if key_value_head_count == 0 || key_value_capacity == 0 || key_value_token_count > key_value_capacity || query_head_count % key_value_head_count != 0 {
         return ERR_HEADS;
     }
 
@@ -579,7 +581,8 @@ pub unsafe extern "C" fn hp_gqa_attention_f32(
             let mut max_score = f32::NEG_INFINITY;
 
             for key_token in 0..key_value_token_count {
-                let key_offset = (key_token * key_value_head_count + kv_head) * head_size;
+                let physical_key_token = (key_value_start + key_token) % key_value_capacity;
+                let key_offset = (physical_key_token * key_value_head_count + kv_head) * head_size;
                 let mut dot = 0.0_f32;
                 for index in 0..head_size {
                     dot = (dot + (query_values[index] * key[key_offset + index]).round_to_f32()).round_to_f32();
@@ -616,10 +619,11 @@ pub unsafe extern "C" fn hp_gqa_attention_f32(
             for index in 0..head_size {
                 let mut weighted = 0.0_f32;
                 for key_token in 0..key_value_token_count {
+                    let physical_value_token = (key_value_start + key_token) % key_value_capacity;
                     let value_offset = if value_layout == 1 {
-                        (index * key_value_head_count + kv_head) * key_value_token_count + key_token
+                        (index * key_value_head_count + kv_head) * key_value_capacity + physical_value_token
                     } else {
-                        (key_token * key_value_head_count + kv_head) * head_size + index
+                        (physical_value_token * key_value_head_count + kv_head) * head_size + index
                     };
                     weighted = (weighted + ((scores[key_token] / sum) * value[value_offset]).round_to_f32()).round_to_f32();
                 }

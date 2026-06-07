@@ -110,6 +110,7 @@ function assistantInput() {
         headCountKv: 1,
         contextLength: 1,
         tokenCount: 1,
+        logicalStart: 0,
       }],
     },
     position: 0,

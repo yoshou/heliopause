@@ -1,5 +1,6 @@
 import type { GgufMetadata, GgufTensorInfo } from "../gguf";
 import type { LayerKind, ModelManifest } from "../model";
+import { kvCacheCapacity } from "../runtime";
 import { tensorByteLength } from "../tensor-reader";
 import type {
   LayerResourceRequirement,
@@ -22,6 +23,7 @@ export type ModelResourceRequirementOptions = {
   fixedBytes?: number;
   scratchBytes?: number;
   cacheElementByteLength?: number;
+  slidingWindowReserveTokens?: number;
   outputTensorNames?: readonly string[];
   targetResourceConstrained?: boolean;
   canRunFullModel?: boolean;
@@ -70,6 +72,7 @@ export function createModelResourceRequirements(
       layer,
       options.contextLength,
       options.cacheElementByteLength,
+      options.slidingWindowReserveTokens,
     );
     const scratchBytes = options.scratchBytes ?? 0;
     const residentBytes = options.residentBytes?.({
@@ -144,6 +147,7 @@ function attentionCacheBytes(
   layer: number,
   contextLength: number,
   elementByteLength = Float32Array.BYTES_PER_ELEMENT,
+  slidingWindowReserveTokens = 0,
 ): number {
   if (!manifest.layerHasKv[layer]) {
     return 0;
@@ -151,5 +155,7 @@ function attentionCacheBytes(
   const keyLength = manifest.layerKeyLengths[layer] ?? manifest.keyLength;
   const valueLength = manifest.layerValueLengths[layer] ?? manifest.valueLength;
   const headCountKv = manifest.layerHeadCountKv[layer] ?? manifest.headCountKv;
-  return contextLength * headCountKv * (keyLength + valueLength) * elementByteLength;
+  const kind = manifest.layerKinds[layer] === "sliding-attention" ? "sliding" : "full";
+  const capacity = kvCacheCapacity(kind, contextLength, manifest.slidingWindow, slidingWindowReserveTokens);
+  return capacity * headCountKv * (keyLength + valueLength) * elementByteLength;
 }

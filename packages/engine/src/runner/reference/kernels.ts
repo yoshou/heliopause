@@ -220,6 +220,8 @@ export function gqaAttention(
     keyValueHeadCount,
     tokenCount,
     keyValueTokenCount = tokenCount,
+    keyValueStart = 0,
+    keyValueCapacity = keyValueTokenCount,
     scale,
     causal = true,
     mask,
@@ -230,10 +232,10 @@ export function gqaAttention(
   if (query.length !== tokenCount * queryHeadCount * headSize) {
     throw new Error(`GQA query shape mismatch: ${query.length}`);
   }
-  if (key.length !== keyValueTokenCount * keyValueHeadCount * headSize) {
+  if (key.length !== keyValueCapacity * keyValueHeadCount * headSize) {
     throw new Error(`GQA key shape mismatch: ${key.length}`);
   }
-  if (value.length !== keyValueTokenCount * keyValueHeadCount * headSize) {
+  if (value.length !== keyValueCapacity * keyValueHeadCount * headSize) {
     throw new Error(`GQA value shape mismatch: ${value.length}`);
   }
   if (mask && mask.length !== tokenCount * keyValueTokenCount) {
@@ -264,7 +266,8 @@ export function gqaAttention(
           continue;
         }
 
-        const keyOffset = (keyToken * keyValueHeadCount + kvHead) * headSize;
+        const physicalKeyToken = (keyValueStart + keyToken) % keyValueCapacity;
+        const keyOffset = (physicalKeyToken * keyValueHeadCount + kvHead) * headSize;
         let dot = 0;
         for (let index = 0; index < headSize; index += 1) {
           dot = Math.fround(
@@ -289,10 +292,11 @@ export function gqaAttention(
       for (let index = 0; index < headSize; index += 1) {
         let weighted = 0;
         for (let keyToken = 0; keyToken <= maxKeyToken; keyToken += 1) {
+          const physicalValueToken = (keyValueStart + keyToken) % keyValueCapacity;
           const valueOffset =
             valueLayout === "token-head-dim"
-              ? (keyToken * keyValueHeadCount + kvHead) * headSize + index
-              : (index * keyValueHeadCount + kvHead) * keyValueTokenCount + keyToken;
+              ? (physicalValueToken * keyValueHeadCount + kvHead) * headSize + index
+              : (index * keyValueHeadCount + kvHead) * keyValueCapacity + physicalValueToken;
           weighted = Math.fround(
             weighted +
               Math.fround(((scores[keyToken] ?? 0) / sum) * (value[valueOffset] ?? 0)),

@@ -4,6 +4,9 @@ import {
 import {
   mtpDistributionFromTopTokens,
 } from "../../mtp-target";
+import {
+  ensureSlidingKvCacheReserve,
+} from "../../runtime";
 import type {
   InferenceState,
   ModelSession,
@@ -31,6 +34,7 @@ const webGpuMtpTargetRunner: MtpTargetRunner = {
   provider: "webgpu",
   async prefill(session, state, tokenIds, options) {
     throwIfAborted(options.signal);
+    ensureSlidingKvCacheReserve(state, session.manifest, mtpReserveTokens(state, options.maxSpeculativeTokens));
     if (tokenIds.length === 0) {
       throw new Error("Cannot prefill MTP target from an empty token sequence.");
     }
@@ -75,6 +79,12 @@ const webGpuMtpTargetRunner: MtpTargetRunner = {
   },
   async verify(session, state, draftTokenIds, options) {
     throwIfAborted(options.signal);
+    const reserveTokens = mtpReserveTokens(state, options.maxSpeculativeTokens);
+    const requiredReserveTokens = Math.max(0, draftTokenIds.length - 1);
+    if (reserveTokens < requiredReserveTokens) {
+      throw new Error(`MTP maxSpeculativeTokens ${reserveTokens} is smaller than draft reserve ${requiredReserveTokens}.`);
+    }
+    ensureSlidingKvCacheReserve(state, session.manifest, reserveTokens);
     if (draftTokenIds.length === 0) {
       throw new Error("Cannot verify an empty MTP draft.");
     }
@@ -200,6 +210,16 @@ function updateNextPosition(state: InferenceState, positions: Int32Array, tokenC
   for (const position of tokenPositions) {
     state.nextPosition = Math.max(state.nextPosition, position + 1);
   }
+}
+
+function mtpReserveTokens(state: InferenceState, maxSpeculativeTokens: number | undefined): number {
+  if (maxSpeculativeTokens === undefined) {
+    return state.contextLength;
+  }
+  if (!Number.isInteger(maxSpeculativeTokens) || maxSpeculativeTokens < 0) {
+    throw new Error(`Invalid MTP maxSpeculativeTokens ${maxSpeculativeTokens}.`);
+  }
+  return maxSpeculativeTokens;
 }
 
 async function normalizedHiddenSlice(session: ModelSession, hidden: Float32Array, tokenIndex: number): Promise<Float32Array> {

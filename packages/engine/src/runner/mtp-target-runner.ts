@@ -35,6 +35,7 @@ export type MtpTargetPrefillOptions = {
   positions?: Int32Array | number[];
   logitsTopK: number;
   assistantManifest: MtpAssistantManifest;
+  maxSpeculativeTokens?: number;
   signal?: AbortSignal;
 };
 
@@ -51,6 +52,7 @@ export type MtpTargetVerificationResult = {
 export type MtpTargetVerifyOptions = {
   logitsTopK: number;
   assistantManifest: MtpAssistantManifest;
+  maxSpeculativeTokens?: number;
   signal?: AbortSignal;
 };
 

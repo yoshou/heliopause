@@ -4,6 +4,8 @@ export type GqaAttentionOptions = {
   keyValueHeadCount: number;
   tokenCount: number;
   keyValueTokenCount?: number;
+  keyValueStart?: number;
+  keyValueCapacity?: number;
   scale: number;
   causal?: boolean;
   mask?: Float32Array;

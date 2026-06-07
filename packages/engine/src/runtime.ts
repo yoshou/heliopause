@@ -30,6 +30,9 @@ export type FullAttentionCache = {
   keyLength: number;
   valueLength: number;
   headCountKv: number;
+  kind: "full" | "sliding";
+  contextLength: number;
+  capacity: number;
 };
 
 export type InferenceState = {
@@ -270,7 +273,7 @@ export function createModelSession(
 
 export function createInferenceState(
   manifest: ModelManifest,
-  options: { contextLength?: number } = {},
+  options: { contextLength?: number; slidingWindowReserveTokens?: number } = {},
 ): InferenceState {
   const fullAttention = new Map<number, FullAttentionCache>();
   const contextLength = options.contextLength ?? manifest.contextLength;
@@ -281,16 +284,66 @@ export function createInferenceState(
     const keyLength = manifest.layerKeyLengths[layer] ?? manifest.keyLength;
     const valueLength = manifest.layerValueLengths[layer] ?? manifest.valueLength;
     const headCountKv = manifest.layerHeadCountKv[layer] ?? manifest.headCountKv;
+    const kind = manifest.layerKinds[layer] === "sliding-attention" ? "sliding" : "full";
+    const capacity = kvCacheCapacity(kind, contextLength, manifest.slidingWindow, options.slidingWindowReserveTokens);
     fullAttention.set(layer, {
-      key: new Float32Array(contextLength * headCountKv * keyLength),
-      value: new Float32Array(contextLength * headCountKv * valueLength),
+      key: new Float32Array(capacity * headCountKv * keyLength),
+      value: new Float32Array(capacity * headCountKv * valueLength),
       keyLength,
       valueLength,
       headCountKv,
+      kind,
+      contextLength,
+      capacity,
     });
   }
 
   return { fullAttention, contextLength, nextPosition: 0 };
+}
+
+export function ensureSlidingKvCacheReserve(
+  state: InferenceState,
+  manifest: ModelManifest,
+  reserveTokens: number,
+): void {
+  assertInferenceStateActive(state);
+  if (!Number.isInteger(reserveTokens) || reserveTokens <= 0 || manifest.slidingWindow <= 0) {
+    return;
+  }
+  for (let layer = 0; layer < manifest.blockCount; layer += 1) {
+    if (manifest.layerKinds[layer] !== "sliding-attention") {
+      continue;
+    }
+    const cache = state.fullAttention.get(layer);
+    if (!cache || cache.kind !== "sliding") {
+      continue;
+    }
+    const nextCapacity = kvCacheCapacity("sliding", state.contextLength, manifest.slidingWindow, reserveTokens);
+    if (nextCapacity <= cache.capacity) {
+      continue;
+    }
+    const nextKey = new Float32Array(nextCapacity * cache.headCountKv * cache.keyLength);
+    const nextValue = new Float32Array(nextCapacity * cache.headCountKv * cache.valueLength);
+    const available = Math.min(cache.contextLength, state.nextPosition, cache.capacity);
+    const start = Math.max(0, state.nextPosition - available);
+    for (let logical = start; logical < state.nextPosition; logical += 1) {
+      const oldSlot = logical % cache.capacity;
+      const nextSlot = logical % nextCapacity;
+      for (let head = 0; head < cache.headCountKv; head += 1) {
+        for (let dim = 0; dim < cache.keyLength; dim += 1) {
+          nextKey[(nextSlot * cache.headCountKv + head) * cache.keyLength + dim] =
+            cache.key[(oldSlot * cache.headCountKv + head) * cache.keyLength + dim] ?? 0;
+        }
+        for (let dim = 0; dim < cache.valueLength; dim += 1) {
+          nextValue[(dim * cache.headCountKv + head) * nextCapacity + nextSlot] =
+            cache.value[(dim * cache.headCountKv + head) * cache.capacity + oldSlot] ?? 0;
+        }
+      }
+    }
+    cache.key = nextKey;
+    cache.value = nextValue;
+    cache.capacity = nextCapacity;
+  }
 }
 
 export function cloneInferenceState(state: InferenceState): InferenceState {
@@ -304,6 +357,9 @@ export function cloneInferenceState(state: InferenceState): InferenceState {
       keyLength: cache.keyLength,
       valueLength: cache.valueLength,
       headCountKv: cache.headCountKv,
+      kind: cache.kind,
+      contextLength: cache.contextLength,
+      capacity: cache.capacity,
     });
   }
 
@@ -312,6 +368,32 @@ export function cloneInferenceState(state: InferenceState): InferenceState {
     contextLength: state.contextLength,
     nextPosition: state.nextPosition,
   };
+}
+
+export function kvCacheCapacity(
+  kind: "full" | "sliding",
+  contextLength: number,
+  slidingWindow: number,
+  reserveTokens = 0,
+): number {
+  return kind === "full" ? contextLength : Math.min(contextLength, slidingWindow + Math.max(0, reserveTokens));
+}
+
+export function slidingWindowReserveTokensForState(state: InferenceState, manifest: ModelManifest): number {
+  assertInferenceStateActive(state);
+  const baseCapacity = kvCacheCapacity("sliding", state.contextLength, manifest.slidingWindow);
+  let reserveTokens = 0;
+  for (let layer = 0; layer < manifest.blockCount; layer += 1) {
+    if (manifest.layerKinds[layer] !== "sliding-attention") {
+      continue;
+    }
+    const cache = state.fullAttention.get(layer);
+    if (!cache || cache.kind !== "sliding") {
+      continue;
+    }
+    reserveTokens = Math.max(reserveTokens, cache.capacity - baseCapacity);
+  }
+  return Math.max(0, reserveTokens);
 }
 
 export function addInferenceStateDisposeCallback(

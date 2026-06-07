@@ -14,9 +14,12 @@ import {
   GgufTensorReader,
   prefillState,
   ReferenceSegmentRunner,
+  createWasmProvider,
+  WasmSegmentRunner,
   type ModelRunnerProvider,
 } from "../src/index.ts";
-import { addInferenceStateDisposeCallback } from "../src/runtime.ts";
+import { webGpuKvCacheBufferByteLength } from "../src/runner/webgpu/segment-runner.ts";
+import { addInferenceStateDisposeCallback, ensureSlidingKvCacheReserve, kvCacheCapacity, slidingWindowReserveTokensForState } from "../src/runtime.ts";
 
 test("tensor coverage audit fails closed on unknown and unused tensors", async () => {
   const gguf = {
@@ -169,6 +172,214 @@ test("inference state allocates layer-wise KV head cache sizes", () => {
   assert.equal(state.fullAttention.get(0)?.key.length, 16);
   assert.equal(state.fullAttention.get(5)?.headCountKv, 1);
   assert.equal(state.fullAttention.get(5)?.key.length, 2);
+});
+
+test("inference state uses ring capacity for sliding attention caches", () => {
+  const manifest = buildModelManifest({
+    ...minimalGguf(),
+    metadata: {
+      ...minimalGguf().metadata,
+      "gemma4.block_count": 2,
+      "gemma4.context_length": 8,
+      "gemma4.attention.sliding_window": 3,
+      "gemma4.full_attention_interval": 2,
+      "gemma4.attention.sliding_window_pattern": {
+        type: "bool",
+        length: 2,
+        sample: [true, false],
+        truncated: false,
+      },
+    },
+  });
+
+  const state = createInferenceState(manifest);
+  const sliding = state.fullAttention.get(0);
+  const full = state.fullAttention.get(1);
+
+  assert.equal(sliding?.kind, "sliding");
+  assert.equal(sliding?.contextLength, 8);
+  assert.equal(sliding?.capacity, 3);
+  assert.equal(sliding?.key.length, 6);
+  assert.equal(sliding?.value.length, 6);
+  assert.equal(full?.kind, "full");
+  assert.equal(full?.contextLength, 8);
+  assert.equal(full?.capacity, 8);
+  assert.equal(full?.key.length, 16);
+  assert.equal(full?.value.length, 16);
+});
+
+test("MTP reserve expands sliding ring capacity and preserves cached slots", () => {
+  const manifest = buildModelManifest({
+    ...minimalGguf(),
+    metadata: {
+      ...minimalGguf().metadata,
+      "gemma4.block_count": 1,
+      "gemma4.context_length": 6,
+      "gemma4.attention.sliding_window": 2,
+      "gemma4.attention.sliding_window_pattern": {
+        type: "bool",
+        length: 1,
+        sample: [true],
+        truncated: false,
+      },
+    },
+  });
+  const state = createInferenceState(manifest);
+  const cache = state.fullAttention.get(0);
+  assert(cache);
+  cache.key.set([10, 11], 0);
+  cache.key.set([20, 21], 2);
+  cache.value[0] = 100;
+  cache.value[1] = 200;
+  cache.value[2] = 101;
+  cache.value[3] = 201;
+  state.nextPosition = 2;
+
+  ensureSlidingKvCacheReserve(state, manifest, 2);
+
+  assert.equal(slidingWindowReserveTokensForState(state, manifest), 2);
+  assert.equal(cache.capacity, 4);
+  assert.equal(cache.key.length, 8);
+  assert.equal(cache.value.length, 8);
+  assert.deepEqual(Array.from(cache.key.slice(0, 4)), [10, 11, 20, 21]);
+  assert.deepEqual(Array.from(cache.value), [100, 200, 0, 0, 101, 201, 0, 0]);
+});
+
+test("WebGPU KV cache buffers align odd MTP ring capacity for readback copies", () => {
+  const capacity = kvCacheCapacity("sliding", 16, 4, 3);
+  const logicalBytes = capacity * 1 * 1 * 2;
+  const bufferBytes = webGpuKvCacheBufferByteLength(capacity, 1, 1);
+
+  assert.equal(capacity, 7);
+  assert.equal(logicalBytes, 14);
+  assert.equal(bufferBytes, 16);
+  assert.equal(bufferBytes % 4, 0);
+  assert.ok(bufferBytes >= logicalBytes);
+});
+
+test("reference sliding ring chunking matches token-by-token decode", async () => {
+  const reader = tensorReaderFromTensors(sharedKeyReferenceLayerTensors(), {
+    "gemma4.block_count": 1,
+    "gemma4.context_length": 4,
+    "gemma4.attention.sliding_window": 2,
+    "gemma4.attention.sliding_window_pattern": {
+      type: "bool",
+      length: 1,
+      sample: [true],
+      truncated: false,
+    },
+  });
+  const session = createModelSession(reader, { providers: [createReferenceProvider()] });
+  const runner = new ReferenceSegmentRunner({ session });
+  const input = new Float32Array([
+    0.1, -0.2, 0.3, -0.4,
+    0.2, -0.1, 0.4, -0.3,
+    0.3, -0.4, 0.1, -0.2,
+  ]);
+
+  const batched = await runner.runTokensHidden(
+    input,
+    new Int32Array([0, 1, 2]),
+    session.createInferenceState(),
+  );
+  const tokenState = session.createInferenceState();
+  let tokenOutput = new Float32Array(0);
+  for (let token = 0; token < 3; token += 1) {
+    const result = await runner.runTokenHidden(
+      input.subarray(token * 4, (token + 1) * 4),
+      new Int32Array([token]),
+      tokenState,
+    );
+    tokenOutput = result.hidden;
+  }
+
+  assertFloatArrayClose(batched.hidden, tokenOutput, 1e-5);
+});
+
+test("reference sliding ring chunking preserves layer-major per-layer inputs", async () => {
+  const reader = tensorReaderFromTensors([
+    ...sharedKeyReferenceLayerTensorsFor(0),
+    ...sharedKeyReferenceLayerTensorsFor(1),
+  ], {
+    "gemma4.block_count": 2,
+    "gemma4.context_length": 4,
+    "gemma4.attention.sliding_window": 2,
+    "gemma4.embedding_length_per_layer_input": 2,
+    "gemma4.attention.sliding_window_pattern": {
+      type: "bool",
+      length: 2,
+      sample: [true, true],
+      truncated: false,
+    },
+  });
+  const session = createModelSession(reader, { providers: [createReferenceProvider()] });
+  const runner = new ReferenceSegmentRunner({ session });
+  const input = slidingRingInput();
+  const perLayerInputs = new Float32Array([
+    1, 0.5, 2, 0.5, 3, 0.5,
+    -1, 0.25, -2, 0.25, -3, 0.25,
+  ]);
+
+  const batched = await runner.runTokensHidden(input, new Int32Array([0, 1, 2]), session.createInferenceState(), {
+    perLayerInputs,
+  });
+  const tokenState = session.createInferenceState();
+  let tokenOutput = new Float32Array(0);
+  for (let token = 0; token < 3; token += 1) {
+    const result = await runner.runTokenHidden(
+      input.subarray(token * 4, (token + 1) * 4),
+      new Int32Array([token]),
+      tokenState,
+      { perLayerInputs: slicePerTokenPerLayerInputs(perLayerInputs, 2, 3, 2, token) },
+    );
+    tokenOutput = result.hidden;
+  }
+
+  assertFloatArrayClose(batched.hidden, tokenOutput, 1e-5);
+});
+
+test("reference sliding attention reads ring cache without compacting", async () => {
+  const reader = tensorReaderFromTensors(sharedKeyReferenceLayerTensors(), slidingRingMetadata());
+  const session = createModelSession(reader, { providers: [createReferenceProvider()] });
+  const runner = new ReferenceSegmentRunner({ session });
+  const sections: string[] = [];
+
+  await runner.runTokensHidden(
+    slidingRingInput(),
+    new Int32Array([0, 1, 2]),
+    session.createInferenceState(),
+    {
+      trace: {
+        phase: "prefill",
+        onTiming: (event) => sections.push(event.section),
+      },
+    },
+  );
+
+  assert.ok(!sections.includes("key compact"), `Reference sliding attention compacted key cache: ${sections.join(", ")}`);
+  assert.ok(!sections.includes("value compact"), `Reference sliding attention compacted value cache: ${sections.join(", ")}`);
+});
+
+test("WASM sliding attention reads ring cache without compacting", async () => {
+  const reader = tensorReaderFromTensors(sharedKeyReferenceLayerTensors(), slidingRingMetadata());
+  const session = createModelSession(reader, { providers: [createWasmProvider()] });
+  const runner = new WasmSegmentRunner({ session });
+  const sections: string[] = [];
+
+  await runner.runTokensHidden(
+    slidingRingInput(),
+    new Int32Array([0, 1, 2]),
+    session.createInferenceState(),
+    {
+      trace: {
+        phase: "prefill",
+        onTiming: (event) => sections.push(event.section),
+      },
+    },
+  );
+
+  assert.ok(!sections.includes("key compact"), `WASM sliding attention compacted key cache: ${sections.join(", ")}`);
+  assert.ok(!sections.includes("value compact"), `WASM sliding attention compacted value cache: ${sections.join(", ")}`);
 });
 
 test("reference shared-with-key runs without attn_v weight", async () => {
@@ -483,20 +694,51 @@ function fullAttentionLayerTensors() {
 function sharedKeyReferenceLayerTensors() {
   return [
     f32Tensor("token_embd.weight", [4, 8], sequence(32)),
-    f32Tensor("blk.0.attn_norm.weight", [4], new Float32Array([1, 1, 1, 1])),
-    f32Tensor("blk.0.attn_q.weight", [4, 2], sequence(8)),
-    f32Tensor("blk.0.attn_k.weight", [4, 2], sequence(8)),
-    f32Tensor("blk.0.attn_q_norm.weight", [2], new Float32Array([1, 1])),
-    f32Tensor("blk.0.attn_k_norm.weight", [2], new Float32Array([1, 1])),
-    f32Tensor("blk.0.attn_output.weight", [2, 4], sequence(8)),
-    f32Tensor("blk.0.post_attention_norm.weight", [4], new Float32Array([1, 1, 1, 1])),
-    f32Tensor("blk.0.ffn_norm.weight", [4], new Float32Array([1, 1, 1, 1])),
-    f32Tensor("blk.0.ffn_gate.weight", [4, 8], sequence(32)),
-    f32Tensor("blk.0.ffn_up.weight", [4, 8], sequence(32)),
-    f32Tensor("blk.0.ffn_down.weight", [8, 4], sequence(32)),
-    f32Tensor("blk.0.post_ffw_norm.weight", [4], new Float32Array([1, 1, 1, 1])),
-    f32Tensor("blk.0.layer_output_scale.weight", [1], new Float32Array([1])),
+    ...sharedKeyReferenceLayerTensorsFor(0),
   ];
+}
+
+function sharedKeyReferenceLayerTensorsFor(layer: number) {
+  return [
+    f32Tensor(`blk.${layer}.attn_norm.weight`, [4], new Float32Array([1, 1, 1, 1])),
+    f32Tensor(`blk.${layer}.attn_q.weight`, [4, 2], sequence(8)),
+    f32Tensor(`blk.${layer}.attn_k.weight`, [4, 2], sequence(8)),
+    f32Tensor(`blk.${layer}.attn_q_norm.weight`, [2], new Float32Array([1, 1])),
+    f32Tensor(`blk.${layer}.attn_k_norm.weight`, [2], new Float32Array([1, 1])),
+    f32Tensor(`blk.${layer}.attn_output.weight`, [2, 4], sequence(8)),
+    f32Tensor(`blk.${layer}.post_attention_norm.weight`, [4], new Float32Array([1, 1, 1, 1])),
+    f32Tensor(`blk.${layer}.ffn_norm.weight`, [4], new Float32Array([1, 1, 1, 1])),
+    f32Tensor(`blk.${layer}.ffn_gate.weight`, [4, 8], sequence(32)),
+    f32Tensor(`blk.${layer}.ffn_up.weight`, [4, 8], sequence(32)),
+    f32Tensor(`blk.${layer}.ffn_down.weight`, [8, 4], sequence(32)),
+    f32Tensor(`blk.${layer}.post_ffw_norm.weight`, [4], new Float32Array([1, 1, 1, 1])),
+    f32Tensor(`blk.${layer}.layer_output_scale.weight`, [1], new Float32Array([1])),
+    f32Tensor(`blk.${layer}.inp_gate.weight`, [4, 2], sequence(8)),
+    f32Tensor(`blk.${layer}.proj.weight`, [2, 4], sequence(8)),
+    f32Tensor(`blk.${layer}.post_norm.weight`, [4], new Float32Array([1, 1, 1, 1])),
+  ];
+}
+
+function slidingRingMetadata() {
+  return {
+    "gemma4.block_count": 1,
+    "gemma4.context_length": 4,
+    "gemma4.attention.sliding_window": 2,
+    "gemma4.attention.sliding_window_pattern": {
+      type: "bool",
+      length: 1,
+      sample: [true],
+      truncated: false,
+    },
+  };
+}
+
+function slidingRingInput(): Float32Array {
+  return new Float32Array([
+    0.1, -0.2, 0.3, -0.4,
+    0.2, -0.1, 0.4, -0.3,
+    0.3, -0.4, 0.1, -0.2,
+  ]);
 }
 
 function tensorReaderFromTensors(
@@ -565,6 +807,21 @@ function f32Tensor(name: string, dimensions: number[], values: Float32Array) {
     type: "F32" as const,
     bytes: new Uint8Array(values.buffer, values.byteOffset, values.byteLength).slice(),
   };
+}
+
+function slicePerTokenPerLayerInputs(
+  values: Float32Array,
+  layerCount: number,
+  sourceTokenCount: number,
+  perLayerLength: number,
+  token: number,
+): Float32Array {
+  const output = new Float32Array(layerCount * perLayerLength);
+  for (let layer = 0; layer < layerCount; layer += 1) {
+    const sourceBase = layer * sourceTokenCount * perLayerLength + token * perLayerLength;
+    output.set(values.subarray(sourceBase, sourceBase + perLayerLength), layer * perLayerLength);
+  }
+  return output;
 }
 
 function bytesTensor(name: string, dimensions: number[], type: "Q8_0" | "Q4_K", bytes: Uint8Array) {

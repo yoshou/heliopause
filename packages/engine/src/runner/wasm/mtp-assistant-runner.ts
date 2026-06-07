@@ -95,7 +95,7 @@ async function forwardAssistantLayer(
     freqFactors: await readRopeFreqFactors(session, kind),
     activePairCount: kind === "full-attention" ? Math.floor(manifest.rope.fullDimensionCount * 0.25 / 2) : undefined,
   });
-  const keyValueTokenCount = Math.min(targetKv.tokenCount, targetKv.contextLength, input.position + 1);
+  const keyValueTokenCount = targetKvKeyValueTokenCount(targetKv, input.position);
   const attention = await gqaAttentionWasm(
     qRope,
     compactKey(targetKv, keyValueTokenCount),
@@ -108,7 +108,12 @@ async function forwardAssistantLayer(
       keyValueTokenCount,
       scale: 1,
       causal: true,
-      mask: attentionMask(input.position, keyValueTokenCount, kind === "sliding-attention" ? manifest.slidingWindow : undefined),
+      mask: attentionMask(
+        input.position,
+        targetKv.logicalStart,
+        keyValueTokenCount,
+        kind === "sliding-attention" ? manifest.slidingWindow : undefined,
+      ),
       valueLayout: "dim-head-token",
     },
   );
@@ -262,7 +267,7 @@ function validateTargetKvLayer(
   if (layer.keyLength !== expectedKeySize || layer.valueLength !== expectedValueSize) {
     throw new Error(`Target KV head size mismatch for assistant layer ${layerIndex}: ${layer.keyLength}/${layer.valueLength}`);
   }
-  if (layer.tokenCount <= position) {
+  if (layer.tokenCount <= position || position < layer.logicalStart) {
     throw new Error(`Target KV for assistant layer ${layerIndex} does not cover position ${position}`);
   }
 }
@@ -314,11 +319,16 @@ function compactValue(layer: MtpTargetKvLayerView, keyValueTokenCount: number): 
   return output;
 }
 
-function attentionMask(position: number, keyValueTokenCount: number, slidingWindow?: number): Float32Array {
+function targetKvKeyValueTokenCount(layer: MtpTargetKvLayerView, position: number): number {
+  return Math.min(layer.tokenCount, layer.contextLength, position - layer.logicalStart + 1);
+}
+
+function attentionMask(position: number, logicalStart: number, keyValueTokenCount: number, slidingWindow?: number): Float32Array {
   const output = new Float32Array(keyValueTokenCount);
   const minPosition = slidingWindow === undefined ? 0 : Math.max(0, position - slidingWindow + 1);
   for (let keyToken = 0; keyToken < keyValueTokenCount; keyToken += 1) {
-    output[keyToken] = keyToken <= position && keyToken >= minPosition ? 0 : -Infinity;
+    const logicalPosition = logicalStart + keyToken;
+    output[keyToken] = logicalPosition <= position && logicalPosition >= minPosition ? 0 : -Infinity;
   }
   return output;
 }

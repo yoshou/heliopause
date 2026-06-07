@@ -23,6 +23,7 @@ export type WebGpuResourceOptions = {
   mode?: RunnerExecutionMode;
   memoryLimitBytes?: number;
   contextLength?: number;
+  slidingWindowReserveTokens?: number;
   support?: RunnerProviderSupport;
 };
 
@@ -46,6 +47,7 @@ export function webGpuResourceRequirements(
     fixedBytes: DEFAULT_GPU_FIXED_BYTES,
     scratchBytes: DEFAULT_GPU_SCRATCH_BYTES,
     cacheElementByteLength: 2,
+    slidingWindowReserveTokens: options.slidingWindowReserveTokens,
     outputTensorNames: ["token_embd.weight", "output_norm.weight"],
     targetResourceConstrained: true,
     canRunFullModel: false,

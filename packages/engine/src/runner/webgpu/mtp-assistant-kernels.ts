@@ -118,6 +118,7 @@ export function createMtpAttentionResources(
     keyValueTokenCount: number;
     contextLength: number;
     position: number;
+    keyValueStart?: number;
     slidingWindow?: number;
   },
 ): MtpKernelResource {
@@ -131,7 +132,7 @@ export function createMtpAttentionResources(
     options.position,
     options.slidingWindow ?? 0,
     options.slidingWindow === undefined ? 0 : 1,
-    0,
+    options.keyValueStart ?? 0,
     0,
     0,
   ]);
@@ -306,7 +307,7 @@ struct Params {
   position: u32,
   slidingWindow: u32,
   hasSlidingWindow: u32,
-  _pad0: u32,
+  keyValueStart: u32,
   _pad1: u32,
   _pad2: u32,
 };
@@ -318,14 +319,15 @@ struct Params {
 @group(0) @binding(4) var<storage, read_write> outputValues: array<f32>;
 
 fn keyAllowed(token: u32) -> bool {
-  if (token > params.position) {
+  let logicalPosition = params.keyValueStart + token;
+  if (logicalPosition > params.position) {
     return false;
   }
   if (params.hasSlidingWindow == 0u) {
     return true;
   }
   let minPosition = select(0u, params.position + 1u - params.slidingWindow, params.position + 1u > params.slidingWindow);
-  return token >= minPosition;
+  return logicalPosition >= minPosition;
 }
 
 fn attentionScore(qHead: u32, kvHead: u32, token: u32) -> f32 {

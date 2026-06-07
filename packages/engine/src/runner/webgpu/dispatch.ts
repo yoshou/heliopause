@@ -172,6 +172,7 @@ export function dispatchBatchedFullAttentionRollingTile(
     keyValueHeadCount: number;
     keyValueTokenCount: number;
     contextLength: number;
+    keyValueStart?: number;
     slidingWindow?: number;
     tokenCount: number;
     scale: number;
@@ -223,6 +224,7 @@ export function dispatchBatchedFullAttentionRollingTile(
       queryHeadCount: options.queryHeadCount,
       keyValueHeadCount: options.keyValueHeadCount,
       contextLength: options.contextLength,
+      keyValueStart: options.keyValueStart ?? 0,
       tileSize,
       tileStart,
       tileLength: tileEnd - tileStart,
@@ -1112,6 +1114,7 @@ export function dispatchFullAttentionScore(
     keyValueHeadCount: number;
     keyValueTokenCount: number;
     contextLength: number;
+    keyValueStart?: number;
     scale: number;
     tokenPosition: number;
     slidingWindow?: number;

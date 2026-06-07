@@ -12,6 +12,7 @@ import type {
   ModelSession,
 } from "../../runtime";
 import {
+  slidingWindowReserveTokensForState,
   timedAsync,
 } from "../../runtime";
 import {
@@ -102,8 +103,9 @@ async function webGpuSegmentRunnerForForward(
   if (!providerOptions) {
     throw new Error("WebGPU segment runner is not enabled for this session.");
   }
+  const slidingWindowReserveTokens = slidingWindowReserveTokensForState(state, session.manifest);
   const webGpuStartLayer = providerOptions.segmentStartLayer ??
-    plannedWebGpuStartLayer(session, state.contextLength, providerOptions.memoryLimitBytes);
+    plannedWebGpuStartLayer(session, state.contextLength, providerOptions.memoryLimitBytes, slidingWindowReserveTokens);
   return webGpuSegmentRunner(session, state, { segmentStartLayer: webGpuStartLayer });
 }
 
@@ -114,8 +116,9 @@ async function webGpuModelSegmentRunner(
   if (!providerOptions) {
     throw new Error("WebGPU model runner is not enabled for this session.");
   }
+  const slidingWindowReserveTokens = slidingWindowReserveTokensForState(options.state, options.session.manifest);
   const webGpuStartLayer = providerOptions.segmentStartLayer ??
-    plannedWebGpuStartLayer(options.session, options.state.contextLength, providerOptions.memoryLimitBytes);
+    plannedWebGpuStartLayer(options.session, options.state.contextLength, providerOptions.memoryLimitBytes, slidingWindowReserveTokens);
 
   if (webGpuStartLayer === undefined || webGpuStartLayer >= options.segmentEndLayerExclusive) {
     throw new Error(
@@ -143,10 +146,11 @@ function plannedWebGpuStartLayer(
   session: ModelSession,
   contextLength: number,
   memoryLimitBytes: number,
+  slidingWindowReserveTokens: number,
 ): number | undefined {
   const plan = planModelPlacement(
     session.providers.map((provider) =>
-      provider.modelResourceRequirements(session, { contextLength })
+      provider.modelResourceRequirements(session, { contextLength, slidingWindowReserveTokens })
     ),
     {
       mode: "enabled",

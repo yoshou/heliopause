@@ -827,12 +827,13 @@ export function createFullAttentionScoreResources(
     keyValueHeadCount: number;
     keyValueTokenCount: number;
     contextLength: number;
+    keyValueStart?: number;
     scale: number;
     tokenPosition: number;
     slidingWindow?: number;
   },
 ): { pipeline: unknown; bindGroup: unknown; destroy: () => void } {
-  const keyValueStart = attentionKeyValueStart(options.tokenPosition, options.slidingWindow);
+  const keyValueStart = options.keyValueStart ?? attentionKeyValueStart(options.tokenPosition, options.slidingWindow);
   const paramsF32 = new Float32Array([options.scale, 0, 0, 0, 0, 0, 0, 0]);
   const paramsU32 = new Uint32Array(paramsF32.buffer);
   paramsU32[1] = options.headSize;
@@ -1121,6 +1122,7 @@ export function createBatchedFullAttentionRollingTileProbabilityResources(
     keyValueHeadCount: number;
     keyValueTokenCount: number;
     contextLength: number;
+    keyValueStart?: number;
     slidingWindow?: number;
     tokenCount: number;
     scale: number;
@@ -1144,6 +1146,7 @@ export function createBatchedFullAttentionRollingTileProbabilityResources(
   params[10] = options.tileSize;
   params[11] = options.tileStart;
   params[12] = options.tileLength;
+  params[13] = options.keyValueStart ?? 0;
   const paramsBuffer = device.createBuffer({ size: uniformBufferSize(params.byteLength), usage: GPU_UNIFORM | GPU_COPY_DST });
   device.queue.writeBuffer(paramsBuffer, 0, params);
   const bindGroupLayout = device.createBindGroupLayout({
@@ -1246,6 +1249,7 @@ export function createBatchedFullAttentionRollingTileApplyResources(
     queryHeadCount: number;
     keyValueHeadCount: number;
     contextLength: number;
+    keyValueStart?: number;
     tileSize: number;
     tileStart: number;
     tileLength: number;
@@ -1261,6 +1265,7 @@ export function createBatchedFullAttentionRollingTileApplyResources(
     options.tileStart,
     options.tileLength,
     options.tokenCount,
+    options.keyValueStart ?? 0,
   ]);
   const paramsBuffer = device.createBuffer({ size: uniformBufferSize(params.byteLength), usage: GPU_UNIFORM | GPU_COPY_DST });
   device.queue.writeBuffer(paramsBuffer, 0, params);

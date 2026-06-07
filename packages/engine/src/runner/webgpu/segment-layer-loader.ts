@@ -1,4 +1,4 @@
-import type { LayerKind, ModelManifest } from "../../model";
+import type { LayerKind, LayerValueProjectionMode, ModelManifest } from "../../model";
 import {
   tensorByteLength,
   type GgufTensorReader,
@@ -23,6 +23,8 @@ export type GpuLayer = {
   kvSourceLayer: number;
   headSize: number;
   valueSize: number;
+  headCountKv: number;
+  valueProjectionMode: LayerValueProjectionMode;
   attnNorm: F32Handle;
   q: QuantizedHandle;
   k?: QuantizedHandle;
@@ -50,12 +52,13 @@ export async function loadGpuLayer(
 ): Promise<GpuLayer> {
   const hasPerLayerInput = manifest.perLayerEmbeddingLength > 0;
   const hasKv = manifest.layerHasKv[layer] === true;
+  const valueProjectionMode = manifest.layerValueProjectionModes[layer] ?? "separate";
   const tensorNames = [
     `blk.${layer}.attn_norm.weight`,
     `blk.${layer}.attn_q.weight`,
     ...(hasKv ? [
       `blk.${layer}.attn_k.weight`,
-      `blk.${layer}.attn_v.weight`,
+      ...(valueProjectionMode === "shared-with-key" ? [] : [`blk.${layer}.attn_v.weight`]),
     ] : []),
     `blk.${layer}.attn_q_norm.weight`,
     ...(hasKv ? [`blk.${layer}.attn_k_norm.weight`] : []),
@@ -81,10 +84,14 @@ export async function loadGpuLayer(
     kvSourceLayer: manifest.kvSourceLayers[layer] ?? layer,
     headSize: manifest.layerKeyLengths[layer] ?? manifest.keyLength,
     valueSize: manifest.layerValueLengths[layer] ?? manifest.valueLength,
+    headCountKv: manifest.layerHeadCountKv[layer] ?? manifest.headCountKv,
+    valueProjectionMode,
     attnNorm: createF32HandleFromBytes(arena, tensorReader, `blk.${layer}.attn_norm.weight`, requireTensorBytes(tensorBytes, `blk.${layer}.attn_norm.weight`)),
     q: createQuantizedHandleFromTensorBytes(arena, tensorReader, `blk.${layer}.attn_q.weight`, requireTensorBytes(tensorBytes, `blk.${layer}.attn_q.weight`)),
     k: hasKv ? createQuantizedHandleFromTensorBytes(arena, tensorReader, `blk.${layer}.attn_k.weight`, requireTensorBytes(tensorBytes, `blk.${layer}.attn_k.weight`)) : undefined,
-    v: hasKv ? createQuantizedHandleFromTensorBytes(arena, tensorReader, `blk.${layer}.attn_v.weight`, requireTensorBytes(tensorBytes, `blk.${layer}.attn_v.weight`)) : undefined,
+    v: hasKv && valueProjectionMode !== "shared-with-key"
+      ? createQuantizedHandleFromTensorBytes(arena, tensorReader, `blk.${layer}.attn_v.weight`, requireTensorBytes(tensorBytes, `blk.${layer}.attn_v.weight`))
+      : undefined,
     qNorm: createF32HandleFromBytes(arena, tensorReader, `blk.${layer}.attn_q_norm.weight`, requireTensorBytes(tensorBytes, `blk.${layer}.attn_q_norm.weight`)),
     kNorm: hasKv ? createF32HandleFromBytes(arena, tensorReader, `blk.${layer}.attn_k_norm.weight`, requireTensorBytes(tensorBytes, `blk.${layer}.attn_k_norm.weight`)) : undefined,
     attnOut: createQuantizedHandleFromTensorBytes(arena, tensorReader, `blk.${layer}.attn_output.weight`, requireTensorBytes(tensorBytes, `blk.${layer}.attn_output.weight`)),

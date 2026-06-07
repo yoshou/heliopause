@@ -136,6 +136,8 @@ type KernelExports = WebAssembly.Exports & {
     keyValueHeadCount: number,
     tokenCount: number,
     keyValueTokenCount: number,
+    keyValueStart: number,
+    keyValueCapacity: number,
     scale: number,
     valueLayout: number,
     quantizeQueryF16: number,
@@ -861,6 +863,8 @@ export async function gqaAttentionWasm(
     keyValueHeadCount,
     tokenCount,
     keyValueTokenCount = tokenCount,
+    keyValueStart = 0,
+    keyValueCapacity = keyValueTokenCount,
     scale,
     causal = true,
     mask,
@@ -881,6 +885,8 @@ export async function gqaAttentionWasm(
     keyValueHeadCount,
     tokenCount,
     keyValueTokenCount,
+    keyValueStart,
+    keyValueCapacity,
     scale,
     causal,
     mask,
@@ -913,6 +919,8 @@ export async function gqaAttentionWasm(
       keyValueHeadCount,
       tokenCount,
       keyValueTokenCount,
+      keyValueStart,
+      keyValueCapacity,
       scale,
       valueLayout === "dim-head-token" ? 1 : 0,
       quantizeQueryForScore === "f16" ? 1 : 0,
@@ -1975,15 +1983,16 @@ function validateGqaShapes(
     keyValueHeadCount,
     tokenCount,
     keyValueTokenCount = tokenCount,
+    keyValueCapacity = keyValueTokenCount,
   }: GqaAttentionOptions,
 ): void {
   if (query.length !== tokenCount * queryHeadCount * headSize) {
     throw new Error(`GQA query shape mismatch: ${query.length}`);
   }
-  if (key.length !== keyValueTokenCount * keyValueHeadCount * headSize) {
+  if (key.length !== keyValueCapacity * keyValueHeadCount * headSize) {
     throw new Error(`GQA key shape mismatch: ${key.length}`);
   }
-  if (value.length !== keyValueTokenCount * keyValueHeadCount * headSize) {
+  if (value.length !== keyValueCapacity * keyValueHeadCount * headSize) {
     throw new Error(`GQA value shape mismatch: ${value.length}`);
   }
   if (mask && mask.length !== tokenCount * keyValueTokenCount) {

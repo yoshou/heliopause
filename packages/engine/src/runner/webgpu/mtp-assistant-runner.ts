@@ -283,7 +283,7 @@ class WebGpuMtpAssistantRunner {
       hasFreqFactors: kind === "full-attention" && this.session.hasTensor("rope_freqs.weight"),
     });
 
-    const keyValueTokenCount = Math.min(targetKv.tokenCount, targetKv.contextLength, input.position + 1);
+    const keyValueTokenCount = targetKvKeyValueTokenCount(targetKv, input.position);
     const key = this.bufferFromF32(`mtp.blk.${layer}.target_key`, compactKey(targetKv, keyValueTokenCount), run.cleanup);
     const value = this.bufferFromF32(`mtp.blk.${layer}.target_value`, compactValue(targetKv, keyValueTokenCount), run.cleanup);
     const attention = scratchF32(this.arena, manifest.headCount * valueSize, run.cleanup, `mtp.blk.${layer}.attention`);
@@ -295,6 +295,7 @@ class WebGpuMtpAssistantRunner {
       keyValueTokenCount,
       contextLength: keyValueTokenCount,
       position: input.position,
+      keyValueStart: targetKv.logicalStart,
       slidingWindow: kind === "sliding-attention" ? manifest.slidingWindow : undefined,
     });
     run.resources.push(attentionResource);
@@ -639,7 +640,7 @@ function validateTargetKvLayer(
   if (layer.keyLength !== expectedKeySize || layer.valueLength !== expectedValueSize) {
     throw new Error(`Target KV head size mismatch for WebGPU assistant layer ${layerIndex}: ${layer.keyLength}/${layer.valueLength}`);
   }
-  if (layer.tokenCount <= position) {
+  if (layer.tokenCount <= position || position < layer.logicalStart) {
     throw new Error(`Target KV for WebGPU assistant layer ${layerIndex} does not cover position ${position}`);
   }
 }
@@ -663,6 +664,10 @@ function compactValue(layer: MtpTargetKvLayerView, keyValueTokenCount: number): 
     }
   }
   return output;
+}
+
+function targetKvKeyValueTokenCount(layer: MtpTargetKvLayerView, position: number): number {
+  return Math.min(layer.tokenCount, layer.contextLength, position - layer.logicalStart + 1);
 }
 
 function pairsToMappedTopTokens(

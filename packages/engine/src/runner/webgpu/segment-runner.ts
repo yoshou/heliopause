@@ -1,13 +1,14 @@
 import type { GgmlTypeName } from "../../gguf";
 import { type GgufTensorReader, type TensorByteRange } from "../../tensor-reader";
 import type { ModelManifest } from "../../model";
-import { addInferenceStateDisposeCallback, type InferenceState } from "../../runtime";
+import { addInferenceStateDisposeCallback, kvCacheCapacity, type InferenceState } from "../../runtime";
 import { dequantizeRow, float16ToFloat32 } from "../../quant";
 import type {
   MtpTargetKvLayerView,
   MtpTargetKvView,
 } from "../mtp-assistant-runner";
-import { GPU_COPY_DST, GPU_COPY_SRC, GPU_MAP_READ, GPU_QUERY_RESOLVE, GPU_STORAGE, WEBGPU_MEMORY_LIMIT_BYTES } from "./gpu-constants";
+import { GPU_COPY_DST, GPU_COPY_SRC, GPU_MAP_READ, GPU_QUERY_RESOLVE, GPU_SHADER_STAGE_COMPUTE, GPU_STORAGE, GPU_UNIFORM, WEBGPU_MEMORY_LIMIT_BYTES } from "./gpu-constants";
+import { bindBuffer, storageEntry } from "./gpu-bindings";
 import { webGpuAdapterLimits, webGpuDevice } from "./gpu-device";
 import {
   GpuMemoryArena,
@@ -73,7 +74,7 @@ import {
   runtimeResourceCreateMs,
   type WebGpuRuntimeResourceCache,
 } from "./runtime-resources";
-import type { WebGpuBufferLike, WebGpuCommandEncoderLike, WebGpuComputePassLike, WebGpuQuerySetLike, WebGpuTopToken } from "./gpu-types";
+import type { WebGpuBufferLike, WebGpuCommandEncoderLike, WebGpuComputePassLike, WebGpuDeviceLike, WebGpuQuerySetLike, WebGpuTopToken } from "./gpu-types";
 import type { SegmentRunner } from "../segment-runner";
 
 export type WebGpuSegmentRunnerOptions = {
@@ -91,6 +92,7 @@ export type WebGpuSegmentRunnerOptions = {
 export type WebGpuStateLike = {
   contextLength: number;
   nextPosition: number;
+  fullAttention?: InferenceState["fullAttention"];
 };
 
 export type WebGpuTokenResult = {
@@ -195,6 +197,14 @@ export type WebGpuRuntimeStats = {
 type FullAttentionGpuLayerState = {
   key: WebGpuBufferLike;
   value: WebGpuBufferLike;
+  capacity: number;
+  headCountKv: number;
+};
+
+type KvResizeResource = {
+  pipeline: unknown;
+  bindGroup: unknown;
+  paramsBuffer: WebGpuBufferLike;
 };
 
 type GpuState = {
@@ -917,7 +927,7 @@ export class WebGpuSegmentRunner implements SegmentRunner {
       if (!layerState) {
         throw new Error(`Missing WebGPU MTP KV state for target layer ${layerIndex}.`);
       }
-      layers.push(await this.readMtpTargetKvLayer(layer, layerState, state.contextLength, tokenCount));
+      layers.push(await this.readMtpTargetKvLayer(layer, layerState, tokenCount));
     }
     return { layers };
   }
@@ -1304,11 +1314,18 @@ export class WebGpuSegmentRunner implements SegmentRunner {
     try {
       // Match llama.cpp: non-causal attention is evaluated as one physical batch.
       const prefillChunkSize = options.attentionCausal === false ? tokenCount : this.prefillChunkSize;
-      for (let chunkStart = 0; chunkStart < tokenCount; chunkStart += prefillChunkSize) {
+      for (let chunkStart = 0; chunkStart < tokenCount;) {
         const cleanup: GpuResource[] = [];
         const resources: Array<{ destroy: () => void }> = [];
         const encoder = this.arena.device.createCommandEncoder();
-        const chunkTokenCount = Math.min(prefillChunkSize, tokenCount - chunkStart);
+        const chunkTokenCount = this.prefillChunkTokenCount(
+          tokenPositions,
+          chunkStart,
+          tokenCount,
+          prefillChunkSize,
+          state,
+          options.attentionCausal !== false,
+        );
         const chunkByteLength = chunkTokenCount * hiddenByteLength;
         try {
           const chunkPositions = tokenPositions.slice(chunkStart, chunkStart + chunkTokenCount);
@@ -1438,6 +1455,7 @@ export class WebGpuSegmentRunner implements SegmentRunner {
             item.destroy?.();
           }
         }
+        chunkStart += chunkTokenCount;
       }
 
       this.activeRunEncodeMs += nowMs() - encodeStartMs;
@@ -1557,8 +1575,8 @@ export class WebGpuSegmentRunner implements SegmentRunner {
     const tokenCount = tokenPositions.length;
     const queryDim = this.manifest.headCount * layer.headSize;
     const valueDim = this.manifest.headCount * layer.valueSize;
-    const kvDim = this.manifest.headCountKv * layer.headSize;
-    const kvValueDim = this.manifest.headCountKv * layer.valueSize;
+    const kvDim = layer.headCountKv * layer.headSize;
+    const kvValueDim = layer.headCountKv * layer.valueSize;
 
     const attnQ8 = scratchQ8K(this.arena, hiddenSize, tokenCount, cleanup, `blk.${layer.layer}.prefill.attn_norm.q8k`);
     dispatchBatchedRmsNormQ8KQuantize(this.arena.device, pass, resources, input, layer.attnNorm.buffer, attnQ8, {
@@ -1592,16 +1610,18 @@ export class WebGpuSegmentRunner implements SegmentRunner {
 
     if (layer.hasKv) {
       const layerState = gpuState.fullAttention.get(layer.layer);
-      if (!layerState || !layer.k || !layer.v || !layer.kNorm) {
+      if (!layerState || !layer.k || !layer.kNorm || (layer.valueProjectionMode !== "shared-with-key" && !layer.v)) {
         throw new Error(`Missing WebGPU KV state or weights for layer ${layer.layer}`);
       }
       const kProjection = scratchF32(this.arena, kvDim * tokenCount, cleanup, `blk.${layer.layer}.prefill.k`);
-      const vProjection = scratchF32(this.arena, kvValueDim * tokenCount, cleanup, `blk.${layer.layer}.prefill.v`);
-      const dispatchedDualKv = webGpuFusionEnabled() && dispatchDualQ4KMatMul(
+      const vProjection = layer.valueProjectionMode === "shared-with-key"
+        ? kProjection
+        : scratchF32(this.arena, kvValueDim * tokenCount, cleanup, `blk.${layer.layer}.prefill.v`);
+      const dispatchedDualKv = layer.valueProjectionMode !== "shared-with-key" && webGpuFusionEnabled() && dispatchDualQ4KMatMul(
         pass,
         resources,
         layer.k,
-        layer.v,
+        layer.v!,
         attnQ8,
         kProjection,
         vProjection,
@@ -1609,7 +1629,9 @@ export class WebGpuSegmentRunner implements SegmentRunner {
       );
       if (!dispatchedDualKv) {
         dispatchKMatMul(pass, resources, layer.k, attnQ8, kProjection, tokenCount);
-        dispatchKMatMul(pass, resources, layer.v, attnQ8, vProjection, tokenCount);
+        if (layer.valueProjectionMode !== "shared-with-key") {
+          dispatchKMatMul(pass, resources, layer.v!, attnQ8, vProjection, tokenCount);
+        }
       }
       dispatchBatchedFullKvUpdate(
         this.arena.device,
@@ -1623,14 +1645,14 @@ export class WebGpuSegmentRunner implements SegmentRunner {
         layerState.key,
         layerState.value,
         {
-          headCount: this.manifest.headCountKv,
+          headCount: layer.headCountKv,
           headSize: layer.headSize,
           valueSize: layer.valueSize,
           ropeDims: ropeDimensionCount(this.manifest, layer.kind),
           epsilon: this.epsilon,
           freqBase: ropeFreqBase(this.manifest, layer.kind),
           tokenCount,
-          contextLength,
+          contextLength: layerState.capacity,
           hasFreqFactors: this.hasRopeFreqFactors && layer.kind === "full-attention",
         },
       );
@@ -1640,18 +1662,19 @@ export class WebGpuSegmentRunner implements SegmentRunner {
     if (!state) {
       throw new Error(`Missing WebGPU KV state for layer ${layer.layer}`);
     }
-    const keyValueTokenCount = Math.min(contextLength, maxInt32(tokenPositions) + 1);
     const attention = scratchF32(this.arena, tokenCount * valueDim, cleanup, `blk.${layer.layer}.prefill.attention`);
     const slidingWindow = options.attentionCausal === false
       ? undefined
       : layer.kind === "sliding-attention" ? this.manifest.slidingWindow : undefined;
+    const keyValueRange = attentionLogicalRange(maxInt32(tokenPositions), state.capacity, contextLength, slidingWindow);
     const attentionOptions = {
       headSize: layer.headSize,
       valueSize: layer.valueSize,
       queryHeadCount: this.manifest.headCount,
-      keyValueHeadCount: this.manifest.headCountKv,
-      keyValueTokenCount,
-      contextLength,
+      keyValueHeadCount: state.headCountKv,
+      keyValueTokenCount: keyValueRange.count,
+      contextLength: state.capacity,
+      keyValueStart: keyValueRange.start,
       slidingWindow,
       tokenCount,
       scale: 1,
@@ -1853,18 +1876,16 @@ export class WebGpuSegmentRunner implements SegmentRunner {
   private async readMtpTargetKvLayer(
     layer: GpuLayer,
     layerState: FullAttentionGpuLayerState,
-    contextLength: number,
     tokenCount: number,
   ): Promise<MtpTargetKvLayerView> {
-    const keyElementCount = tokenCount * this.manifest.headCountKv * layer.headSize;
-    const valueElementCount = tokenCount * this.manifest.headCountKv * layer.valueSize;
-    const keyBytes = keyElementCount * F16_BYTE_LENGTH;
-    const valueBytes = valueElementCount * F16_BYTE_LENGTH;
-    const keyCopyBytes = alignBufferCopyBytes(keyBytes);
-    const valueRowCount = this.manifest.headCountKv * layer.valueSize;
-    const valueRowBytes = tokenCount * F16_BYTE_LENGTH;
-    const valueRowCopyBytes = alignBufferCopyBytes(valueRowBytes);
-    const valueReadbackBytes = valueRowCount * valueRowCopyBytes;
+    const viewTokenCount = mtpTargetKvViewTokenCount(layer, layerState.capacity, this.manifest.slidingWindow, tokenCount);
+    const logicalStart = Math.max(0, tokenCount - viewTokenCount);
+    const keyCapacityElementCount = layerState.capacity * layer.headCountKv * layer.headSize;
+    const valueCapacityElementCount = layerState.capacity * layer.headCountKv * layer.valueSize;
+    const keyCapacityBytes = keyCapacityElementCount * F16_BYTE_LENGTH;
+    const valueCapacityBytes = valueCapacityElementCount * F16_BYTE_LENGTH;
+    const keyCopyBytes = alignBufferCopyBytes(keyCapacityBytes);
+    const valueCopyBytes = alignBufferCopyBytes(valueCapacityBytes);
     const keyReadback = this.arena.device.createBuffer({
       label: `blk.${layer.layer}.mtp.key.readback`,
       size: Math.max(1, keyCopyBytes),
@@ -1872,35 +1893,37 @@ export class WebGpuSegmentRunner implements SegmentRunner {
     });
     const valueReadback = this.arena.device.createBuffer({
       label: `blk.${layer.layer}.mtp.value.readback`,
-      size: Math.max(1, valueReadbackBytes),
+      size: Math.max(1, valueCopyBytes),
       usage: GPU_COPY_DST | GPU_MAP_READ,
     });
     try {
       const encoder = this.arena.device.createCommandEncoder();
-      if (keyBytes > 0) {
+      if (keyCapacityBytes > 0) {
         encoder.copyBufferToBuffer(layerState.key, 0, keyReadback, 0, keyCopyBytes);
       }
-      if (valueBytes > 0) {
-        let destinationOffset = 0;
-        const sourceRowBytes = contextLength * F16_BYTE_LENGTH;
-        if (valueRowCopyBytes > sourceRowBytes) {
-          throw new Error(`MTP KV value readback row copy ${valueRowCopyBytes} exceeds source row ${sourceRowBytes}.`);
-        }
-        for (let dim = 0; dim < layer.valueSize; dim += 1) {
-          for (let head = 0; head < this.manifest.headCountKv; head += 1) {
-            const sourceOffset = ((dim * this.manifest.headCountKv + head) * contextLength) * F16_BYTE_LENGTH;
-            if (sourceOffset % 4 !== 0) {
-              throw new Error("MTP KV value readback requires 4-byte aligned source rows.");
-            }
-            encoder.copyBufferToBuffer(layerState.value, sourceOffset, valueReadback, destinationOffset, valueRowCopyBytes);
-            destinationOffset += valueRowCopyBytes;
-          }
-        }
+      if (valueCapacityBytes > 0) {
+        encoder.copyBufferToBuffer(layerState.value, 0, valueReadback, 0, valueCopyBytes);
       }
       this.submitCommandBuffer(encoder.finish());
 
-      const key = await this.readF16BufferAsF32(keyReadback, keyElementCount, keyBytes);
-      const value = await this.readF16RowsAsF32(valueReadback, valueRowCount, tokenCount, valueRowCopyBytes, valueBytes);
+      const keyCapacity = await this.readF16BufferAsF32(keyReadback, keyCapacityElementCount, keyCapacityBytes);
+      const valueCapacity = await this.readF16BufferAsF32(valueReadback, valueCapacityElementCount, valueCapacityBytes);
+      const key = compactMtpTargetKeyView(keyCapacity, {
+        logicalStart,
+        tokenCount: viewTokenCount,
+        capacity: layerState.capacity,
+        headCountKv: layer.headCountKv,
+        headSize: layer.headSize,
+      });
+      const value = compactMtpTargetValueView(valueCapacity, {
+        logicalStart,
+        tokenCount: viewTokenCount,
+        capacity: layerState.capacity,
+        headCountKv: layer.headCountKv,
+        valueSize: layer.valueSize,
+      });
+      const keyBytes = key.length * F16_BYTE_LENGTH;
+      const valueBytes = value.length * F16_BYTE_LENGTH;
       this.readbackBytes += keyBytes + valueBytes;
       this.activeRunReadbackBytes += keyBytes + valueBytes;
       return {
@@ -1908,9 +1931,10 @@ export class WebGpuSegmentRunner implements SegmentRunner {
         value,
         keyLength: layer.headSize,
         valueLength: layer.valueSize,
-        headCountKv: this.manifest.headCountKv,
-        contextLength: tokenCount,
+        headCountKv: layer.headCountKv,
+        contextLength: viewTokenCount,
         tokenCount,
+        logicalStart,
       };
     } finally {
       keyReadback.destroy?.();
@@ -1933,35 +1957,6 @@ export class WebGpuSegmentRunner implements SegmentRunner {
       const output = new Float32Array(elementCount);
       for (let index = 0; index < values.length; index += 1) {
         output[index] = float16ToFloat32(values[index] ?? 0);
-      }
-      return output;
-    } finally {
-      buffer.unmap();
-    }
-  }
-
-  private async readF16RowsAsF32(
-    buffer: WebGpuBufferLike,
-    rowCount: number,
-    rowElementCount: number,
-    rowStrideBytes: number,
-    byteLength: number,
-  ): Promise<Float32Array> {
-    if (byteLength <= 0) {
-      return new Float32Array();
-    }
-    this.readbackCount += 1;
-    await this.mapReadback(buffer);
-    try {
-      const values = new Uint16Array(buffer.getMappedRange());
-      const rowStrideElements = rowStrideBytes / F16_BYTE_LENGTH;
-      const output = new Float32Array(rowCount * rowElementCount);
-      for (let row = 0; row < rowCount; row += 1) {
-        const sourceOffset = row * rowStrideElements;
-        const targetOffset = row * rowElementCount;
-        for (let index = 0; index < rowElementCount; index += 1) {
-          output[targetOffset + index] = float16ToFloat32(values[sourceOffset + index] ?? 0);
-        }
       }
       return output;
     } finally {
@@ -2158,22 +2153,24 @@ export class WebGpuSegmentRunner implements SegmentRunner {
       return;
     }
     const layerState = gpuState.fullAttention.get(layer.layer);
-    if (!layerState || !layer.k || !layer.v || !layer.kNorm) {
+    if (!layerState || !layer.k || !layer.kNorm || (layer.valueProjectionMode !== "shared-with-key" && !layer.v)) {
       throw new Error(`Missing WebGPU KV state or weights for layer ${layer.layer}`);
     }
     const hiddenSize = this.manifest.embeddingLength;
     const tokenCount = 1;
-    const kvDim = this.manifest.headCountKv * layer.headSize;
-    const kvValueDim = this.manifest.headCountKv * layer.valueSize;
+    const kvDim = layer.headCountKv * layer.headSize;
+    const kvValueDim = layer.headCountKv * layer.valueSize;
     const attnQ8 = scratchQ8K(this.arena, hiddenSize, tokenCount, cleanup, `blk.${layer.layer}.prefill_kv.attn_norm.q8k`);
     this.dispatchRmsNormToQ8K(pass, resources, input, layer.attnNorm.buffer, attnQ8, hiddenSize, cleanup, `blk.${layer.layer}.prefill_kv.attn_norm`);
     const kProjection = scratchF32(this.arena, kvDim, cleanup, `blk.${layer.layer}.prefill_kv.k`);
-    const vProjection = scratchF32(this.arena, kvValueDim, cleanup, `blk.${layer.layer}.prefill_kv.v`);
-    const dispatchedDualKv = webGpuFusionEnabled() && dispatchDualQ4KMatMul(
+    const vProjection = layer.valueProjectionMode === "shared-with-key"
+      ? kProjection
+      : scratchF32(this.arena, kvValueDim, cleanup, `blk.${layer.layer}.prefill_kv.v`);
+    const dispatchedDualKv = layer.valueProjectionMode !== "shared-with-key" && webGpuFusionEnabled() && dispatchDualQ4KMatMul(
       pass,
       resources,
       layer.k,
-      layer.v,
+      layer.v!,
       attnQ8,
       kProjection,
       vProjection,
@@ -2181,7 +2178,9 @@ export class WebGpuSegmentRunner implements SegmentRunner {
     );
     if (!dispatchedDualKv) {
       dispatchKMatMul(pass, resources, layer.k, attnQ8, kProjection, tokenCount);
-      dispatchKMatMul(pass, resources, layer.v, attnQ8, vProjection, tokenCount);
+      if (layer.valueProjectionMode !== "shared-with-key") {
+        dispatchKMatMul(pass, resources, layer.v!, attnQ8, vProjection, tokenCount);
+      }
     }
     if (webGpuFusionEnabled()) {
       dispatchFullKvUpdate(
@@ -2195,7 +2194,7 @@ export class WebGpuSegmentRunner implements SegmentRunner {
         layerState.key,
         layerState.value,
         {
-          headCount: this.manifest.headCountKv,
+          headCount: layer.headCountKv,
           headSize: layer.headSize,
           valueSize: layer.valueSize,
           ropeDims: ropeDimensionCount(this.manifest, layer.kind),
@@ -2203,7 +2202,7 @@ export class WebGpuSegmentRunner implements SegmentRunner {
           freqBase: ropeFreqBase(this.manifest, layer.kind),
           position: mropeTextPosition(positions, tokenPosition),
           tokenPosition,
-          contextLength,
+          contextLength: layerState.capacity,
           hasFreqFactors: this.hasRopeFreqFactors && layer.kind === "full-attention",
         },
       );
@@ -2218,7 +2217,7 @@ export class WebGpuSegmentRunner implements SegmentRunner {
       layer.kNorm.buffer,
       kNormed,
       {
-        headCount: this.manifest.headCountKv,
+        headCount: layer.headCountKv,
         headSize: layer.headSize,
         epsilon: this.epsilon,
       },
@@ -2231,12 +2230,12 @@ export class WebGpuSegmentRunner implements SegmentRunner {
       this.ropeFreqFactors.buffer,
       layerState.key,
       {
-        headCount: this.manifest.headCountKv,
+        headCount: layer.headCountKv,
         headSize: layer.headSize,
         ropeDims: ropeDimensionCount(this.manifest, layer.kind),
         freqBase: ropeFreqBase(this.manifest, layer.kind),
         position: mropeTextPosition(positions, tokenPosition),
-        tokenPosition,
+        tokenPosition: tokenPosition % layerState.capacity,
         hasFreqFactors: this.hasRopeFreqFactors && layer.kind === "full-attention",
       },
     );
@@ -2248,7 +2247,7 @@ export class WebGpuSegmentRunner implements SegmentRunner {
       vProjection,
       vNormed,
       {
-        headCount: this.manifest.headCountKv,
+        headCount: layer.headCountKv,
         headSize: layer.valueSize,
         epsilon: this.epsilon,
       },
@@ -2260,10 +2259,10 @@ export class WebGpuSegmentRunner implements SegmentRunner {
       vNormed,
       layerState.value,
       {
-        headCount: this.manifest.headCountKv,
+        headCount: layer.headCountKv,
         valueSize: layer.valueSize,
-        tokenPosition,
-        contextLength,
+        tokenPosition: tokenPosition % layerState.capacity,
+        contextLength: layerState.capacity,
       },
     );
   }
@@ -2719,8 +2718,8 @@ export class WebGpuSegmentRunner implements SegmentRunner {
     const tokenCount = 1;
     const queryDim = this.manifest.headCount * layer.headSize;
     const valueDim = this.manifest.headCount * layer.valueSize;
-    const kvDim = this.manifest.headCountKv * layer.headSize;
-    const kvValueDim = this.manifest.headCountKv * layer.valueSize;
+    const kvDim = layer.headCountKv * layer.headSize;
+    const kvValueDim = layer.headCountKv * layer.valueSize;
 
     const attnQ8 = scratchQ8K(this.arena, hiddenSize, tokenCount, cleanup, `blk.${layer.layer}.attn_norm.q8k`);
     this.dispatchRmsNormToQ8K(pass, resources, input, layer.attnNorm.buffer, attnQ8, hiddenSize, cleanup, `blk.${layer.layer}.attn_norm`);
@@ -2783,17 +2782,19 @@ export class WebGpuSegmentRunner implements SegmentRunner {
     }
     if (layer.hasKv && options.skipKvUpdate !== true) {
       const layerState = gpuState.fullAttention.get(layer.layer);
-      if (!layerState || !layer.k || !layer.v || !layer.kNorm) {
+      if (!layerState || !layer.k || !layer.kNorm || (layer.valueProjectionMode !== "shared-with-key" && !layer.v)) {
         throw new Error(`Missing WebGPU KV state or weights for layer ${layer.layer}`);
       }
       const kProjection = scratchF32(this.arena, kvDim, cleanup, `blk.${layer.layer}.k`);
-      const vProjection = scratchF32(this.arena, kvValueDim, cleanup, `blk.${layer.layer}.v`);
+      const vProjection = layer.valueProjectionMode === "shared-with-key"
+        ? kProjection
+        : scratchF32(this.arena, kvValueDim, cleanup, `blk.${layer.layer}.v`);
       restartLayerSection("attn.kv_proj");
-      const dispatchedDualKv = webGpuFusionEnabled() && dispatchDualQ4KMatMul(
+      const dispatchedDualKv = layer.valueProjectionMode !== "shared-with-key" && webGpuFusionEnabled() && dispatchDualQ4KMatMul(
         pass,
         resources,
         layer.k,
-        layer.v,
+        layer.v!,
         attnQ8,
         kProjection,
         vProjection,
@@ -2801,7 +2802,9 @@ export class WebGpuSegmentRunner implements SegmentRunner {
       );
       if (!dispatchedDualKv) {
         dispatchKMatMul(pass, resources, layer.k, attnQ8, kProjection, tokenCount);
-        dispatchKMatMul(pass, resources, layer.v, attnQ8, vProjection, tokenCount);
+        if (layer.valueProjectionMode !== "shared-with-key") {
+          dispatchKMatMul(pass, resources, layer.v!, attnQ8, vProjection, tokenCount);
+        }
       }
       restartLayerSection("attn.kv_update");
       if (webGpuFusionEnabled()) {
@@ -2816,7 +2819,7 @@ export class WebGpuSegmentRunner implements SegmentRunner {
           layerState.key,
           layerState.value,
           {
-            headCount: this.manifest.headCountKv,
+            headCount: layer.headCountKv,
             headSize: layer.headSize,
             valueSize: layer.valueSize,
             ropeDims: ropeDimensionCount(this.manifest, layer.kind),
@@ -2824,7 +2827,7 @@ export class WebGpuSegmentRunner implements SegmentRunner {
             freqBase: ropeFreqBase(this.manifest, layer.kind),
             position: mropeTextPosition(positions, tokenPosition),
             tokenPosition,
-            contextLength,
+            contextLength: layerState.capacity,
             hasFreqFactors: this.hasRopeFreqFactors && layer.kind === "full-attention",
           },
         );
@@ -2838,7 +2841,7 @@ export class WebGpuSegmentRunner implements SegmentRunner {
           layer.kNorm.buffer,
           kNormed,
           {
-            headCount: this.manifest.headCountKv,
+            headCount: layer.headCountKv,
             headSize: layer.headSize,
             epsilon: this.epsilon,
           },
@@ -2851,12 +2854,12 @@ export class WebGpuSegmentRunner implements SegmentRunner {
           this.ropeFreqFactors.buffer,
           layerState.key,
           {
-            headCount: this.manifest.headCountKv,
+            headCount: layer.headCountKv,
             headSize: layer.headSize,
             ropeDims: ropeDimensionCount(this.manifest, layer.kind),
             freqBase: ropeFreqBase(this.manifest, layer.kind),
             position: mropeTextPosition(positions, tokenPosition),
-            tokenPosition,
+            tokenPosition: tokenPosition % layerState.capacity,
             hasFreqFactors: this.hasRopeFreqFactors && layer.kind === "full-attention",
           },
         );
@@ -2868,7 +2871,7 @@ export class WebGpuSegmentRunner implements SegmentRunner {
           vProjection,
           vNormed,
           {
-            headCount: this.manifest.headCountKv,
+            headCount: layer.headCountKv,
             headSize: layer.valueSize,
             epsilon: this.epsilon,
           },
@@ -2880,10 +2883,10 @@ export class WebGpuSegmentRunner implements SegmentRunner {
           vNormed,
           layerState.value,
           {
-            headCount: this.manifest.headCountKv,
+            headCount: layer.headCountKv,
             valueSize: layer.valueSize,
-            tokenPosition,
-            contextLength,
+            tokenPosition: tokenPosition % layerState.capacity,
+            contextLength: layerState.capacity,
           },
         );
       }
@@ -2894,10 +2897,13 @@ export class WebGpuSegmentRunner implements SegmentRunner {
     if (!state) {
       throw new Error(`Missing WebGPU KV state for layer ${layer.layer}`);
     }
-    const keyValueTokenCount = options.attentionCausal === false
-      ? Math.min(contextLength, options.keyValueTokenCount ?? tokenPosition + 1)
-      : Math.min(contextLength, tokenPosition + 1);
-    const probabilityTokenCapacity = bucketAttentionProbabilityTokenCount(keyValueTokenCount);
+    const slidingWindow = options.attentionCausal === false
+      ? undefined
+      : layer.kind === "sliding-attention" ? this.manifest.slidingWindow : undefined;
+    const keyValueRange = options.attentionCausal === false
+      ? { start: 0, count: Math.min(state.capacity, contextLength, options.keyValueTokenCount ?? tokenPosition + 1) }
+      : attentionLogicalRange(tokenPosition, state.capacity, contextLength, slidingWindow);
+    const probabilityTokenCapacity = bucketAttentionProbabilityTokenCount(keyValueRange.count);
     const probabilities = scratchF32(
       this.arena,
       this.manifest.headCount * probabilityTokenCapacity,
@@ -2913,21 +2919,19 @@ export class WebGpuSegmentRunner implements SegmentRunner {
       headSize: layer.headSize,
       valueSize: layer.valueSize,
       queryHeadCount: this.manifest.headCount,
-      keyValueHeadCount: this.manifest.headCountKv,
-      keyValueTokenCount,
-      contextLength,
+      keyValueHeadCount: state.headCountKv,
+      keyValueTokenCount: keyValueRange.count,
+      contextLength: state.capacity,
+      keyValueStart: keyValueRange.start,
       scale: 1,
       tokenPosition,
-      slidingWindow: options.attentionCausal === false
-        ? undefined
-        : layer.kind === "sliding-attention" ? this.manifest.slidingWindow : undefined,
+      slidingWindow,
     };
-    const keyValueStart = attentionKeyValueStart(tokenPosition, attentionOptions.slidingWindow);
     dispatchFullAttentionScore(this.arena.device, pass, resources, query, state.key, probabilities, attentionOptions);
     restartLayerSection("attn.apply");
     dispatchFullAttentionApply(this.arena.device, pass, resources, state.value, probabilities, attention, {
       ...attentionOptions,
-      keyValueStart,
+      keyValueStart: keyValueRange.start,
     });
 
     restartLayerSection("attn.out");
@@ -3215,6 +3219,16 @@ export class WebGpuSegmentRunner implements SegmentRunner {
     const key = state as object;
     const existing = this.states.get(key);
     if (existing) {
+      for (const layer of this.layers) {
+        if (!layer.hasKv) {
+          continue;
+        }
+        const expectedCapacity = state.fullAttention?.get(layer.layer)?.capacity;
+        const layerState = existing.fullAttention.get(layer.layer);
+        if (expectedCapacity !== undefined && layerState !== undefined && layerState.capacity < expectedCapacity) {
+          this.resizeGpuKvCacheLayer(state, layer, layerState, expectedCapacity);
+        }
+      }
       return existing;
     }
     if (state.nextPosition !== 0) {
@@ -3225,17 +3239,16 @@ export class WebGpuSegmentRunner implements SegmentRunner {
       if (!layer.hasKv) {
         continue;
       }
+      const capacity = state.fullAttention?.get(layer.layer)?.capacity ?? kvCacheCapacity(
+        layer.kind === "sliding-attention" ? "sliding" : "full",
+        state.contextLength,
+        this.manifest.slidingWindow,
+      );
       fullAttention.set(layer.layer, {
-        key: this.arena.createBuffer(
-          `blk.${layer.layer}.gpu.key_cache`,
-          state.contextLength * this.manifest.headCountKv * layer.headSize * F16_BYTE_LENGTH,
-          GPU_STORAGE | GPU_COPY_SRC,
-        ),
-        value: this.arena.createBuffer(
-          `blk.${layer.layer}.gpu.value_cache`,
-          state.contextLength * this.manifest.headCountKv * layer.valueSize * F16_BYTE_LENGTH,
-          GPU_STORAGE | GPU_COPY_SRC,
-        ),
+        key: this.createGpuKvCacheBuffer(layer, capacity, "key", layer.headSize),
+        value: this.createGpuKvCacheBuffer(layer, capacity, "value", layer.valueSize),
+        capacity,
+        headCountKv: layer.headCountKv,
       });
     }
     const created = { fullAttention };
@@ -3245,6 +3258,132 @@ export class WebGpuSegmentRunner implements SegmentRunner {
       this.states.delete(key);
     });
     return created;
+  }
+
+  private createGpuKvCacheBuffer(
+    layer: GpuLayer,
+    capacity: number,
+    kind: "key" | "value",
+    itemSize: number,
+  ): WebGpuBufferLike {
+    return this.arena.createBuffer(
+      `blk.${layer.layer}.gpu.${kind}_cache`,
+      webGpuKvCacheBufferByteLength(capacity, layer.headCountKv, itemSize),
+      GPU_STORAGE | GPU_COPY_SRC,
+    );
+  }
+
+  private resizeGpuKvCacheLayer(
+    state: WebGpuStateLike,
+    layer: GpuLayer,
+    layerState: FullAttentionGpuLayerState,
+    nextCapacity: number,
+  ): void {
+    const previousCapacity = layerState.capacity;
+    const nextKey = this.createGpuKvCacheBuffer(layer, nextCapacity, "key", layer.headSize);
+    const nextValue = this.createGpuKvCacheBuffer(layer, nextCapacity, "value", layer.valueSize);
+    const cleanup: GpuResource[] = [layerState.key, layerState.value];
+    const resources: KvResizeResource[] = [];
+    try {
+      const available = Math.min(state.contextLength, state.nextPosition, previousCapacity);
+      const logicalStart = Math.max(0, state.nextPosition - available);
+      if (available > 0) {
+        const encoder = this.arena.device.createCommandEncoder();
+        const pass = this.countedPass(encoder.beginComputePass());
+        const keyResource = createKvResizeResource(this.arena.device, layerState.key, nextKey, {
+          logicalStart,
+          tokenCount: available,
+          oldCapacity: previousCapacity,
+          newCapacity: nextCapacity,
+          elementStride: layer.headCountKv * layer.headSize,
+          layout: "token-major",
+        });
+        resources.push(keyResource);
+        pass.setPipeline(keyResource.pipeline);
+        pass.setBindGroup(0, keyResource.bindGroup);
+        pass.dispatchWorkgroups(Math.ceil((available * layer.headCountKv * layer.headSize) / 256));
+
+        const valueResource = createKvResizeResource(this.arena.device, layerState.value, nextValue, {
+          logicalStart,
+          tokenCount: available,
+          oldCapacity: previousCapacity,
+          newCapacity: nextCapacity,
+          elementStride: layer.headCountKv * layer.valueSize,
+          layout: "dim-head-token",
+        });
+        resources.push(valueResource);
+        pass.setPipeline(valueResource.pipeline);
+        pass.setBindGroup(0, valueResource.bindGroup);
+        pass.dispatchWorkgroups(Math.ceil((available * layer.headCountKv * layer.valueSize) / 256));
+        pass.end();
+        this.submitCommandBuffer(encoder.finish());
+      }
+
+      layerState.key = nextKey;
+      layerState.value = nextValue;
+      layerState.capacity = nextCapacity;
+      cleanup.push(...resources.map((resource) => resource.paramsBuffer));
+      this.deferResourceCleanup(cleanup);
+    } catch (error) {
+      nextKey.destroy?.();
+      nextValue.destroy?.();
+      for (const resource of resources) {
+        resource.paramsBuffer.destroy?.();
+      }
+      throw error;
+    }
+  }
+
+  private prefillChunkTokenCount(
+    tokenPositions: Int32Array,
+    chunkStart: number,
+    tokenCount: number,
+    requestedChunkSize: number,
+    state: WebGpuStateLike,
+    causal: boolean,
+  ): number {
+    const requested = Math.min(requestedChunkSize, tokenCount - chunkStart);
+    if (!causal) {
+      return requested;
+    }
+    const ringCapacity = this.minSlidingRingCapacity(state);
+    if (ringCapacity === undefined) {
+      return requested;
+    }
+    if (ringCapacity <= 1) {
+      return 1;
+    }
+    let minPosition = Infinity;
+    let maxPosition = -Infinity;
+    let count = 0;
+    for (let offset = 0; offset < requested; offset += 1) {
+      const position = tokenPositions[chunkStart + offset] ?? 0;
+      const nextMin = Math.min(minPosition, position);
+      const nextMax = Math.max(maxPosition, position);
+      if (offset > 0 && nextMax - nextMin >= ringCapacity) {
+        break;
+      }
+      minPosition = nextMin;
+      maxPosition = nextMax;
+      count += 1;
+    }
+    return Math.max(1, count);
+  }
+
+  private minSlidingRingCapacity(state: WebGpuStateLike): number | undefined {
+    let capacity: number | undefined;
+    for (const layer of this.layers) {
+      if (!layer.hasKv || layer.kind !== "sliding-attention") {
+        continue;
+      }
+      const layerCapacity = state.fullAttention?.get(layer.layer)?.capacity ??
+        kvCacheCapacity("sliding", state.contextLength, this.manifest.slidingWindow);
+      if (layerCapacity >= state.contextLength) {
+        continue;
+      }
+      capacity = capacity === undefined ? layerCapacity : Math.min(capacity, layerCapacity);
+    }
+    return capacity;
   }
 
   private assertBatchedHidden(inputHidden: Float32Array, positions: Int32Array): number {
@@ -3290,6 +3429,71 @@ function alignBufferCopyBytes(byteLength: number): number {
   }
   const remainder = byteLength % 4;
   return remainder === 0 ? byteLength : byteLength + 4 - remainder;
+}
+
+export function webGpuKvCacheBufferByteLength(capacity: number, headCountKv: number, itemSize: number): number {
+  return alignBufferCopyBytes(capacity * headCountKv * itemSize * F16_BYTE_LENGTH);
+}
+
+function mtpTargetKvViewTokenCount(
+  layer: GpuLayer,
+  capacity: number,
+  slidingWindow: number,
+  tokenCount: number,
+): number {
+  if (tokenCount <= 0 || capacity <= 0) {
+    return 0;
+  }
+  if (layer.kind === "sliding-attention") {
+    return Math.min(tokenCount, slidingWindow, capacity);
+  }
+  return Math.min(tokenCount, capacity);
+}
+
+function compactMtpTargetKeyView(
+  source: Float32Array,
+  options: {
+    logicalStart: number;
+    tokenCount: number;
+    capacity: number;
+    headCountKv: number;
+    headSize: number;
+  },
+): Float32Array {
+  const tokenStride = options.headCountKv * options.headSize;
+  const output = new Float32Array(options.tokenCount * tokenStride);
+  for (let token = 0; token < options.tokenCount; token += 1) {
+    const sourceSlot = (options.logicalStart + token) % options.capacity;
+    output.set(
+      source.subarray(sourceSlot * tokenStride, (sourceSlot + 1) * tokenStride),
+      token * tokenStride,
+    );
+  }
+  return output;
+}
+
+function compactMtpTargetValueView(
+  source: Float32Array,
+  options: {
+    logicalStart: number;
+    tokenCount: number;
+    capacity: number;
+    headCountKv: number;
+    valueSize: number;
+  },
+): Float32Array {
+  const output = new Float32Array(options.valueSize * options.headCountKv * options.tokenCount);
+  for (let dim = 0; dim < options.valueSize; dim += 1) {
+    for (let head = 0; head < options.headCountKv; head += 1) {
+      const sourceRow = (dim * options.headCountKv + head) * options.capacity;
+      const targetRow = (dim * options.headCountKv + head) * options.tokenCount;
+      for (let token = 0; token < options.tokenCount; token += 1) {
+        const sourceSlot = (options.logicalStart + token) % options.capacity;
+        output[targetRow + token] = source[sourceRow + sourceSlot] ?? 0;
+      }
+    }
+  }
+  return output;
 }
 
 async function loadRopeFreqFactors(
@@ -3465,8 +3669,75 @@ function outputTop1CandidateCount(outputStripes: readonly OutputStripe[]): numbe
   return outputStripes.reduce((sum, stripe) => sum + Math.ceil(stripe.rowCount / TOP1_CHUNK_SIZE), 0);
 }
 
-function attentionKeyValueStart(tokenPosition: number, slidingWindow: number | undefined): number {
-  return slidingWindow === undefined ? 0 : Math.max(0, tokenPosition + 1 - slidingWindow);
+function createKvResizeResource(
+  device: WebGpuDeviceLike,
+  source: WebGpuBufferLike,
+  destination: WebGpuBufferLike,
+  options: {
+    logicalStart: number;
+    tokenCount: number;
+    oldCapacity: number;
+    newCapacity: number;
+    elementStride: number;
+    layout: "token-major" | "dim-head-token";
+  },
+): KvResizeResource {
+  const params = new Uint32Array([
+    options.logicalStart,
+    options.tokenCount,
+    options.oldCapacity,
+    options.newCapacity,
+    options.elementStride,
+    options.layout === "dim-head-token" ? 1 : 0,
+    0,
+    0,
+  ]);
+  const paramsBuffer = device.createBuffer({
+    size: uniformBufferSize(params.byteLength),
+    usage: GPU_UNIFORM | GPU_COPY_DST,
+  });
+  device.queue.writeBuffer(paramsBuffer, 0, params);
+  const bindGroupLayout = device.createBindGroupLayout({
+    entries: [
+      storageEntry(0, "read-only-storage"),
+      storageEntry(1, "storage"),
+      { binding: 2, visibility: GPU_SHADER_STAGE_COMPUTE, buffer: { type: "uniform" } },
+    ],
+  });
+  const pipeline = device.createComputePipeline({
+    layout: device.createPipelineLayout({ bindGroupLayouts: [bindGroupLayout] }),
+    compute: { module: device.createShaderModule({ code: KV_CACHE_RESIZE_WGSL }), entryPoint: "main" },
+  });
+  return {
+    pipeline,
+    bindGroup: device.createBindGroup({
+      layout: bindGroupLayout,
+      entries: [
+        bindBuffer(0, source),
+        bindBuffer(1, destination),
+        bindBuffer(2, paramsBuffer),
+      ],
+    }),
+    paramsBuffer,
+  };
+}
+
+function uniformBufferSize(byteLength: number): number {
+  return Math.max(32, Math.ceil(byteLength / 16) * 16);
+}
+
+function attentionLogicalRange(
+  tokenPosition: number,
+  cacheCapacity: number,
+  contextLength: number,
+  slidingWindow: number | undefined,
+): { start: number; count: number } {
+  const available = Math.min(contextLength, tokenPosition + 1);
+  if (slidingWindow === undefined) {
+    return { start: 0, count: Math.min(cacheCapacity, available) };
+  }
+  const count = Math.min(cacheCapacity, slidingWindow, available);
+  return { start: Math.max(0, tokenPosition + 1 - count), count };
 }
 
 function bucketAttentionProbabilityTokenCount(tokenCount: number): number {
@@ -3490,6 +3761,47 @@ function webGpuGpuTimingEnabled(): boolean {
 function webGpuGpuDetailedTimingEnabled(): boolean {
   return (globalThis as { __heliopauseEnableWebGpuDetailedTimings?: unknown }).__heliopauseEnableWebGpuDetailedTimings === true;
 }
+
+const KV_CACHE_RESIZE_WGSL = `
+enable f16;
+
+struct Params {
+  logicalStart: u32,
+  tokenCount: u32,
+  oldCapacity: u32,
+  newCapacity: u32,
+  elementStride: u32,
+  layout: u32,
+  _pad0: u32,
+  _pad1: u32,
+};
+
+@group(0) @binding(0) var<storage, read> sourceValues: array<f16>;
+@group(0) @binding(1) var<storage, read_write> destinationValues: array<f16>;
+@group(0) @binding(2) var<uniform> params: Params;
+
+@compute @workgroup_size(256, 1, 1)
+fn main(@builtin(global_invocation_id) globalId: vec3<u32>) {
+  let linear = globalId.x;
+  let total = params.tokenCount * params.elementStride;
+  if (linear >= total) {
+    return;
+  }
+
+  let token = linear / params.elementStride;
+  let element = linear % params.elementStride;
+  let logicalPosition = params.logicalStart + token;
+  let oldSlot = logicalPosition % params.oldCapacity;
+  let newSlot = logicalPosition % params.newCapacity;
+  var sourceIndex = oldSlot * params.elementStride + element;
+  var destinationIndex = newSlot * params.elementStride + element;
+  if (params.layout == 1u) {
+    sourceIndex = element * params.oldCapacity + oldSlot;
+    destinationIndex = element * params.newCapacity + newSlot;
+  }
+  destinationValues[destinationIndex] = sourceValues[sourceIndex];
+}
+`;
 
 function webGpuFusionEnabled(): boolean {
   return (globalThis as { __heliopauseDisableWebGpuFusion?: unknown }).__heliopauseDisableWebGpuFusion !== true;

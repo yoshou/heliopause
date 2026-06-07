@@ -74,6 +74,7 @@ export function createWasmProvider(options: WasmProviderOptions = {}): Multimoda
       gguf: session.tensorReader.metadata,
       manifest: session.manifest,
       contextLength: resourceOptions.contextLength,
+      slidingWindowReserveTokens: resourceOptions.slidingWindowReserveTokens,
       memoryLimitBytes: Number.POSITIVE_INFINITY,
       targetResourceConstrained: false,
       canRunFullModel: true,

@@ -14,6 +14,7 @@ export type MtpTargetKvLayerView = {
   readonly headCountKv: number;
   readonly contextLength: number;
   readonly tokenCount: number;
+  readonly logicalStart: number;
 };
 
 export type MtpTargetKvView = {

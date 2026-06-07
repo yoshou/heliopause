@@ -63,6 +63,7 @@ export function createReferenceProvider(): MultimodalRunnerProvider & MtpAssista
       gguf: session.tensorReader.metadata,
       manifest: session.manifest,
       contextLength: options.contextLength,
+      slidingWindowReserveTokens: options.slidingWindowReserveTokens,
       memoryLimitBytes: Number.POSITIVE_INFINITY,
       targetResourceConstrained: false,
       canRunFullModel: true,

@@ -29,7 +29,10 @@ export type RunnerProvider = {
 
 export type ModelRunnerProvider = RunnerProvider & {
   createModelRunner(): ModelRunner;
-  modelResourceRequirements(session: ModelSession, options: { contextLength: number }): ProviderResourceRequirements;
+  modelResourceRequirements(
+    session: ModelSession,
+    options: { contextLength: number; slidingWindowReserveTokens?: number },
+  ): ProviderResourceRequirements;
 };
 
 export type AudioRunnerProvider = RunnerProvider & {

@@ -61,6 +61,7 @@ export function createWebGpuProvider(options: WebGpuProviderOptions = {}): Multi
       return webGpuResourceRequirements(session.tensorReader.metadata, session.manifest, {
         mode: "enabled",
         contextLength: resourceOptions.contextLength,
+        slidingWindowReserveTokens: resourceOptions.slidingWindowReserveTokens,
         memoryLimitBytes: providerOptions?.memoryLimitBytes,
       });
     },

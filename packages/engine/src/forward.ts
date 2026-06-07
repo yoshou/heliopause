@@ -1,6 +1,7 @@
 import {
   assertInferenceStateActive,
   createForwardTrace,
+  slidingWindowReserveTokensForState,
   type InferenceState,
   type ModelSession,
   type OutputResult,
@@ -252,10 +253,12 @@ function modelRuntimeForForward(session: ModelSession, state: InferenceState): P
   if (!firstRuntime) {
     throw new Error("No model runner was selected.");
   }
+  const slidingWindowReserveTokens = slidingWindowReserveTokensForState(state, session.manifest);
   const plan = planModelPlacement(
     session.providers.map((provider) =>
       provider.modelResourceRequirements(session, {
         contextLength: state.contextLength,
+        slidingWindowReserveTokens,
       })
     ),
     {

@@ -4,6 +4,7 @@ import test from "node:test";
 import type { GgufMetadata } from "../src/gguf.ts";
 import type { ModelManifest } from "../src/model.ts";
 import { createModelResourceRequirements } from "../src/runner/model-resources.ts";
+import { createWebGpuProvider } from "../src/runner/webgpu/index.ts";
 import { webGpuResourceRequirements } from "../src/runner/webgpu/planning.ts";
 
 test("model resource requirements can estimate KV cache with native f16 element size", () => {
@@ -27,6 +28,80 @@ test("model resource requirements can estimate KV cache with native f16 element 
 
   const webgpu = webGpuResourceRequirements(emptyGguf(), manifestWithKv(), { contextLength: 3 });
   assert.equal(webgpu.layers[0]?.cacheBytes, f16.layers[0]?.cacheBytes);
+});
+
+test("model resource requirements estimate sliding KV cache with ring capacity", () => {
+  const manifest = {
+    ...manifestWithKv(),
+    contextLength: 16,
+    slidingWindow: 4,
+    layerKinds: ["sliding-attention"],
+    slidingAttentionLayerCount: 1,
+    fullAttentionLayerCount: 0,
+    slidingAttentionLayers: [0],
+    fullAttentionLayers: [],
+  } satisfies ModelManifest;
+  const requirements = createModelResourceRequirements({
+    provider: "webgpu",
+    gguf: emptyGguf(),
+    manifest,
+    contextLength: 16,
+    cacheElementByteLength: 2,
+  });
+
+  assert.equal(requirements.layers[0]?.cacheBytes, 160);
+});
+
+test("model resource requirements include sliding KV reserve tokens", () => {
+  const manifest = {
+    ...manifestWithKv(),
+    contextLength: 16,
+    slidingWindow: 4,
+    layerKinds: ["sliding-attention"],
+    slidingAttentionLayerCount: 1,
+    fullAttentionLayerCount: 0,
+    slidingAttentionLayers: [0],
+    fullAttentionLayers: [],
+  } satisfies ModelManifest;
+  const requirements = createModelResourceRequirements({
+    provider: "webgpu",
+    gguf: emptyGguf(),
+    manifest,
+    contextLength: 16,
+    cacheElementByteLength: 2,
+    slidingWindowReserveTokens: 3,
+  });
+  const webgpu = webGpuResourceRequirements(emptyGguf(), manifest, {
+    contextLength: 16,
+    slidingWindowReserveTokens: 3,
+  });
+
+  assert.equal(requirements.layers[0]?.cacheBytes, 280);
+  assert.equal(webgpu.layers[0]?.cacheBytes, requirements.layers[0]?.cacheBytes);
+});
+
+test("WebGPU provider forwards sliding KV reserve tokens to resource planning", () => {
+  const manifest = {
+    ...manifestWithKv(),
+    contextLength: 16,
+    slidingWindow: 4,
+    layerKinds: ["sliding-attention"],
+    slidingAttentionLayerCount: 1,
+    fullAttentionLayerCount: 0,
+    slidingAttentionLayers: [0],
+    fullAttentionLayers: [],
+  } satisfies ModelManifest;
+  const provider = createWebGpuProvider();
+  const requirements = provider.modelResourceRequirements({
+    tensorReader: { metadata: emptyGguf() },
+    manifest,
+    provider: (name: string) => name === "webgpu" ? provider : undefined,
+  } as never, {
+    contextLength: 16,
+    slidingWindowReserveTokens: 3,
+  });
+
+  assert.equal(requirements.layers[0]?.cacheBytes, 280);
 });
 
 function emptyGguf(): GgufMetadata {

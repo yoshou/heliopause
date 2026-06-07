@@ -5,6 +5,7 @@ import {
 } from "./gguf";
 import {
   createModelSession,
+  ensureSlidingKvCacheReserve,
   type InferenceState,
   type ModelSession,
   type ModelSessionOptions,
@@ -417,6 +418,9 @@ export async function generateChatTurn(
   throwIfAborted(options.signal);
   const sampling = resolveGenerationSamplingOptions(options);
   validateMtpGenerationOptions(session, sampling, options.mtp);
+  if (options.mtp) {
+    ensureSlidingKvCacheReserve(state, session.manifest, options.mtp.numSpeculativeTokens);
+  }
 
   const messages = normalizeChatTurnInput(turn);
   const prefillText = applyChatTemplate(messages, {
@@ -734,6 +738,7 @@ async function generateAssistantWithMtp(
       {
         logitsTopK: sampling.logitsTopK,
         assistantManifest: options.mtp.assistantSession.manifest,
+        maxSpeculativeTokens: draftBudget,
         signal: options.signal,
       },
     );
@@ -798,6 +803,7 @@ export async function* generateChatCompletion(
       positions: Int32Array.from({ length: promptTokenIds.length }, (_, index) => index),
       logitsTopK: sampling.logitsTopK,
       assistantManifest: options.mtp.assistantSession.manifest,
+      maxSpeculativeTokens: options.mtp.numSpeculativeTokens,
       signal: options.signal,
     });
     let pendingTokenId = sampleMtpTokenDistribution(prefillResult.firstTokenDistribution, sampling, rng);
@@ -830,6 +836,7 @@ export async function* generateChatCompletion(
         {
           logitsTopK: sampling.logitsTopK,
           assistantManifest: options.mtp.assistantSession.manifest,
+          maxSpeculativeTokens: draftBudget,
           signal: options.signal,
         },
       );
@@ -1037,6 +1044,7 @@ async function prefillMtpChatText(
     positions,
     logitsTopK: options.logitsTopK,
     assistantManifest: options.mtp.assistantSession.manifest,
+    maxSpeculativeTokens: options.mtp.numSpeculativeTokens,
     signal: options.signal,
   });
 }

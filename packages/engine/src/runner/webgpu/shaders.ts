@@ -1093,7 +1093,8 @@ fn main(@builtin(workgroup_id) workgroupId: vec3<u32>, @builtin(local_invocation
   let head = workgroupId.x;
   let lane = localId.x;
   let base = head * params.headSize;
-  let keyBase = (params.tokenPosition * params.headCount + head) * params.headSize;
+  let cacheToken = params.tokenPosition % params.contextLength;
+  let keyBase = (cacheToken * params.headCount + head) * params.headSize;
   if (head >= params.headCount) {
     return;
   }
@@ -1287,7 +1288,8 @@ fn main(@builtin(workgroup_id) workgroupId: vec3<u32>, @builtin(local_invocation
   }
   let scale = inverseSqrt(kvReduceValues[0] / f32(params.headSize) + params.epsilon);
   workgroupBarrier();
-  let keyBase = (params.tokenPosition * params.headCount + head) * params.headSize;
+  let cacheToken = params.tokenPosition % params.contextLength;
+  let keyBase = (cacheToken * params.headCount + head) * params.headSize;
   for (var dim = lane + params.ropeDims; dim < params.headSize; dim = dim + 256u) {
     keyCache[keyBase + dim] = f16(normed(head, dim, scale));
   }
@@ -1307,7 +1309,7 @@ fn main(@builtin(workgroup_id) workgroupId: vec3<u32>, @builtin(local_invocation
   }
   let valueScale = inverseSqrt(kvReduceValues[0] / f32(params.valueSize) + params.epsilon);
   for (var dim = lane; dim < params.valueSize; dim = dim + 256u) {
-    valueCache[(dim * params.headCount + head) * params.contextLength + params.tokenPosition] =
+    valueCache[(dim * params.headCount + head) * params.contextLength + cacheToken] =
       f16(vProjectionValues[valueBase + dim] * valueScale);
   }
   let ropePairCount = params.ropeDims / 2u;
@@ -1487,7 +1489,8 @@ fn main(@builtin(workgroup_id) workgroupId: vec3<u32>, @builtin(local_invocation
   let scale = inverseSqrt(batchedKvReduceValues[0] / f32(params.headSize) + params.epsilon);
   workgroupBarrier();
   let tokenPosition = positions[token];
-  let keyBase = (tokenPosition * params.headCount + head) * params.headSize;
+  let cacheToken = tokenPosition % params.contextLength;
+  let keyBase = (cacheToken * params.headCount + head) * params.headSize;
   for (var dim = lane + params.ropeDims; dim < params.headSize; dim = dim + 256u) {
     keyCache[keyBase + dim] = f16(batchedKvNormed(token, head, dim, scale));
   }
@@ -1507,7 +1510,7 @@ fn main(@builtin(workgroup_id) workgroupId: vec3<u32>, @builtin(local_invocation
   }
   let valueScale = inverseSqrt(batchedKvReduceValues[0] / f32(params.valueSize) + params.epsilon);
   for (var dim = lane; dim < params.valueSize; dim = dim + 256u) {
-    valueCache[(dim * params.headCount + head) * params.contextLength + tokenPosition] =
+    valueCache[(dim * params.headCount + head) * params.contextLength + cacheToken] =
       f16(vProjectionValues[valueBase + dim] * valueScale);
   }
   let ropePairCount = params.ropeDims / 2u;
@@ -2783,7 +2786,8 @@ fn queryValue(index: u32) -> f32 {
 
 fn attentionScore(qHead: u32, kvHead: u32, keyToken: u32) -> f32 {
   let queryOffset = qHead * params.headSize;
-  let keyOffset = (keyToken * params.keyValueHeadCount + kvHead) * params.headSize;
+  let physicalKeyToken = (params.keyValueStart + keyToken) % params.contextLength;
+  let keyOffset = (physicalKeyToken * params.keyValueHeadCount + kvHead) * params.headSize;
   var dot = 0.0;
   for (var dim = 0u; dim < params.headSize; dim = dim + 1u) {
     dot = dot + queryValue(queryOffset + dim) * f32(keyValues[keyOffset + dim]);
@@ -2807,7 +2811,7 @@ fn main(
   let kvHead = qHead / groupSize;
   let probabilityOffset = qHead * params.keyValueTokenCount;
   var localMax = -3.4028234663852886e38;
-  for (var keyToken = params.keyValueStart + lane; keyToken < params.keyValueTokenCount; keyToken = keyToken + 256u) {
+  for (var keyToken = lane; keyToken < params.keyValueTokenCount; keyToken = keyToken + 256u) {
     let score = attentionScore(qHead, kvHead, keyToken);
     probabilityValues[probabilityOffset + keyToken] = score;
     localMax = max(localMax, score);
@@ -2823,7 +2827,7 @@ fn main(
   let maxScore = reduceValues[0];
   workgroupBarrier();
   var localSum = 0.0;
-  for (var keyToken = params.keyValueStart + lane; keyToken < params.keyValueTokenCount; keyToken = keyToken + 256u) {
+  for (var keyToken = lane; keyToken < params.keyValueTokenCount; keyToken = keyToken + 256u) {
     let probability = exp(probabilityValues[probabilityOffset + keyToken] - maxScore);
     probabilityValues[probabilityOffset + keyToken] = probability;
     localSum = localSum + probability;
@@ -2837,7 +2841,7 @@ fn main(
     workgroupBarrier();
   }
   let sum = reduceValues[0];
-  for (var keyToken = params.keyValueStart + lane; keyToken < params.keyValueTokenCount; keyToken = keyToken + 256u) {
+  for (var keyToken = lane; keyToken < params.keyValueTokenCount; keyToken = keyToken + 256u) {
     let index = probabilityOffset + keyToken;
     probabilityValues[index] = probabilityValues[index] / sum;
   }
@@ -2874,9 +2878,10 @@ fn main(@builtin(workgroup_id) workgroupId: vec3<u32>, @builtin(local_invocation
   let kvHead = qHead / groupSize;
   var weighted = 0.0;
   let probabilityOffset = qHead * params.keyValueTokenCount;
-  for (var keyToken = params.keyValueStart + lane; keyToken < params.keyValueTokenCount; keyToken = keyToken + 256u) {
+  for (var keyToken = lane; keyToken < params.keyValueTokenCount; keyToken = keyToken + 256u) {
     let probability = probabilityValues[probabilityOffset + keyToken];
-    let valueIndex = (dim * params.keyValueHeadCount + kvHead) * params.contextLength + keyToken;
+    let physicalKeyToken = (params.keyValueStart + keyToken) % params.contextLength;
+    let valueIndex = (dim * params.keyValueHeadCount + kvHead) * params.contextLength + physicalKeyToken;
     weighted = weighted + probability * f32(valueValues[valueIndex]);
   }
   attentionApplyValues[lane] = weighted;
@@ -3112,7 +3117,7 @@ struct Params {
   tileSize: u32,
   tileStart: u32,
   tileLength: u32,
-  _pad0: u32,
+  keyValueStart: u32,
   _pad1: u32,
   _pad2: u32,
 };
@@ -3126,10 +3131,11 @@ struct Params {
 @group(0) @binding(6) var<storage, read_write> tileSumValues: array<f32>;
 
 fn rollingTileAllowed(queryPosition: u32, keyToken: u32) -> bool {
-  if (params.causal != 0u && keyToken > queryPosition) {
+  let logicalKeyPosition = params.keyValueStart + keyToken;
+  if (params.causal != 0u && logicalKeyPosition > queryPosition) {
     return false;
   }
-  if (params.hasSlidingWindow != 0u && keyToken + params.slidingWindow <= queryPosition) {
+  if (params.hasSlidingWindow != 0u && logicalKeyPosition + params.slidingWindow <= queryPosition) {
     return false;
   }
   return keyToken < params.keyValueTokenCount;
@@ -3137,7 +3143,8 @@ fn rollingTileAllowed(queryPosition: u32, keyToken: u32) -> bool {
 
 fn rollingTileScore(token: u32, qHead: u32, kvHead: u32, keyToken: u32) -> f32 {
   let queryOffset = token * params.queryHeadCount * params.headSize + qHead * params.headSize;
-  let keyOffset = (keyToken * params.keyValueHeadCount + kvHead) * params.headSize;
+  let physicalKeyToken = (params.keyValueStart + keyToken) % params.contextLength;
+  let keyOffset = (physicalKeyToken * params.keyValueHeadCount + kvHead) * params.headSize;
   var dot = 0.0;
   for (var dim = 0u; dim < params.headSize; dim = dim + 1u) {
     dot = dot + queryValues[queryOffset + dim] * f32(keyValues[keyOffset + dim]);
@@ -3264,6 +3271,10 @@ struct Params {
   tileStart: u32,
   tileLength: u32,
   tokenCount: u32,
+  keyValueStart: u32,
+  _pad0: u32,
+  _pad1: u32,
+  _pad2: u32,
 };
 
 @group(0) @binding(0) var<storage, read> valueValues: array<f16>;
@@ -3292,7 +3303,8 @@ fn main(@builtin(workgroup_id) workgroupId: vec3<u32>, @builtin(local_invocation
   for (var offset = lane; offset < params.tileLength; offset = offset + 256u) {
     let probability = probabilityTileValues[tileBase + offset];
     let keyToken = params.tileStart + offset;
-    let valueIndex = (dim * params.keyValueHeadCount + kvHead) * params.contextLength + keyToken;
+    let physicalKeyToken = (params.keyValueStart + keyToken) % params.contextLength;
+    let valueIndex = (dim * params.keyValueHeadCount + kvHead) * params.contextLength + physicalKeyToken;
     weighted = weighted + probability * f32(valueValues[valueIndex]);
   }
   rollingApplyReduceValues[lane] = weighted;
