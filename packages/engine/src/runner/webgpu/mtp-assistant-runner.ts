@@ -609,7 +609,7 @@ class WebGpuMtpAssistantRunner {
 }
 
 function assertSupportedQuantizedType(type: GgmlTypeName, name: string): void {
-  if (type !== "Q4_K" && type !== "Q5_K" && type !== "Q6_K" && type !== "Q8_0") {
+  if (type !== "Q4_0" && type !== "Q4_K" && type !== "Q5_K" && type !== "Q6_K" && type !== "Q8_0") {
     throw new Error(`${name} has unsupported WebGPU MTP assistant tensor type ${type}.`);
   }
 }

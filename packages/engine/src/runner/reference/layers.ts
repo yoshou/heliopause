@@ -13,6 +13,7 @@ import {
   quantizeQ8_0,
   quantizeQ8_K,
   vecDotIQ4_XS_Q8_K,
+  vecDotQ4_0_Q8_0,
   vecDotQ4_K_Q8_K,
   vecDotQ5_K_Q8_K,
   vecDotQ6_K_Q8_K,
@@ -573,6 +574,9 @@ export async function matMulWeight(
   if (tensor.type === "Q4_K" || tensor.type === "Q5_K" || tensor.type === "Q6_K" || tensor.type === "IQ4_XS") {
     return matMulKQ8K(session, weightName, inputColumns, tensor.type, trace);
   }
+  if (tensor.type === "Q4_0") {
+    return matMulQ4_0Weight(session, weightName, inputColumns, trace);
+  }
   if (tensor.type === "Q8_0") {
     return matMulQ8_0Weight(session, weightName, inputColumns, trace);
   }
@@ -692,6 +696,50 @@ async function matMulQ8_0Weight(
     () => matMulQ8_0Reference(weightBytes, inputColumns, inputSize, rowCount, columnCount, rowByteLength),
     { weightName },
   );
+}
+
+async function matMulQ4_0Weight(
+  session: ReferenceTensorSession,
+  weightName: string,
+  inputColumns: Float32Array,
+  trace?: ForwardTrace,
+): Promise<Float32Array> {
+  const tensor = session.getTensor(weightName);
+  if (tensor.type !== "Q4_0") {
+    throw new Error(`${weightName} must be Q4_0, got ${tensor.type}`);
+  }
+  const inputSize = tensor.dimensions[0] ?? 0;
+  const rowCount = tensor.dimensions[1] ?? 0;
+  const columnCount = inputColumns.length / inputSize;
+  const rowByteLength = tensorByteLength({ ...tensor, dimensions: [inputSize] });
+  const weightBytes = await session.readWeightBytes(weightName);
+  return timedAsync(
+    trace,
+    "reference Q4_0 matmul",
+    () => matMulQ4_0Reference(weightBytes, inputColumns, inputSize, rowCount, columnCount, rowByteLength),
+    { weightName },
+  );
+}
+
+function matMulQ4_0Reference(
+  weightBytes: Uint8Array,
+  inputColumns: Float32Array,
+  inputSize: number,
+  rowCount: number,
+  columnCount: number,
+  rowByteLength: number,
+): Float32Array {
+  const output = new Float32Array(rowCount * columnCount);
+  for (let column = 0; column < columnCount; column += 1) {
+    const q8 = quantizeQ8_0(inputColumns.slice(column * inputSize, (column + 1) * inputSize));
+    for (let row = 0; row < rowCount; row += 1) {
+      output[column * rowCount + row] = vecDotQ4_0_Q8_0(
+        weightBytes.subarray(row * rowByteLength, (row + 1) * rowByteLength),
+        q8,
+      );
+    }
+  }
+  return output;
 }
 
 function matMulQ8_0Reference(

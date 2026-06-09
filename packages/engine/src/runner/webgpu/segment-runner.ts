@@ -24,10 +24,12 @@ import {
   dispatchBatchedFullKvUpdate,
   dispatchBatchedFullQuery,
   dispatchBatchedGegluSlice,
+  dispatchBatchedRmsNormQ8_0Quantize,
   dispatchBatchedRmsNormQ8KQuantize,
   dispatchBatchedRmsNormResidualAdd,
   dispatchBatchedRmsNormResidualAddScale,
   dispatchDualQ4KMatMul,
+  dispatchDualQ4_0MatMul,
   dispatchF32GatherRowsScale,
   dispatchF32MatMul,
   dispatchFullAttentionApply,
@@ -638,6 +640,21 @@ export class WebGpuSegmentRunner implements SegmentRunner {
     const normalized = scratchF32(this.arena, length, cleanup, label);
     dispatchRmsNorm(this.arena.device, pass, resources, input, weight, normalized, length, this.epsilon);
     dispatchQ8KQuantize(this.arena.device, pass, resources, normalized, q8, length, 1);
+  }
+
+  private dispatchRmsNormToQ8_0(
+    pass: WebGpuComputePassLike,
+    resources: Array<{ destroy: () => void }>,
+    input: WebGpuBufferLike,
+    weight: WebGpuBufferLike,
+    q8: ReturnType<typeof scratchQ8_0>,
+    length: number,
+  ): void {
+    dispatchBatchedRmsNormQ8_0Quantize(this.arena.device, pass, resources, input, weight, q8, {
+      length,
+      tokenCount: 1,
+      epsilon: this.epsilon,
+    });
   }
 
   private dispatchRmsNormThenResidualAdd(
@@ -1578,15 +1595,28 @@ export class WebGpuSegmentRunner implements SegmentRunner {
     const kvDim = layer.headCountKv * layer.headSize;
     const kvValueDim = layer.headCountKv * layer.valueSize;
 
-    const attnQ8 = scratchQ8K(this.arena, hiddenSize, tokenCount, cleanup, `blk.${layer.layer}.prefill.attn_norm.q8k`);
-    dispatchBatchedRmsNormQ8KQuantize(this.arena.device, pass, resources, input, layer.attnNorm.buffer, attnQ8, {
-      length: hiddenSize,
-      tokenCount,
-      epsilon: this.epsilon,
-    });
-
     const qProjection = scratchF32(this.arena, queryDim * tokenCount, cleanup, `blk.${layer.layer}.prefill.q`);
-    dispatchKMatMul(pass, resources, layer.q, attnQ8, qProjection, tokenCount);
+    const attnQ8_0 = layer.q.type === "Q4_0"
+      ? scratchQ8_0(this.arena, hiddenSize, tokenCount, hiddenSize / 32, cleanup, `blk.${layer.layer}.prefill.attn_norm.q8_0`)
+      : undefined;
+    const attnQ8K = attnQ8_0
+      ? undefined
+      : scratchQ8K(this.arena, hiddenSize, tokenCount, cleanup, `blk.${layer.layer}.prefill.attn_norm.q8k`);
+    if (attnQ8_0) {
+      dispatchBatchedRmsNormQ8_0Quantize(this.arena.device, pass, resources, input, layer.attnNorm.buffer, attnQ8_0, {
+        length: hiddenSize,
+        tokenCount,
+        epsilon: this.epsilon,
+      });
+      dispatchQ8_0MatMul(pass, resources, layer.q, attnQ8_0, qProjection, tokenCount);
+    } else if (attnQ8K) {
+      dispatchBatchedRmsNormQ8KQuantize(this.arena.device, pass, resources, input, layer.attnNorm.buffer, attnQ8K, {
+        length: hiddenSize,
+        tokenCount,
+        epsilon: this.epsilon,
+      });
+      dispatchKMatMul(pass, resources, layer.q, attnQ8K, qProjection, tokenCount);
+    }
     const query = scratchF32(this.arena, queryDim * tokenCount, cleanup, `blk.${layer.layer}.prefill.q_rope`);
     dispatchBatchedFullQuery(
       this.arena.device,
@@ -1617,20 +1647,23 @@ export class WebGpuSegmentRunner implements SegmentRunner {
       const vProjection = layer.valueProjectionMode === "shared-with-key"
         ? kProjection
         : scratchF32(this.arena, kvValueDim * tokenCount, cleanup, `blk.${layer.layer}.prefill.v`);
-      const dispatchedDualKv = layer.valueProjectionMode !== "shared-with-key" && webGpuFusionEnabled() && dispatchDualQ4KMatMul(
-        pass,
-        resources,
-        layer.k,
-        layer.v!,
-        attnQ8,
-        kProjection,
-        vProjection,
-        tokenCount,
+      const dispatchedDualKv = layer.valueProjectionMode !== "shared-with-key" && webGpuFusionEnabled() && (
+        attnQ8_0
+          ? dispatchDualQ4_0MatMul(pass, resources, layer.k, layer.v!, attnQ8_0, kProjection, vProjection, tokenCount)
+          : dispatchDualQ4KMatMul(pass, resources, layer.k, layer.v!, attnQ8K!, kProjection, vProjection, tokenCount)
       );
       if (!dispatchedDualKv) {
-        dispatchKMatMul(pass, resources, layer.k, attnQ8, kProjection, tokenCount);
+        if (attnQ8_0) {
+          dispatchQ8_0MatMul(pass, resources, layer.k, attnQ8_0, kProjection, tokenCount);
+        } else {
+          dispatchKMatMul(pass, resources, layer.k, attnQ8K!, kProjection, tokenCount);
+        }
         if (layer.valueProjectionMode !== "shared-with-key") {
-          dispatchKMatMul(pass, resources, layer.v!, attnQ8, vProjection, tokenCount);
+          if (attnQ8_0) {
+            dispatchQ8_0MatMul(pass, resources, layer.v!, attnQ8_0, vProjection, tokenCount);
+          } else {
+            dispatchKMatMul(pass, resources, layer.v!, attnQ8K!, vProjection, tokenCount);
+          }
         }
       }
       dispatchBatchedFullKvUpdate(
@@ -1741,17 +1774,29 @@ export class WebGpuSegmentRunner implements SegmentRunner {
     resources: Array<{ destroy: () => void }>,
   ): WebGpuBufferLike {
     const hiddenSize = this.manifest.embeddingLength;
-    const ffnQ8 = scratchQ8K(this.arena, hiddenSize, tokenCount, cleanup, `blk.${layer.layer}.prefill.ffn_norm.q8k`);
-    dispatchBatchedRmsNormQ8KQuantize(this.arena.device, pass, resources, residual, layer.ffnNorm.buffer, ffnQ8, {
-      length: hiddenSize,
-      tokenCount,
-      epsilon: this.epsilon,
-    });
     const gate = scratchF32(this.arena, this.manifest.feedForwardLength * tokenCount, cleanup, `blk.${layer.layer}.prefill.ffn_gate`);
     const up = scratchF32(this.arena, this.manifest.feedForwardLength * tokenCount, cleanup, `blk.${layer.layer}.prefill.ffn_up`);
     const geglu = scratchF32(this.arena, this.manifest.feedForwardLength * tokenCount, cleanup, `blk.${layer.layer}.prefill.ffn_geglu`);
-    dispatchKMatMul(pass, resources, layer.ffnGate, ffnQ8, gate, tokenCount);
-    dispatchKMatMul(pass, resources, layer.ffnUp, ffnQ8, up, tokenCount);
+    if (layer.ffnGate.type === "Q4_0" && layer.ffnUp.type === "Q4_0") {
+      const ffnQ8 = scratchQ8_0(this.arena, hiddenSize, tokenCount, hiddenSize / 32, cleanup, `blk.${layer.layer}.prefill.ffn_norm.q8_0`);
+      dispatchBatchedRmsNormQ8_0Quantize(this.arena.device, pass, resources, residual, layer.ffnNorm.buffer, ffnQ8, {
+        length: hiddenSize,
+        tokenCount,
+        epsilon: this.epsilon,
+      });
+      if (!dispatchDualQ4_0MatMul(pass, resources, layer.ffnGate, layer.ffnUp, ffnQ8, gate, up, tokenCount)) {
+        throw new Error(`WebGPU Q4_0 FFN dual matmul failed for layer ${layer.layer}`);
+      }
+    } else {
+      const ffnQ8 = scratchQ8K(this.arena, hiddenSize, tokenCount, cleanup, `blk.${layer.layer}.prefill.ffn_norm.q8k`);
+      dispatchBatchedRmsNormQ8KQuantize(this.arena.device, pass, resources, residual, layer.ffnNorm.buffer, ffnQ8, {
+        length: hiddenSize,
+        tokenCount,
+        epsilon: this.epsilon,
+      });
+      dispatchKMatMul(pass, resources, layer.ffnGate, ffnQ8, gate, tokenCount);
+      dispatchKMatMul(pass, resources, layer.ffnUp, ffnQ8, up, tokenCount);
+    }
     dispatchGeglu(this.arena.device, pass, resources, gate, up, geglu, this.manifest.feedForwardLength * tokenCount);
     const ffnOut = this.dispatchQuantizedMatMul(pass, resources, layer.ffnDown, geglu, tokenCount, cleanup, `blk.${layer.layer}.prefill.ffn_out`);
     const output = scratchF32(this.arena, hiddenSize * tokenCount, cleanup, `blk.${layer.layer}.prefill.ffn_residual`);
@@ -2074,23 +2119,45 @@ export class WebGpuSegmentRunner implements SegmentRunner {
             tokenCount,
           );
         } else {
-          const q8 = scratchQ8K(
-            this.arena,
-            this.manifest.embeddingLength,
-            tokenCount,
-            cleanup,
-            "input.hidden.q8k",
-          );
-          dispatchQ8KQuantize(
-            this.arena.device,
-            compute.pass,
-            resources,
-            hidden,
-            q8,
-            this.manifest.embeddingLength,
-            tokenCount,
-          );
-          dispatchKMatMul(compute.pass, resources, input.perLayerModelProjection, q8, projected, tokenCount);
+          if (input.perLayerModelProjection.type === "Q4_0" || input.perLayerModelProjection.type === "Q8_0") {
+            const q8 = scratchQ8_0(
+              this.arena,
+              this.manifest.embeddingLength,
+              tokenCount,
+              this.manifest.embeddingLength / 32,
+              cleanup,
+              "input.hidden.q8_0",
+            );
+            dispatchQ8_0Quantize(
+              this.arena.device,
+              compute.pass,
+              resources,
+              hidden,
+              q8,
+              this.manifest.embeddingLength,
+              tokenCount,
+              this.manifest.embeddingLength / 32,
+            );
+            dispatchQ8_0MatMul(compute.pass, resources, input.perLayerModelProjection, q8, projected, tokenCount);
+          } else {
+            const q8 = scratchQ8K(
+              this.arena,
+              this.manifest.embeddingLength,
+              tokenCount,
+              cleanup,
+              "input.hidden.q8k",
+            );
+            dispatchQ8KQuantize(
+              this.arena.device,
+              compute.pass,
+              resources,
+              hidden,
+              q8,
+              this.manifest.embeddingLength,
+              tokenCount,
+            );
+            dispatchKMatMul(compute.pass, resources, input.perLayerModelProjection, q8, projected, tokenCount);
+          }
         }
 
         dispatchPreparePerLayerInputs(
@@ -2160,26 +2227,38 @@ export class WebGpuSegmentRunner implements SegmentRunner {
     const tokenCount = 1;
     const kvDim = layer.headCountKv * layer.headSize;
     const kvValueDim = layer.headCountKv * layer.valueSize;
-    const attnQ8 = scratchQ8K(this.arena, hiddenSize, tokenCount, cleanup, `blk.${layer.layer}.prefill_kv.attn_norm.q8k`);
-    this.dispatchRmsNormToQ8K(pass, resources, input, layer.attnNorm.buffer, attnQ8, hiddenSize, cleanup, `blk.${layer.layer}.prefill_kv.attn_norm`);
+    const attnQ8_0 = layer.k?.type === "Q4_0"
+      ? scratchQ8_0(this.arena, hiddenSize, tokenCount, hiddenSize / 32, cleanup, `blk.${layer.layer}.prefill_kv.attn_norm.q8_0`)
+      : undefined;
+    const attnQ8K = attnQ8_0
+      ? undefined
+      : scratchQ8K(this.arena, hiddenSize, tokenCount, cleanup, `blk.${layer.layer}.prefill_kv.attn_norm.q8k`);
+    if (attnQ8_0) {
+      this.dispatchRmsNormToQ8_0(pass, resources, input, layer.attnNorm.buffer, attnQ8_0, hiddenSize);
+    } else if (attnQ8K) {
+      this.dispatchRmsNormToQ8K(pass, resources, input, layer.attnNorm.buffer, attnQ8K, hiddenSize, cleanup, `blk.${layer.layer}.prefill_kv.attn_norm`);
+    }
     const kProjection = scratchF32(this.arena, kvDim, cleanup, `blk.${layer.layer}.prefill_kv.k`);
     const vProjection = layer.valueProjectionMode === "shared-with-key"
       ? kProjection
       : scratchF32(this.arena, kvValueDim, cleanup, `blk.${layer.layer}.prefill_kv.v`);
-    const dispatchedDualKv = layer.valueProjectionMode !== "shared-with-key" && webGpuFusionEnabled() && dispatchDualQ4KMatMul(
-      pass,
-      resources,
-      layer.k,
-      layer.v!,
-      attnQ8,
-      kProjection,
-      vProjection,
-      tokenCount,
+    const dispatchedDualKv = layer.valueProjectionMode !== "shared-with-key" && webGpuFusionEnabled() && (
+      attnQ8_0
+        ? dispatchDualQ4_0MatMul(pass, resources, layer.k, layer.v!, attnQ8_0, kProjection, vProjection, tokenCount)
+        : dispatchDualQ4KMatMul(pass, resources, layer.k, layer.v!, attnQ8K!, kProjection, vProjection, tokenCount)
     );
     if (!dispatchedDualKv) {
-      dispatchKMatMul(pass, resources, layer.k, attnQ8, kProjection, tokenCount);
+      if (attnQ8_0) {
+        dispatchQ8_0MatMul(pass, resources, layer.k, attnQ8_0, kProjection, tokenCount);
+      } else {
+        dispatchKMatMul(pass, resources, layer.k, attnQ8K!, kProjection, tokenCount);
+      }
       if (layer.valueProjectionMode !== "shared-with-key") {
-        dispatchKMatMul(pass, resources, layer.v!, attnQ8, vProjection, tokenCount);
+        if (attnQ8_0) {
+          dispatchQ8_0MatMul(pass, resources, layer.v!, attnQ8_0, vProjection, tokenCount);
+        } else {
+          dispatchKMatMul(pass, resources, layer.v!, attnQ8K!, vProjection, tokenCount);
+        }
       }
     }
     if (webGpuFusionEnabled()) {
@@ -2721,12 +2800,21 @@ export class WebGpuSegmentRunner implements SegmentRunner {
     const kvDim = layer.headCountKv * layer.headSize;
     const kvValueDim = layer.headCountKv * layer.valueSize;
 
-    const attnQ8 = scratchQ8K(this.arena, hiddenSize, tokenCount, cleanup, `blk.${layer.layer}.attn_norm.q8k`);
-    this.dispatchRmsNormToQ8K(pass, resources, input, layer.attnNorm.buffer, attnQ8, hiddenSize, cleanup, `blk.${layer.layer}.attn_norm`);
-
     restartLayerSection("attn.q_proj");
     const qProjection = scratchF32(this.arena, queryDim, cleanup, `blk.${layer.layer}.q`);
-    dispatchKMatMul(pass, resources, layer.q, attnQ8, qProjection, tokenCount);
+    const attnQ8_0 = layer.q.type === "Q4_0"
+      ? scratchQ8_0(this.arena, hiddenSize, tokenCount, hiddenSize / 32, cleanup, `blk.${layer.layer}.attn_norm.q8_0`)
+      : undefined;
+    const attnQ8K = attnQ8_0
+      ? undefined
+      : scratchQ8K(this.arena, hiddenSize, tokenCount, cleanup, `blk.${layer.layer}.attn_norm.q8k`);
+    if (attnQ8_0) {
+      this.dispatchRmsNormToQ8_0(pass, resources, input, layer.attnNorm.buffer, attnQ8_0, hiddenSize);
+      dispatchQ8_0MatMul(pass, resources, layer.q, attnQ8_0, qProjection, tokenCount);
+    } else if (attnQ8K) {
+      this.dispatchRmsNormToQ8K(pass, resources, input, layer.attnNorm.buffer, attnQ8K, hiddenSize, cleanup, `blk.${layer.layer}.attn_norm`);
+      dispatchKMatMul(pass, resources, layer.q, attnQ8K, qProjection, tokenCount);
+    }
     restartLayerSection("attn.q_rope");
     const query = scratchF32(this.arena, queryDim, cleanup, `blk.${layer.layer}.q_rope`);
     if (webGpuFusionEnabled()) {
@@ -2790,20 +2878,23 @@ export class WebGpuSegmentRunner implements SegmentRunner {
         ? kProjection
         : scratchF32(this.arena, kvValueDim, cleanup, `blk.${layer.layer}.v`);
       restartLayerSection("attn.kv_proj");
-      const dispatchedDualKv = layer.valueProjectionMode !== "shared-with-key" && webGpuFusionEnabled() && dispatchDualQ4KMatMul(
-        pass,
-        resources,
-        layer.k,
-        layer.v!,
-        attnQ8,
-        kProjection,
-        vProjection,
-        tokenCount,
+      const dispatchedDualKv = layer.valueProjectionMode !== "shared-with-key" && webGpuFusionEnabled() && (
+        attnQ8_0
+          ? dispatchDualQ4_0MatMul(pass, resources, layer.k, layer.v!, attnQ8_0, kProjection, vProjection, tokenCount)
+          : dispatchDualQ4KMatMul(pass, resources, layer.k, layer.v!, attnQ8K!, kProjection, vProjection, tokenCount)
       );
       if (!dispatchedDualKv) {
-        dispatchKMatMul(pass, resources, layer.k, attnQ8, kProjection, tokenCount);
+        if (attnQ8_0) {
+          dispatchQ8_0MatMul(pass, resources, layer.k, attnQ8_0, kProjection, tokenCount);
+        } else {
+          dispatchKMatMul(pass, resources, layer.k, attnQ8K!, kProjection, tokenCount);
+        }
         if (layer.valueProjectionMode !== "shared-with-key") {
-          dispatchKMatMul(pass, resources, layer.v!, attnQ8, vProjection, tokenCount);
+          if (attnQ8_0) {
+            dispatchQ8_0MatMul(pass, resources, layer.v!, attnQ8_0, vProjection, tokenCount);
+          } else {
+            dispatchKMatMul(pass, resources, layer.v!, attnQ8K!, vProjection, tokenCount);
+          }
         }
       }
       restartLayerSection("attn.kv_update");
@@ -2961,15 +3052,24 @@ export class WebGpuSegmentRunner implements SegmentRunner {
   ): WebGpuBufferLike {
     let activePass = pass;
     const hiddenSize = this.manifest.embeddingLength;
-    const ffnQ8 = scratchQ8K(this.arena, hiddenSize, 1, cleanup, `blk.${layer.layer}.ffn_norm.q8k`);
-    this.dispatchRmsNormToQ8K(activePass, resources, residual, layer.ffnNorm.buffer, ffnQ8, hiddenSize, cleanup, `blk.${layer.layer}.ffn_norm`);
     const gate = scratchF32(this.arena, this.manifest.feedForwardLength, cleanup, `blk.${layer.layer}.ffn_gate`);
     const up = scratchF32(this.arena, this.manifest.feedForwardLength, cleanup, `blk.${layer.layer}.ffn_up`);
     const geglu = scratchF32(this.arena, this.manifest.feedForwardLength, cleanup, `blk.${layer.layer}.ffn_geglu`);
-    activePass = restartSection?.("gate") ?? activePass;
-    dispatchKMatMul(activePass, resources, layer.ffnGate, ffnQ8, gate, 1);
-    activePass = restartSection?.("up") ?? activePass;
-    dispatchKMatMul(activePass, resources, layer.ffnUp, ffnQ8, up, 1);
+    if (layer.ffnGate.type === "Q4_0" && layer.ffnUp.type === "Q4_0") {
+      const ffnQ8 = scratchQ8_0(this.arena, hiddenSize, 1, hiddenSize / 32, cleanup, `blk.${layer.layer}.ffn_norm.q8_0`);
+      this.dispatchRmsNormToQ8_0(activePass, resources, residual, layer.ffnNorm.buffer, ffnQ8, hiddenSize);
+      activePass = restartSection?.("gate_up") ?? activePass;
+      if (!dispatchDualQ4_0MatMul(activePass, resources, layer.ffnGate, layer.ffnUp, ffnQ8, gate, up, 1)) {
+        throw new Error(`WebGPU Q4_0 FFN dual matmul failed for layer ${layer.layer}`);
+      }
+    } else {
+      const ffnQ8 = scratchQ8K(this.arena, hiddenSize, 1, cleanup, `blk.${layer.layer}.ffn_norm.q8k`);
+      this.dispatchRmsNormToQ8K(activePass, resources, residual, layer.ffnNorm.buffer, ffnQ8, hiddenSize, cleanup, `blk.${layer.layer}.ffn_norm`);
+      activePass = restartSection?.("gate") ?? activePass;
+      dispatchKMatMul(activePass, resources, layer.ffnGate, ffnQ8, gate, 1);
+      activePass = restartSection?.("up") ?? activePass;
+      dispatchKMatMul(activePass, resources, layer.ffnUp, ffnQ8, up, 1);
+    }
     activePass = restartSection?.("geglu") ?? activePass;
     dispatchGeglu(this.arena.device, activePass, resources, gate, up, geglu, this.manifest.feedForwardLength);
     activePass = restartSection?.("down") ?? activePass;
@@ -3050,7 +3150,7 @@ export class WebGpuSegmentRunner implements SegmentRunner {
     label: string,
   ): WebGpuBufferLike {
     const output = scratchF32(this.arena, handle.rowCount * columnCount, cleanup, label);
-    if (handle.type === "Q8_0") {
+    if (handle.type === "Q4_0" || handle.type === "Q8_0") {
       const q8 = scratchQ8_0(this.arena, handle.inputSize, columnCount, handle.blockCount, cleanup, `${label}.q8_0`);
       dispatchQ8_0Quantize(this.arena.device, pass, resources, input, q8, handle.inputSize, columnCount, handle.blockCount);
       dispatchQ8_0MatMul(pass, resources, handle, q8, output, columnCount);
@@ -3060,6 +3160,27 @@ export class WebGpuSegmentRunner implements SegmentRunner {
     dispatchQ8KQuantize(this.arena.device, pass, resources, input, q8, handle.inputSize, columnCount);
     dispatchKMatMul(pass, resources, handle, q8, output, columnCount);
     return output;
+  }
+
+  private dispatchPreparedOutputMatMul(
+    pass: WebGpuComputePassLike,
+    resources: Array<{ destroy: () => void }>,
+    stripe: OutputStripe,
+    q8_0: ReturnType<typeof scratchQ8_0> | undefined,
+    q8k: ReturnType<typeof scratchQ8K> | undefined,
+    logits: WebGpuBufferLike,
+  ): void {
+    if (stripe.type === "Q4_0" || stripe.type === "Q8_0") {
+      if (!q8_0) {
+        throw new Error(`WebGPU ${stripe.type} output matmul requires Q8_0 activation.`);
+      }
+      dispatchQ8_0MatMul(pass, resources, stripe, q8_0, logits, 1);
+      return;
+    }
+    if (!q8k) {
+      throw new Error(`WebGPU ${stripe.type} output matmul requires Q8_K activation.`);
+    }
+    dispatchKMatMul(pass, resources, stripe, q8k, logits, 1);
   }
 
   private dispatchOutputTopK(
@@ -3072,8 +3193,14 @@ export class WebGpuSegmentRunner implements SegmentRunner {
     const outputNorm = this.requireOutputNorm();
     const outputStripes = this.requireOutputStripes();
     const hiddenSize = this.manifest.embeddingLength;
-    const q8 = scratchQ8K(this.arena, hiddenSize, 1, cleanup, "output_norm.q8k");
-    this.dispatchRmsNormToQ8K(pass, resources, hidden, outputNorm.buffer, q8, hiddenSize, cleanup, "output_norm");
+    const usesQ8_0 = outputStripesUseQ8_0(outputStripes);
+    const q8_0 = usesQ8_0 ? scratchQ8_0(this.arena, hiddenSize, 1, hiddenSize / 32, cleanup, "output_norm.q8_0") : undefined;
+    const q8k = usesQ8_0 ? undefined : scratchQ8K(this.arena, hiddenSize, 1, cleanup, "output_norm.q8k");
+    if (q8_0) {
+      this.dispatchRmsNormToQ8_0(pass, resources, hidden, outputNorm.buffer, q8_0, hiddenSize);
+    } else if (q8k) {
+      this.dispatchRmsNormToQ8K(pass, resources, hidden, outputNorm.buffer, q8k, hiddenSize, cleanup, "output_norm");
+    }
 
     const candidates = this.arena.createScratchBuffer(
       "output.topk.candidates",
@@ -3087,7 +3214,7 @@ export class WebGpuSegmentRunner implements SegmentRunner {
         continue;
       }
       const logits = scratchF32(this.arena, stripe.rowCount, cleanup, `output.logits.${index}`);
-      dispatchKMatMul(pass, resources, stripe, q8, logits, 1);
+      this.dispatchPreparedOutputMatMul(pass, resources, stripe, q8_0, q8k, logits);
       dispatchTopK(this.arena.device, pass, resources, logits, candidates, {
         rowCount: stripe.rowCount,
         rowOffset: stripe.rowOffset,
@@ -3107,8 +3234,14 @@ export class WebGpuSegmentRunner implements SegmentRunner {
     const outputNorm = this.requireOutputNorm();
     const outputStripes = this.requireOutputStripes();
     const hiddenSize = this.manifest.embeddingLength;
-    const q8 = scratchQ8K(this.arena, hiddenSize, 1, cleanup, "output_norm.selected.q8k");
-    this.dispatchRmsNormToQ8K(pass, resources, hidden, outputNorm.buffer, q8, hiddenSize, cleanup, "output_norm.selected");
+    const usesQ8_0 = outputStripesUseQ8_0(outputStripes);
+    const q8_0 = usesQ8_0 ? scratchQ8_0(this.arena, hiddenSize, 1, hiddenSize / 32, cleanup, "output_norm.selected.q8_0") : undefined;
+    const q8k = usesQ8_0 ? undefined : scratchQ8K(this.arena, hiddenSize, 1, cleanup, "output_norm.selected.q8k");
+    if (q8_0) {
+      this.dispatchRmsNormToQ8_0(pass, resources, hidden, outputNorm.buffer, q8_0, hiddenSize);
+    } else if (q8k) {
+      this.dispatchRmsNormToQ8K(pass, resources, hidden, outputNorm.buffer, q8k, hiddenSize, cleanup, "output_norm.selected");
+    }
     const candidateCount = outputTop1CandidateCount(outputStripes);
 
     const candidates = this.arena.createScratchBuffer(
@@ -3129,7 +3262,7 @@ export class WebGpuSegmentRunner implements SegmentRunner {
         continue;
       }
       const logits = scratchF32(this.arena, stripe.rowCount, cleanup, `output.selected.logits.${index}`);
-      dispatchKMatMul(pass, resources, stripe, q8, logits, 1);
+      this.dispatchPreparedOutputMatMul(pass, resources, stripe, q8_0, q8k, logits);
       candidateOffset += 2 * dispatchTop1Chunks(this.arena.device, pass, resources, logits, candidates, {
         rowCount: stripe.rowCount,
         rowOffset: stripe.rowOffset,
@@ -3165,8 +3298,14 @@ export class WebGpuSegmentRunner implements SegmentRunner {
     const outputNorm = this.requireOutputNorm();
     const outputStripes = this.requireOutputStripes();
     const hiddenSize = this.manifest.embeddingLength;
-    const q8 = scratchQ8K(this.arena, hiddenSize, 1, cleanup, "output_norm.selected.q8k");
-    this.dispatchRmsNormToQ8K(pass, resources, hidden, outputNorm.buffer, q8, hiddenSize, cleanup, "output_norm.selected");
+    const usesQ8_0 = outputStripesUseQ8_0(outputStripes);
+    const q8_0 = usesQ8_0 ? scratchQ8_0(this.arena, hiddenSize, 1, hiddenSize / 32, cleanup, "output_norm.selected.q8_0") : undefined;
+    const q8k = usesQ8_0 ? undefined : scratchQ8K(this.arena, hiddenSize, 1, cleanup, "output_norm.selected.q8k");
+    if (q8_0) {
+      this.dispatchRmsNormToQ8_0(pass, resources, hidden, outputNorm.buffer, q8_0, hiddenSize);
+    } else if (q8k) {
+      this.dispatchRmsNormToQ8K(pass, resources, hidden, outputNorm.buffer, q8k, hiddenSize, cleanup, "output_norm.selected");
+    }
     const candidateCount = outputTop1CandidateCount(outputStripes);
 
     const candidates = this.arena.createScratchBuffer(
@@ -3190,7 +3329,7 @@ export class WebGpuSegmentRunner implements SegmentRunner {
       compute = this.restartComputePass(encoder, compute, `output.selected.stripe.${index}.matmul`);
       pass = compute.pass;
       const logits = scratchF32(this.arena, stripe.rowCount, cleanup, `output.selected.logits.${index}`);
-      dispatchKMatMul(pass, resources, stripe, q8, logits, 1);
+      this.dispatchPreparedOutputMatMul(pass, resources, stripe, q8_0, q8k, logits);
       compute = this.restartComputePass(encoder, compute, `output.selected.stripe.${index}.top1_chunks`);
       pass = compute.pass;
       candidateOffset += 2 * dispatchTop1Chunks(this.arena.device, pass, resources, logits, candidates, {
@@ -3595,7 +3734,7 @@ function isF32Handle(handle: QuantizedHandle | F32Handle): handle is F32Handle {
 }
 
 function isSupportedEmbeddingGatherType(type: string): boolean {
-  return type === "F32" || type === "Q4_K" || type === "Q5_K" || type === "Q6_K" || type === "Q8_0";
+  return type === "F32" || type === "Q4_0" || type === "Q4_K" || type === "Q5_K" || type === "Q6_K" || type === "Q8_0";
 }
 
 function isF32CompatibleType(type: string): boolean {
@@ -3603,7 +3742,7 @@ function isF32CompatibleType(type: string): boolean {
 }
 
 function isSupportedProjectionType(type: string): boolean {
-  return isF32CompatibleType(type) || type === "Q4_K" || type === "Q5_K" || type === "Q6_K" || type === "Q8_0";
+  return isF32CompatibleType(type) || type === "Q4_0" || type === "Q4_K" || type === "Q5_K" || type === "Q6_K" || type === "Q8_0";
 }
 
 function mergeTopCandidates(
@@ -3667,6 +3806,10 @@ function shouldProfileLayerDetails(layer: number): boolean {
 
 function outputTop1CandidateCount(outputStripes: readonly OutputStripe[]): number {
   return outputStripes.reduce((sum, stripe) => sum + Math.ceil(stripe.rowCount / TOP1_CHUNK_SIZE), 0);
+}
+
+function outputStripesUseQ8_0(outputStripes: readonly OutputStripe[]): boolean {
+  return outputStripes.length > 0 && outputStripes.every((stripe) => stripe.type === "Q4_0" || stripe.type === "Q8_0");
 }
 
 function createKvResizeResource(

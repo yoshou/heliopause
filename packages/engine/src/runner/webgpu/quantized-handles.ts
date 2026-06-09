@@ -65,12 +65,12 @@ export function webGpuQuantizedWeightLayout(
   type: WebGpuQuantizedMatMulType,
   inputSize: number,
 ): { blockCount: number; rowByteLength: number } {
-  if (type === "Q8_0") {
+  if (type === "Q4_0" || type === "Q8_0") {
     if (inputSize % 32 !== 0) {
-      throw new Error(`WebGPU Q8_0 matmul input size must be divisible by 32, got ${inputSize}`);
+      throw new Error(`WebGPU ${type} matmul input size must be divisible by 32, got ${inputSize}`);
     }
     const blockCount = inputSize / 32;
-    return { blockCount, rowByteLength: blockCount * 34 };
+    return { blockCount, rowByteLength: blockCount * (type === "Q4_0" ? 18 : 34) };
   }
   if (inputSize % 256 !== 0) {
     throw new Error(`WebGPU ${type} matmul input size must be divisible by 256, got ${inputSize}`);
@@ -241,7 +241,7 @@ export function createQuantizedHandleFromBytes(
 }
 
 export function webGpuMatMulType(type: GgmlTypeName, name: string): WebGpuQuantizedMatMulType {
-  if (type === "Q4_K" || type === "Q5_K" || type === "Q6_K" || type === "Q8_0") {
+  if (type === "Q4_0" || type === "Q4_K" || type === "Q5_K" || type === "Q6_K" || type === "Q8_0") {
     return type;
   }
   throw new Error(`${name} has unsupported WebGPU quantized type ${type}`);

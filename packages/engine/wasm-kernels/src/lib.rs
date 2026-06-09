@@ -14,6 +14,7 @@ const TYPE_Q5_K: i32 = 2;
 const TYPE_Q6_K: i32 = 3;
 const TYPE_IQ4_XS: i32 = 4;
 const TYPE_Q8_0: i32 = 5;
+const TYPE_Q4_0: i32 = 6;
 const QK_K: usize = 256;
 const KVALUES_IQ4_NL: [i8; 16] = [
     -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
@@ -68,11 +69,16 @@ pub unsafe extern "C" fn hp_matmul_quantized_f32(
 
     for column in 0..column_count {
         let input_column = &input[column * input_size..(column + 1) * input_size];
-        if type_id == TYPE_Q8_0 {
+        if uses_q8_0_activation(type_id) {
             let q8 = quantize_q8_0(input_column);
             for row in 0..row_count {
                 let row_offset = row * row_bytes;
-                output[column * row_count + row] = vec_dot_q8_0_q8_0(&weight[row_offset..row_offset + row_bytes], &q8);
+                let row_data = &weight[row_offset..row_offset + row_bytes];
+                output[column * row_count + row] = match type_id {
+                    TYPE_Q4_0 => vec_dot_q4_0_q8_0(row_data, &q8),
+                    TYPE_Q8_0 => vec_dot_q8_0_q8_0(row_data, &q8),
+                    _ => return ERR_TYPE,
+                };
             }
         } else {
             let q8 = quantize_q8_k(input_column);
@@ -174,7 +180,7 @@ pub unsafe extern "C" fn hp_prepare_quantized_scales_f32(
 
     let weight = slice::from_raw_parts(weight_ptr, weight_len);
     let scales = slice::from_raw_parts_mut(scale_ptr, scale_len);
-    let block_count = if type_id == TYPE_Q8_0 { input_size / 32 } else { input_size / QK_K };
+    let block_count = if uses_q8_0_activation(type_id) { input_size / 32 } else { input_size / QK_K };
 
     for row in 0..row_count {
         let row_offset = row * row_bytes;
@@ -201,6 +207,10 @@ pub unsafe extern "C" fn hp_prepare_quantized_scales_f32(
                 }
                 TYPE_Q8_0 => {
                     let offset = row_offset + block * 34;
+                    scales[scale_offset + block] = float16_to_float32(read_u16_le(weight, offset));
+                }
+                TYPE_Q4_0 => {
+                    let offset = row_offset + block * 18;
                     scales[scale_offset + block] = float16_to_float32(read_u16_le(weight, offset));
                 }
                 _ => return ERR_TYPE,
@@ -253,16 +263,18 @@ pub unsafe extern "C" fn hp_matmul_quantized_prepared_f32(
 
     for column in 0..column_count {
         let input_column = &input[column * input_size..(column + 1) * input_size];
-        if type_id == TYPE_Q8_0 {
+        if uses_q8_0_activation(type_id) {
             let q8 = quantize_q8_0(input_column);
             for row in 0..row_count {
                 let row_offset = row * row_bytes;
                 let scale_offset = row * scale_values_per_row;
-                output[column * row_count + row] = vec_dot_q8_0_q8_0_prepared(
-                    &weight[row_offset..row_offset + row_bytes],
-                    &q8,
-                    &scales[scale_offset..scale_offset + scale_values_per_row],
-                );
+                let row_data = &weight[row_offset..row_offset + row_bytes];
+                let row_scales = &scales[scale_offset..scale_offset + scale_values_per_row];
+                output[column * row_count + row] = match type_id {
+                    TYPE_Q4_0 => vec_dot_q4_0_q8_0_prepared(row_data, &q8, row_scales),
+                    TYPE_Q8_0 => vec_dot_q8_0_q8_0_prepared(row_data, &q8, row_scales),
+                    _ => return ERR_TYPE,
+                };
             }
         } else {
             let q8 = quantize_q8_k(input_column);
@@ -372,7 +384,7 @@ pub unsafe extern "C" fn hp_matmul_quantized_prepared_multi_f32(
             let output = slice::from_raw_parts_mut(*output_ptr, *output_len);
             let output_base = column * *row_count;
 
-            if *type_id == TYPE_Q8_0 {
+            if uses_q8_0_activation(*type_id) {
                 if q8_0.is_none() {
                     q8_0 = Some(quantize_q8_0(input_column));
                 }
@@ -380,11 +392,13 @@ pub unsafe extern "C" fn hp_matmul_quantized_prepared_multi_f32(
                 for row in 0..*row_count {
                     let row_offset = row * row_bytes;
                     let scale_offset = row * scale_values_per_row;
-                    output[output_base + row] = vec_dot_q8_0_q8_0_prepared(
-                        &weight[row_offset..row_offset + row_bytes],
-                        q8,
-                        &scales[scale_offset..scale_offset + scale_values_per_row],
-                    );
+                    let row_data = &weight[row_offset..row_offset + row_bytes];
+                    let row_scales = &scales[scale_offset..scale_offset + scale_values_per_row];
+                    output[output_base + row] = match *type_id {
+                        TYPE_Q4_0 => vec_dot_q4_0_q8_0_prepared(row_data, q8, row_scales),
+                        TYPE_Q8_0 => vec_dot_q8_0_q8_0_prepared(row_data, q8, row_scales),
+                        _ => return ERR_TYPE,
+                    };
                 }
             } else {
                 if q8_k.is_none() {
@@ -484,15 +498,19 @@ pub unsafe extern "C" fn hp_matmul_quantized_multi_f32(
             let output = slice::from_raw_parts_mut(*output_ptr, *output_len);
             let output_base = column * *row_count;
 
-            if *type_id == TYPE_Q8_0 {
+            if uses_q8_0_activation(*type_id) {
                 if q8_0.is_none() {
                     q8_0 = Some(quantize_q8_0(input_column));
                 }
                 let q8 = q8_0.as_ref().expect("q8_0 initialized");
                 for row in 0..*row_count {
                     let row_offset = row * row_bytes;
-                    output[output_base + row] =
-                        vec_dot_q8_0_q8_0(&weight[row_offset..row_offset + row_bytes], q8);
+                    let row_data = &weight[row_offset..row_offset + row_bytes];
+                    output[output_base + row] = match *type_id {
+                        TYPE_Q4_0 => vec_dot_q4_0_q8_0(row_data, q8),
+                        TYPE_Q8_0 => vec_dot_q8_0_q8_0(row_data, q8),
+                        _ => return ERR_TYPE,
+                    };
                 }
             } else {
                 if q8_k.is_none() {
@@ -1537,6 +1555,7 @@ fn quantized_row_bytes(type_id: i32, elements: usize) -> Option<usize> {
         TYPE_Q6_K if elements % QK_K == 0 => Some(elements / QK_K * 210),
         TYPE_IQ4_XS if elements % QK_K == 0 => Some(elements / QK_K * 136),
         TYPE_Q8_0 if elements % 32 == 0 => Some(elements / 32 * 34),
+        TYPE_Q4_0 if elements % 32 == 0 => Some(elements / 32 * 18),
         _ => None,
     }
 }
@@ -1546,6 +1565,7 @@ fn quantized_scale_values_per_row(type_id: i32, elements: usize) -> Option<usize
         TYPE_Q4_K | TYPE_Q5_K if elements % QK_K == 0 => Some(elements / QK_K * 2),
         TYPE_Q6_K | TYPE_IQ4_XS if elements % QK_K == 0 => Some(elements / QK_K),
         TYPE_Q8_0 if elements % 32 == 0 => Some(elements / 32),
+        TYPE_Q4_0 if elements % 32 == 0 => Some(elements / 32),
         _ => None,
     }
 }
@@ -1560,8 +1580,33 @@ fn dequantize_quantized_row(type_id: i32, bytes: &[u8], elements: usize, output:
         TYPE_Q6_K => dequantize_q6_k(bytes, elements, output),
         TYPE_IQ4_XS => dequantize_iq4_xs(bytes, elements, output),
         TYPE_Q8_0 => dequantize_q8_0(bytes, elements, output),
+        TYPE_Q4_0 => dequantize_q4_0(bytes, elements, output),
         _ => false,
     }
+}
+
+fn uses_q8_0_activation(type_id: i32) -> bool {
+    type_id == TYPE_Q4_0 || type_id == TYPE_Q8_0
+}
+
+fn dequantize_q4_0(bytes: &[u8], elements: usize, output: &mut [f32]) -> bool {
+    if elements % 32 != 0 || bytes.len() != elements / 32 * 18 {
+        return false;
+    }
+    let mut offset = 0;
+    let mut out = 0;
+    for _block in 0..elements / 32 {
+        let d = float16_to_float32(read_u16_le(bytes, offset));
+        offset += 2;
+        for index in 0..16 {
+            let packed = bytes[offset + index];
+            output[out + index] = ((packed & 0x0f) as i32 - 8) as f32 * d;
+            output[out + index + 16] = ((packed >> 4) as i32 - 8) as f32 * d;
+        }
+        offset += 16;
+        out += 32;
+    }
+    true
 }
 
 fn dequantize_q8_0(bytes: &[u8], elements: usize, output: &mut [f32]) -> bool {
@@ -1797,12 +1842,33 @@ fn vec_dot_q8_0_q8_0(q8_bytes: &[u8], input: &QuantizedQ8_0) -> f32 {
     sum
 }
 
+fn vec_dot_q4_0_q8_0(q4_bytes: &[u8], input: &QuantizedQ8_0) -> f32 {
+    let mut sum = 0.0_f32;
+    for block in 0..input.d.len() {
+        let offset = block * 18;
+        let isum = dot_q4_0_q8_0_32(&q4_bytes[offset + 2..offset + 18], &input.qs, block * 32);
+        sum += isum as f32 * (float16_to_float32(read_u16_le(q4_bytes, offset)) * input.d[block]);
+    }
+    sum
+}
+
 #[inline(always)]
 fn vec_dot_q8_0_q8_0_prepared(q8_bytes: &[u8], input: &QuantizedQ8_0, scales: &[f32]) -> f32 {
     let mut sum = 0.0_f32;
     for block in 0..input.d.len() {
         let offset = block * 34;
         let isum = dot_i8_i8_32(&q8_bytes[offset + 2..offset + 34], &input.qs, block * 32);
+        sum += isum as f32 * (scales[block] * input.d[block]);
+    }
+    sum
+}
+
+#[inline(always)]
+fn vec_dot_q4_0_q8_0_prepared(q4_bytes: &[u8], input: &QuantizedQ8_0, scales: &[f32]) -> f32 {
+    let mut sum = 0.0_f32;
+    for block in 0..input.d.len() {
+        let offset = block * 18;
+        let isum = dot_q4_0_q8_0_32(&q4_bytes[offset + 2..offset + 18], &input.qs, block * 32);
         sum += isum as f32 * (scales[block] * input.d[block]);
     }
     sum
@@ -2260,6 +2326,16 @@ fn dot_i8_i8_32(left: &[u8], right: &[i8], right_offset: usize) -> i32 {
         }
         sum
     }
+}
+
+fn dot_q4_0_q8_0_32(left: &[u8], right: &[i8], right_offset: usize) -> i32 {
+    let mut sum = 0_i32;
+    for index in 0..16 {
+        let packed = left[index];
+        sum += ((packed & 0x0f) as i32 - 8) * right[right_offset + index] as i32;
+        sum += ((packed >> 4) as i32 - 8) * right[right_offset + index + 16] as i32;
+    }
+    sum
 }
 
 #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]

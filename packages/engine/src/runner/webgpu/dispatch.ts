@@ -11,10 +11,12 @@ import {
   createBatchedFullKvUpdateResources,
   createBatchedFullQueryResources,
   createBatchedGegluSliceResources,
+  createBatchedRmsNormQ8_0QuantizeResources,
   createBatchedRmsNormQ8KQuantizeResources,
   createBatchedRmsNormResidualAddResources,
   createBatchedRmsNormResidualAddScaleResources,
   createDualQ4KMatMulBindResources,
+  createDualQ4_0MatMulBindResources,
   createElementwiseMulResources,
   createF16CastResources,
   createF32GatherRowsScaleResources,
@@ -75,6 +77,33 @@ export function dispatchBatchedRmsNormQ8KQuantize(
     q8.scale,
     q8.qs,
     q8.bsums,
+    options,
+  );
+  resources.push(resource);
+  pass.setPipeline(resource.pipeline);
+  pass.setBindGroup(0, resource.bindGroup);
+  pass.dispatchWorkgroups(1, options.tokenCount);
+}
+
+export function dispatchBatchedRmsNormQ8_0Quantize(
+  device: WebGpuDeviceLike,
+  pass: WebGpuComputePassLike,
+  resources: Array<{ destroy: () => void }>,
+  input: WebGpuBufferLike,
+  weight: WebGpuBufferLike,
+  q8: Q8_0Buffers,
+  options: {
+    length: number;
+    tokenCount: number;
+    epsilon: number;
+  },
+): void {
+  const resource = createBatchedRmsNormQ8_0QuantizeResources(
+    device,
+    input,
+    weight,
+    q8.scale,
+    q8.qs,
     options,
   );
   resources.push(resource);
@@ -376,8 +405,8 @@ export function dispatchKMatMul(
   output: WebGpuBufferLike,
   columnCount: number,
 ): void {
-  if (handle.type === "Q8_0") {
-    throw new Error("Q8_0 handle cannot use K-quant matmul dispatch");
+  if (handle.type === "Q4_0" || handle.type === "Q8_0") {
+    throw new Error(`${handle.type} handle cannot use K-quant matmul dispatch`);
   }
   const resource = createKMatMulBindResources(handle, q8.scale, q8.qs, q8.bsums, output, columnCount);
   resources.push(resource);
@@ -424,6 +453,43 @@ export function dispatchDualQ4KMatMul(
   return true;
 }
 
+export function dispatchDualQ4_0MatMul(
+  pass: WebGpuComputePassLike,
+  resources: Array<{ destroy: () => void }>,
+  leftHandle: QuantizedHandle,
+  rightHandle: QuantizedHandle,
+  q8: Q8_0Buffers,
+  leftOutput: WebGpuBufferLike,
+  rightOutput: WebGpuBufferLike,
+  columnCount: number,
+): boolean {
+  if (
+    leftHandle.type !== "Q4_0" ||
+    rightHandle.type !== "Q4_0" ||
+    leftHandle.device !== rightHandle.device ||
+    leftHandle.inputSize !== rightHandle.inputSize ||
+    leftHandle.rowCount !== rightHandle.rowCount ||
+    leftHandle.blockCount !== rightHandle.blockCount ||
+    leftHandle.rowByteLength !== rightHandle.rowByteLength
+  ) {
+    return false;
+  }
+  const resource = createDualQ4_0MatMulBindResources(
+    leftHandle,
+    rightHandle,
+    q8.scale,
+    q8.qs,
+    leftOutput,
+    rightOutput,
+    columnCount,
+  );
+  resources.push(resource);
+  pass.setPipeline(resource.pipeline);
+  pass.setBindGroup(0, resource.bindGroup);
+  pass.dispatchWorkgroups(Math.ceil(leftHandle.rowCount / 8), columnCount);
+  return true;
+}
+
 export function dispatchQ8_0MatMul(
   pass: WebGpuComputePassLike,
   resources: Array<{ destroy: () => void }>,
@@ -432,7 +498,7 @@ export function dispatchQ8_0MatMul(
   output: WebGpuBufferLike,
   columnCount: number,
 ): void {
-  if (handle.type !== "Q8_0") {
+  if (handle.type !== "Q4_0" && handle.type !== "Q8_0") {
     throw new Error("K-quant handle cannot use Q8_0 matmul dispatch");
   }
   const resource = createQ8_0MatMulBindResources(handle, q8.scale, q8.qs, output, columnCount);

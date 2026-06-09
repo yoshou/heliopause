@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  dequantizeQ4_0,
   dequantizeQ8_0,
   float16ToFloat32,
   float32ToFloat16,
@@ -36,8 +37,27 @@ test("Q8_0 dequantizes one block", () => {
   assert.equal(values[31], -16);
 });
 
+test("Q4_0 dequantizes one block", () => {
+  const bytes = new Uint8Array(18);
+  const view = new DataView(bytes.buffer);
+  view.setUint16(0, 0x4000, true);
+  for (let index = 0; index < 16; index += 1) {
+    bytes[2 + index] = (index & 0x0f) | ((15 - index) << 4);
+  }
+
+  const values = dequantizeQ4_0(bytes, 32);
+
+  assert.equal(values[0], -16);
+  assert.equal(values[7], -2);
+  assert.equal(values[8], 0);
+  assert.equal(values[15], 14);
+  assert.equal(values[16], 14);
+  assert.equal(values[31], -16);
+});
+
 test("tensorByteLength uses ggml block sizes for observed types", () => {
   assert.equal(tensorByteLength(tensor("f32", "F32", [4])), 16);
+  assert.equal(tensorByteLength(tensor("q4", "Q4_0", [32])), 18);
   assert.equal(tensorByteLength(tensor("q8", "Q8_0", [32])), 34);
   assert.equal(tensorByteLength(tensor("q4k", "Q4_K", [256])), 144);
   assert.equal(tensorByteLength(tensor("q5k", "Q5_K", [256])), 176);

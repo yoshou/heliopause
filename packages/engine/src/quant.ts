@@ -13,6 +13,8 @@ export function dequantizeRow(type: GgmlTypeName, bytes: Uint8Array, elements: n
       return dequantizeF16(bytes, elements);
     case "BF16":
       return dequantizeBF16(bytes, elements);
+    case "Q4_0":
+      return dequantizeQ4_0(bytes, elements);
     case "Q8_0":
       return dequantizeQ8_0(bytes, elements);
     case "Q4_K":
@@ -45,6 +47,25 @@ export function dequantizeBF16(bytes: Uint8Array, elements: number): Float32Arra
   for (let index = 0; index < elements; index += 1) {
     scratchView.setUint32(0, view.getUint16(index * 2, true) << 16, false);
     output[index] = scratchView.getFloat32(0, false);
+  }
+  return output;
+}
+
+export function dequantizeQ4_0(bytes: Uint8Array, elements: number): Float32Array {
+  assertDivisible(elements, 32, "Q4_0");
+  const output = new Float32Array(elements);
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  let offset = 0;
+  let out = 0;
+  for (let block = 0; block < elements / 32; block += 1) {
+    const d = float16ToFloat32(view.getUint16(offset, true));
+    offset += 2;
+    for (let i = 0; i < 16; i += 1) {
+      output[out + i] = (((bytes[offset + i] ?? 0) & 0x0f) - 8) * d;
+      output[out + i + 16] = (((bytes[offset + i] ?? 0) >> 4) - 8) * d;
+    }
+    offset += 16;
+    out += 32;
   }
   return output;
 }
@@ -540,6 +561,28 @@ export function vecDotQ8_0_Q8_0(q8Bytes: Uint8Array, input: QuantizedQ8_0): numb
       isum += signedByte(q8Bytes[offset + 2 + index] ?? 0) * (input.qs[block * 32 + index] ?? 0);
     }
     sum += isum * (float16ToFloat32(view.getUint16(offset, true)) * (input.d[block] ?? 0));
+  }
+  return sum;
+}
+
+export function vecDotQ4_0_Q8_0(q4Bytes: Uint8Array, input: QuantizedQ8_0): number {
+  const blockCount = input.d.length;
+  if (q4Bytes.length !== blockCount * 18) {
+    throw new Error(`Q4_0/Q8_0 block mismatch: q4=${q4Bytes.length} input=${blockCount}`);
+  }
+  const view = new DataView(q4Bytes.buffer, q4Bytes.byteOffset, q4Bytes.byteLength);
+  let sum = 0;
+  for (let block = 0; block < blockCount; block += 1) {
+    const offset = block * 18;
+    const d = float16ToFloat32(view.getUint16(offset, true)) * (input.d[block] ?? 0);
+    let isum = 0;
+    const inputOffset = block * 32;
+    for (let index = 0; index < 16; index += 1) {
+      const packed = q4Bytes[offset + 2 + index] ?? 0;
+      isum += ((packed & 0x0f) - 8) * (input.qs[inputOffset + index] ?? 0);
+      isum += ((packed >> 4) - 8) * (input.qs[inputOffset + index + 16] ?? 0);
+    }
+    sum += isum * d;
   }
   return sum;
 }

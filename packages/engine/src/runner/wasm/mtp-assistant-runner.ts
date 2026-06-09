@@ -203,8 +203,8 @@ function matMulDequantizedRows(
   return output;
 }
 
-function isWasmQuantizedType(type: GgmlTypeName): type is "Q4_K" | "Q5_K" | "Q6_K" | "IQ4_XS" | "Q8_0" {
-  return type === "Q4_K" || type === "Q5_K" || type === "Q6_K" || type === "IQ4_XS" || type === "Q8_0";
+function isWasmQuantizedType(type: GgmlTypeName): type is "Q4_0" | "Q4_K" | "Q5_K" | "Q6_K" | "IQ4_XS" | "Q8_0" {
+  return type === "Q4_0" || type === "Q4_K" || type === "Q5_K" || type === "Q6_K" || type === "IQ4_XS" || type === "Q8_0";
 }
 
 async function maskedEmbeddingTopTokens(

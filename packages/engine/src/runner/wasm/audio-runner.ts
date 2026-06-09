@@ -107,7 +107,7 @@ function residentWeightCache(session: AudioSession): AudioWasmWeightCache {
 async function readWasmWeightHandle(
   session: AudioSession,
   weightName: string,
-  type: "Q4_K" | "Q5_K" | "Q6_K" | "IQ4_XS" | "Q8_0",
+  type: "Q4_0" | "Q4_K" | "Q5_K" | "Q6_K" | "IQ4_XS" | "Q8_0",
   inputSize: number,
   rowCount: number,
 ): Promise<WasmQuantizedWeightHandle | undefined> {
@@ -461,7 +461,7 @@ async function matMulAudioWeightBatch(
   if (audioResidentWeightCacheEnabled(session)) {
     const handles = await Promise.all(weightNames.map((name, index) => {
       const tensor = tensors[index];
-      return readWasmWeightHandle(session, name, tensor?.type as "Q4_K" | "Q5_K" | "Q6_K" | "IQ4_XS" | "Q8_0", inputSize, tensor?.dimensions[1] ?? 0);
+      return readWasmWeightHandle(session, name, tensor?.type as "Q4_0" | "Q4_K" | "Q5_K" | "Q6_K" | "IQ4_XS" | "Q8_0", inputSize, tensor?.dimensions[1] ?? 0);
     }));
     if (handles.every((handle): handle is WasmQuantizedWeightHandle => Boolean(handle))) {
       outputs = await matMulQuantizedWasmResidentMulti(handles, clampedInput, inputSize, columnCount);
@@ -551,7 +551,7 @@ async function matMulDenseRows(
 async function matMulQuantizedRows(
   session: AudioSession,
   weightName: string,
-  type: "Q4_K" | "Q5_K" | "Q6_K" | "IQ4_XS" | "Q8_0",
+  type: "Q4_0" | "Q4_K" | "Q5_K" | "Q6_K" | "IQ4_XS" | "Q8_0",
   inputColumns: Float32Array,
 ): Promise<Float32Array> {
   const tensor = session.getTensor(weightName);
@@ -639,8 +639,8 @@ async function readClamp(
   };
 }
 
-function isWasmQuantizedType(type: GgmlTypeName): type is "Q4_K" | "Q5_K" | "Q6_K" | "IQ4_XS" | "Q8_0" {
-  return type === "Q4_K" || type === "Q5_K" || type === "Q6_K" || type === "IQ4_XS" || type === "Q8_0";
+function isWasmQuantizedType(type: GgmlTypeName): type is "Q4_0" | "Q4_K" | "Q5_K" | "Q6_K" | "IQ4_XS" | "Q8_0" {
+  return type === "Q4_0" || type === "Q4_K" || type === "Q5_K" || type === "Q6_K" || type === "IQ4_XS" || type === "Q8_0";
 }
 
 function audioRelativePositionEmbeddings(manifest: AudioManifest): Float32Array {

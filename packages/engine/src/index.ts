@@ -47,6 +47,7 @@ export {
 export {
   dequantizeF16,
   dequantizeIQ4_XS,
+  dequantizeQ4_0,
   dequantizeQ4_K,
   dequantizeQ5_K,
   dequantizeQ6_K,
@@ -57,6 +58,7 @@ export {
   quantizeQ8_0,
   quantizeQ8_K,
   vecDotIQ4_XS_Q8_K,
+  vecDotQ4_0_Q8_0,
   vecDotQ4_K_Q8_K,
   vecDotQ5_K_Q8_K,
   vecDotQ6_K_Q8_K,

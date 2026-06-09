@@ -325,6 +325,35 @@ export class WasmThreadPool {
 }
 
 async function createWorkerBridge(): Promise<WorkerBridge> {
+  const processLike = globalThis as typeof globalThis & { process?: { execArgv?: string[]; versions?: { node?: string } } };
+  if (processLike.process?.versions?.node) {
+    const module = await dynamicImport<{
+      Worker: new (
+        filename: URL,
+        options?: { type?: "module"; execArgv?: string[] },
+      ) => {
+        postMessage(message: WasmThreadWorkerRequest, transfer?: Transferable[]): void;
+        on(event: "message", handler: (response: WasmThreadWorkerResponse) => void): void;
+        on(event: "error", handler: (error: Error) => void): void;
+      };
+    }>("node:worker_threads");
+    const worker = new module.Worker(new URL("./thread-worker.ts", import.meta.url), {
+      type: "module",
+      execArgv: nodeWorkerExecArgv(processLike.process.execArgv ?? []),
+    });
+    return {
+      postMessage(message, transfer = []) {
+        worker.postMessage(message, transfer);
+      },
+      onMessage(handler) {
+        worker.on("message", handler);
+      },
+      onError(handler) {
+        worker.on("error", handler);
+      },
+    };
+  }
+
   if (typeof Worker !== "undefined") {
     const worker = new Worker(new URL("./thread-worker.ts", import.meta.url), {
       type: "module",
@@ -342,32 +371,7 @@ async function createWorkerBridge(): Promise<WorkerBridge> {
     };
   }
 
-  const module = await dynamicImport<{
-    Worker: new (
-      filename: URL,
-      options?: { type?: "module"; execArgv?: string[] },
-    ) => {
-      postMessage(message: WasmThreadWorkerRequest, transfer?: Transferable[]): void;
-      on(event: "message", handler: (response: WasmThreadWorkerResponse) => void): void;
-      on(event: "error", handler: (error: Error) => void): void;
-    };
-  }>("node:worker_threads");
-  const processLike = globalThis as typeof globalThis & { process?: { execArgv?: string[] } };
-  const worker = new module.Worker(new URL("./thread-worker.ts", import.meta.url), {
-    type: "module",
-    execArgv: nodeWorkerExecArgv(processLike.process?.execArgv ?? []),
-  });
-  return {
-    postMessage(message, transfer = []) {
-      worker.postMessage(message, transfer);
-    },
-    onMessage(handler) {
-      worker.on("message", handler);
-    },
-    onError(handler) {
-      worker.on("error", handler);
-    },
-  };
+  throw new Error("WASM worker implementation is unavailable in this runtime.");
 }
 
 async function dynamicImport<T>(specifier: string): Promise<T> {
@@ -379,14 +383,26 @@ function nodeWorkerExecArgv(execArgv: string[]): string[] {
   const output: string[] = [];
   for (let index = 0; index < execArgv.length; index += 1) {
     const value = execArgv[index] ?? "";
-    if (value === "--input-type") {
-      index += 1;
+    if (value === "--experimental-strip-types") {
+      output.push(value);
       continue;
     }
-    if (value.startsWith("--input-type=")) {
+    if (value === "--loader" || value === "--experimental-loader" || value === "--import") {
+      const next = execArgv[index + 1];
+      if (next) {
+        output.push(value, next);
+        index += 1;
+      }
       continue;
     }
-    output.push(value);
+    if (
+      value.startsWith("--loader=") ||
+      value.startsWith("--experimental-loader=") ||
+      value.startsWith("--import=")
+    ) {
+      output.push(value);
+      continue;
+    }
   }
   return output;
 }

@@ -620,7 +620,7 @@ class WebGpuAudioRunner {
       dispatchF32MatMul(this.arena.device, pass, run.resources, handle.buffer, current, output, inputSize, rowCount, columnCount);
     } else {
       const handle = await this.quantizedHandle(weightName);
-      if (handle.type === "Q8_0") {
+      if (handle.type === "Q4_0" || handle.type === "Q8_0") {
         const q8 = scratchQ8_0(this.arena, inputSize, columnCount, handle.blockCount, run.cleanup, `${weightName}.q8_0`);
         dispatchQ8_0Quantize(this.arena.device, pass, run.resources, current, q8, inputSize, columnCount, handle.blockCount);
         dispatchQ8_0MatMul(pass, run.resources, handle, q8, output, columnCount);

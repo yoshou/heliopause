@@ -6,10 +6,12 @@ import {
   TOKEN_WRITE_WGSL,
   F32_GATHER_ROWS_SCALE_WGSL,
   Q8_0_GATHER_ROWS_SCALE_WGSL,
+  Q4_0_GATHER_ROWS_SCALE_WGSL,
   Q4_K_GATHER_ROWS_SCALE_WGSL,
   Q5_K_GATHER_ROWS_SCALE_WGSL,
   Q6_K_GATHER_ROWS_SCALE_WGSL,
   PREPARE_PER_LAYER_INPUTS_WGSL,
+  BATCHED_RMS_NORM_Q8_0_QUANTIZE_WGSL,
   BATCHED_RMS_NORM_Q8_K_QUANTIZE_WGSL,
   BATCHED_FULL_QUERY_NORM_ROPE_WGSL,
   BATCHED_FULL_KV_UPDATE_WGSL,
@@ -39,6 +41,8 @@ import {
   TOPK_CHUNK_CANDIDATES_WGSL,
   TOPK_MERGE_CANDIDATES_WGSL,
   Q8_0_MATMUL_WGSL,
+  Q4_0_DUAL_MATMUL_WGSL,
+  Q4_0_MATMUL_WGSL,
   SWIGLU_WGSL,
   GEGLU_WGSL,
   GEGLU_SLICE_WGSL,
@@ -218,6 +222,63 @@ export function createDualQ4KMatMulBindResources(
         bindBuffer(5, paramsBuffer),
         bindBuffer(6, leftOutputBuffer),
         bindBuffer(7, rightOutputBuffer),
+      ],
+    }),
+    destroy: () => paramsBuffer.destroy?.(),
+  };
+}
+
+export function createDualQ4_0MatMulBindResources(
+  leftHandle: WebGpuQuantizedWeightHandleInternal,
+  rightHandle: WebGpuQuantizedWeightHandleInternal,
+  inputScaleBuffer: WebGpuBufferLike,
+  inputQsBuffer: WebGpuBufferLike,
+  leftOutputBuffer: WebGpuBufferLike,
+  rightOutputBuffer: WebGpuBufferLike,
+  columnCount: number,
+): { pipeline: unknown; bindGroup: unknown; destroy: () => void } {
+  const params = new Uint32Array([
+    leftHandle.inputSize,
+    leftHandle.rowCount,
+    columnCount,
+    leftHandle.blockCount,
+    leftHandle.rowByteLength,
+    0,
+    0,
+    0,
+  ]);
+  const paramsBuffer = leftHandle.device.createBuffer({
+    size: uniformBufferSize(params.byteLength),
+    usage: GPU_UNIFORM | GPU_COPY_DST,
+  });
+  leftHandle.device.queue.writeBuffer(paramsBuffer, 0, params);
+  const bindGroupLayout = leftHandle.device.createBindGroupLayout({
+    entries: [
+      storageEntry(0, "read-only-storage"),
+      storageEntry(1, "read-only-storage"),
+      storageEntry(2, "read-only-storage"),
+      storageEntry(3, "read-only-storage"),
+      { binding: 4, visibility: GPU_SHADER_STAGE_COMPUTE, buffer: { type: "uniform" } },
+      storageEntry(5, "storage"),
+      storageEntry(6, "storage"),
+    ],
+  });
+  const pipeline = leftHandle.device.createComputePipeline({
+    layout: leftHandle.device.createPipelineLayout({ bindGroupLayouts: [bindGroupLayout] }),
+    compute: { module: leftHandle.device.createShaderModule({ code: Q4_0_DUAL_MATMUL_WGSL }), entryPoint: "main" },
+  });
+  return {
+    pipeline,
+    bindGroup: leftHandle.device.createBindGroup({
+      layout: bindGroupLayout,
+      entries: [
+        bindBuffer(0, leftHandle.weightBuffer),
+        bindBuffer(1, rightHandle.weightBuffer),
+        bindBuffer(2, inputScaleBuffer),
+        bindBuffer(3, inputQsBuffer),
+        bindBuffer(4, paramsBuffer),
+        bindBuffer(5, leftOutputBuffer),
+        bindBuffer(6, rightOutputBuffer),
       ],
     }),
     destroy: () => paramsBuffer.destroy?.(),
@@ -673,6 +734,54 @@ export function createBatchedRmsNormQ8KQuantizeResources(
         bindBuffer(3, qsBuffer),
         bindBuffer(4, bsumsBuffer),
         bindBuffer(5, paramsBuffer),
+      ],
+    }),
+    destroy: () => paramsBuffer.destroy?.(),
+  };
+}
+
+export function createBatchedRmsNormQ8_0QuantizeResources(
+  device: WebGpuDeviceLike,
+  inputBuffer: WebGpuBufferLike,
+  weightBuffer: WebGpuBufferLike,
+  scaleBuffer: WebGpuBufferLike,
+  qsBuffer: WebGpuBufferLike,
+  options: {
+    length: number;
+    tokenCount: number;
+    epsilon: number;
+  },
+): { pipeline: unknown; bindGroup: unknown; destroy: () => void } {
+  const paramsF32 = new Float32Array([options.epsilon, 0, 0, 0]);
+  const paramsU32 = new Uint32Array(paramsF32.buffer);
+  paramsU32[1] = options.length;
+  paramsU32[2] = options.length / 32;
+  paramsU32[3] = options.tokenCount;
+  const paramsBuffer = device.createBuffer({ size: uniformBufferSize(paramsU32.byteLength), usage: GPU_UNIFORM | GPU_COPY_DST });
+  device.queue.writeBuffer(paramsBuffer, 0, paramsU32);
+  const bindGroupLayout = device.createBindGroupLayout({
+    entries: [
+      storageEntry(0, "read-only-storage"),
+      storageEntry(1, "read-only-storage"),
+      storageEntry(2, "storage"),
+      storageEntry(3, "storage"),
+      { binding: 4, visibility: GPU_SHADER_STAGE_COMPUTE, buffer: { type: "uniform" } },
+    ],
+  });
+  const pipeline = device.createComputePipeline({
+    layout: device.createPipelineLayout({ bindGroupLayouts: [bindGroupLayout] }),
+    compute: { module: device.createShaderModule({ code: BATCHED_RMS_NORM_Q8_0_QUANTIZE_WGSL }), entryPoint: "main" },
+  });
+  return {
+    pipeline,
+    bindGroup: device.createBindGroup({
+      layout: bindGroupLayout,
+      entries: [
+        bindBuffer(0, inputBuffer),
+        bindBuffer(1, weightBuffer),
+        bindBuffer(2, scaleBuffer),
+        bindBuffer(3, qsBuffer),
+        bindBuffer(4, paramsBuffer),
       ],
     }),
     destroy: () => paramsBuffer.destroy?.(),
@@ -1510,7 +1619,7 @@ export function createQ8_0MatMulBindResources(
   const pipeline = handle.device.createComputePipeline({
     layout: handle.device.createPipelineLayout({ bindGroupLayouts: [bindGroupLayout] }),
     compute: {
-      module: handle.device.createShaderModule({ code: Q8_0_MATMUL_WGSL }),
+      module: handle.device.createShaderModule({ code: handle.type === "Q4_0" ? Q4_0_MATMUL_WGSL : Q8_0_MATMUL_WGSL }),
       entryPoint: "main",
     },
   });
@@ -2475,6 +2584,56 @@ export function createQ8_0GatherRowsScaleResources(
   };
 }
 
+export function createQ4_0GatherRowsScaleResources(
+  device: WebGpuDeviceLike,
+  weight: WebGpuBufferLike,
+  tokenIds: WebGpuBufferLike,
+  output: WebGpuBufferLike,
+  options: {
+    rowSize: number;
+    tokenCount: number;
+    blockCount: number;
+    rowByteLength: number;
+    scale: number;
+    outputTokenOffset?: number;
+  },
+): { pipeline: unknown; bindGroup: unknown; destroy: () => void } {
+  const paramsF32 = new Float32Array([0, 0, 0, 0, options.scale, 0, 0, 0]);
+  const paramsU32 = new Uint32Array(paramsF32.buffer);
+  paramsU32[0] = options.rowSize;
+  paramsU32[1] = options.tokenCount;
+  paramsU32[2] = options.blockCount;
+  paramsU32[3] = options.rowByteLength;
+  paramsU32[5] = options.outputTokenOffset ?? 0;
+  const paramsBuffer = device.createBuffer({ size: uniformBufferSize(paramsU32.byteLength), usage: GPU_UNIFORM | GPU_COPY_DST });
+  device.queue.writeBuffer(paramsBuffer, 0, paramsU32);
+  const bindGroupLayout = device.createBindGroupLayout({
+    entries: [
+      storageEntry(0, "read-only-storage"),
+      storageEntry(1, "read-only-storage"),
+      { binding: 2, visibility: GPU_SHADER_STAGE_COMPUTE, buffer: { type: "uniform" } },
+      storageEntry(3, "storage"),
+    ],
+  });
+  const pipeline = device.createComputePipeline({
+    layout: device.createPipelineLayout({ bindGroupLayouts: [bindGroupLayout] }),
+    compute: { module: device.createShaderModule({ code: Q4_0_GATHER_ROWS_SCALE_WGSL }), entryPoint: "main" },
+  });
+  return {
+    pipeline,
+    bindGroup: device.createBindGroup({
+      layout: bindGroupLayout,
+      entries: [
+        bindBuffer(0, weight),
+        bindBuffer(1, tokenIds),
+        bindBuffer(2, paramsBuffer),
+        bindBuffer(3, output),
+      ],
+    }),
+    destroy: () => paramsBuffer.destroy?.(),
+  };
+}
+
 export function createQuantizedGatherRowsScaleResources(
   device: WebGpuDeviceLike,
   type: WebGpuQuantizedMatMulType,
@@ -2492,6 +2651,9 @@ export function createQuantizedGatherRowsScaleResources(
 ): { pipeline: unknown; bindGroup: unknown; destroy: () => void } {
   if (type === "Q8_0") {
     return createQ8_0GatherRowsScaleResources(device, weight, tokenIds, output, options);
+  }
+  if (type === "Q4_0") {
+    return createQ4_0GatherRowsScaleResources(device, weight, tokenIds, output, options);
   }
   const paramsF32 = new Float32Array([0, 0, 0, 0, options.scale, 0, 0, 0]);
   const paramsU32 = new Uint32Array(paramsF32.buffer);

@@ -369,7 +369,7 @@ type Allocation = {
 };
 
 export type QuantizedMatMulInput = {
-  type: "Q4_K" | "Q5_K" | "Q6_K" | "IQ4_XS" | "Q8_0";
+  type: "Q4_0" | "Q4_K" | "Q5_K" | "Q6_K" | "IQ4_XS" | "Q8_0";
   weightBytes: Uint8Array;
   rowCount: number;
 };
@@ -397,7 +397,7 @@ const maxResidentInstanceBytes = 3 * 1024 * 1024 * 1024;
 
 export type WasmQuantizedWeightHandle = {
   instanceId: number;
-  type: "Q4_K" | "Q5_K" | "Q6_K" | "IQ4_XS" | "Q8_0";
+  type: "Q4_0" | "Q4_K" | "Q5_K" | "Q6_K" | "IQ4_XS" | "Q8_0";
   ptr: number;
   byteLength: number;
   scalePtr: number;
@@ -430,7 +430,7 @@ export function setPrefillWasmTrace(trace: PrefillWasmTrace | undefined): void {
 
 
 export async function matMulQuantizedWasm(
-  type: "Q4_K" | "Q5_K" | "Q6_K" | "IQ4_XS" | "Q8_0",
+  type: "Q4_0" | "Q4_K" | "Q5_K" | "Q6_K" | "IQ4_XS" | "Q8_0",
   weightBytes: Uint8Array,
   inputColumns: Float32Array,
   inputSize: number,
@@ -482,7 +482,7 @@ export async function matMulQuantizedWasm(
 }
 
 export async function matMulDequantizedWasm(
-  type: "Q4_K" | "Q5_K" | "Q6_K" | "IQ4_XS" | "Q8_0",
+  type: "Q4_0" | "Q4_K" | "Q5_K" | "Q6_K" | "IQ4_XS" | "Q8_0",
   weightBytes: Uint8Array,
   inputColumns: Float32Array,
   inputSize: number,
@@ -534,7 +534,7 @@ export async function matMulDequantizedWasm(
 }
 
 export async function createWasmQuantizedWeightHandle(
-  type: "Q4_K" | "Q5_K" | "Q6_K" | "IQ4_XS" | "Q8_0",
+  type: "Q4_0" | "Q4_K" | "Q5_K" | "Q6_K" | "IQ4_XS" | "Q8_0",
   weightBytes: Uint8Array,
   inputSize: number,
   rowCount: number,
@@ -1939,7 +1939,7 @@ function unsignedWasmPtr(ptr: number): number {
   return ptr >>> 0;
 }
 
-function quantizedTypeId(type: "Q4_K" | "Q5_K" | "Q6_K" | "IQ4_XS" | "Q8_0"): number {
+function quantizedTypeId(type: "Q4_0" | "Q4_K" | "Q5_K" | "Q6_K" | "IQ4_XS" | "Q8_0"): number {
   switch (type) {
     case "Q4_K":
       return 1;
@@ -1951,17 +1951,19 @@ function quantizedTypeId(type: "Q4_K" | "Q5_K" | "Q6_K" | "IQ4_XS" | "Q8_0"): nu
       return 4;
     case "Q8_0":
       return 5;
+    case "Q4_0":
+      return 6;
   }
 }
 
 function quantizedScaleValueCount(
-  type: "Q4_K" | "Q5_K" | "Q6_K" | "IQ4_XS" | "Q8_0",
+  type: "Q4_0" | "Q4_K" | "Q5_K" | "Q6_K" | "IQ4_XS" | "Q8_0",
   inputSize: number,
   rowCount: number,
 ): number {
-  if (type === "Q8_0") {
+  if (type === "Q4_0" || type === "Q8_0") {
     if (inputSize % 32 !== 0) {
-      throw new Error(`Q8_0 scale shape mismatch: ${inputSize}`);
+      throw new Error(`${type} scale shape mismatch: ${inputSize}`);
     }
     return (inputSize / 32) * rowCount;
   }

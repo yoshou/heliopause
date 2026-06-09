@@ -343,7 +343,7 @@ function dispatchMatMul(
     dispatchF32MatMul(device, pass, resources, handle.buffer, input, output, inputSize, rowCount, columnCount);
     return;
   }
-  if (handle.type === "Q8_0") {
+  if (handle.type === "Q4_0" || handle.type === "Q8_0") {
     const q8 = scratchQ8_0(arena, inputSize, columnCount, inputSize / 32, cleanup, "model-input.hidden.q8_0");
     dispatchQ8_0Quantize(device, pass, resources, input, q8, inputSize, columnCount, inputSize / 32);
     dispatchQ8_0MatMul(pass, resources, handle, q8, output, columnCount);
@@ -426,7 +426,7 @@ function isF32Handle(value: F32Handle | QuantizedHandle): value is F32Handle {
 }
 
 function isSupportedEmbeddingGatherType(type: GgmlTypeName): boolean {
-  return type === "F32" || type === "Q4_K" || type === "Q5_K" || type === "Q6_K" || type === "Q8_0";
+  return type === "F32" || type === "Q4_0" || type === "Q4_K" || type === "Q5_K" || type === "Q6_K" || type === "Q8_0";
 }
 
 function isF32CompatibleType(type: GgmlTypeName): boolean {
@@ -434,7 +434,7 @@ function isF32CompatibleType(type: GgmlTypeName): boolean {
 }
 
 function isSupportedProjectionType(type: GgmlTypeName): boolean {
-  return isF32CompatibleType(type) || type === "Q4_K" || type === "Q5_K" || type === "Q6_K" || type === "Q8_0";
+  return isF32CompatibleType(type) || type === "Q4_0" || type === "Q4_K" || type === "Q5_K" || type === "Q6_K" || type === "Q8_0";
 }
 
 function destroyAll(items: readonly { destroy?: () => void }[]): void {

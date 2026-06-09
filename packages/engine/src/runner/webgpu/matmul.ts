@@ -14,7 +14,7 @@ import {
   createTop1Resources,
 } from "./kernel-resources";
 import { quantizedWeightUploadBytes, quantizeQ8_0Columns, quantizeQ8_KColumns, webGpuQuantizedWeightLayout } from "./quantized-handles";
-import { Q4_K_MATMUL_WGSL, Q5_K_MATMUL_WGSL, Q6_K_MATMUL_WGSL, Q8_0_MATMUL_WGSL } from "./shaders";
+import { Q4_0_MATMUL_WGSL, Q4_K_MATMUL_WGSL, Q5_K_MATMUL_WGSL, Q6_K_MATMUL_WGSL, Q8_0_MATMUL_WGSL } from "./shaders";
 import type { WebGpuBufferLike, WebGpuComputePassLike, WebGpuDeviceLike, WebGpuQuantizedWeightHandle, WebGpuQuantizedWeightHandleInternal, WebGpuTopToken } from "./gpu-types";
 
 export async function matMulQ8_0WebGpu(
@@ -461,7 +461,7 @@ export async function matMulWebGpuQuantizedResident(
     throw new Error(`WebGPU ${resident.type} resident matmul input shape mismatch: ${inputColumns.length}`);
   }
 
-  if (resident.type === "Q8_0") {
+  if (resident.type === "Q4_0" || resident.type === "Q8_0") {
     return matMulQ8_0Resident(resident, inputColumns, columnCount);
   }
   if (resident.type === "Q6_K") {
@@ -481,7 +481,7 @@ export async function matMulTop1WebGpuQuantizedResident(
   if (inputColumns.length !== resident.inputSize) {
     throw new Error(`WebGPU ${resident.type} top-1 input shape mismatch: ${inputColumns.length}`);
   }
-  if (resident.type === "Q8_0") {
+  if (resident.type === "Q4_0" || resident.type === "Q8_0") {
     return top1Cpu(await matMulWebGpuQuantizedResident(handle, inputColumns, 1));
   }
 
@@ -546,7 +546,7 @@ export async function matMulSwiGluWebGpuResident(
   if (inputColumns.length !== gate.inputSize * columnCount) {
     throw new Error(`WebGPU SwiGLU input shape mismatch: ${inputColumns.length}`);
   }
-  if (gate.type === "Q8_0" || up.type === "Q8_0") {
+  if (gate.type === "Q4_0" || gate.type === "Q8_0" || up.type === "Q4_0" || up.type === "Q8_0") {
     throw new Error("WebGPU SwiGLU currently supports K-quant gate/up weights only");
   }
 
@@ -637,7 +637,7 @@ export async function matMulSwiGluDownWebGpuResident(
   if (inputColumns.length !== gate.inputSize * columnCount) {
     throw new Error(`WebGPU FFN input shape mismatch: ${inputColumns.length}`);
   }
-  if (gate.type === "Q8_0" || up.type === "Q8_0" || down.type === "Q8_0") {
+  if (gate.type === "Q4_0" || gate.type === "Q8_0" || up.type === "Q4_0" || up.type === "Q8_0" || down.type === "Q4_0" || down.type === "Q8_0") {
     throw new Error("WebGPU FFN resident path currently supports K-quant weights only");
   }
 
@@ -740,7 +740,7 @@ export async function fullAttentionDecodeOutWebGpuResident(
   },
 ): Promise<Float32Array | undefined> {
   const out = outHandle as WebGpuQuantizedWeightHandleInternal;
-  if (out.type === "Q8_0") {
+  if (out.type === "Q4_0" || out.type === "Q8_0") {
     return undefined;
   }
   const { headSize, queryHeadCount, keyValueHeadCount, keyValueTokenCount, contextLength, scale } = options;
@@ -913,7 +913,7 @@ async function matMulQ8_0Resident(
     handle.device.queue.writeBuffer(inputQsBuffer, 0, q8.qs);
     handle.device.queue.writeBuffer(paramsBuffer, 0, params);
 
-    const shaderModule = handle.device.createShaderModule({ code: Q8_0_MATMUL_WGSL });
+    const shaderModule = handle.device.createShaderModule({ code: handle.type === "Q4_0" ? Q4_0_MATMUL_WGSL : Q8_0_MATMUL_WGSL });
     const bindGroupLayout = handle.device.createBindGroupLayout({
       entries: [
         storageEntry(0, "read-only-storage"),

@@ -125,7 +125,7 @@ export type WebGpuComputePassLike = {
   end: () => void;
 };
 
-export type WebGpuQuantizedMatMulType = "Q4_K" | "Q5_K" | "Q6_K" | "Q8_0";
+export type WebGpuQuantizedMatMulType = "Q4_0" | "Q4_K" | "Q5_K" | "Q6_K" | "Q8_0";
 
 export type WebGpuQuantizedWeightHandle = {
   readonly type: WebGpuQuantizedMatMulType;

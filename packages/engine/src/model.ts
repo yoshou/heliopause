@@ -807,14 +807,14 @@ function buildExpectedTensors(params: {
     {
       name: "token_embd.weight",
       dimensions: [embeddingLength, vocabSize],
-      allowedTypes: observedType(tensorsByName, "token_embd.weight", ["Q4_K"]),
+      allowedTypes: observedType(tensorsByName, "token_embd.weight", ["Q4_0", "Q4_K"]),
     },
   ];
   if (tensorsByName.has("output.weight")) {
     expected.unshift({
       name: "output.weight",
       dimensions: [embeddingLength, vocabSize],
-      allowedTypes: observedType(tensorsByName, "output.weight", ["Q6_K"]),
+      allowedTypes: observedType(tensorsByName, "output.weight", ["Q4_0", "Q6_K"]),
     });
   }
   if (perLayerEmbeddingLength > 0) {
@@ -850,20 +850,20 @@ function buildExpectedTensors(params: {
       layerTensor(layer, "post_attention_norm.weight", [embeddingLength], ["F32"]),
       layerTensor(layer, "post_ffw_norm.weight", [embeddingLength], ["F32"]),
       layerTensor(layer, "layer_output_scale.weight", [1], ["F32"]),
-      layerTensor(layer, "attn_q.weight", [embeddingLength, queryDim], observedType(tensorsByName, `blk.${layer}.attn_q.weight`, ["Q4_K", "Q5_K", "IQ4_XS"]), layerKind),
-      layerTensor(layer, "attn_output.weight", [queryDim, embeddingLength], observedType(tensorsByName, `blk.${layer}.attn_output.weight`, ["Q4_K"]), layerKind),
+      layerTensor(layer, "attn_q.weight", [embeddingLength, queryDim], observedType(tensorsByName, `blk.${layer}.attn_q.weight`, ["Q4_0", "Q4_K", "Q5_K", "IQ4_XS"]), layerKind),
+      layerTensor(layer, "attn_output.weight", [queryDim, embeddingLength], observedType(tensorsByName, `blk.${layer}.attn_output.weight`, ["Q4_0", "Q4_K"]), layerKind),
       layerTensor(layer, "attn_q_norm.weight", [headSize], ["F32"], layerKind),
       ...(layerHasKv[layer] ? [
-        layerTensor(layer, "attn_k.weight", [embeddingLength, keyValueDim], observedType(tensorsByName, `blk.${layer}.attn_k.weight`, ["Q4_K", "Q5_K", "IQ4_XS"]), layerKind),
+        layerTensor(layer, "attn_k.weight", [embeddingLength, keyValueDim], observedType(tensorsByName, `blk.${layer}.attn_k.weight`, ["Q4_0", "Q4_K", "Q5_K", "IQ4_XS"]), layerKind),
         ...(layerValueProjectionModes[layer] === "separate"
-          ? [layerTensor(layer, "attn_v.weight", [embeddingLength, valueDim], observedType(tensorsByName, `blk.${layer}.attn_v.weight`, ["Q5_K", "Q6_K"]), layerKind)]
+          ? [layerTensor(layer, "attn_v.weight", [embeddingLength, valueDim], observedType(tensorsByName, `blk.${layer}.attn_v.weight`, ["Q4_0", "Q5_K", "Q6_K"]), layerKind)]
           : []),
         layerTensor(layer, "attn_k_norm.weight", [headSize], ["F32"], layerKind),
       ] : []),
       layerTensor(layer, "ffn_norm.weight", [embeddingLength], ["F32"]),
-      layerTensor(layer, "ffn_gate.weight", [embeddingLength, feedForwardLength], observedType(tensorsByName, `blk.${layer}.ffn_gate.weight`, ["Q4_K", "Q5_K", "IQ4_XS"])),
-      layerTensor(layer, "ffn_up.weight", [embeddingLength, feedForwardLength], observedType(tensorsByName, `blk.${layer}.ffn_up.weight`, ["Q4_K", "Q5_K", "IQ4_XS"])),
-      layerTensor(layer, "ffn_down.weight", [feedForwardLength, embeddingLength], observedType(tensorsByName, `blk.${layer}.ffn_down.weight`, ["Q4_K", "Q5_K", "Q6_K"])),
+      layerTensor(layer, "ffn_gate.weight", [embeddingLength, feedForwardLength], observedType(tensorsByName, `blk.${layer}.ffn_gate.weight`, ["Q4_0", "Q4_K", "Q5_K", "IQ4_XS"])),
+      layerTensor(layer, "ffn_up.weight", [embeddingLength, feedForwardLength], observedType(tensorsByName, `blk.${layer}.ffn_up.weight`, ["Q4_0", "Q4_K", "Q5_K", "IQ4_XS"])),
+      layerTensor(layer, "ffn_down.weight", [feedForwardLength, embeddingLength], observedType(tensorsByName, `blk.${layer}.ffn_down.weight`, ["Q4_0", "Q4_K", "Q5_K", "Q6_K"])),
     );
     if (perLayerEmbeddingLength > 0) {
       expected.push(

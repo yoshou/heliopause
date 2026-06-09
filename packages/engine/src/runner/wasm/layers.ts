@@ -567,7 +567,7 @@ export async function matMulWeight(
   if (tensor.type === "F32" || tensor.type === "F16" || tensor.type === "BF16") {
     return matMulDenseRows(session, weightName, inputColumns);
   }
-  if (tensor.type === "Q4_K" || tensor.type === "Q5_K" || tensor.type === "Q6_K" || tensor.type === "IQ4_XS") {
+  if (tensor.type === "Q4_0" || tensor.type === "Q4_K" || tensor.type === "Q5_K" || tensor.type === "Q6_K" || tensor.type === "IQ4_XS") {
     return matMulKQ8K(session, weightName, inputColumns, tensor.type, trace);
   }
   if (tensor.type === "Q8_0") {
@@ -717,8 +717,8 @@ async function matMulWeightBatch(
 
 function isQuantizedMatmulWasmType(
   type: GgmlTypeName,
-): type is Extract<GgmlTypeName, "Q4_K" | "Q5_K" | "Q6_K" | "IQ4_XS" | "Q8_0"> {
-  return type === "Q4_K" || type === "Q5_K" || type === "Q6_K" || type === "IQ4_XS" || type === "Q8_0";
+): type is Extract<GgmlTypeName, "Q4_0" | "Q4_K" | "Q5_K" | "Q6_K" | "IQ4_XS" | "Q8_0"> {
+  return type === "Q4_0" || type === "Q4_K" || type === "Q5_K" || type === "Q6_K" || type === "IQ4_XS" || type === "Q8_0";
 }
 
 async function matMulDenseRows(
@@ -752,7 +752,7 @@ async function matMulKQ8K(
   session: ModelSession,
   weightName: string,
   inputColumns: Float32Array,
-  type: Extract<GgmlTypeName, "Q4_K" | "Q5_K" | "Q6_K" | "IQ4_XS">,
+  type: Extract<GgmlTypeName, "Q4_0" | "Q4_K" | "Q5_K" | "Q6_K" | "IQ4_XS">,
   trace?: ForwardTrace,
 ): Promise<Float32Array> {
   const tensor = session.getTensor(weightName);

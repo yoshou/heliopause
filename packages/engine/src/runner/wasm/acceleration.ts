@@ -51,7 +51,7 @@ type WasmIoPrefetchState = {
 
 type WasmPrefetchWeight = {
   name: string;
-  type: "Q4_K" | "Q5_K" | "Q6_K" | "IQ4_XS" | "Q8_0";
+  type: "Q4_0" | "Q4_K" | "Q5_K" | "Q6_K" | "IQ4_XS" | "Q8_0";
   inputSize: number;
   rowCount: number;
   byteLength: number;
@@ -164,7 +164,7 @@ function enqueueWasmIoPrefetch(session: ModelSession, weights: WasmPrefetchWeigh
 export async function readWasmWeightHandle(
   session: ModelSession,
   name: string,
-  type: "Q4_K" | "Q5_K" | "Q6_K" | "IQ4_XS" | "Q8_0",
+  type: "Q4_0" | "Q4_K" | "Q5_K" | "Q6_K" | "IQ4_XS" | "Q8_0",
   inputSize: number,
   rowCount: number,
 ): Promise<WasmQuantizedWeightHandle | undefined> {
@@ -203,7 +203,7 @@ export async function readWasmWeightHandle(
 export async function readWasmShardedWeightHandle(
   session: ModelSession,
   name: string,
-  type: "Q4_K" | "Q5_K" | "Q6_K" | "IQ4_XS" | "Q8_0",
+  type: "Q4_0" | "Q4_K" | "Q5_K" | "Q6_K" | "IQ4_XS" | "Q8_0",
   inputSize: number,
   rowCount: number,
 ): Promise<WasmShardedQuantizedWeightHandle | undefined> {
@@ -375,7 +375,7 @@ async function prepareWasmShardedWeightHandle(
   session: ModelSession,
   pool: WasmThreadPool,
   name: string,
-  type: "Q4_K" | "Q5_K" | "Q6_K" | "IQ4_XS" | "Q8_0",
+  type: "Q4_0" | "Q4_K" | "Q5_K" | "Q6_K" | "IQ4_XS" | "Q8_0",
   inputSize: number,
   rowCount: number,
   cache: WasmShardedWeightCache,
@@ -433,7 +433,7 @@ async function prepareWasmShardedWeightHandleFromBlob(
   session: ModelSession,
   pool: WasmThreadPool,
   name: string,
-  type: "Q4_K" | "Q5_K" | "Q6_K" | "IQ4_XS" | "Q8_0",
+  type: "Q4_0" | "Q4_K" | "Q5_K" | "Q6_K" | "IQ4_XS" | "Q8_0",
   inputSize: number,
   rowCount: number,
   sourceBlob: Blob,
@@ -567,5 +567,5 @@ function prefetchWeightForName(session: ModelSession, name: string): WasmPrefetc
 }
 
 function isWasmPrefetchType(type: string): type is WasmPrefetchWeight["type"] {
-  return type === "Q4_K" || type === "Q5_K" || type === "Q6_K" || type === "IQ4_XS" || type === "Q8_0";
+  return type === "Q4_0" || type === "Q4_K" || type === "Q5_K" || type === "Q6_K" || type === "IQ4_XS" || type === "Q8_0";
 }

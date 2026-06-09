@@ -504,7 +504,7 @@ export function timedSync<T>(
 }
 
 function isCachedMatmulWeightType(type: GgmlTypeName): boolean {
-  return type === "Q4_K" || type === "Q5_K" || type === "Q6_K" || type === "IQ4_XS" || type === "Q8_0";
+  return type === "Q4_0" || type === "Q4_K" || type === "Q5_K" || type === "Q6_K" || type === "IQ4_XS" || type === "Q8_0";
 }
 
 function nowMs(): number {
