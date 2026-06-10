@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import { auditRunnerPlacementCopies } from "./audit-helpers.ts";
 import {
-  auditRunnerPlacementCopies,
   planModelPlacement,
   type LayerResourceRequirement,
   type ProviderResourceRequirements,

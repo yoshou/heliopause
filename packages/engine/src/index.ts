@@ -10,8 +10,6 @@ export {
 } from "./gguf";
 
 export {
-  auditMtpAssistantTensorCoverage,
-  auditTensorCoverage,
   buildAudioManifest,
   buildMtpAssistantManifest,
   buildModelManifest,
@@ -26,7 +24,6 @@ export {
   type LayerValueProjectionMode,
   type ModelManifest,
   type MtpAssistantManifest,
-  type TensorCoverageAudit,
   type VisionManifest,
 } from "./model";
 
@@ -263,13 +260,10 @@ export type {
 } from "./runner/segment-runner";
 
 export {
-  auditRunnerPlacementCopies,
   planModelPlacement,
   type LayerResourceRequirement,
   type ProviderResourceRequirements,
   type ResourceBudget,
-  type RunnerCopyAuditObservation,
-  type RunnerCopyAuditResult,
   type RunnerCopyExpectations,
   type RunnerLayerPlacement,
   type RunnerNodePlacement,

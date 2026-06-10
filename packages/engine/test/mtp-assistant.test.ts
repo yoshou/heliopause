@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import { auditMtpAssistantTensorCoverage } from "./audit-helpers.ts";
 import {
-  auditMtpAssistantTensorCoverage,
   buildMtpAssistantManifest,
   createMtpAssistantSession,
   createReferenceProvider,

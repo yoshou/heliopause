@@ -130,22 +130,6 @@ export type RunnerPlacementPlan = {
   copyExpectations: RunnerCopyExpectations;
 };
 
-export type RunnerCopyAuditObservation = {
-  decodeTensorReads: number;
-  segmentIntermediateReadbacks: number;
-  logitsReadbacks: number;
-  boundaryUploads: number;
-  tokenReadbacks: number;
-  selectedTokenReadbacks?: number;
-};
-
-export type RunnerCopyAuditResult = {
-  ok: boolean;
-  errors: string[];
-  expected: RunnerCopyExpectations;
-  observed: RunnerCopyAuditObservation;
-};
-
 const EMPTY_COPY_EXPECTATIONS: RunnerCopyExpectations = {
   decodeTensorReads: 0,
   segmentIntermediateReadbacks: 0,
@@ -221,51 +205,6 @@ export function planModelPlacement(
     selectedLayers: selected,
     resourceUsage,
     copyExpectations: copyExpectationsFor(accelerated, selected, nodes),
-  };
-}
-
-export function auditRunnerPlacementCopies(
-  plan: RunnerPlacementPlan,
-  observed: RunnerCopyAuditObservation,
-): RunnerCopyAuditResult {
-  const expected = plan.copyExpectations;
-  const errors: string[] = [];
-
-  if (observed.decodeTensorReads !== expected.decodeTensorReads) {
-    errors.push(
-      `decode tensor reads: expected ${expected.decodeTensorReads}, got ${observed.decodeTensorReads}`,
-    );
-  }
-  if (observed.segmentIntermediateReadbacks !== expected.segmentIntermediateReadbacks) {
-    errors.push(
-      `segment intermediate readbacks: expected ${expected.segmentIntermediateReadbacks}, got ${observed.segmentIntermediateReadbacks}`,
-    );
-  }
-  if (observed.logitsReadbacks !== expected.logitsReadbacks) {
-    errors.push(`logits readbacks: expected ${expected.logitsReadbacks}, got ${observed.logitsReadbacks}`);
-  }
-  if (observed.boundaryUploads > expected.expectedBoundaryUploads) {
-    errors.push(
-      `boundary uploads: expected at most ${expected.expectedBoundaryUploads}, got ${observed.boundaryUploads}`,
-    );
-  }
-  if (observed.tokenReadbacks > expected.expectedTokenReadbacks) {
-    errors.push(
-      `token readbacks: expected at most ${expected.expectedTokenReadbacks}, got ${observed.tokenReadbacks}`,
-    );
-  }
-  const observedSelectedTokenReadbacks = observed.selectedTokenReadbacks ?? 0;
-  if (observedSelectedTokenReadbacks > expected.expectedSelectedTokenReadbacks) {
-    errors.push(
-      `selected token readbacks: expected at most ${expected.expectedSelectedTokenReadbacks}, got ${observedSelectedTokenReadbacks}`,
-    );
-  }
-
-  return {
-    ok: errors.length === 0,
-    errors,
-    expected,
-    observed,
   };
 }
 

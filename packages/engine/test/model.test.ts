@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import { auditTensorCoverage } from "./audit-helpers.ts";
 import {
-  auditTensorCoverage,
   buildModelManifest,
   cloneInferenceState,
   createReferenceProvider,
