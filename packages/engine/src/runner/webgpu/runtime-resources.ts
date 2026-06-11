@@ -21,8 +21,8 @@ export type WebGpuRuntimeResourceStats = {
   bindGroupCreateMs: number;
   bufferCreates: number;
   bufferCreateMs: number;
-  bufferCreateLabels: string;
-  bufferCreateLabelCounts: Record<string, number>;
+  bufferAllocationsByLabel: string;
+  bufferAllocationLabelCounts: Record<string, number>;
 };
 
 export type WebGpuRuntimeResourceCache = {
@@ -44,7 +44,8 @@ type RuntimeResourceCacheState = {
   uniformBufferPools: Map<string, PooledUniformGpuBuffer[]>;
   readbackBufferPools: Map<string, PooledReadbackGpuBuffer[]>;
   statsValue: WebGpuRuntimeResourceStats;
-  bufferCreateLabels: Map<string, number>;
+  bufferAllocationLabels: Map<string, number>;
+  trackBufferAllocations: boolean;
 };
 
 /**
@@ -151,7 +152,7 @@ function pushPooled<T>(pools: Map<string, T[]>, key: string, buffer: T): void {
   }
 }
 
-const installedResources = new WeakMap<WebGpuDeviceLike, WebGpuRuntimeResources>();
+const installedResources = new WeakMap<WebGpuDeviceLike, Map<string, WebGpuRuntimeResources>>();
 
 const emptyStats = (): WebGpuRuntimeResourceStats => ({
   shaderModuleHits: 0,
@@ -172,8 +173,8 @@ const emptyStats = (): WebGpuRuntimeResourceStats => ({
   bindGroupCreateMs: 0,
   bufferCreates: 0,
   bufferCreateMs: 0,
-  bufferCreateLabels: "",
-  bufferCreateLabelCounts: {},
+  bufferAllocationsByLabel: "",
+  bufferAllocationLabelCounts: {},
 });
 
 /**
@@ -184,8 +185,15 @@ const emptyStats = (): WebGpuRuntimeResourceStats => ({
  */
 export function installWebGpuRuntimeResourceCache(
   device: WebGpuDeviceLike,
+  options: { trackBufferAllocations?: boolean } = {},
 ): WebGpuRuntimeResources {
-  const existing = installedResources.get(device);
+  let resourcesByMode = installedResources.get(device);
+  if (!resourcesByMode) {
+    resourcesByMode = new Map();
+    installedResources.set(device, resourcesByMode);
+  }
+  const cacheKey = options.trackBufferAllocations === true ? "tracked" : "untracked";
+  const existing = resourcesByMode.get(cacheKey);
   if (existing) {
     return existing;
   }
@@ -200,7 +208,8 @@ export function installWebGpuRuntimeResourceCache(
     // TODO: Add bounded flush/eviction for these exact-size buffer pools once the cache policy is redesigned.
     uniformBufferPools: new Map<string, PooledUniformGpuBuffer[]>(),
     readbackBufferPools: new Map<string, PooledReadbackGpuBuffer[]>(),
-    bufferCreateLabels: new Map<string, number>(),
+    bufferAllocationLabels: new Map<string, number>(),
+    trackBufferAllocations: options.trackBufferAllocations === true,
     statsValue: emptyStats(),
   };
 
@@ -247,7 +256,7 @@ export function installWebGpuRuntimeResourceCache(
       } finally {
         state.statsValue.bufferCreates += 1;
         state.statsValue.bufferCreateMs += nowMs() - start;
-        recordBufferCreateLabel(descriptor, state);
+        recordBufferAllocationLabel(descriptor, state);
       }
     },
 
@@ -324,17 +333,17 @@ export function installWebGpuRuntimeResourceCache(
 
   const cache: WebGpuRuntimeResourceCache = {
     stats() {
-      const bufferCreateLabelCounts = Object.fromEntries(state.bufferCreateLabels);
+      const bufferAllocationLabelCounts = Object.fromEntries(state.bufferAllocationLabels);
       return {
         ...state.statsValue,
-        bufferCreateLabels: formatBufferCreateLabels(bufferCreateLabelCounts),
-        bufferCreateLabelCounts,
+        bufferAllocationsByLabel: formatBufferAllocationLabels(bufferAllocationLabelCounts),
+        bufferAllocationLabelCounts,
       };
     },
   };
 
   const resources: WebGpuRuntimeResources = { device: wrapped, cache };
-  installedResources.set(device, resources);
+  resourcesByMode.set(cacheKey, resources);
   return resources;
 }
 
@@ -368,7 +377,7 @@ export function diffWebGpuRuntimeResourceStats(
   after: WebGpuRuntimeResourceStats,
   before: WebGpuRuntimeResourceStats,
 ): WebGpuRuntimeResourceStats {
-  const bufferCreateLabelCounts = diffCounts(after.bufferCreateLabelCounts, before.bufferCreateLabelCounts);
+  const bufferAllocationLabelCounts = diffCounts(after.bufferAllocationLabelCounts, before.bufferAllocationLabelCounts);
   return {
     shaderModuleHits: after.shaderModuleHits - before.shaderModuleHits,
     shaderModuleMisses: after.shaderModuleMisses - before.shaderModuleMisses,
@@ -388,8 +397,8 @@ export function diffWebGpuRuntimeResourceStats(
     bindGroupCreateMs: after.bindGroupCreateMs - before.bindGroupCreateMs,
     bufferCreates: after.bufferCreates - before.bufferCreates,
     bufferCreateMs: after.bufferCreateMs - before.bufferCreateMs,
-    bufferCreateLabels: formatBufferCreateLabels(bufferCreateLabelCounts),
-    bufferCreateLabelCounts,
+    bufferAllocationsByLabel: formatBufferAllocationLabels(bufferAllocationLabelCounts),
+    bufferAllocationLabelCounts,
   };
 }
 
@@ -423,7 +432,7 @@ function stableKey(value: unknown, state: RuntimeResourceCacheState): string {
   return String(value);
 }
 
-function recordBufferCreateLabel(
+function recordBufferAllocationLabel(
   descriptor: {
     label?: string;
     size: number;
@@ -431,16 +440,16 @@ function recordBufferCreateLabel(
   },
   state: RuntimeResourceCacheState,
 ): void {
-  if (!webGpuBufferCreateLabelTimingEnabled()) {
+  if (!state.trackBufferAllocations) {
     return;
   }
   const label = descriptor.label ?? `usage:${descriptor.usage}:size:${descriptor.size}`;
-  state.bufferCreateLabels.set(label, (state.bufferCreateLabels.get(label) ?? 0) + 1);
+  state.bufferAllocationLabels.set(label, (state.bufferAllocationLabels.get(label) ?? 0) + 1);
 }
 
-function formatBufferCreateLabels(labels: Record<string, number>): string {
+function formatBufferAllocationLabels(labels: Record<string, number>): string {
   const entries = Object.entries(labels).filter(([, count]) => count > 0);
-  if (!webGpuBufferCreateLabelTimingEnabled() || entries.length === 0) {
+  if (entries.length === 0) {
     return "";
   }
   return entries
@@ -459,10 +468,6 @@ function diffCounts(after: Record<string, number>, before: Record<string, number
     }
   }
   return diff;
-}
-
-function webGpuBufferCreateLabelTimingEnabled(): boolean {
-  return (globalThis as { __heliopauseDisableWebGpuBufferCreateLabels?: unknown }).__heliopauseDisableWebGpuBufferCreateLabels !== true;
 }
 
 function objectId(value: object, state: RuntimeResourceCacheState): number {

@@ -79,6 +79,7 @@ export type {
   WebGpuSupport,
 } from "./gpu-types";
 export type {
+  WebGpuOptimizationLevel,
   WebGpuProviderOptions,
 } from "./execution-provider";
 

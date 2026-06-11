@@ -112,6 +112,39 @@ test("WebGPU runtime resource stats diff returns per-run deltas", () => {
   assert.equal(diff.computePipelineMisses, 1);
 });
 
+test("WebGPU runtime resource cache tracks buffer allocations only when requested", () => {
+  {
+    const { device: rawDevice } = fakeDevice();
+    const { device, cache } = installWebGpuRuntimeResourceCache(rawDevice);
+    device.createBuffer({ label: "scratch.hidden", size: 4, usage: 1 });
+
+    assert.equal(cache.stats().bufferAllocationsByLabel, "");
+    assert.deepEqual(cache.stats().bufferAllocationLabelCounts, {});
+  }
+
+  {
+    const { device: rawDevice } = fakeDevice();
+    const { device, cache } = installWebGpuRuntimeResourceCache(rawDevice, {
+      trackBufferAllocations: true,
+    });
+    const before = cache.stats();
+    device.createBuffer({ label: "scratch.hidden", size: 4, usage: 1 });
+    device.createBuffer({ label: "scratch.hidden", size: 8, usage: 1 });
+    device.createBuffer({ size: 16, usage: 2 });
+
+    const stats = cache.stats();
+    assert.equal(stats.bufferAllocationsByLabel, "scratch.hidden=2;usage:2:size:16=1");
+    assert.deepEqual(stats.bufferAllocationLabelCounts, {
+      "scratch.hidden": 2,
+      "usage:2:size:16": 1,
+    });
+
+    const diff = diffWebGpuRuntimeResourceStats(stats, before);
+    assert.equal(diff.bufferAllocationsByLabel, stats.bufferAllocationsByLabel);
+    assert.deepEqual(diff.bufferAllocationLabelCounts, stats.bufferAllocationLabelCounts);
+  }
+});
+
 function fakeDevice(): {
   device: WebGpuDeviceLike;
   counts: {

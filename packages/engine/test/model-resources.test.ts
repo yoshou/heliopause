@@ -5,6 +5,7 @@ import type { GgufMetadata } from "../src/gguf.ts";
 import type { ModelManifest } from "../src/model.ts";
 import { createModelResourceRequirements } from "../src/runner/model-resources.ts";
 import { createWebGpuProvider } from "../src/runner/webgpu/index.ts";
+import { webGpuExecutionProviderOptions } from "../src/runner/webgpu/execution-provider.ts";
 import { webGpuResourceRequirements } from "../src/runner/webgpu/planning.ts";
 
 test("model resource requirements can estimate KV cache with native f16 element size", () => {
@@ -104,6 +105,28 @@ test("WebGPU provider forwards sliding KV reserve tokens to resource planning", 
   assert.equal(requirements.layers[0]?.cacheBytes, 280);
 });
 
+test("WebGPU provider options normalize profiling, allocation tracking, and optimization level", () => {
+  const defaults = webGpuExecutionProviderOptions(fakeSession(createWebGpuProvider()));
+  assert.equal(defaults?.optimizationLevel, "standard");
+  assert.equal(defaults?.gpuProfiling, false);
+  assert.equal(defaults?.trackBufferAllocations, false);
+
+  const configured = webGpuExecutionProviderOptions(fakeSession(createWebGpuProvider({
+    memoryLimitBytes: 123,
+    segmentStartLayer: 2,
+    prefillChunkSize: 8,
+    optimizationLevel: "baseline",
+    gpuProfiling: true,
+    trackBufferAllocations: true,
+  })));
+  assert.equal(configured?.memoryLimitBytes, 123);
+  assert.equal(configured?.segmentStartLayer, 2);
+  assert.equal(configured?.prefillChunkSize, 8);
+  assert.equal(configured?.optimizationLevel, "baseline");
+  assert.equal(configured?.gpuProfiling, true);
+  assert.equal(configured?.trackBufferAllocations, true);
+});
+
 function emptyGguf(): GgufMetadata {
   return {
     version: 3,
@@ -113,6 +136,12 @@ function emptyGguf(): GgufMetadata {
     tensors: [],
     dataStart: 0n,
   };
+}
+
+function fakeSession(provider: ReturnType<typeof createWebGpuProvider>) {
+  return {
+    provider: (name: string) => name === "webgpu" ? provider : undefined,
+  } as never;
 }
 
 function manifestWithKv(): ModelManifest {

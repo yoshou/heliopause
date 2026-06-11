@@ -3,10 +3,11 @@ import { bindBuffer, storageEntry } from "./gpu-bindings";
 import { wrapWebGpuDevice } from "./gpu-buffer";
 import type { NavigatorWithWebGpu, WebGpuAdapterLike, WebGpuDeviceLike, WebGpuSmokeTest, WebGpuSupport } from "./gpu-types";
 
-let devicePromise: Promise<WebGpuDeviceLike | undefined> | undefined;
+const devicePromises = new WeakMap<object, Map<string, Promise<WebGpuDeviceLike | undefined>>>();
 let adapterLimitsPromise: Promise<Pick<WebGpuAdapterLike, "limits">["limits"] | undefined> | undefined;
 
 export const WEBGPU_REQUIRED_FEATURES = ["shader-f16"] as const;
+export const WEBGPU_PROFILING_REQUIRED_FEATURES = ["timestamp-query"] as const;
 
 export async function checkWebGpuSupport(): Promise<WebGpuSupport> {
   if (typeof navigator === "undefined") {
@@ -197,11 +198,31 @@ function describeAdapter(adapter: WebGpuAdapterLike): string | undefined {
   ].filter(Boolean).join(" / ") || undefined;
 }
 
-export async function webGpuDevice(): Promise<WebGpuDeviceLike | undefined> {
-  if (!devicePromise) {
-    devicePromise = requestWebGpuDevice();
+export async function webGpuDevice(
+  options: { gpuProfiling?: boolean } = {},
+): Promise<WebGpuDeviceLike | undefined> {
+  if (typeof navigator === "undefined") {
+    return undefined;
   }
-  return devicePromise;
+  const gpu = (navigator as NavigatorWithWebGpu).gpu;
+  if (!gpu) {
+    return undefined;
+  }
+  let promises = devicePromises.get(gpu);
+  if (!promises) {
+    promises = new Map();
+    devicePromises.set(gpu, promises);
+  }
+  const cacheKey = options.gpuProfiling === true ? "profiling" : "standard";
+  let promise = promises.get(cacheKey);
+  if (!promise) {
+    promise = requestWebGpuDevice({ gpuProfiling: options.gpuProfiling === true }).catch((error: unknown) => {
+      promises.delete(cacheKey);
+      throw error;
+    });
+    promises.set(cacheKey, promise);
+  }
+  return promise;
 }
 
 export function webGpuAdapterSupportsRequiredFeatures(adapter: WebGpuAdapterLike): boolean {
@@ -214,7 +235,7 @@ export function webGpuRequiredDeviceFeatures(
 ): string[] {
   const features: string[] = [...WEBGPU_REQUIRED_FEATURES];
   if (options.includeTimestampQuery === true && adapter.features?.has("timestamp-query")) {
-    features.push("timestamp-query");
+    features.push(...WEBGPU_PROFILING_REQUIRED_FEATURES);
   }
   return features;
 }
@@ -245,7 +266,9 @@ export async function assertStorageBindingFits(label: string, byteLength: number
   }
 }
 
-async function requestWebGpuDevice(): Promise<WebGpuDeviceLike | undefined> {
+async function requestWebGpuDevice(
+  options: { gpuProfiling?: boolean } = {},
+): Promise<WebGpuDeviceLike | undefined> {
   if (typeof navigator === "undefined") {
     return undefined;
   }
@@ -261,24 +284,24 @@ async function requestWebGpuDevice(): Promise<WebGpuDeviceLike | undefined> {
     return undefined;
   }
   const requiredLimits = requestedDeviceLimits(adapter.limits);
-  if (webGpuGpuTimingEnabled() && adapter.features?.has("timestamp-query")) {
+  if (options.gpuProfiling === true) {
+    if (!WEBGPU_PROFILING_REQUIRED_FEATURES.every((feature) => adapter.features?.has(feature))) {
+      throw new Error("WebGPU GPU profiling requires timestamp-query support.");
+    }
     try {
       return wrapWebGpuDevice(await adapter.requestDevice({
         requiredFeatures: webGpuRequiredDeviceFeatures(adapter, { includeTimestampQuery: true }),
         requiredLimits,
       }));
-    } catch {
-      // Timestamp profiling is optional; keep WebGPU execution available without it.
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new Error(`WebGPU GPU profiling device request failed: ${message}`);
     }
   }
   return wrapWebGpuDevice(await adapter.requestDevice({
     requiredFeatures: webGpuRequiredDeviceFeatures(adapter),
     requiredLimits,
   }));
-}
-
-function webGpuGpuTimingEnabled(): boolean {
-  return (globalThis as { __heliopauseDisableWebGpuGpuTiming?: unknown }).__heliopauseDisableWebGpuGpuTiming !== true;
 }
 
 function requestedDeviceLimits(limits: WebGpuAdapterLike["limits"]): Record<string, number> {

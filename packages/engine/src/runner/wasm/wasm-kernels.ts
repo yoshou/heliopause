@@ -374,19 +374,8 @@ export type QuantizedMatMulInput = {
   rowCount: number;
 };
 
-export type PrefillWasmTraceEvent = {
-  kernel: string;
-  section: "allocation + input copy" | "kernel call" | "output copy + free" | "resident weight copy" | "resident scale prepare";
-  durationMs: number;
-  bytes?: number;
-};
-
-export type PrefillWasmTrace = (event: PrefillWasmTraceEvent) => void;
-
-let wasmBase64ForTesting: string | undefined;
 let instancePromise: Promise<KernelExports | undefined> | undefined;
 let modulePromise: Promise<WebAssembly.Module | undefined> | undefined;
-let wasmTrace: PrefillWasmTrace | undefined;
 const scratchPool: Allocation[] = [];
 const maxScratchPoolEntries = 16;
 const maxScratchPoolBytes = 512 * 1024 * 1024;
@@ -424,11 +413,6 @@ type ResidentWasmInstance = {
   residentBytes: number;
 };
 
-export function setPrefillWasmTrace(trace: PrefillWasmTrace | undefined): void {
-  wasmTrace = trace;
-}
-
-
 export async function matMulQuantizedWasm(
   type: "Q4_0" | "Q4_K" | "Q5_K" | "Q6_K" | "IQ4_XS" | "Q8_0",
   weightBytes: Uint8Array,
@@ -452,12 +436,12 @@ export async function matMulQuantizedWasm(
   const allocations: Allocation[] = [];
   try {
     const outputLength = rowCount * columnCount;
-    const { weightAlloc, inputAlloc, outputAlloc } = timedWasmSection("matMulQuantized", "allocation + input copy", () => ({
+    const { weightAlloc, inputAlloc, outputAlloc } = ({
       weightAlloc: copyU8ToWasm(exports, weightBytes, allocations),
       inputAlloc: copyF32ToWasm(exports, inputColumns, allocations),
       outputAlloc: allocateBytes(exports, outputLength * Float32Array.BYTES_PER_ELEMENT, allocations),
-    }), weightBytes.byteLength + inputColumns.byteLength + outputLength * Float32Array.BYTES_PER_ELEMENT);
-    const code = timedWasmSection("matMulQuantized", "kernel call", () => exports.hp_matmul_quantized_f32(
+    });
+    const code = exports.hp_matmul_quantized_f32(
       typeId,
       weightAlloc.ptr,
       weightBytes.length,
@@ -468,14 +452,14 @@ export async function matMulQuantizedWasm(
       columnCount,
       outputAlloc.ptr,
       outputLength,
-    ));
+    );
     assertWasmOk(code, "matMulQuantized");
-    return timedWasmSection("matMulQuantized", "output copy + free", () => {
+    return (() => {
       const output = readF32FromWasm(exports, outputAlloc.ptr, outputLength);
       releaseAllocations(exports, allocations);
       allocations.length = 0;
       return output;
-    }, outputLength * Float32Array.BYTES_PER_ELEMENT);
+    })();
   } finally {
     releaseAllocations(exports, allocations);
   }
@@ -504,12 +488,12 @@ export async function matMulDequantizedWasm(
   const allocations: Allocation[] = [];
   try {
     const outputLength = rowCount * columnCount;
-    const { weightAlloc, inputAlloc, outputAlloc } = timedWasmSection("matMulDequantized", "allocation + input copy", () => ({
+    const { weightAlloc, inputAlloc, outputAlloc } = ({
       weightAlloc: copyU8ToWasm(exports, weightBytes, allocations),
       inputAlloc: copyF32ToWasm(exports, inputColumns, allocations),
       outputAlloc: allocateBytes(exports, outputLength * Float32Array.BYTES_PER_ELEMENT, allocations),
-    }), weightBytes.byteLength + inputColumns.byteLength + outputLength * Float32Array.BYTES_PER_ELEMENT);
-    const code = timedWasmSection("matMulDequantized", "kernel call", () => exports.hp_matmul_dequantized_f32(
+    });
+    const code = exports.hp_matmul_dequantized_f32(
       typeId,
       weightAlloc.ptr,
       weightBytes.length,
@@ -520,14 +504,14 @@ export async function matMulDequantizedWasm(
       columnCount,
       outputAlloc.ptr,
       outputLength,
-    ));
+    );
     assertWasmOk(code, "matMulDequantized");
-    return timedWasmSection("matMulDequantized", "output copy + free", () => {
+    return (() => {
       const output = readF32FromWasm(exports, outputAlloc.ptr, outputLength);
       releaseAllocations(exports, allocations);
       allocations.length = 0;
       return output;
-    }, outputLength * Float32Array.BYTES_PER_ELEMENT);
+    })();
   } finally {
     releaseAllocations(exports, allocations);
   }
@@ -553,13 +537,13 @@ export async function createWasmQuantizedWeightHandle(
     return undefined;
   }
 
-  const allocation = timedWasmSection("matMulQuantizedResident", "resident weight copy", () => {
+  const allocation = (() => {
     const ptr = unsignedWasmPtr(instance.exports.hp_alloc(weightBytes.byteLength));
     assertAllocation(ptr, weightBytes.byteLength);
     new Uint8Array(instance.exports.memory.buffer, ptr, weightBytes.length).set(weightBytes);
     return { ptr, byteLength: weightBytes.byteLength };
-  }, weightBytes.byteLength);
-  const scaleAllocation = timedWasmSection("matMulQuantizedResident", "resident scale prepare", () => {
+  })();
+  const scaleAllocation = (() => {
     const scalePtr = unsignedWasmPtr(instance.exports.hp_alloc(scaleByteLength));
     assertAllocation(scalePtr, scaleByteLength);
     const code = instance.exports.hp_prepare_quantized_scales_f32(
@@ -573,7 +557,7 @@ export async function createWasmQuantizedWeightHandle(
     );
     assertWasmOk(code, "prepareQuantizedScales");
     return { ptr: scalePtr, byteLength: scaleByteLength };
-  }, scaleByteLength);
+  })();
 
   instance.residentBytes += weightBytes.byteLength + scaleByteLength;
   return {
@@ -631,11 +615,11 @@ export async function matMulQuantizedWasmResident(
   const allocations: Allocation[] = [];
   try {
     const outputLength = rowCount * columnCount;
-    const { inputAlloc, outputAlloc } = timedWasmSection("matMulQuantizedResident", "allocation + input copy", () => ({
+    const { inputAlloc, outputAlloc } = ({
       inputAlloc: copyF32ToWasm(instance.exports, inputColumns, allocations),
       outputAlloc: allocateBytes(instance.exports, outputLength * Float32Array.BYTES_PER_ELEMENT, allocations),
-    }), inputColumns.byteLength + outputLength * Float32Array.BYTES_PER_ELEMENT);
-    const code = timedWasmSection("matMulQuantizedResident", "kernel call", () => instance.exports.hp_matmul_quantized_prepared_f32(
+    });
+    const code = instance.exports.hp_matmul_quantized_prepared_f32(
       typeId,
       handle.ptr,
       handle.byteLength,
@@ -648,14 +632,14 @@ export async function matMulQuantizedWasmResident(
       columnCount,
       outputAlloc.ptr,
       outputLength,
-    ));
+    );
     assertWasmOk(code, "matMulQuantizedResident");
-    return timedWasmSection("matMulQuantizedResident", "output copy + free", () => {
+    return (() => {
       const output = readF32FromWasm(instance.exports, outputAlloc.ptr, outputLength);
       releaseAllocations(instance.exports, allocations);
       allocations.length = 0;
       return output;
-    }, outputLength * Float32Array.BYTES_PER_ELEMENT);
+    })();
   } finally {
     releaseAllocations(instance.exports, allocations);
   }
@@ -695,13 +679,13 @@ export async function matMulQuantizedWasmResidentMulti(
   const allocations: Allocation[] = [];
   try {
     const outputLengths = handles.map((handle) => handle.rowCount * columnCount);
-    const allocated = timedWasmSection("matMulQuantizedResidentMulti", "allocation + input copy", () => {
+    const allocated = (() => {
       const inputAlloc = copyF32ToWasm(instance.exports, inputColumns, allocations);
       const outputAllocs = outputLengths.map((length) =>
         allocateBytes(instance.exports, length * Float32Array.BYTES_PER_ELEMENT, allocations),
       );
       return { inputAlloc, outputAllocs };
-    }, inputColumns.byteLength + outputLengths.reduce((sum, length) => sum + length * Float32Array.BYTES_PER_ELEMENT, 0));
+    })();
 
     const slots = Array.from({ length: 4 }, (_, index) => ({
       typeId: typeIds[index] ?? 0,
@@ -710,7 +694,7 @@ export async function matMulQuantizedWasmResidentMulti(
       outputLength: outputLengths[index] ?? 0,
     }));
 
-    const code = timedWasmSection("matMulQuantizedResidentMulti", "kernel call", () => instance.exports.hp_matmul_quantized_prepared_multi_f32(
+    const code = instance.exports.hp_matmul_quantized_prepared_multi_f32(
       handles.length,
       allocated.inputAlloc.ptr,
       inputColumns.length,
@@ -748,17 +732,17 @@ export async function matMulQuantizedWasmResidentMulti(
       slots[3].handle?.rowCount ?? 0,
       slots[3].outputAlloc.ptr,
       slots[3].outputLength,
-    ));
+    );
     assertWasmOk(code, "MatMulQuantizedResidentMulti");
 
-    return timedWasmSection("matMulQuantizedResidentMulti", "output copy + free", () => {
+    return (() => {
       const outputs = slots.slice(0, handles.length).map((slot) =>
         readF32FromWasm(instance.exports, slot.outputAlloc.ptr, slot.outputLength),
       );
       releaseAllocations(instance.exports, allocations);
       allocations.length = 0;
       return outputs;
-    }, outputLengths.reduce((sum, length) => sum + length * Float32Array.BYTES_PER_ELEMENT, 0));
+    })();
   } finally {
     releaseAllocations(instance.exports, allocations);
   }
@@ -788,15 +772,14 @@ export async function matMulQuantizedMultiWasm(
   const allocations: Allocation[] = [];
   try {
     const outputLengths = weights.map((weight) => weight.rowCount * columnCount);
-    const allocated = timedWasmSection("matMulQuantizedMulti", "allocation + input copy", () => {
+    const allocated = (() => {
       const weightAllocs = weights.map((weight) => copyU8ToWasm(exports, weight.weightBytes, allocations));
       const inputAlloc = copyF32ToWasm(exports, inputColumns, allocations);
       const outputAllocs = outputLengths.map((length) =>
         allocateBytes(exports, length * Float32Array.BYTES_PER_ELEMENT, allocations),
       );
       return { weightAllocs, inputAlloc, outputAllocs };
-    }, weights.reduce((sum, weight) => sum + weight.weightBytes.byteLength, inputColumns.byteLength) +
-      outputLengths.reduce((sum, length) => sum + length * Float32Array.BYTES_PER_ELEMENT, 0));
+    })();
 
     const slots = Array.from({ length: 4 }, (_, index) => ({
       typeId: typeIds[index] ?? 0,
@@ -807,7 +790,7 @@ export async function matMulQuantizedMultiWasm(
       outputLength: outputLengths[index] ?? 0,
     }));
 
-    const code = timedWasmSection("matMulQuantizedMulti", "kernel call", () => exports.hp_matmul_quantized_multi_f32(
+    const code = exports.hp_matmul_quantized_multi_f32(
       weights.length,
       allocated.inputAlloc.ptr,
       inputColumns.length,
@@ -837,17 +820,17 @@ export async function matMulQuantizedMultiWasm(
       slots[3].rowCount,
       slots[3].outputAlloc.ptr,
       slots[3].outputLength,
-    ));
+    );
     assertWasmOk(code, "matMulQuantizedMulti");
 
-    return timedWasmSection("matMulQuantizedMulti", "output copy + free", () => {
+    return (() => {
       const outputs = slots.slice(0, weights.length).map((slot) =>
         readF32FromWasm(exports, slot.outputAlloc.ptr, slot.outputLength),
       );
       releaseAllocations(exports, allocations);
       allocations.length = 0;
       return outputs;
-    }, outputLengths.reduce((sum, length) => sum + length * Float32Array.BYTES_PER_ELEMENT, 0));
+    })();
   } finally {
     releaseAllocations(exports, allocations);
   }
@@ -897,15 +880,14 @@ export async function gqaAttentionWasm(
   const allocations: Allocation[] = [];
   try {
     const outputLength = tokenCount * queryHeadCount * headSize;
-    const { queryAlloc, keyAlloc, valueAlloc, maskAlloc, outputAlloc } = timedWasmSection("gqaAttention", "allocation + input copy", () => ({
+    const { queryAlloc, keyAlloc, valueAlloc, maskAlloc, outputAlloc } = ({
       queryAlloc: copyF32ToWasm(exports, query, allocations),
       keyAlloc: copyF32ToWasm(exports, key, allocations),
       valueAlloc: copyF32ToWasm(exports, value, allocations),
       maskAlloc: mask ? copyF32ToWasm(exports, mask, allocations) : { ptr: 0, byteLength: 0 },
       outputAlloc: allocateBytes(exports, outputLength * Float32Array.BYTES_PER_ELEMENT, allocations),
-    }), query.byteLength + key.byteLength + value.byteLength + (mask?.byteLength ?? 0) +
-      outputLength * Float32Array.BYTES_PER_ELEMENT);
-    const code = timedWasmSection("gqaAttention", "kernel call", () => exports.hp_gqa_attention_f32(
+    });
+    const code = exports.hp_gqa_attention_f32(
       queryAlloc.ptr,
       query.length,
       keyAlloc.ptr,
@@ -926,14 +908,14 @@ export async function gqaAttentionWasm(
       quantizeQueryForScore === "f16" ? 1 : 0,
       outputAlloc.ptr,
       outputLength,
-    ));
+    );
     assertWasmOk(code, "gqaAttention");
-    return timedWasmSection("gqaAttention", "output copy + free", () => {
+    return (() => {
       const output = readF32FromWasm(exports, outputAlloc.ptr, outputLength);
       releaseAllocations(exports, allocations);
       allocations.length = 0;
       return output;
-    }, outputLength * Float32Array.BYTES_PER_ELEMENT);
+    })();
   } finally {
     releaseAllocations(exports, allocations);
   }
@@ -955,12 +937,12 @@ export async function visionPatchEmbedWasm(
   const outputLength = patchGridX * patchGridY * embeddingLength;
   const allocations: Allocation[] = [];
   try {
-    const { pixelsAlloc, weightsAlloc, outputAlloc } = timedWasmSection("visionPatchEmbed", "allocation + input copy", () => ({
+    const { pixelsAlloc, weightsAlloc, outputAlloc } = ({
       pixelsAlloc: copyF32ToWasm(exports, pixels, allocations),
       weightsAlloc: copyF32ToWasm(exports, weights, allocations),
       outputAlloc: allocateBytes(exports, outputLength * Float32Array.BYTES_PER_ELEMENT, allocations),
-    }), pixels.byteLength + weights.byteLength + outputLength * Float32Array.BYTES_PER_ELEMENT);
-    const code = timedWasmSection("visionPatchEmbed", "kernel call", () => exports.hp_vision_patch_embed_f32(
+    });
+    const code = exports.hp_vision_patch_embed_f32(
       pixelsAlloc.ptr,
       pixels.length,
       weightsAlloc.ptr,
@@ -972,9 +954,9 @@ export async function visionPatchEmbedWasm(
       embeddingLength,
       outputAlloc.ptr,
       outputLength,
-    ));
+    );
     assertWasmOk(code, "visionPatchEmbed");
-    return readVisionOutput(exports, allocations, outputAlloc.ptr, outputLength, "visionPatchEmbed");
+    return readVisionOutput(exports, allocations, outputAlloc.ptr, outputLength);
   } finally {
     releaseAllocations(exports, allocations);
   }
@@ -994,12 +976,12 @@ export async function visionAddPositionEmbeddingsWasm(
   }
   const allocations: Allocation[] = [];
   try {
-    const { hiddenAlloc, positionsAlloc, outputAlloc } = timedWasmSection("visionAddPosition", "allocation + input copy", () => ({
+    const { hiddenAlloc, positionsAlloc, outputAlloc } = ({
       hiddenAlloc: copyF32ToWasm(exports, hidden, allocations),
       positionsAlloc: copyF32ToWasm(exports, positions, allocations),
       outputAlloc: allocateBytes(exports, hidden.byteLength, allocations),
-    }), hidden.byteLength + positions.byteLength + hidden.byteLength);
-    const code = timedWasmSection("visionAddPosition", "kernel call", () => exports.hp_vision_add_position_f32(
+    });
+    const code = exports.hp_vision_add_position_f32(
       hiddenAlloc.ptr,
       hidden.length,
       positionsAlloc.ptr,
@@ -1010,9 +992,9 @@ export async function visionAddPositionEmbeddingsWasm(
       tableSize,
       outputAlloc.ptr,
       hidden.length,
-    ));
+    );
     assertWasmOk(code, "visionAddPosition");
-    return readVisionOutput(exports, allocations, outputAlloc.ptr, hidden.length, "visionAddPosition");
+    return readVisionOutput(exports, allocations, outputAlloc.ptr, hidden.length);
   } finally {
     releaseAllocations(exports, allocations);
   }
@@ -1030,12 +1012,12 @@ export async function visionRmsNormWasm(
   }
   const allocations: Allocation[] = [];
   try {
-    const { inputAlloc, weightAlloc, outputAlloc } = timedWasmSection("visionRmsNorm", "allocation + input copy", () => ({
+    const { inputAlloc, weightAlloc, outputAlloc } = ({
       inputAlloc: copyF32ToWasm(exports, input, allocations),
       weightAlloc: weight ? copyF32ToWasm(exports, weight, allocations) : { ptr: 0, byteLength: 0, exports },
       outputAlloc: allocateBytes(exports, input.byteLength, allocations),
-    }), input.byteLength + (weight?.byteLength ?? 0) + input.byteLength);
-    const code = timedWasmSection("visionRmsNorm", "kernel call", () => exports.hp_vision_rms_norm_f32(
+    });
+    const code = exports.hp_vision_rms_norm_f32(
       inputAlloc.ptr,
       input.length,
       weightAlloc.ptr,
@@ -1044,9 +1026,9 @@ export async function visionRmsNormWasm(
       epsilon,
       outputAlloc.ptr,
       input.length,
-    ));
+    );
     assertWasmOk(code, "visionRmsNorm");
-    return readVisionOutput(exports, allocations, outputAlloc.ptr, input.length, "visionRmsNorm");
+    return readVisionOutput(exports, allocations, outputAlloc.ptr, input.length);
   } finally {
     releaseAllocations(exports, allocations);
   }
@@ -1066,11 +1048,11 @@ export async function visionRope2dNeoxWasm(
   }
   const allocations: Allocation[] = [];
   try {
-    const { inputAlloc, outputAlloc } = timedWasmSection("visionRope2dNeox", "allocation + input copy", () => ({
+    const { inputAlloc, outputAlloc } = ({
       inputAlloc: copyF32ToWasm(exports, input, allocations),
       outputAlloc: allocateBytes(exports, input.byteLength, allocations),
-    }), input.byteLength * 2);
-    const code = timedWasmSection("visionRope2dNeox", "kernel call", () => exports.hp_vision_rope2d_neox_f32(
+    });
+    const code = exports.hp_vision_rope2d_neox_f32(
       inputAlloc.ptr,
       input.length,
       patchGridX,
@@ -1080,9 +1062,9 @@ export async function visionRope2dNeoxWasm(
       freqBase,
       outputAlloc.ptr,
       input.length,
-    ));
+    );
     assertWasmOk(code, "visionRope2dNeox");
-    return readVisionOutput(exports, allocations, outputAlloc.ptr, input.length, "visionRope2dNeox");
+    return readVisionOutput(exports, allocations, outputAlloc.ptr, input.length);
   } finally {
     releaseAllocations(exports, allocations);
   }
@@ -1099,20 +1081,20 @@ export async function visionClampWasm(
   }
   const allocations: Allocation[] = [];
   try {
-    const { inputAlloc, outputAlloc } = timedWasmSection("visionClamp", "allocation + input copy", () => ({
+    const { inputAlloc, outputAlloc } = ({
       inputAlloc: copyF32ToWasm(exports, input, allocations),
       outputAlloc: allocateBytes(exports, input.byteLength, allocations),
-    }), input.byteLength * 2);
-    const code = timedWasmSection("visionClamp", "kernel call", () => exports.hp_vision_clamp_f32(
+    });
+    const code = exports.hp_vision_clamp_f32(
       inputAlloc.ptr,
       input.length,
       min,
       max,
       outputAlloc.ptr,
       input.length,
-    ));
+    );
     assertWasmOk(code, "visionClamp");
-    return readVisionOutput(exports, allocations, outputAlloc.ptr, input.length, "visionClamp");
+    return readVisionOutput(exports, allocations, outputAlloc.ptr, input.length);
   } finally {
     releaseAllocations(exports, allocations);
   }
@@ -1128,21 +1110,21 @@ export async function visionGeluMulWasm(
   }
   const allocations: Allocation[] = [];
   try {
-    const { gateAlloc, upAlloc, outputAlloc } = timedWasmSection("visionGeluMul", "allocation + input copy", () => ({
+    const { gateAlloc, upAlloc, outputAlloc } = ({
       gateAlloc: copyF32ToWasm(exports, gate, allocations),
       upAlloc: copyF32ToWasm(exports, up, allocations),
       outputAlloc: allocateBytes(exports, gate.byteLength, allocations),
-    }), gate.byteLength + up.byteLength + gate.byteLength);
-    const code = timedWasmSection("visionGeluMul", "kernel call", () => exports.hp_vision_gelu_mul_f32(
+    });
+    const code = exports.hp_vision_gelu_mul_f32(
       gateAlloc.ptr,
       gate.length,
       upAlloc.ptr,
       up.length,
       outputAlloc.ptr,
       gate.length,
-    ));
+    );
     assertWasmOk(code, "visionGeluMul");
-    return readVisionOutput(exports, allocations, outputAlloc.ptr, gate.length, "visionGeluMul");
+    return readVisionOutput(exports, allocations, outputAlloc.ptr, gate.length);
   } finally {
     releaseAllocations(exports, allocations);
   }
@@ -1158,21 +1140,21 @@ export async function visionResidualAddWasm(
   }
   const allocations: Allocation[] = [];
   try {
-    const { leftAlloc, rightAlloc, outputAlloc } = timedWasmSection("visionResidualAdd", "allocation + input copy", () => ({
+    const { leftAlloc, rightAlloc, outputAlloc } = ({
       leftAlloc: copyF32ToWasm(exports, left, allocations),
       rightAlloc: copyF32ToWasm(exports, right, allocations),
       outputAlloc: allocateBytes(exports, left.byteLength, allocations),
-    }), left.byteLength + right.byteLength + left.byteLength);
-    const code = timedWasmSection("visionResidualAdd", "kernel call", () => exports.hp_vision_residual_add_f32(
+    });
+    const code = exports.hp_vision_residual_add_f32(
       leftAlloc.ptr,
       left.length,
       rightAlloc.ptr,
       right.length,
       outputAlloc.ptr,
       left.length,
-    ));
+    );
     assertWasmOk(code, "visionResidualAdd");
-    return readVisionOutput(exports, allocations, outputAlloc.ptr, left.length, "visionResidualAdd");
+    return readVisionOutput(exports, allocations, outputAlloc.ptr, left.length);
   } finally {
     releaseAllocations(exports, allocations);
   }
@@ -1193,11 +1175,11 @@ export async function visionAveragePoolScaleWasm(
   const outputLength = (patchGridX / kernelSize) * (patchGridY / kernelSize) * embeddingLength;
   const allocations: Allocation[] = [];
   try {
-    const { inputAlloc, outputAlloc } = timedWasmSection("visionAveragePoolScale", "allocation + input copy", () => ({
+    const { inputAlloc, outputAlloc } = ({
       inputAlloc: copyF32ToWasm(exports, input, allocations),
       outputAlloc: allocateBytes(exports, outputLength * Float32Array.BYTES_PER_ELEMENT, allocations),
-    }), input.byteLength + outputLength * Float32Array.BYTES_PER_ELEMENT);
-    const code = timedWasmSection("visionAveragePoolScale", "kernel call", () => exports.hp_vision_average_pool_scale_f32(
+    });
+    const code = exports.hp_vision_average_pool_scale_f32(
       inputAlloc.ptr,
       input.length,
       patchGridX,
@@ -1207,9 +1189,9 @@ export async function visionAveragePoolScaleWasm(
       outputScale,
       outputAlloc.ptr,
       outputLength,
-    ));
+    );
     assertWasmOk(code, "visionAveragePoolScale");
-    return readVisionOutput(exports, allocations, outputAlloc.ptr, outputLength, "visionAveragePoolScale");
+    return readVisionOutput(exports, allocations, outputAlloc.ptr, outputLength);
   } finally {
     releaseAllocations(exports, allocations);
   }
@@ -1227,13 +1209,13 @@ export async function visionStdNormalizeWasm(
   }
   const allocations: Allocation[] = [];
   try {
-    const { inputAlloc, biasAlloc, scaleAlloc, outputAlloc } = timedWasmSection("visionStdNormalize", "allocation + input copy", () => ({
+    const { inputAlloc, biasAlloc, scaleAlloc, outputAlloc } = ({
       inputAlloc: copyF32ToWasm(exports, input, allocations),
       biasAlloc: copyF32ToWasm(exports, bias, allocations),
       scaleAlloc: copyF32ToWasm(exports, scale, allocations),
       outputAlloc: allocateBytes(exports, input.byteLength, allocations),
-    }), input.byteLength + bias.byteLength + scale.byteLength + input.byteLength);
-    const code = timedWasmSection("visionStdNormalize", "kernel call", () => exports.hp_vision_std_normalize_f32(
+    });
+    const code = exports.hp_vision_std_normalize_f32(
       inputAlloc.ptr,
       input.length,
       biasAlloc.ptr,
@@ -1243,9 +1225,9 @@ export async function visionStdNormalizeWasm(
       rowSize,
       outputAlloc.ptr,
       input.length,
-    ));
+    );
     assertWasmOk(code, "visionStdNormalize");
-    return readVisionOutput(exports, allocations, outputAlloc.ptr, input.length, "visionStdNormalize");
+    return readVisionOutput(exports, allocations, outputAlloc.ptr, input.length);
   } finally {
     releaseAllocations(exports, allocations);
   }
@@ -1269,13 +1251,13 @@ export async function visionPreprocessRgbaWasm(
   try {
     const meanValues = new Float32Array(mean);
     const stdValues = new Float32Array(std);
-    const { rgbaAlloc, meanAlloc, stdAlloc, outputAlloc } = timedWasmSection("visionPreprocessRgba", "allocation + input copy", () => ({
+    const { rgbaAlloc, meanAlloc, stdAlloc, outputAlloc } = ({
       rgbaAlloc: copyU8ToWasm(exports, rgba, allocations),
       meanAlloc: copyF32ToWasm(exports, meanValues, allocations),
       stdAlloc: copyF32ToWasm(exports, stdValues, allocations),
       outputAlloc: allocateBytes(exports, outputLength * Float32Array.BYTES_PER_ELEMENT, allocations),
-    }), rgba.byteLength + meanValues.byteLength + stdValues.byteLength + outputLength * Float32Array.BYTES_PER_ELEMENT);
-    const code = timedWasmSection("visionPreprocessRgba", "kernel call", () => exports.hp_vision_preprocess_rgba_f32(
+    });
+    const code = exports.hp_vision_preprocess_rgba_f32(
       rgbaAlloc.ptr,
       rgba.length,
       sourceWidth,
@@ -1288,9 +1270,9 @@ export async function visionPreprocessRgbaWasm(
       stdValues.length,
       outputAlloc.ptr,
       outputLength,
-    ));
+    );
     assertWasmOk(code, "visionPreprocessRgba");
-    return readVisionOutput(exports, allocations, outputAlloc.ptr, outputLength, "visionPreprocessRgba");
+    return readVisionOutput(exports, allocations, outputAlloc.ptr, outputLength);
   } finally {
     releaseAllocations(exports, allocations);
   }
@@ -1318,14 +1300,14 @@ export async function audioLogMelWasm(
   const outputLength = config.frameCount * config.featureSize;
   const allocations: Allocation[] = [];
   try {
-    const { pcmAlloc, windowAlloc, filtersAlloc, outputAlloc, maskAlloc } = timedWasmSection("audioLogMel", "allocation + input copy", () => ({
+    const { pcmAlloc, windowAlloc, filtersAlloc, outputAlloc, maskAlloc } = ({
       pcmAlloc: copyF32ToWasm(exports, pcm, allocations),
       windowAlloc: copyF32ToWasm(exports, window, allocations),
       filtersAlloc: copyF32ToWasm(exports, filters, allocations),
       outputAlloc: allocateBytes(exports, outputLength * Float32Array.BYTES_PER_ELEMENT, allocations),
       maskAlloc: allocateBytes(exports, config.frameCount * Uint8Array.BYTES_PER_ELEMENT, allocations),
-    }), pcm.byteLength + window.byteLength + filters.byteLength + outputLength * Float32Array.BYTES_PER_ELEMENT + config.frameCount);
-    const code = timedWasmSection("audioLogMel", "kernel call", () => exports.hp_audio_log_mel_f32(
+    });
+    const code = exports.hp_audio_log_mel_f32(
       pcmAlloc.ptr,
       pcm.length,
       windowAlloc.ptr,
@@ -1341,15 +1323,15 @@ export async function audioLogMelWasm(
       outputLength,
       maskAlloc.ptr,
       config.frameCount,
-    ));
+    );
     assertWasmOk(code, "audioLogMel");
-    return timedWasmSection("audioLogMel", "output copy + free", () => {
+    return (() => {
       const values = readF32FromWasm(exports, outputAlloc.ptr, outputLength);
       const attentionMask = readU8FromWasm(exports, maskAlloc.ptr, config.frameCount);
       releaseAllocations(exports, allocations);
       allocations.length = 0;
       return { values, attentionMask };
-    }, outputLength * Float32Array.BYTES_PER_ELEMENT + config.frameCount);
+    })();
   } finally {
     releaseAllocations(exports, allocations);
   }
@@ -1376,16 +1358,15 @@ export async function audioConv2dSubsampleWasm(
   const outputLength = outTime * outChannels * outFrequency;
   const allocations: Allocation[] = [];
   try {
-    const { inputAlloc, maskAlloc, weightAlloc, biasAlloc, normAlloc, outputAlloc } = timedWasmSection("audioConv2dSubsample", "allocation + input copy", () => ({
+    const { inputAlloc, maskAlloc, weightAlloc, biasAlloc, normAlloc, outputAlloc } = ({
       inputAlloc: copyF32ToWasm(exports, input, allocations),
       maskAlloc: copyU8ToWasm(exports, mask, allocations),
       weightAlloc: copyF32ToWasm(exports, weight, allocations),
       biasAlloc: bias ? copyF32ToWasm(exports, bias, allocations) : { ptr: 0, byteLength: 0, exports },
       normAlloc: copyF32ToWasm(exports, norm, allocations),
       outputAlloc: allocateBytes(exports, outputLength * Float32Array.BYTES_PER_ELEMENT, allocations),
-    }), input.byteLength + mask.byteLength + weight.byteLength + (bias?.byteLength ?? 0) + norm.byteLength +
-      outputLength * Float32Array.BYTES_PER_ELEMENT);
-    const code = timedWasmSection("audioConv2dSubsample", "kernel call", () => exports.hp_audio_conv2d_subsample_f32(
+    });
+    const code = exports.hp_audio_conv2d_subsample_f32(
       inputAlloc.ptr,
       input.length,
       maskAlloc.ptr,
@@ -1403,9 +1384,9 @@ export async function audioConv2dSubsampleWasm(
       epsilon,
       outputAlloc.ptr,
       outputLength,
-    ));
+    );
     assertWasmOk(code, "audioConv2dSubsample");
-    return readVisionOutput(exports, allocations, outputAlloc.ptr, outputLength, "audioConv2dSubsample");
+    return readVisionOutput(exports, allocations, outputAlloc.ptr, outputLength);
   } finally {
     releaseAllocations(exports, allocations);
   }
@@ -1424,11 +1405,11 @@ export async function audioFlattenChannelsLastWasm(
   const outputLength = timeCount * frequencyCount * channelCount;
   const allocations: Allocation[] = [];
   try {
-    const { inputAlloc, outputAlloc } = timedWasmSection("audioFlattenChannelsLast", "allocation + input copy", () => ({
+    const { inputAlloc, outputAlloc } = ({
       inputAlloc: copyF32ToWasm(exports, input, allocations),
       outputAlloc: allocateBytes(exports, outputLength * Float32Array.BYTES_PER_ELEMENT, allocations),
-    }), input.byteLength + outputLength * Float32Array.BYTES_PER_ELEMENT);
-    const code = timedWasmSection("audioFlattenChannelsLast", "kernel call", () => exports.hp_audio_flatten_channels_last_f32(
+    });
+    const code = exports.hp_audio_flatten_channels_last_f32(
       inputAlloc.ptr,
       input.length,
       timeCount,
@@ -1436,9 +1417,9 @@ export async function audioFlattenChannelsLastWasm(
       channelCount,
       outputAlloc.ptr,
       outputLength,
-    ));
+    );
     assertWasmOk(code, "audioFlattenChannelsLast");
-    return readVisionOutput(exports, allocations, outputAlloc.ptr, outputLength, "audioFlattenChannelsLast");
+    return readVisionOutput(exports, allocations, outputAlloc.ptr, outputLength);
   } finally {
     releaseAllocations(exports, allocations);
   }
@@ -1455,12 +1436,12 @@ export async function audioRmsNormWasm(
   }
   const allocations: Allocation[] = [];
   try {
-    const { inputAlloc, weightAlloc, outputAlloc } = timedWasmSection("audioRmsNorm", "allocation + input copy", () => ({
+    const { inputAlloc, weightAlloc, outputAlloc } = ({
       inputAlloc: copyF32ToWasm(exports, input, allocations),
       weightAlloc: copyF32ToWasm(exports, weight, allocations),
       outputAlloc: allocateBytes(exports, input.byteLength, allocations),
-    }), input.byteLength + weight.byteLength + input.byteLength);
-    const code = timedWasmSection("audioRmsNorm", "kernel call", () => exports.hp_audio_rms_norm_f32(
+    });
+    const code = exports.hp_audio_rms_norm_f32(
       inputAlloc.ptr,
       input.length,
       weightAlloc.ptr,
@@ -1468,9 +1449,9 @@ export async function audioRmsNormWasm(
       epsilon,
       outputAlloc.ptr,
       input.length,
-    ));
+    );
     assertWasmOk(code, "audioRmsNorm");
-    return readVisionOutput(exports, allocations, outputAlloc.ptr, input.length, "audioRmsNorm");
+    return readVisionOutput(exports, allocations, outputAlloc.ptr, input.length);
   } finally {
     releaseAllocations(exports, allocations);
   }
@@ -1483,20 +1464,20 @@ export async function audioClampWasm(input: Float32Array, min: number, max: numb
   }
   const allocations: Allocation[] = [];
   try {
-    const { inputAlloc, outputAlloc } = timedWasmSection("audioClamp", "allocation + input copy", () => ({
+    const { inputAlloc, outputAlloc } = ({
       inputAlloc: copyF32ToWasm(exports, input, allocations),
       outputAlloc: allocateBytes(exports, input.byteLength, allocations),
-    }), input.byteLength * 2);
-    const code = timedWasmSection("audioClamp", "kernel call", () => exports.hp_audio_clamp_f32(
+    });
+    const code = exports.hp_audio_clamp_f32(
       inputAlloc.ptr,
       input.length,
       min,
       max,
       outputAlloc.ptr,
       input.length,
-    ));
+    );
     assertWasmOk(code, "audioClamp");
-    return readVisionOutput(exports, allocations, outputAlloc.ptr, input.length, "audioClamp");
+    return readVisionOutput(exports, allocations, outputAlloc.ptr, input.length);
   } finally {
     releaseAllocations(exports, allocations);
   }
@@ -1509,21 +1490,21 @@ export async function audioResidualAddWasm(left: Float32Array, right: Float32Arr
   }
   const allocations: Allocation[] = [];
   try {
-    const { leftAlloc, rightAlloc, outputAlloc } = timedWasmSection("audioResidualAdd", "allocation + input copy", () => ({
+    const { leftAlloc, rightAlloc, outputAlloc } = ({
       leftAlloc: copyF32ToWasm(exports, left, allocations),
       rightAlloc: copyF32ToWasm(exports, right, allocations),
       outputAlloc: allocateBytes(exports, left.byteLength, allocations),
-    }), left.byteLength + right.byteLength + left.byteLength);
-    const code = timedWasmSection("audioResidualAdd", "kernel call", () => exports.hp_audio_residual_add_f32(
+    });
+    const code = exports.hp_audio_residual_add_f32(
       leftAlloc.ptr,
       left.length,
       rightAlloc.ptr,
       right.length,
       outputAlloc.ptr,
       left.length,
-    ));
+    );
     assertWasmOk(code, "audioResidualAdd");
-    return readVisionOutput(exports, allocations, outputAlloc.ptr, left.length, "audioResidualAdd");
+    return readVisionOutput(exports, allocations, outputAlloc.ptr, left.length);
   } finally {
     releaseAllocations(exports, allocations);
   }
@@ -1536,12 +1517,12 @@ export async function audioResidualAddScaleWasm(residual: Float32Array, hidden: 
   }
   const allocations: Allocation[] = [];
   try {
-    const { residualAlloc, hiddenAlloc, outputAlloc } = timedWasmSection("audioResidualAddScale", "allocation + input copy", () => ({
+    const { residualAlloc, hiddenAlloc, outputAlloc } = ({
       residualAlloc: copyF32ToWasm(exports, residual, allocations),
       hiddenAlloc: copyF32ToWasm(exports, hidden, allocations),
       outputAlloc: allocateBytes(exports, residual.byteLength, allocations),
-    }), residual.byteLength + hidden.byteLength + residual.byteLength);
-    const code = timedWasmSection("audioResidualAddScale", "kernel call", () => exports.hp_audio_residual_add_scale_f32(
+    });
+    const code = exports.hp_audio_residual_add_scale_f32(
       residualAlloc.ptr,
       residual.length,
       hiddenAlloc.ptr,
@@ -1549,9 +1530,9 @@ export async function audioResidualAddScaleWasm(residual: Float32Array, hidden: 
       scale,
       outputAlloc.ptr,
       residual.length,
-    ));
+    );
     assertWasmOk(code, "audioResidualAddScale");
-    return readVisionOutput(exports, allocations, outputAlloc.ptr, residual.length, "audioResidualAddScale");
+    return readVisionOutput(exports, allocations, outputAlloc.ptr, residual.length);
   } finally {
     releaseAllocations(exports, allocations);
   }
@@ -1564,18 +1545,18 @@ export async function audioSiluWasm(input: Float32Array): Promise<Float32Array |
   }
   const allocations: Allocation[] = [];
   try {
-    const { inputAlloc, outputAlloc } = timedWasmSection("audioSilu", "allocation + input copy", () => ({
+    const { inputAlloc, outputAlloc } = ({
       inputAlloc: copyF32ToWasm(exports, input, allocations),
       outputAlloc: allocateBytes(exports, input.byteLength, allocations),
-    }), input.byteLength * 2);
-    const code = timedWasmSection("audioSilu", "kernel call", () => exports.hp_audio_silu_f32(
+    });
+    const code = exports.hp_audio_silu_f32(
       inputAlloc.ptr,
       input.length,
       outputAlloc.ptr,
       input.length,
-    ));
+    );
     assertWasmOk(code, "audioSilu");
-    return readVisionOutput(exports, allocations, outputAlloc.ptr, input.length, "audioSilu");
+    return readVisionOutput(exports, allocations, outputAlloc.ptr, input.length);
   } finally {
     releaseAllocations(exports, allocations);
   }
@@ -1590,19 +1571,19 @@ export async function audioGluWasm(input: Float32Array, outputSize: number): Pro
   const outputLength = tokenCount * outputSize;
   const allocations: Allocation[] = [];
   try {
-    const { inputAlloc, outputAlloc } = timedWasmSection("audioGlu", "allocation + input copy", () => ({
+    const { inputAlloc, outputAlloc } = ({
       inputAlloc: copyF32ToWasm(exports, input, allocations),
       outputAlloc: allocateBytes(exports, outputLength * Float32Array.BYTES_PER_ELEMENT, allocations),
-    }), input.byteLength + outputLength * Float32Array.BYTES_PER_ELEMENT);
-    const code = timedWasmSection("audioGlu", "kernel call", () => exports.hp_audio_glu_f32(
+    });
+    const code = exports.hp_audio_glu_f32(
       inputAlloc.ptr,
       input.length,
       outputSize,
       outputAlloc.ptr,
       outputLength,
-    ));
+    );
     assertWasmOk(code, "audioGlu");
-    return readVisionOutput(exports, allocations, outputAlloc.ptr, outputLength, "audioGlu");
+    return readVisionOutput(exports, allocations, outputAlloc.ptr, outputLength);
   } finally {
     releaseAllocations(exports, allocations);
   }
@@ -1620,12 +1601,12 @@ export async function audioDepthwiseConv1dWasm(
   }
   const allocations: Allocation[] = [];
   try {
-    const { inputAlloc, weightAlloc, outputAlloc } = timedWasmSection("audioDepthwiseConv1d", "allocation + input copy", () => ({
+    const { inputAlloc, weightAlloc, outputAlloc } = ({
       inputAlloc: copyF32ToWasm(exports, input, allocations),
       weightAlloc: copyF32ToWasm(exports, weight, allocations),
       outputAlloc: allocateBytes(exports, input.byteLength, allocations),
-    }), input.byteLength + weight.byteLength + input.byteLength);
-    const code = timedWasmSection("audioDepthwiseConv1d", "kernel call", () => exports.hp_audio_depthwise_conv1d_f32(
+    });
+    const code = exports.hp_audio_depthwise_conv1d_f32(
       inputAlloc.ptr,
       input.length,
       weightAlloc.ptr,
@@ -1634,9 +1615,9 @@ export async function audioDepthwiseConv1dWasm(
       channels,
       outputAlloc.ptr,
       input.length,
-    ));
+    );
     assertWasmOk(code, "audioDepthwiseConv1d");
-    return readVisionOutput(exports, allocations, outputAlloc.ptr, input.length, "audioDepthwiseConv1d");
+    return readVisionOutput(exports, allocations, outputAlloc.ptr, input.length);
   } finally {
     releaseAllocations(exports, allocations);
   }
@@ -1649,21 +1630,21 @@ export async function audioAddBiasRowsWasm(input: Float32Array, bias: Float32Arr
   }
   const allocations: Allocation[] = [];
   try {
-    const { inputAlloc, biasAlloc, outputAlloc } = timedWasmSection("audioAddBiasRows", "allocation + input copy", () => ({
+    const { inputAlloc, biasAlloc, outputAlloc } = ({
       inputAlloc: copyF32ToWasm(exports, input, allocations),
       biasAlloc: copyF32ToWasm(exports, bias, allocations),
       outputAlloc: allocateBytes(exports, input.byteLength, allocations),
-    }), input.byteLength + bias.byteLength + input.byteLength);
-    const code = timedWasmSection("audioAddBiasRows", "kernel call", () => exports.hp_audio_add_bias_rows_f32(
+    });
+    const code = exports.hp_audio_add_bias_rows_f32(
       inputAlloc.ptr,
       input.length,
       biasAlloc.ptr,
       bias.length,
       outputAlloc.ptr,
       input.length,
-    ));
+    );
     assertWasmOk(code, "audioAddBiasRows");
-    return readVisionOutput(exports, allocations, outputAlloc.ptr, input.length, "audioAddBiasRows");
+    return readVisionOutput(exports, allocations, outputAlloc.ptr, input.length);
   } finally {
     releaseAllocations(exports, allocations);
   }
@@ -1677,7 +1658,7 @@ export async function checkWasmSupport(): Promise<WasmSupport> {
   if (typeof WebAssembly === "undefined") {
     return { available: false, reason: "webassembly-missing" };
   }
-  if (!(wasmBase64ForTesting ?? PREFILL_WASM_SIMD_BASE64)) {
+  if (!PREFILL_WASM_SIMD_BASE64) {
     return { available: false, reason: "module-missing" };
   }
   try {
@@ -1693,19 +1674,20 @@ export async function checkWasmSupport(): Promise<WasmSupport> {
   }
 }
 
-export function resetPrefillWasmForTesting(base64?: string): void {
-  wasmBase64ForTesting = base64;
-  instancePromise = undefined;
-  modulePromise = undefined;
-  scratchPool.length = 0;
-  scratchPoolBytes = 0;
-  residentInstances.length = 0;
-  nextResidentInstanceId = 1;
-}
-
 async function prefillWasmExports(): Promise<KernelExports | undefined> {
   if (!instancePromise) {
-    instancePromise = instantiatePrefillWasm();
+    instancePromise = instantiatePrefillWasm().then(
+      (exports) => {
+        if (!exports) {
+          instancePromise = undefined;
+        }
+        return exports;
+      },
+      (error: unknown) => {
+        instancePromise = undefined;
+        throw error;
+      },
+    );
   }
   return instancePromise;
 }
@@ -1725,13 +1707,24 @@ async function instantiatePrefillWasm(): Promise<KernelExports | undefined> {
 
 async function prefillWasmModule(): Promise<WebAssembly.Module | undefined> {
   if (!modulePromise) {
-    modulePromise = compilePrefillWasmModule();
+    modulePromise = compilePrefillWasmModule().then(
+      (module) => {
+        if (!module) {
+          modulePromise = undefined;
+        }
+        return module;
+      },
+      (error: unknown) => {
+        modulePromise = undefined;
+        throw error;
+      },
+    );
   }
   return modulePromise;
 }
 
 async function compilePrefillWasmModule(): Promise<WebAssembly.Module | undefined> {
-  const base64 = wasmBase64ForTesting ?? PREFILL_WASM_SIMD_BASE64;
+  const base64 = PREFILL_WASM_SIMD_BASE64;
   if (!base64 || typeof WebAssembly === "undefined") {
     return undefined;
   }
@@ -1837,14 +1830,13 @@ function readVisionOutput(
   allocations: Allocation[],
   outputPtr: number,
   outputLength: number,
-  kernelName: string,
 ): Float32Array {
-  return timedWasmSection(kernelName, "output copy + free", () => {
+  return (() => {
     const output = readF32FromWasm(exports, outputPtr, outputLength);
     releaseAllocations(exports, allocations);
     allocations.length = 0;
     return output;
-  }, outputLength * Float32Array.BYTES_PER_ELEMENT);
+  })();
 }
 
 function releaseAllocations(exports: KernelExports, allocations: Allocation[]): void {
@@ -1885,32 +1877,6 @@ function releaseScratchAllocation(exports: KernelExports, allocation: Allocation
   }
   scratchPool.push(allocation);
   scratchPoolBytes += allocation.byteLength;
-}
-
-function timedWasmSection<T>(
-  kernel: string,
-  section: PrefillWasmTraceEvent["section"],
-  run: () => T,
-  bytes?: number,
-): T {
-  if (!wasmTrace) {
-    return run();
-  }
-  const start = nowMs();
-  try {
-    return run();
-  } finally {
-    wasmTrace({
-      kernel,
-      section,
-      durationMs: nowMs() - start,
-      bytes,
-    });
-  }
-}
-
-function nowMs(): number {
-  return globalThis.performance?.now() ?? Date.now();
 }
 
 function assertWasmOk(code: number, kernelName: string): void {

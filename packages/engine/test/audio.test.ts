@@ -19,9 +19,6 @@ import {
   createWasmProvider,
   createWebGpuProvider,
 } from "../src/index.ts";
-import {
-  resetPrefillWasmForTesting,
-} from "../src/runner/wasm/wasm-kernels.ts";
 
 test("audio manifest reads projector metadata", () => {
   const reader = audioTensorReader([]);
@@ -109,21 +106,16 @@ test("audio preprocessor errors instead of falling back when WebGPU is unavailab
     providers: [createWebGpuProvider(), createWasmProvider(), createReferenceProvider()],
   });
 
-  resetPrefillWasmForTesting("");
-  try {
-    await assert.rejects(() => runAudioPreprocessor(session, {
-      pcm: new Float32Array(16_000),
-      sampleRate: 16_000,
-      durationMs: 1000,
-    }), /WebGPU is not available for audio preprocessing/);
+  await assert.rejects(() => runAudioPreprocessor(session, {
+    pcm: new Float32Array(16_000),
+    sampleRate: 16_000,
+    durationMs: 1000,
+  }), /WebGPU is not available for audio preprocessing/);
 
-    const stats = session.cacheStats().executionProviderStats;
-    assert.equal(stats.webgpuAudioPreprocessAttempts, 1);
-    assert.equal(stats.wasmAudioPreprocessAttempts, undefined);
-    assert.equal(stats.referenceAudioPreprocessRuns, undefined);
-  } finally {
-    resetPrefillWasmForTesting();
-  }
+  const stats = session.cacheStats().executionProviderStats;
+  assert.equal(stats.webgpuAudioPreprocessAttempts, 1);
+  assert.equal(stats.wasmAudioPreprocessAttempts, undefined);
+  assert.equal(stats.referenceAudioPreprocessRuns, undefined);
 });
 
 test("audio encoder projects hidden to model embedding size", async () => {

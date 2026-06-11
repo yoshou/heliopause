@@ -42,9 +42,33 @@ test("WebGPU segment runner resizes existing sliding KV buffers when MTP reserve
   );
 });
 
+test("WebGPU segment runner rejects when profiling timestamp readback fails", async () => {
+  const { device } = fakeDevice({ failUnlabeledMapAsync: true });
+  const arena = new GpuMemoryArena(device, 1 << 20);
+  const runner = webGpuRunnerForResizeTest(arena, slidingManifest(), {
+    gpuProfiling: true,
+  }) as unknown as {
+    beginRuntimeRun: () => unknown;
+    beginComputePass: (encoder: ReturnType<WebGpuDeviceLike["createCommandEncoder"]>, label: string) => unknown;
+    endComputePass: (encoder: ReturnType<WebGpuDeviceLike["createCommandEncoder"]>, compute: unknown) => void;
+    readTimestampProfiler: () => Promise<void>;
+  };
+
+  runner.beginRuntimeRun();
+  const encoder = device.createCommandEncoder();
+  const compute = runner.beginComputePass(encoder, "probe");
+  runner.endComputePass(encoder, compute);
+
+  await assert.rejects(
+    () => runner.readTimestampProfiler(),
+    /WebGPU GPU profiling timestamp readback failed: map failed/,
+  );
+});
+
 function webGpuRunnerForResizeTest(
   arena: GpuMemoryArena,
   manifest: ModelManifest,
+  options: { gpuProfiling?: boolean } = {},
 ): WebGpuSegmentRunner & { ensureGpuState(state: unknown): { fullAttention: Map<number, { capacity: number }> } } {
   const buffer = arena.createBuffer("dummy", 4, GPU_STORAGE);
   const f32Handle = { buffer, length: 1, byteLength: 4, destroy() {} };
@@ -85,6 +109,9 @@ function webGpuRunnerForResizeTest(
     0,
     1,
     64,
+    "standard",
+    options.gpuProfiling === true,
+    false,
     0,
   ) as WebGpuSegmentRunner & { ensureGpuState(state: unknown): { fullAttention: Map<number, { capacity: number }> } };
 }
@@ -134,7 +161,7 @@ function kvCacheBufferSizes(buffers: readonly { label?: string; size: number }[]
     .map((buffer) => buffer.size);
 }
 
-function fakeDevice(): {
+function fakeDevice(options: { failUnlabeledMapAsync?: boolean } = {}): {
   device: WebGpuDeviceLike;
   records: {
     buffers: Array<{ label?: string; size: number }>;
@@ -155,15 +182,21 @@ function fakeDevice(): {
   return {
     records,
     device: {
+      features: {
+        has: (feature) => feature === "timestamp-query",
+      },
       createBuffer(descriptor) {
         records.buffers.push({ label: descriptor.label, size: descriptor.size });
-        return fakeBuffer(descriptor.label, records.destroyed);
+        return fakeBuffer(descriptor.label, records.destroyed, {
+          failMapAsync: options.failUnlabeledMapAsync === true && descriptor.label === undefined,
+        });
       },
       createShaderModule: stub,
       createBindGroupLayout: stub,
       createPipelineLayout: stub,
       createComputePipeline: stub,
       createBindGroup: stub,
+      createQuerySet: stub,
       createCommandEncoder: () => ({
         beginComputePass: () => ({
           setPipeline() {},
@@ -174,6 +207,7 @@ function fakeDevice(): {
           end() {},
         }),
         copyBufferToBuffer() {},
+        resolveQuerySet() {},
         finish: () => ({}),
       }),
       queue: {
@@ -191,11 +225,19 @@ function fakeDevice(): {
   };
 }
 
-function fakeBuffer(label: string | undefined, destroyed: Array<string | undefined>): WebGpuBufferLike {
+function fakeBuffer(
+  label: string | undefined,
+  destroyed: Array<string | undefined>,
+  options: { failMapAsync?: boolean } = {},
+): WebGpuBufferLike {
   return {
     getMappedRange: () => new ArrayBuffer(0),
     unmap() {},
-    mapAsync: async () => {},
+    mapAsync: async () => {
+      if (options.failMapAsync === true) {
+        throw new Error("map failed");
+      }
+    },
     destroy: () => {
       destroyed.push(label);
     },

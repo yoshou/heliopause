@@ -232,6 +232,7 @@ export {
   checkWebGpuSupport,
   createWebGpuProvider,
   WebGpuSegmentRunner,
+  type WebGpuOptimizationLevel,
   type WebGpuRuntimeStats,
   type WebGpuProviderOptions,
   type WebGpuSegmentRunnerOptions,

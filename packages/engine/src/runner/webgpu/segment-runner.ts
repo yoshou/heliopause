@@ -3,6 +3,7 @@ import { type GgufTensorReader, type TensorByteRange } from "../../tensor-reader
 import type { ModelManifest } from "../../model";
 import { addInferenceStateDisposeCallback, kvCacheCapacity, type InferenceState } from "../../runtime";
 import { dequantizeRow, float16ToFloat32 } from "../../quant";
+import type { WebGpuOptimizationLevel } from "./execution-provider";
 import type {
   MtpTargetKvLayerView,
   MtpTargetKvView,
@@ -86,6 +87,9 @@ export type WebGpuSegmentRunnerOptions = {
   contextLength: number;
   memoryLimitBytes?: number;
   prefillChunkSize?: number;
+  optimizationLevel?: WebGpuOptimizationLevel;
+  gpuProfiling?: boolean;
+  trackBufferAllocations?: boolean;
   segmentStartLayer: number;
   segmentEndLayerExclusive?: number;
   loadOutput?: boolean;
@@ -172,7 +176,7 @@ export type WebGpuRuntimeStats = {
   webgpuLastRunBindGroupCreateMs: number;
   webgpuLastRunBufferCreates: number;
   webgpuLastRunBufferCreateMs: number;
-  webgpuLastRunBufferCreateLabels: string;
+  webgpuLastRunBufferAllocationsByLabel: string;
   webgpuLastRunEncodeMs: number;
   webgpuLastRunSubmitMs: number;
   webgpuLastRunReadbackWaitMs: number;
@@ -255,8 +259,7 @@ type TimestampPass = {
 type ActiveComputePass = {
   pass: WebGpuComputePassLike;
   timestampPass?: TimestampPass;
-  profileGpuPass: boolean;
-  profileSections: boolean;
+  profiling: boolean;
 };
 
 const TIMESTAMP_QUERY_PAIR_BYTES = 2 * BigUint64Array.BYTES_PER_ELEMENT;
@@ -280,6 +283,9 @@ export class WebGpuSegmentRunner implements SegmentRunner {
   private readonly hasRopeFreqFactors: boolean;
   private readonly tensorReader: GgufTensorReader;
   private readonly prefillChunkSize: number;
+  private readonly optimizationLevel: WebGpuOptimizationLevel;
+  private readonly gpuProfiling: boolean;
+  private readonly trackBufferAllocations: boolean;
   private lazyLoadMs: number;
   private inputResourcesPromise?: Promise<GpuInputResources>;
   private readbackBytes = 0;
@@ -313,7 +319,7 @@ export class WebGpuSegmentRunner implements SegmentRunner {
     timestampReadbackWaitMs: 0,
     gpuPassMs: 0,
     gpuSections: "",
-    gpuTimingStatus: "not-requested",
+    gpuTimingStatus: "disabled",
     selectedTokenId: -1,
     peakResidentBytes: 0,
     attentionTempBytes: 0,
@@ -346,6 +352,9 @@ export class WebGpuSegmentRunner implements SegmentRunner {
     segmentStartLayer: number,
     segmentEndLayerExclusive: number,
     prefillChunkSize: number,
+    optimizationLevel: WebGpuOptimizationLevel,
+    gpuProfiling: boolean,
+    trackBufferAllocations: boolean,
     lazyLoadMs: number,
   ) {
     this.arena = arena;
@@ -360,12 +369,18 @@ export class WebGpuSegmentRunner implements SegmentRunner {
     this.segmentStartLayer = segmentStartLayer;
     this.segmentEndLayerExclusive = segmentEndLayerExclusive;
     this.prefillChunkSize = prefillChunkSize;
+    this.optimizationLevel = optimizationLevel;
+    this.gpuProfiling = gpuProfiling;
+    this.trackBufferAllocations = trackBufferAllocations;
     this.lazyLoadMs = lazyLoadMs;
   }
 
   static async create(options: WebGpuSegmentRunnerOptions): Promise<WebGpuSegmentRunner> {
     const startMs = nowMs();
-    const device = await webGpuDevice();
+    const optimizationLevel = normalizeOptimizationLevel(options.optimizationLevel);
+    const gpuProfiling = options.gpuProfiling === true;
+    const trackBufferAllocations = options.trackBufferAllocations === true;
+    const device = await webGpuDevice({ gpuProfiling });
     if (!device) {
       throw new Error("WebGPU is not available for  segment execution.");
     }
@@ -422,6 +437,9 @@ export class WebGpuSegmentRunner implements SegmentRunner {
       segmentStartLayer,
       segmentEndLayerExclusive,
       normalizePrefillChunkSize(options.prefillChunkSize),
+      optimizationLevel,
+      gpuProfiling,
+      trackBufferAllocations,
       nowMs() - startMs,
     );
   }
@@ -473,7 +491,7 @@ export class WebGpuSegmentRunner implements SegmentRunner {
       webgpuLastRunBindGroupCreateMs: this.lastRunStats.resourceStats?.bindGroupCreateMs ?? 0,
       webgpuLastRunBufferCreates: this.lastRunStats.resourceStats?.bufferCreates ?? 0,
       webgpuLastRunBufferCreateMs: this.lastRunStats.resourceStats?.bufferCreateMs ?? 0,
-      webgpuLastRunBufferCreateLabels: this.lastRunStats.resourceStats?.bufferCreateLabels ?? "",
+      webgpuLastRunBufferAllocationsByLabel: this.lastRunStats.resourceStats?.bufferAllocationsByLabel ?? "",
       webgpuLastRunEncodeMs: this.lastRunStats.encodeMs,
       webgpuLastRunSubmitMs: this.lastRunStats.submitMs,
       webgpuLastRunReadbackWaitMs: this.lastRunStats.readbackWaitMs,
@@ -503,7 +521,9 @@ export class WebGpuSegmentRunner implements SegmentRunner {
       return;
     }
     const startMs = nowMs();
-    const { device, cache } = installWebGpuRuntimeResourceCache(this.arena.device);
+    const { device, cache } = installWebGpuRuntimeResourceCache(this.arena.device, {
+      trackBufferAllocations: this.trackBufferAllocations,
+    });
     this.arena.device = device;
     this.runtimeResourceCache = cache;
     this.runtimeInitMs += nowMs() - startMs;
@@ -530,7 +550,7 @@ export class WebGpuSegmentRunner implements SegmentRunner {
     this.activeRunTimestampPassCount = 0;
     this.activeRunTimestampPassLabels = [];
     this.activeRunGpuSections = "";
-    this.activeRunTimestampStatus = webGpuGpuTimingEnabled() ? "not-requested" : "disabled";
+    this.activeRunTimestampStatus = this.gpuProfiling ? "not-requested" : "disabled";
     this.activeRunSelectedTokenId = -1;
     return {
       startMs: nowMs(),
@@ -633,7 +653,7 @@ export class WebGpuSegmentRunner implements SegmentRunner {
     cleanup: GpuResource[],
     label: string,
   ): void {
-    if (webGpuFusionEnabled()) {
+    if (this.usesStandardOptimizations()) {
       dispatchRmsNormQ8KQuantize(this.arena.device, pass, resources, input, weight, q8, length, this.epsilon);
       return;
     }
@@ -668,7 +688,7 @@ export class WebGpuSegmentRunner implements SegmentRunner {
     cleanup: GpuResource[],
     label: string,
   ): void {
-    if (webGpuFusionEnabled()) {
+    if (this.usesStandardOptimizations()) {
       dispatchRmsNormResidualAdd(this.arena.device, pass, resources, input, weight, residual, output, length, this.epsilon);
       return;
     }
@@ -689,7 +709,7 @@ export class WebGpuSegmentRunner implements SegmentRunner {
     cleanup: GpuResource[],
     label: string,
   ): void {
-    if (webGpuFusionEnabled()) {
+    if (this.usesStandardOptimizations()) {
       dispatchRmsNormResidualAddScale(this.arena.device, pass, resources, input, weight, residual, scale, output, length, this.epsilon);
       return;
     }
@@ -702,11 +722,12 @@ export class WebGpuSegmentRunner implements SegmentRunner {
 
   private beginComputePass(
     encoder: WebGpuCommandEncoderLike,
-    profileGpuPass: boolean,
     label = "gpu",
-    profileSections = false,
   ): ActiveComputePass {
-    const timestampPass = profileGpuPass ? this.allocateTimestampPass(label) : undefined;
+    const timestampPass = this.gpuProfiling ? this.allocateTimestampPass(label) : undefined;
+    if (this.gpuProfiling && !timestampPass) {
+      throw new Error(`WebGPU GPU profiling is unavailable: ${this.activeRunTimestampStatus}`);
+    }
     const descriptor = timestampPass
       ? {
           timestampWrites: {
@@ -719,8 +740,7 @@ export class WebGpuSegmentRunner implements SegmentRunner {
     return {
       pass: this.countedPass(encoder.beginComputePass(descriptor)),
       timestampPass,
-      profileGpuPass,
-      profileSections,
+      profiling: timestampPass !== undefined,
     };
   }
 
@@ -734,11 +754,11 @@ export class WebGpuSegmentRunner implements SegmentRunner {
     computePass: ActiveComputePass,
     label: string,
   ): ActiveComputePass {
-    if (!computePass.profileSections) {
+    if (!computePass.profiling) {
       return computePass;
     }
     this.endComputePass(encoder, computePass);
-    return this.beginComputePass(encoder, computePass.profileGpuPass, label, computePass.profileSections);
+    return this.beginComputePass(encoder, label);
   }
 
   private finishTimestampPass(encoder: WebGpuCommandEncoderLike, timestampPass: TimestampPass | undefined): void {
@@ -800,22 +820,31 @@ export class WebGpuSegmentRunner implements SegmentRunner {
       this.timestampProfilerStatus = "resolve-query-set-unavailable";
       return undefined;
     }
-    const maxPasses = TIMESTAMP_MAX_PASSES;
+    const maxPasses = Math.max(TIMESTAMP_MAX_PASSES, this.layers.length * 24 + 64);
     const byteLength = maxPasses * TIMESTAMP_RESOLVE_STRIDE_BYTES;
+    let querySet: WebGpuQuerySetLike | undefined;
+    let resolveBuffer: WebGpuBufferLike | undefined;
+    let readbackBuffer: WebGpuBufferLike | undefined;
     try {
+      querySet = device.createQuerySet({ type: "timestamp", count: maxPasses * 2 });
+      resolveBuffer = device.createBuffer({
+        size: byteLength,
+        usage: GPU_QUERY_RESOLVE | GPU_COPY_SRC,
+      });
+      readbackBuffer = device.createBuffer({
+        size: byteLength,
+        usage: GPU_MAP_READ | GPU_COPY_DST,
+      });
       this.timestampProfiler = {
-        querySet: device.createQuerySet({ type: "timestamp", count: maxPasses * 2 }),
-        resolveBuffer: device.createBuffer({
-          size: byteLength,
-          usage: GPU_QUERY_RESOLVE | GPU_COPY_SRC,
-        }),
-        readbackBuffer: device.createBuffer({
-          size: byteLength,
-          usage: GPU_MAP_READ | GPU_COPY_DST,
-        }),
+        querySet,
+        resolveBuffer,
+        readbackBuffer,
         maxPasses,
       };
     } catch {
+      querySet?.destroy?.();
+      resolveBuffer?.destroy?.();
+      readbackBuffer?.destroy?.();
       this.timestampProfilerStatus = "timestamp-profiler-create-failed";
       return undefined;
     }
@@ -831,9 +860,10 @@ export class WebGpuSegmentRunner implements SegmentRunner {
     const startMs = nowMs();
     try {
       await profiler.readbackBuffer.mapAsync(GPU_MAP_READ);
-    } catch {
+    } catch (error) {
       this.activeRunTimestampStatus = "timestamp-readback-failed";
-      return;
+      const message = error instanceof Error ? error.message : String(error);
+      throw new Error(`WebGPU GPU profiling timestamp readback failed: ${message}`);
     } finally {
       this.activeRunTimestampReadbackWaitMs += nowMs() - startMs;
     }
@@ -890,11 +920,15 @@ export class WebGpuSegmentRunner implements SegmentRunner {
     return this.supportsGpuInputPreparation();
   }
 
+  private usesStandardOptimizations(): boolean {
+    return this.optimizationLevel === "standard";
+  }
+
   async prepareTokenIds(tokenIds: readonly number[]): Promise<WebGpuPreparedInput> {
     this.ensureRuntimeResources();
     const runtimeRun = this.beginRuntimeRun();
     try {
-      const prepared = await this.prepareGpuInput(tokenIds, false);
+      const prepared = await this.prepareGpuInput(tokenIds);
       this.tokenIdInputBatches += 1;
       this.tokenIdInputTokens += tokenIds.length;
       return prepared;
@@ -1041,10 +1075,7 @@ export class WebGpuSegmentRunner implements SegmentRunner {
     const runtimeRun = this.beginRuntimeRun();
     try {
       const tokenCount = this.assertTokenIdBatch(tokenIds, positions);
-      const profileGpuPasses = webGpuGpuTimingEnabled() &&
-        tokenCount === 1 &&
-        (options.computeTopK === true || options.computeSelectedToken === true);
-      const prepared = await this.prepareGpuInput(tokenIds, profileGpuPasses);
+      const prepared = await this.prepareGpuInput(tokenIds);
       this.tokenIdInputBatches += 1;
       this.tokenIdInputTokens += tokenCount;
       if (tokenCount > 1) {
@@ -1288,14 +1319,6 @@ export class WebGpuSegmentRunner implements SegmentRunner {
     let topTokensReadback: WebGpuBufferLike | undefined;
     let selectedTokenReadback: WebGpuBufferLike | undefined;
     let selectedTokensReadback: WebGpuBufferLike | undefined;
-    const profileGpuPass = webGpuGpuTimingEnabled() &&
-      (
-        options.computeTopK === true ||
-        options.computeSelectedToken === true ||
-        options.computeSelectedTokens === true ||
-        webGpuGpuDetailedTimingEnabled()
-      );
-
     const perLayerInputsBuffer = this.prepareBatchedPerLayerInputBuffer(options, persistentCleanup);
 
     const encodeStartMs = nowMs();
@@ -1355,8 +1378,9 @@ export class WebGpuSegmentRunner implements SegmentRunner {
           cleanup.push(currentBatch);
           encoder.copyBufferToBuffer(boundary, chunkStart * hiddenByteLength, currentBatch, 0, chunkByteLength);
 
-          let compute = this.beginComputePass(encoder, profileGpuPass, `prefill.chunk.${chunkStart}`);
+          let compute = this.beginComputePass(encoder, `prefill.chunk.${chunkStart}`);
           for (const layer of this.layers) {
+            compute = this.restartComputePass(encoder, compute, `layer.${layer.layer}.prefill`);
             currentBatch = this.dispatchBatchedLayer(
               compute.pass,
               layer,
@@ -1390,6 +1414,7 @@ export class WebGpuSegmentRunner implements SegmentRunner {
             : currentBatch;
 
           if (isLastChunk && options.computeTopK === true) {
+            compute = this.restartComputePass(encoder, compute, "output.topk");
             candidateCount = Math.max(1, options.topK ?? 1);
             const outputStripes = this.requireOutputStripes();
             candidateByteLength = outputStripes.length * candidateCount * 2 * Float32Array.BYTES_PER_ELEMENT;
@@ -1400,6 +1425,7 @@ export class WebGpuSegmentRunner implements SegmentRunner {
             });
           }
           if (isLastChunk && options.computeSelectedToken === true) {
+            compute = this.restartComputePass(encoder, compute, "output.selected");
             selectedTokenBuffer = this.dispatchOutputSelectedToken(compute.pass, selectedHidden, cleanup, resources);
             selectedTokenReadback = this.arena.device.createBuffer({
               size: Uint32Array.BYTES_PER_ELEMENT,
@@ -1407,6 +1433,7 @@ export class WebGpuSegmentRunner implements SegmentRunner {
             });
           }
           if (options.computeSelectedTokens === true) {
+            compute = this.restartComputePass(encoder, compute, "output.selected_tokens");
             for (let tokenIndex = 0; tokenIndex < chunkTokenCount; tokenIndex += 1) {
               const tokenHidden = chunkTokenCount === 1
                 ? currentBatch
@@ -1415,6 +1442,7 @@ export class WebGpuSegmentRunner implements SegmentRunner {
             }
           }
           if (options.computeTopKTokens === true) {
+            compute = this.restartComputePass(encoder, compute, "output.topk_tokens");
             for (let tokenIndex = 0; tokenIndex < chunkTokenCount; tokenIndex += 1) {
               const tokenHidden = chunkTokenCount === 1
                 ? currentBatch
@@ -1478,6 +1506,7 @@ export class WebGpuSegmentRunner implements SegmentRunner {
       this.activeRunEncodeMs += nowMs() - encodeStartMs;
 
       if (!hiddenReadback && !topReadback && !topTokensReadback && !selectedTokenReadback && !selectedTokensReadback) {
+        await this.readTimestampProfiler();
         return {
           hidden: new Float32Array(),
           selectedTokenId: undefined,
@@ -1647,7 +1676,7 @@ export class WebGpuSegmentRunner implements SegmentRunner {
       const vProjection = layer.valueProjectionMode === "shared-with-key"
         ? kProjection
         : scratchF32(this.arena, kvValueDim * tokenCount, cleanup, `blk.${layer.layer}.prefill.v`);
-      const dispatchedDualKv = layer.valueProjectionMode !== "shared-with-key" && webGpuFusionEnabled() && (
+      const dispatchedDualKv = layer.valueProjectionMode !== "shared-with-key" && this.usesStandardOptimizations() && (
         attnQ8_0
           ? dispatchDualQ4_0MatMul(pass, resources, layer.k, layer.v!, attnQ8_0, kProjection, vProjection, tokenCount)
           : dispatchDualQ4KMatMul(pass, resources, layer.k, layer.v!, attnQ8K!, kProjection, vProjection, tokenCount)
@@ -2030,7 +2059,7 @@ export class WebGpuSegmentRunner implements SegmentRunner {
     return this.runTokenFromBoundaryInternal(boundary, tokenIndex, positions, state, options, true);
   }
 
-  private async prepareGpuInput(tokenIds: readonly number[], profileGpuPass: boolean): Promise<PreparedGpuInput> {
+  private async prepareGpuInput(tokenIds: readonly number[]): Promise<PreparedGpuInput> {
     if (!this.supportsGpuInputPreparation()) {
       throw new Error("WebGPU token-id input preparation is not supported for this segment or tensor layout.");
     }
@@ -2069,7 +2098,7 @@ export class WebGpuSegmentRunner implements SegmentRunner {
 
       const encodeStartMs = nowMs();
       const encoder = this.arena.device.createCommandEncoder();
-      const compute = this.beginComputePass(encoder, profileGpuPass, "input.prepare");
+      const compute = this.beginComputePass(encoder, "input.prepare");
       this.dispatchEmbeddingRowChunks(compute.pass, resources, cleanup, tokenEmbeddingChunks, hidden, {
         rowSize: this.manifest.embeddingLength,
         scale: Math.sqrt(this.manifest.embeddingLength),
@@ -2182,6 +2211,7 @@ export class WebGpuSegmentRunner implements SegmentRunner {
       this.endComputePass(encoder, compute);
       this.activeRunEncodeMs += nowMs() - encodeStartMs;
       this.submitCommandBuffer(encoder.finish());
+      await this.readTimestampProfiler();
       this.deferResourceCleanup(resources);
 
       return {
@@ -2242,7 +2272,7 @@ export class WebGpuSegmentRunner implements SegmentRunner {
     const vProjection = layer.valueProjectionMode === "shared-with-key"
       ? kProjection
       : scratchF32(this.arena, kvValueDim, cleanup, `blk.${layer.layer}.prefill_kv.v`);
-    const dispatchedDualKv = layer.valueProjectionMode !== "shared-with-key" && webGpuFusionEnabled() && (
+    const dispatchedDualKv = layer.valueProjectionMode !== "shared-with-key" && this.usesStandardOptimizations() && (
       attnQ8_0
         ? dispatchDualQ4_0MatMul(pass, resources, layer.k, layer.v!, attnQ8_0, kProjection, vProjection, tokenCount)
         : dispatchDualQ4KMatMul(pass, resources, layer.k, layer.v!, attnQ8K!, kProjection, vProjection, tokenCount)
@@ -2261,7 +2291,7 @@ export class WebGpuSegmentRunner implements SegmentRunner {
         }
       }
     }
-    if (webGpuFusionEnabled()) {
+    if (this.usesStandardOptimizations()) {
       dispatchFullKvUpdate(
         this.arena.device,
         pass,
@@ -2625,11 +2655,7 @@ export class WebGpuSegmentRunner implements SegmentRunner {
     const resources: Array<{ destroy: () => void }> = [];
     const encodeStartMs = nowMs();
     const encoder = this.arena.device.createCommandEncoder();
-    const profileGpuPass = webGpuGpuTimingEnabled() &&
-      options.sourceTokenCount === 1 &&
-      (options.computeTopK === true || options.computeSelectedToken === true);
-    const profileSections = webGpuGpuDetailedTimingEnabled();
-    let compute = this.beginComputePass(encoder, profileGpuPass, "decode", profileSections);
+    let compute = this.beginComputePass(encoder, "decode");
     let hiddenReadback: WebGpuBufferLike | undefined;
     let topReadback: WebGpuBufferLike | undefined;
     let selectedTokenReadback: WebGpuBufferLike | undefined;
@@ -2642,11 +2668,6 @@ export class WebGpuSegmentRunner implements SegmentRunner {
       });
 
       for (const layer of this.layers) {
-        compute = this.restartComputePass(
-          encoder,
-          compute,
-          profileSections && shouldProfileLayerDetails(layer.layer) ? `layer.${layer.layer}.attn.norm_quant` : `layer.${layer.layer}`,
-        );
         const layerResult = this.dispatchLayer(encoder, compute, layer, gpuState, current, positions, tokenPosition, state.contextLength, options, cleanup, resources);
         current = layerResult.output;
         compute = layerResult.compute;
@@ -2706,6 +2727,7 @@ export class WebGpuSegmentRunner implements SegmentRunner {
       this.submitCommandBuffer(encoder.finish());
 
       if (!hiddenReadback && !topReadback && !selectedTokenReadback) {
+        await this.readTimestampProfiler();
         this.deferResourceCleanup(resources, cleanup);
         resources.length = 0;
         cleanup.length = 0;
@@ -2785,7 +2807,7 @@ export class WebGpuSegmentRunner implements SegmentRunner {
   ): { output: WebGpuBufferLike; compute: ActiveComputePass } {
     let compute = computePass;
     let pass = compute.pass;
-    const profileDetails = compute.profileSections && shouldProfileLayerDetails(layer.layer);
+    const profileDetails = compute.profiling;
     const restartLayerSection = (section: string): void => {
       if (!profileDetails) {
         return;
@@ -2817,7 +2839,7 @@ export class WebGpuSegmentRunner implements SegmentRunner {
     }
     restartLayerSection("attn.q_rope");
     const query = scratchF32(this.arena, queryDim, cleanup, `blk.${layer.layer}.q_rope`);
-    if (webGpuFusionEnabled()) {
+    if (this.usesStandardOptimizations()) {
       dispatchFullQuery(
         this.arena.device,
         pass,
@@ -2878,7 +2900,7 @@ export class WebGpuSegmentRunner implements SegmentRunner {
         ? kProjection
         : scratchF32(this.arena, kvValueDim, cleanup, `blk.${layer.layer}.v`);
       restartLayerSection("attn.kv_proj");
-      const dispatchedDualKv = layer.valueProjectionMode !== "shared-with-key" && webGpuFusionEnabled() && (
+      const dispatchedDualKv = layer.valueProjectionMode !== "shared-with-key" && this.usesStandardOptimizations() && (
         attnQ8_0
           ? dispatchDualQ4_0MatMul(pass, resources, layer.k, layer.v!, attnQ8_0, kProjection, vProjection, tokenCount)
           : dispatchDualQ4KMatMul(pass, resources, layer.k, layer.v!, attnQ8K!, kProjection, vProjection, tokenCount)
@@ -2898,7 +2920,7 @@ export class WebGpuSegmentRunner implements SegmentRunner {
         }
       }
       restartLayerSection("attn.kv_update");
-      if (webGpuFusionEnabled()) {
+      if (this.usesStandardOptimizations()) {
         dispatchFullKvUpdate(
           this.arena.device,
           pass,
@@ -3287,7 +3309,7 @@ export class WebGpuSegmentRunner implements SegmentRunner {
     cleanup: GpuResource[],
     resources: Array<{ destroy: () => void }>,
   ): { selectedToken: WebGpuBufferLike; compute: ActiveComputePass } {
-    if (!computePass.profileSections) {
+    if (!computePass.profiling) {
       return {
         selectedToken: this.dispatchOutputSelectedToken(computePass.pass, hidden, cleanup, resources),
         compute: computePass,
@@ -3800,10 +3822,6 @@ function formatGpuSectionMs(sectionMs: ReadonlyMap<string, number>): string {
     .join(";");
 }
 
-function shouldProfileLayerDetails(layer: number): boolean {
-  return layer < 3 || layer % 6 === 5;
-}
-
 function outputTop1CandidateCount(outputStripes: readonly OutputStripe[]): number {
   return outputStripes.reduce((sum, stripe) => sum + Math.ceil(stripe.rowCount / TOP1_CHUNK_SIZE), 0);
 }
@@ -3897,12 +3915,8 @@ function normalizePrefillChunkSize(value: number | undefined): number {
   return value;
 }
 
-function webGpuGpuTimingEnabled(): boolean {
-  return (globalThis as { __heliopauseDisableWebGpuGpuTiming?: unknown }).__heliopauseDisableWebGpuGpuTiming !== true;
-}
-
-function webGpuGpuDetailedTimingEnabled(): boolean {
-  return (globalThis as { __heliopauseEnableWebGpuDetailedTimings?: unknown }).__heliopauseEnableWebGpuDetailedTimings === true;
+function normalizeOptimizationLevel(value: WebGpuOptimizationLevel | undefined): WebGpuOptimizationLevel {
+  return value === "baseline" || value === "standard" ? value : "standard";
 }
 
 const KV_CACHE_RESIZE_WGSL = `
@@ -3945,7 +3959,3 @@ fn main(@builtin(global_invocation_id) globalId: vec3<u32>) {
   destinationValues[destinationIndex] = sourceValues[sourceIndex];
 }
 `;
-
-function webGpuFusionEnabled(): boolean {
-  return (globalThis as { __heliopauseDisableWebGpuFusion?: unknown }).__heliopauseDisableWebGpuFusion !== true;
-}

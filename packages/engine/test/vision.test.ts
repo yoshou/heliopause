@@ -19,7 +19,6 @@ import {
   createWebGpuProvider,
 } from "../src/index.ts";
 import {
-  resetPrefillWasmForTesting,
   visionPreprocessRgbaWasm,
 } from "../src/runner/wasm/wasm-kernels.ts";
 import {
@@ -91,18 +90,13 @@ test("Vision encoder errors instead of falling back when WebGPU is unavailable",
     providers: [createWebGpuProvider({ memoryLimitBytes: 1 }), createReferenceProvider()],
   });
 
-  resetPrefillWasmForTesting("");
-  try {
-    await assert.rejects(() => runVisionEncoder(session, {
-      values: new Float32Array([0.25, 0.5, 0.75]),
-      width: 1,
-      height: 1,
-    }), /WebGPU is not available for vision encoder execution/);
+  await assert.rejects(() => runVisionEncoder(session, {
+    values: new Float32Array([0.25, 0.5, 0.75]),
+    width: 1,
+    height: 1,
+  }), /WebGPU is not available for vision encoder execution/);
 
-    assert.equal(session.cacheStats().executionProviderStats.webgpuVisionAttempts, 1);
-  } finally {
-    resetPrefillWasmForTesting();
-  }
+  assert.equal(session.cacheStats().executionProviderStats.webgpuVisionAttempts, 1);
 });
 
 test("Vision reference encoder projects hidden to model embedding size", async () => {
@@ -123,6 +117,38 @@ test("Vision reference encoder projects hidden to model embedding size", async (
 
   assert.equal(encoded.tokenCount, 1);
   assert.equal(encoded.hidden.length, 2);
+});
+
+test("Vision preprocessor errors instead of falling back when WASM is unavailable", async () => {
+  const reader = visionTensorReader([
+    f32Tensor("v.patch_embd.weight", [1, 1, 3, 2], new Float32Array(6)),
+  ], {
+    "clip.vision.projector.scale_factor": 1,
+  });
+  const session = createVisionSession(reader, {
+    preprocessProviderOrder: [
+      "wasm",
+      "reference",
+    ],
+    providers: [createWasmProvider(), createReferenceProvider()],
+  });
+
+  await withWebAssembly(undefined, async () => {
+    await assert.rejects(() => runVisionPreprocessProviders(
+      session,
+      {
+        rgba: new Uint8ClampedArray([32, 64, 96, 255]),
+        sourceWidth: 1,
+        sourceHeight: 1,
+        resize: { width: 1, height: 1, outputTokenCount: 1 },
+      },
+      preprocessVisionRgbaCpu,
+    ), /WASM vision preprocessing is unavailable/);
+  });
+
+  const stats = session.cacheStats().executionProviderStats;
+  assert.equal(stats.wasmVisionPreprocessAttempts, 1);
+  assert.equal(stats.referenceVisionPreprocessRuns, undefined);
 });
 
 test("Vision WASM preprocessing matches CPU resize and normalization", async () => {
@@ -166,41 +192,6 @@ test("Vision WASM preprocessing matches CPU resize and normalization", async () 
   assert.ok(wasm);
   assert.equal(wasm.length, cpu.values.length);
   assert.ok(maxAbsDiff(cpu.values, wasm) <= 1e-6);
-});
-
-test("Vision preprocessor errors instead of falling back when WASM is unavailable", async () => {
-  const reader = visionTensorReader([
-    f32Tensor("v.patch_embd.weight", [1, 1, 3, 2], new Float32Array(6)),
-  ], {
-    "clip.vision.projector.scale_factor": 1,
-  });
-  const session = createVisionSession(reader, {
-    preprocessProviderOrder: [
-      "wasm",
-      "reference",
-    ],
-    providers: [createWasmProvider(), createReferenceProvider()],
-  });
-
-  resetPrefillWasmForTesting("");
-  try {
-    await assert.rejects(() => runVisionPreprocessProviders(
-      session,
-      {
-        rgba: new Uint8ClampedArray([32, 64, 96, 255]),
-        sourceWidth: 1,
-        sourceHeight: 1,
-        resize: { width: 1, height: 1, outputTokenCount: 1 },
-      },
-      preprocessVisionRgbaCpu,
-    ), /WASM vision preprocessing is unavailable/);
-
-    const stats = session.cacheStats().executionProviderStats;
-    assert.equal(stats.wasmVisionPreprocessAttempts, 1);
-    assert.equal(stats.referenceVisionPreprocessRuns, undefined);
-  } finally {
-    resetPrefillWasmForTesting();
-  }
 });
 
 test("Vision session rejects empty preprocess provider order", () => {
@@ -322,6 +313,27 @@ function concatBytes(parts: Uint8Array[]): Uint8Array {
     offset += part.byteLength;
   }
   return output;
+}
+
+async function withWebAssembly<T>(
+  value: typeof WebAssembly | undefined,
+  run: () => Promise<T>,
+): Promise<T> {
+  const descriptor = Object.getOwnPropertyDescriptor(globalThis, "WebAssembly");
+  Object.defineProperty(globalThis, "WebAssembly", {
+    configurable: true,
+    writable: true,
+    value,
+  });
+  try {
+    return await run();
+  } finally {
+    if (descriptor) {
+      Object.defineProperty(globalThis, "WebAssembly", descriptor);
+    } else {
+      Reflect.deleteProperty(globalThis, "WebAssembly");
+    }
+  }
 }
 
 function maxAbsDiff(left: Float32Array, right: Float32Array): number {

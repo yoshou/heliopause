@@ -8,9 +8,21 @@ export type WebGpuExecutionProviderOptions = {
   memoryLimitBytes: number;
   segmentStartLayer?: number;
   prefillChunkSize?: number;
+  optimizationLevel: WebGpuOptimizationLevel;
+  gpuProfiling: boolean;
+  trackBufferAllocations: boolean;
 };
 
-export type WebGpuProviderOptions = Partial<WebGpuExecutionProviderOptions>;
+export type WebGpuOptimizationLevel = "baseline" | "standard";
+
+export type WebGpuProviderOptions = {
+  memoryLimitBytes?: number;
+  segmentStartLayer?: number;
+  prefillChunkSize?: number;
+  optimizationLevel?: WebGpuOptimizationLevel;
+  gpuProfiling?: boolean;
+  trackBufferAllocations?: boolean;
+};
 
 export type WebGpuConfiguredProvider = {
   readonly name: "webgpu";
@@ -32,6 +44,9 @@ export function webGpuExecutionProviderOptions(
     memoryLimitBytes: config.options.memoryLimitBytes ?? WEBGPU_MEMORY_LIMIT_BYTES,
     segmentStartLayer: numberOption(config.options, "segmentStartLayer"),
     prefillChunkSize: numberOption(config.options, "prefillChunkSize"),
+    optimizationLevel: optimizationLevelOption(config.options.optimizationLevel),
+    gpuProfiling: config.options.gpuProfiling === true,
+    trackBufferAllocations: config.options.trackBufferAllocations === true,
   };
 }
 
@@ -64,10 +79,18 @@ export function webGpuSegmentRunner(
       contextLength: state.contextLength,
       memoryLimitBytes: providerOptions.memoryLimitBytes,
       prefillChunkSize: providerOptions.prefillChunkSize,
+      optimizationLevel: providerOptions.optimizationLevel,
+      gpuProfiling: providerOptions.gpuProfiling,
+      trackBufferAllocations: providerOptions.trackBufferAllocations,
       segmentStartLayer,
       segmentEndLayerExclusive,
     });
     runners.set(cacheKey, runner);
+    void runner.catch(() => {
+      if (runners?.get(cacheKey) === runner) {
+        runners.delete(cacheKey);
+      }
+    });
     void runner.then((resolved) => {
       session.setExecutionProviderStatsProvider(() => resolved.runtimeStats(), "webgpu");
     });
@@ -78,4 +101,8 @@ export function webGpuSegmentRunner(
 function numberOption(options: Readonly<Record<string, unknown>> | undefined, name: string): number | undefined {
   const value = options?.[name];
   return typeof value === "number" ? value : undefined;
+}
+
+function optimizationLevelOption(value: unknown): WebGpuOptimizationLevel {
+  return value === "baseline" || value === "standard" ? value : "standard";
 }

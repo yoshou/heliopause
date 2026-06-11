@@ -6,8 +6,8 @@ import type { WebGpuBufferLike, WebGpuCommandEncoderLike, WebGpuDeviceLike } fro
  * Internal code holds `GpuBuffer` (or a subclass) everywhere; the underlying
  * `GPUBuffer` is reached only through `.raw`, and only at the WebGPU boundary
  * (bind group entries, `queue.writeBuffer`, `copyBufferToBuffer`,
- * `resolveQuerySet`). This replaces the previous approach of attaching
- * `__heliopause*` expando properties to foreign buffer objects.
+ * `resolveQuerySet`). This avoids attaching engine-owned expando properties
+ * to foreign buffer objects.
  */
 export class GpuBuffer implements WebGpuBufferLike {
   readonly raw: WebGpuBufferLike;
